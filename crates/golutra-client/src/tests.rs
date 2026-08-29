@@ -17,7 +17,10 @@ use golutra_core::{
     UserQuestionMode, UserQuestionOption, UserQuestionPrompt, UserQuestionRequest, VerificationId,
     VerificationRecord, VerificationResult, WorkspaceChangeRequirement, WorkspaceId,
 };
-use golutra_llm::{ConfiguredProvider, MockProvider, ProviderError, ProviderMessage, ProviderRole};
+use golutra_llm::{
+    ConfiguredProvider, MockProvider, ProviderError, ProviderMessage, ProviderRole,
+    ProviderToolCall,
+};
 use golutra_protocol::{
     ArtifactReadRequest, EventFilter, RuntimeEventSource, RuntimeEventType, RuntimeQueryKind,
     TaskTraceRequest,
@@ -33,6 +36,105 @@ use crate::event_codec::{ObservationIntegrityClass, observation_descriptor};
 use crate::governance_commands::memory_support_matches;
 
 use super::*;
+
+fn replay_assistant(calls: &[(&str, &str)]) -> ProviderMessage {
+    ProviderMessage {
+        role: ProviderRole::Assistant,
+        content: String::new(),
+        tool_call_id: None,
+        tool_name: None,
+        tool_calls: calls
+            .iter()
+            .map(|(id, name)| ProviderToolCall {
+                tool_call_id: (*id).to_owned(),
+                tool_name: (*name).to_owned(),
+                arguments: json!({}),
+            })
+            .collect(),
+        metadata: Default::default(),
+    }
+}
+
+fn replay_tool(call_id: Option<&str>) -> ProviderMessage {
+    ProviderMessage {
+        role: ProviderRole::Tool,
+        content: "result".to_owned(),
+        tool_call_id: call_id.map(str::to_owned),
+        tool_name: Some("read_file".to_owned()),
+        tool_calls: Vec::new(),
+        metadata: Default::default(),
+    }
+}
+
+#[test]
+fn provider_transcript_accepts_completed_parallel_tool_calls() {
+    let messages = vec![
+        ProviderMessage {
+            role: ProviderRole::User,
+            content: "inspect".to_owned(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+            metadata: Default::default(),
+        },
+        replay_assistant(&[("call-a", "read_file"), ("call-b", "read_file")]),
+        replay_tool(Some("call-a")),
+        replay_tool(Some("call-b")),
+        ProviderMessage {
+            role: ProviderRole::Assistant,
+            content: "done".to_owned(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+            metadata: Default::default(),
+        },
+    ];
+
+    assert!(crate::execution::provider_transcript_is_replayable(
+        &messages
+    ));
+}
+
+#[test]
+fn provider_transcript_rejects_dangling_tool_call() {
+    let messages = vec![
+        replay_assistant(&[("call-a", "read_file")]),
+        ProviderMessage {
+            role: ProviderRole::User,
+            content: "follow up".to_owned(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+            metadata: Default::default(),
+        },
+    ];
+
+    assert!(!crate::execution::provider_transcript_is_replayable(
+        &messages
+    ));
+}
+
+#[test]
+fn provider_transcript_rejects_reused_tool_call_id() {
+    let messages = vec![
+        replay_assistant(&[("call-a", "read_file")]),
+        replay_tool(Some("call-a")),
+        replay_assistant(&[("call-a", "read_file")]),
+    ];
+
+    assert!(!crate::execution::provider_transcript_is_replayable(
+        &messages
+    ));
+}
+
+#[test]
+fn provider_transcript_rejects_tool_result_without_id() {
+    let messages = vec![replay_tool(None)];
+
+    assert!(!crate::execution::provider_transcript_is_replayable(
+        &messages
+    ));
+}
 
 fn history_projection_event(
     sequence_no: u64,
@@ -7115,6 +7217,19 @@ async fn prompt_runs_mock_agent_loop_and_writes_file() {
         .find(|event| event["event_type"] == json!(RuntimeEventType::ContextSnapshotCreated))
         .and_then(|event| event["payload"]["snapshot"].as_object())
         .expect("context snapshot event");
+    let cache_diagnostics = events
+        .iter()
+        .find(|event| event["event_type"] == json!(RuntimeEventType::ContextSnapshotCreated))
+        .map(|event| &event["payload"]["cache_diagnostics"])
+        .expect("cache diagnostics");
+    assert!(cache_diagnostics["route"]["digest"].is_string());
+    assert!(cache_diagnostics["cache_policy"].is_string());
+    assert!(
+        cache_diagnostics["message_prefix_length"]
+            .as_u64()
+            .is_some()
+    );
+    assert!(cache_diagnostics["message_prefix_digest"].is_string());
     let request_artifact_id = context_snapshot["redacted_request_artifact_ref"]
         .as_str()
         .expect("redacted request artifact ref")

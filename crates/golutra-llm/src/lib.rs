@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     fmt,
     sync::{
-        Arc, OnceLock, RwLock,
+        Arc, Mutex, OnceLock, RwLock,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -741,6 +741,7 @@ pub trait LlmProvider: Send + Sync {
 pub struct MockProvider {
     contract: ProviderContract,
     outcome: MockProviderOutcome,
+    state: Arc<Mutex<MockProviderState>>,
 }
 
 #[derive(Debug, Clone)]
@@ -749,7 +750,54 @@ enum MockProviderOutcome {
     Error(ProviderError),
 }
 
+#[derive(Debug, Default)]
+struct MockProviderState {
+    task_id: Option<TaskId>,
+    tool_call_emitted: bool,
+    request_id: Option<ProviderRequestId>,
+    request_phase: Option<MockResponsePhase>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MockResponsePhase {
+    ToolCall,
+    Completion,
+}
+
 impl MockProvider {
+    /// 只保留当前任务和最近请求，避免长时间复用模拟 provider 时状态无界增长。
+    fn response_phase(&self, request: &ProviderRequest) -> MockResponsePhase {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.task_id != Some(request.task_id) {
+            state.task_id = Some(request.task_id);
+            state.tool_call_emitted = false;
+            state.request_id = None;
+            state.request_phase = None;
+        }
+        if state.request_id == Some(request.request_id)
+            && let Some(phase) = state.request_phase
+        {
+            return phase;
+        }
+        let phase = if request
+            .messages
+            .last()
+            .is_some_and(|message| message.role == ProviderRole::Tool)
+            || state.tool_call_emitted
+        {
+            MockResponsePhase::Completion
+        } else {
+            state.tool_call_emitted = true;
+            MockResponsePhase::ToolCall
+        };
+        state.request_id = Some(request.request_id);
+        state.request_phase = Some(phase);
+        phase
+    }
+
     #[must_use]
     pub fn text_response(content: impl Into<String>) -> Self {
         Self {
@@ -769,6 +817,7 @@ impl MockProvider {
                 finish_reason: ProviderFinishReason::Stop,
                 raw_metadata: serde_json::json!({"provider": "mock"}),
             })),
+            state: Arc::new(Mutex::new(MockProviderState::default())),
         }
     }
 
@@ -789,6 +838,7 @@ impl MockProvider {
                 finish_reason: ProviderFinishReason::ToolCalls,
                 raw_metadata: serde_json::json!({"provider": "mock"}),
             })),
+            state: Arc::new(Mutex::new(MockProviderState::default())),
         }
     }
 
@@ -800,6 +850,7 @@ impl MockProvider {
             outcome: MockProviderOutcome::Error(ProviderError::Failed {
                 message: message.into(),
             }),
+            state: Arc::new(Mutex::new(MockProviderState::default())),
         }
     }
 }
@@ -811,12 +862,11 @@ impl LlmProvider for MockProvider {
             MockProviderOutcome::Response(response) => response.as_ref(),
             MockProviderOutcome::Error(error) => return Err(error.clone()),
         };
-        if !response.tool_calls.is_empty()
-            && request
-                .messages
-                .iter()
-                .any(|message| message.role == ProviderRole::Tool)
-        {
+        if !response.tool_calls.is_empty() {
+            let phase = self.response_phase(&request);
+            if !matches!(phase, MockResponsePhase::Completion) {
+                return Ok(response.clone());
+            }
             let summary = request
                 .messages
                 .iter()
@@ -1937,18 +1987,24 @@ fn is_sensitive_header(name: &str) -> bool {
 
 pub fn provider_tool_description(tool_name: &str) -> &'static str {
     match tool_name {
-        "read_file" => "Read a UTF-8 text file in the workspace.",
-        "write_file" => "Write complete UTF-8 content to a workspace-relative file.",
-        "edit_file" => "Replace the first exact match in a workspace-relative UTF-8 file.",
-        "apply_patch" => "Apply a unified diff atomically to workspace-relative files.",
+        "read_file" => {
+            "Read a UTF-8 workspace file by line window; use offset/limit and continuation.next_offset for more."
+        }
+        "write_file" => "Write complete UTF-8 content to a workspace file.",
+        "edit_file" => {
+            "Atomically apply exact, unique, non-overlapping edits[] to one UTF-8 workspace file."
+        }
+        "apply_patch" => {
+            "Atomically apply a unified or Begin/Update/Add/Delete patch to workspace files."
+        }
         "web_search" => {
-            "Search the web when network access is enabled; return concise source-backed results."
+            "Search the web when network access is enabled; return source-backed results."
         }
         "shell_session" => {
-            "Manage a runtime-owned background shell process: wait, write, or terminate; use its cursor for new output."
+            "Control a runtime-owned background shell; authoritative_pid must match; use cursor to wait, read, write, or terminate."
         }
         "subagent" => {
-            "Run one isolated child task and return a bounded summary and artifact references; it cannot create another child."
+            "Run one isolated child task; it cannot create another child; return a bounded result."
         }
         "list_dir" => "List entries in a workspace-relative directory.",
         "rg_search" => "Search workspace files with ripgrep.",
@@ -1961,7 +2017,7 @@ pub fn provider_tool_description(tool_name: &str) -> &'static str {
             "Delegate one complete, self-contained task to an isolated child agent and wait for its result. The child does not receive this conversation. Omit model and reasoning_effort to inherit the current agent settings; specify either field only when the task benefits from an explicit override."
         }
         "shell" => {
-            "Run a workspace command as argv. Use workdir for a workspace subdirectory; pass a quoted Python heredoc on stdin, or invoke an available shell for pipes, redirects, and compound scripts. With background=true, timeout_ms is the absolute process lifetime, yield_time_ms only the initial wait, and the runtime owns the process until it ends; do not use it for processes that must outlive the runtime."
+            "Run a workspace command via argv or command. argv executes directly; use bash -lc for heredoc, pipes, redirection, or compound scripts. background owns the process until timeout_ms; yield_time_ms is the initial wait."
         }
         "process_list" => {
             "List managed background processes owned by the current session, including redacted commands, states, exit codes, and output statistics. This does not consume process output or advance a cursor."

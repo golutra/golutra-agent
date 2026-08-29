@@ -163,6 +163,74 @@ async fn mock_provider_returns_tool_call() {
     assert_eq!(response.tool_calls[0].tool_name, "read_file");
 }
 
+#[tokio::test]
+async fn mock_provider_does_not_finish_a_new_task_for_replayed_tool_history() {
+    let provider = MockProvider::tool_call("read_file", json!({"path": "README.md"}));
+    let previous = provider
+        .complete(request())
+        .await
+        .expect("previous task response");
+    assert_eq!(previous.finish_reason, ProviderFinishReason::ToolCalls);
+    let mut request = request();
+    request.messages = vec![
+        ProviderMessage {
+            role: ProviderRole::Assistant,
+            content: String::new(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: vec![ProviderToolCall {
+                tool_call_id: "old-call".to_owned(),
+                tool_name: "read_file".to_owned(),
+                arguments: json!({"path": "old.txt"}),
+            }],
+            metadata: Default::default(),
+        },
+        ProviderMessage {
+            role: ProviderRole::Tool,
+            content: json!({"summary": "old result"}).to_string(),
+            tool_call_id: Some("old-call".to_owned()),
+            tool_name: Some("read_file".to_owned()),
+            tool_calls: Vec::new(),
+            metadata: Default::default(),
+        },
+        ProviderMessage {
+            role: ProviderRole::User,
+            content: "new task".to_owned(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+            metadata: Default::default(),
+        },
+    ];
+
+    let response = provider.complete(request).await.expect("response");
+
+    assert_eq!(response.finish_reason, ProviderFinishReason::ToolCalls);
+    assert_eq!(response.tool_calls[0].tool_name, "read_file");
+}
+
+#[tokio::test]
+async fn mock_provider_finishes_after_the_current_task_tool_result() {
+    let provider = MockProvider::tool_call("read_file", json!({"path": "README.md"}));
+    let mut request = request();
+    request.messages.push(ProviderMessage {
+        role: ProviderRole::Tool,
+        content: json!({"summary": "current result"}).to_string(),
+        tool_call_id: Some("mock-tool-call".to_owned()),
+        tool_name: Some("read_file".to_owned()),
+        tool_calls: Vec::new(),
+        metadata: Default::default(),
+    });
+
+    let response = provider.complete(request).await.expect("response");
+
+    assert_eq!(response.finish_reason, ProviderFinishReason::Stop);
+    assert_eq!(
+        response.message.expect("completion").content,
+        "Completed: current result"
+    );
+}
+
 #[test]
 fn openai_tool_parameters_come_from_the_runtime_tool_contract() {
     let input_schema = json!({
@@ -223,20 +291,32 @@ fn openai_tool_parameters_come_from_the_runtime_tool_contract() {
 fn shell_provider_description_distinguishes_lifetime_from_initial_wait() {
     let description = provider_tool_description("shell");
 
-    assert!(description.contains("as argv"));
-    assert!(description.contains("Python heredoc"));
-    assert!(description.contains("timeout_ms is the absolute process lifetime"));
-    assert!(description.contains("yield_time_ms only the initial wait"));
-    assert!(description.contains("runtime owns the process"));
-    assert!(description.contains("must outlive the runtime"));
-    assert!(description.len() < 400);
+    assert!(description.contains("argv"));
+    assert!(description.contains("command"));
+    assert!(description.contains("bash -lc"));
+    assert!(description.contains("heredoc"));
+    assert!(description.contains("timeout_ms"));
+    assert!(description.contains("yield_time_ms"));
+    assert!(description.contains("background"));
+    assert!(description.len() < 240);
 }
 
 #[test]
 fn provider_tool_descriptions_own_file_and_question_usage_details() {
     let write_file = provider_tool_description("write_file");
     assert!(write_file.contains("complete UTF-8 content"));
-    assert!(write_file.contains("workspace-relative file"));
+    assert!(write_file.contains("workspace file"));
+
+    let read_file = provider_tool_description("read_file");
+    assert!(read_file.contains("offset/limit"));
+    assert!(read_file.contains("next_offset"));
+    let edit_file = provider_tool_description("edit_file");
+    assert!(edit_file.contains("non-overlapping"));
+    assert!(edit_file.contains("edits[]"));
+
+    let apply_patch = provider_tool_description("apply_patch");
+    assert!(apply_patch.contains("unified"));
+    assert!(apply_patch.contains("Begin/Update/Add/Delete"));
 
     let ask_user = provider_tool_description("ask_user");
     assert!(ask_user.contains("consequential decision"));
@@ -250,7 +330,8 @@ fn provider_tool_descriptions_own_file_and_question_usage_details() {
     assert!(subagent.contains("isolated child task"));
     assert!(subagent.contains("cannot create another child"));
     assert!(provider_tool_description("web_search").contains("network"));
-    assert!(provider_tool_description("shell_session").contains("background"));
+    assert!(provider_tool_description("shell_session").contains("authoritative_pid"));
+    assert!(provider_tool_description("shell_session").contains("cursor"));
     assert_ne!(
         provider_tool_description("process_list"),
         "Golutra workspace tool."
@@ -270,6 +351,104 @@ fn provider_tool_descriptions_own_file_and_question_usage_details() {
     assert_ne!(
         provider_tool_description("process_reconnect"),
         "Golutra workspace tool."
+    );
+}
+
+#[test]
+fn provider_surface_descriptions_are_bounded_without_dropping_capability_terms() {
+    let required_terms = [
+        ("read_file", &["offset/limit", "next_offset"][..]),
+        ("write_file", &["complete UTF-8", "workspace file"][..]),
+        ("edit_file", &["edits[]", "non-overlapping"][..]),
+        ("apply_patch", &["unified", "Begin/Update/Add/Delete"][..]),
+        ("shell", &["argv", "command", "heredoc", "background"][..]),
+        ("web_search", &["network"][..]),
+        ("shell_session", &["authoritative_pid", "cursor"][..]),
+        (
+            "subagent",
+            &["isolated child", "cannot create another child"][..],
+        ),
+    ];
+    for (tool_name, terms) in required_terms {
+        let description = provider_tool_description(tool_name);
+        assert!(!description.is_empty());
+        assert!(
+            description.len() < 256,
+            "{tool_name} description grew unexpectedly"
+        );
+        for term in terms {
+            assert!(
+                description.contains(term),
+                "{tool_name} description lost `{term}`"
+            );
+        }
+    }
+}
+
+#[test]
+fn multi_edit_schema_keeps_all_replacements_required_for_strict_requests() {
+    let contract = golutra_core::ToolContract {
+        tool_name: "edit_file".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "path": {"type": "string"},
+                "edits": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "old_text": {"type": "string"},
+                            "new_text": {"type": "string"}
+                        },
+                        "required": ["old_text", "new_text"]
+                    }
+                }
+            },
+            "required": ["path", "edits"]
+        }),
+        output_schema: json!({}),
+        error_schema: json!({}),
+        side_effect_type: golutra_core::SideEffectType::File,
+        idempotency_key_policy: "required_for_retry".to_owned(),
+        timeout_policy: "bounded".to_owned(),
+        cancellation_policy: "supported".to_owned(),
+        retry_policy: "no_implicit_retry_for_side_effects".to_owned(),
+        artifact_policy: "none".to_owned(),
+        permission_policy_ref: None,
+    };
+    let request = ProviderRequest {
+        request_id: ProviderRequestId::new(),
+        task_id: TaskId::new(),
+        turn_id: TurnId::new(),
+        session_id: None,
+        cache_scope: None,
+        provider_id: "openai-responses".to_owned(),
+        model_id: "gpt-test".to_owned(),
+        messages: vec![ProviderMessage {
+            role: ProviderRole::User,
+            content: "edit two locations".to_owned(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+            metadata: Default::default(),
+        }],
+        tools: vec![contract],
+        cache_policy: PromptCachePolicy::None,
+        max_output_tokens: None,
+    };
+
+    let chat_request =
+        crate::genai_adapter::genai_chat_request(&request, ProviderProtocol::OpenAiResponses)
+            .expect("genai request");
+    let tool = &chat_request.tools.expect("tool list")[0];
+    assert_eq!(tool.strict, Some(true));
+    let schema = tool.schema.as_ref().expect("schema");
+    assert_eq!(
+        schema["properties"]["edits"]["items"]["required"],
+        json!(["old_text", "new_text"])
     );
 }
 

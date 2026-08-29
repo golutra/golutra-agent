@@ -1440,6 +1440,10 @@ fn context_snapshot_from_request_with_estimates_and_tool_digests_and_message_dig
             index: u32::try_from(index).unwrap_or(u32::MAX),
             role: format!("{:?}", message.role).to_lowercase(),
             content_digest: digest_bytes(message.content.as_bytes()),
+            wire_digest: message_digests
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| provider_message_digest(message)),
             estimated_tokens: message_estimates[index],
             tool_call_ids: message
                 .tool_calls
@@ -1484,6 +1488,12 @@ fn context_snapshot_from_request_with_estimates_and_tool_digests_and_message_dig
         generation_config_digest: None,
         budget_snapshot: plan.budget_snapshot.clone(),
         canonical_request_digest,
+        cache_scope_key: request
+            .cache_scope
+            .as_ref()
+            .map(|scope| scope.key().to_owned())
+            .or_else(|| request.session_id.map(|id| id.to_string()))
+            .or_else(|| Some(session_id.to_string())),
         redacted_request_artifact_ref: None,
         restricted_request_artifact_ref: None,
         estimate_source: "character_div_4".to_owned(),

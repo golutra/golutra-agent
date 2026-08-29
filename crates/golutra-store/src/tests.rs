@@ -1,15 +1,118 @@
 use chrono::Utc;
 use golutra_core::{
-    Actor, ActorKind, ArtifactId, BusyPolicy, CommandId, EventId, EvidenceId, EvidenceStrength,
-    LaneId, PostTaskJob, PostTaskJobId, PostTaskJobKind, PostTaskJobStatus,
-    RUNTIME_EVENT_SCHEMA_VERSION, RedactionStatus, RuntimeLane, TaskId, TaskStatus, ToolCallId,
-    ToolResultStatus, TurnId, WorkspaceId,
+    Actor, ActorKind, ArtifactId, BudgetOverflowAction, BusyPolicy, CommandId, ContextSnapshot,
+    ContextSnapshotId, EventId, EvidenceId, EvidenceStrength, LaneId, PostTaskJob, PostTaskJobId,
+    PostTaskJobKind, PostTaskJobStatus, ProviderRequestId, RUNTIME_EVENT_SCHEMA_VERSION,
+    RedactionStatus, RuntimeLane, TaskId, TaskStatus, TokenBudgetSnapshot, TokenBudgetSnapshotId,
+    ToolCallId, ToolResultStatus, TurnId, WorkspaceId,
 };
 use golutra_protocol::{ArtifactReadRequest, RuntimeEventSource, RuntimeEventType};
 use serde_json::json;
 use tempfile::tempdir;
 
 use super::*;
+
+fn context_snapshot_fixture(
+    session_id: SessionId,
+    task_id: TaskId,
+    policy: &str,
+    created_at: chrono::DateTime<Utc>,
+) -> ContextSnapshot {
+    ContextSnapshot {
+        snapshot_id: ContextSnapshotId::new(),
+        session_id,
+        task_id,
+        turn_id: TurnId::new(),
+        provider_request_id: ProviderRequestId::new(),
+        provider_id: "fixture-provider".to_owned(),
+        model_id: "fixture-model".to_owned(),
+        contributor_manifest: Vec::new(),
+        message_manifest: Vec::new(),
+        tool_schema_digests: Vec::new(),
+        generation_config_digest: None,
+        budget_snapshot: TokenBudgetSnapshot {
+            snapshot_id: TokenBudgetSnapshotId::new(),
+            task_id,
+            turn_id: TurnId::new(),
+            context_window: 8_192,
+            max_output: 512,
+            reserved_output_tokens: 512,
+            planned_input_tokens: 16,
+            planned_tool_tokens: 0,
+            planned_summary_tokens: 0,
+            budget_limit: 7_680,
+            budget_policy: policy.to_owned(),
+            action_if_exceeded: BudgetOverflowAction::Compact,
+        },
+        canonical_request_digest: format!("fixture-{policy}"),
+        cache_scope_key: Some(session_id.to_string()),
+        redacted_request_artifact_ref: None,
+        restricted_request_artifact_ref: None,
+        estimate_source: "fixture".to_owned(),
+        created_at,
+    }
+}
+
+#[tokio::test]
+async fn latest_context_skips_auxiliary_compaction_snapshot() {
+    let store = RuntimeStore::in_memory().await.expect("store");
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let base_time = Utc::now();
+    let main = context_snapshot_fixture(session_id, task_id, "provider_observed", base_time);
+    let auxiliary = context_snapshot_fixture(
+        session_id,
+        task_id,
+        "auxiliary_compaction_summary",
+        base_time + chrono::Duration::seconds(1),
+    );
+    store
+        .store_context_snapshot(&main)
+        .await
+        .expect("main snapshot");
+    store
+        .store_context_snapshot(&auxiliary)
+        .await
+        .expect("auxiliary snapshot");
+
+    let latest = store
+        .load_latest_context_snapshot(session_id)
+        .await
+        .expect("latest snapshot")
+        .expect("main snapshot remains available");
+    assert_eq!(latest.snapshot_id, main.snapshot_id);
+    assert_eq!(latest.budget_snapshot.budget_policy, "provider_observed");
+}
+
+#[tokio::test]
+async fn latest_context_snapshot_is_deterministic_for_equal_timestamps() {
+    let store = RuntimeStore::in_memory().await.expect("store");
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let created_at = Utc::now();
+    let first = context_snapshot_fixture(session_id, task_id, "first", created_at);
+    let second = context_snapshot_fixture(session_id, task_id, "second", created_at);
+    let expected = if first.snapshot_id > second.snapshot_id {
+        first.snapshot_id
+    } else {
+        second.snapshot_id
+    };
+    store
+        .store_context_snapshot(&first)
+        .await
+        .expect("first snapshot");
+    store
+        .store_context_snapshot(&second)
+        .await
+        .expect("second snapshot");
+
+    let latest = store
+        .load_latest_context_snapshot(session_id)
+        .await
+        .expect("latest snapshot")
+        .expect("snapshot exists");
+    assert_eq!(latest.snapshot_id, expected);
+}
 
 #[tokio::test]
 async fn command_journal_atomically_records_receipt_and_completion() {

@@ -295,6 +295,13 @@ impl ArtifactRepository {
         self.store.load_context_snapshots(task_id).await
     }
 
+    pub async fn latest_context(
+        &self,
+        session_id: SessionId,
+    ) -> StoreResult<Option<ContextSnapshot>> {
+        self.store.load_latest_context_snapshot(session_id).await
+    }
+
     pub async fn store_verification(&self, plan: &VerificationPlan) -> StoreResult<()> {
         self.store.store_verification_plan(plan).await
     }

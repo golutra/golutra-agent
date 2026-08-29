@@ -45,7 +45,8 @@ use golutra_protocol::{AgentExecutionMode, AgentToolProfile, ExternalVerificatio
 use golutra_tools::{
     CONTRACT_FILE_CONTENT_VERIFIER_TOOL, CONTRACT_PATH_VERIFIER_TOOL, FileBeforeImage, ToolError,
     ToolExecutionReport, ToolInvocation, ToolRegistry, ToolRequest, ToolRuntime,
-    VerifierExecutionRequest, is_pi_plus_tool, model_visible_tool_result, redact_tool_arguments,
+    VerifierExecutionRequest, is_pi_plus_tool, model_visible_tool_result_with_token_budget,
+    redact_tool_arguments, shell_request_is_strictly_read_only,
 };
 use golutra_verify::VerificationInput;
 use serde_json::{Value, json};
@@ -70,6 +71,26 @@ struct ObservedContextUsage {
     tool_digest: String,
     provider_id: String,
     model_id: String,
+}
+
+/// 只有消息前缀、工具 wire、provider 和模型都未改变时，才能复用上游
+/// 返回的输入 token 检查点；任一边界变化都必须重新按本地计划计量。
+fn reusable_observed_prefix(
+    plan: &ContextBuildPlan,
+    observed: &ObservedContextUsage,
+    provider_tool_digest: &str,
+    provider_contract: &ProviderContract,
+) -> Option<ObservedContextPrefix> {
+    (observed.message_count <= plan.messages.len()
+        && context_message_prefix_digest(plan, observed.message_count)
+            .is_some_and(|digest| digest == observed.message_prefix_digest)
+        && observed.tool_digest == provider_tool_digest
+        && observed.provider_id == provider_contract.provider_id
+        && observed.model_id == provider_contract.model_id)
+        .then_some(ObservedContextPrefix {
+            message_count: observed.message_count,
+            input_tokens: observed.input_tokens,
+        })
 }
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -99,7 +120,32 @@ pub(crate) use step_machine::{
 pub use trace::{AgentLoopTraceEvent, RuntimeObservation, RuntimeObservationSink};
 pub use verification::RuntimeVerificationService;
 
+// 读取批次必须有独立上限；工具失败预算只负责熔断，不能改变合法读取的调度方式。
 const PARALLEL_READ_CONCURRENCY_LIMIT: usize = 8;
+const DEFAULT_ACTIVE_TOOL_RESULT_TOKENS: u64 = 2_048;
+const MIN_ACTIVE_TOOL_RESULT_TOKENS: u64 = 256;
+
+/// 根据剩余 provider 输入预算确定性地选择结果上限。普通回合保持现有 8 KiB
+/// 投影；只有上下文窗口紧张时才收缩，并为下一轮 provider 请求预留少量空间，
+/// 以免过早触发压缩。
+fn active_tool_result_token_budget(
+    plan: &ContextBuildPlan,
+    message_token_total: u64,
+    planned_tool_tokens: u64,
+) -> u64 {
+    let limit = plan.budget_snapshot.budget_limit;
+    if limit == u64::MAX {
+        return DEFAULT_ACTIVE_TOOL_RESULT_TOKENS;
+    }
+    let used = message_token_total.saturating_add(planned_tool_tokens);
+    let available = limit.saturating_sub(used);
+    available
+        .saturating_sub(MIN_ACTIVE_TOOL_RESULT_TOKENS)
+        .clamp(
+            MIN_ACTIVE_TOOL_RESULT_TOKENS,
+            DEFAULT_ACTIVE_TOOL_RESULT_TOKENS,
+        )
+}
 
 #[derive(Debug, Error)]
 pub enum AgentLoopError {
@@ -165,6 +211,28 @@ pub struct AgentLoopOutcome {
 pub struct AgentReplayContext {
     pub initial_messages: Vec<ProviderMessage>,
     pub tools: Vec<ToolContract>,
+    /// 确定性回放默认关闭并行读取；正常 resume 已校验 wire 完整性，可保留并行读取。
+    pub(crate) allow_parallel_reads: bool,
+}
+
+impl AgentReplayContext {
+    #[must_use]
+    pub fn for_replay(initial_messages: Vec<ProviderMessage>, tools: Vec<ToolContract>) -> Self {
+        Self {
+            initial_messages,
+            tools,
+            allow_parallel_reads: false,
+        }
+    }
+
+    #[must_use]
+    pub fn for_resume(initial_messages: Vec<ProviderMessage>, tools: Vec<ToolContract>) -> Self {
+        Self {
+            initial_messages,
+            tools,
+            allow_parallel_reads: true,
+        }
+    }
 }
 
 /// The execution surface currently active at a turn boundary.
@@ -308,6 +376,17 @@ struct ParallelReadOutcome {
     report: ToolExecutionReport,
     progress: Vec<ToolProgress>,
     tool_call_count: u32,
+}
+
+/// 单次 provider 工具尝试的元数据。执行报告保持不可变；旁路表让最终验收能够
+/// 区分原始失败与后续等价恢复，同时不改写错误证据或模型可见结果。
+#[derive(Debug, Clone)]
+struct ToolAttemptMetadata {
+    tool_call_id: golutra_core::ToolCallId,
+    signature: String,
+    step_no: u32,
+    status: ToolResultStatus,
+    recoverable_failure: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1043,6 +1122,7 @@ where
             .validate()
             .map_err(AgentLoopError::TaskContract)?;
         let mut tool_reports = Vec::new();
+        let mut tool_attempts = Vec::<ToolAttemptMetadata>::new();
         let mut last_assistant_message = None;
         let mut last_emitted_assistant_message = None;
         let mut current_turn_id = request.turn_id;
@@ -1106,6 +1186,17 @@ where
             },
         );
         let all_provider_tools = match replay_context.as_ref() {
+            Some(replay_context) if replay_context.allow_parallel_reads => request
+                .tools
+                .iter()
+                .map(|tool_name| {
+                    self.tool_executor
+                        .registry()
+                        .contract(tool_name)
+                        .cloned()
+                        .ok_or_else(|| ToolError::UnknownTool(tool_name.clone()))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
             Some(replay_context) => replay_context.tools.clone(),
             None => request
                 .tools
@@ -1119,12 +1210,14 @@ where
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         };
-        let mut provider_tools = provider_tools_for_objective(
+        // 普通回合固定发送完整的 canonical 工具面。按用户文本猜测工具会隐藏模型
+        // 能力，并使同一会话的工具 schema 在首轮和后续轮次之间发生变化，破坏缓存
+        // 前缀；显式 None profile 仍由 provider_tools_for_turn 关闭工具。
+        let mut provider_tools = provider_tools_for_turn(
             &all_provider_tools,
             &current_task_contract,
             current_tool_profile,
             self.tool_executor.registry(),
-            &current_objective,
         );
         if objective_disables_tools(&current_objective) {
             provider_tools.clear();
@@ -1132,19 +1225,77 @@ where
         let (mut provider_tool_schema_digests, mut planned_tool_tokens, mut provider_tool_digest) =
             provider_tool_snapshot(&provider_tools);
         let base_plan_result = match replay_context.as_ref() {
-            Some(replay_context) => self.context_builder.build_from_messages(
-                request.task_id,
-                current_turn_id,
-                replay_context.initial_messages.clone(),
-            ),
-            None => self.context_builder.build(
-                request.task_id,
-                current_turn_id,
-                request.contributors.clone(),
-            ),
+            Some(replay_context) if replay_context.allow_parallel_reads => {
+                // 正常 resume 同时保留当前任务的 contributor 计划，用它校验
+                // system/project 前缀；校验失败时直接回退到普通历史投影。
+                let normal_plan = self.context_builder.build(
+                    request.task_id,
+                    current_turn_id,
+                    request.contributors.clone(),
+                );
+                match normal_plan {
+                    Ok(normal_plan) => {
+                        let stable_prefix_len = self
+                            .context_builder
+                            .stable_prefix_len(&normal_plan.messages, &normal_plan.message_sources);
+                        let replay_plan = self.context_builder.build_from_messages(
+                            request.task_id,
+                            current_turn_id,
+                            replay_context.initial_messages.clone(),
+                        );
+                        let tools_match = provider_tool_digest
+                            == provider_tool_snapshot(&provider_tools_for_turn(
+                                &replay_context.tools,
+                                &current_task_contract,
+                                current_tool_profile,
+                                self.tool_executor.registry(),
+                            ))
+                            .2;
+                        match replay_plan {
+                            Ok(replay_plan)
+                                if stable_prefix_len > 0
+                                    && tools_match
+                                    && replay_plan.messages.len() >= stable_prefix_len
+                                    && normal_plan.messages[..stable_prefix_len]
+                                        == replay_plan.messages[..stable_prefix_len] =>
+                            {
+                                Ok((replay_plan, stable_prefix_len))
+                            }
+                            _ => Ok((normal_plan, stable_prefix_len)),
+                        }
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            Some(replay_context) => self
+                .context_builder
+                .build_from_messages(
+                    request.task_id,
+                    current_turn_id,
+                    replay_context.initial_messages.clone(),
+                )
+                .map(|plan| {
+                    let stable_prefix_len = self
+                        .context_builder
+                        .stable_prefix_len(&plan.messages, &plan.message_sources);
+                    (plan, stable_prefix_len)
+                }),
+            None => self
+                .context_builder
+                .build(
+                    request.task_id,
+                    current_turn_id,
+                    request.contributors.clone(),
+                )
+                .map(|plan| {
+                    let stable_prefix_len = self
+                        .context_builder
+                        .stable_prefix_len(&plan.messages, &plan.message_sources);
+                    (plan, stable_prefix_len)
+                }),
         };
-        let base_plan = match base_plan_result {
-            Ok(plan) => plan,
+        let (base_plan, protected_prefix_len) = match base_plan_result {
+            Ok((plan, stable_prefix_len)) => (plan, stable_prefix_len),
             Err(error) => {
                 return Ok(context_guard::outcome(
                     &request,
@@ -1161,9 +1312,6 @@ where
                 trimmed_contributors: base_plan.trimmed_contributors.clone(),
             });
         }
-        let protected_prefix_len = self
-            .context_builder
-            .stable_prefix_len(&base_plan.messages, &base_plan.message_sources);
         // 计划只在任务开始时创建一次；后续回合原地更新消息和预算，避免先深拷贝
         // 初始消息再立即覆盖的无效分配。
         let mut plan = base_plan;
@@ -1185,12 +1333,11 @@ where
                     if pending_turn.steer {
                         if let Some(tool_profile) = pending_execution.tool_profile {
                             current_tool_profile = tool_profile;
-                            provider_tools = provider_tools_for_objective(
+                            provider_tools = provider_tools_for_turn(
                                 &all_provider_tools,
                                 &current_task_contract,
                                 current_tool_profile,
                                 self.tool_executor.registry(),
-                                &current_objective,
                             );
                             if objective_disables_tools(&current_objective) {
                                 provider_tools.clear();
@@ -1241,12 +1388,11 @@ where
                         current_task_contract
                             .validate()
                             .map_err(AgentLoopError::TaskContract)?;
-                        provider_tools = provider_tools_for_objective(
+                        provider_tools = provider_tools_for_turn(
                             &all_provider_tools,
                             &current_task_contract,
                             current_tool_profile,
                             self.tool_executor.registry(),
-                            &current_objective,
                         );
                         if objective_disables_tools(&current_objective) {
                             provider_tools.clear();
@@ -1262,6 +1408,7 @@ where
                         current_turn_touched_code =
                             current_task_contract.requires_workspace_evidence();
                         tool_reports.clear();
+                        tool_attempts.clear();
                         turn_state = TurnState::new(current_turn_id);
                         goal_ledger.original_objective = current_objective.clone();
                         goal_ledger.success_criteria = current_completion_criteria.clone();
@@ -1318,20 +1465,14 @@ where
                 plan.budget_snapshot.turn_id = current_turn_id;
                 plan.budget_snapshot.planned_tool_tokens = planned_tool_tokens;
                 let primary_contract = self.provider.contract();
-                let observed_prefix = observed_context_usage
-                    .as_ref()
-                    .filter(|observed| {
-                        observed.message_count <= plan.messages.len()
-                            && context_message_prefix_digest(&plan, observed.message_count)
-                                .is_some_and(|digest| digest == observed.message_prefix_digest)
-                            && observed.tool_digest == provider_tool_digest
-                            && observed.provider_id == primary_contract.provider_id
-                            && observed.model_id == primary_contract.model_id
-                    })
-                    .map(|observed| ObservedContextPrefix {
-                        message_count: observed.message_count,
-                        input_tokens: observed.input_tokens,
-                    });
+                let observed_prefix = observed_context_usage.as_ref().and_then(|observed| {
+                    reusable_observed_prefix(
+                        &plan,
+                        observed,
+                        &provider_tool_digest,
+                        &primary_contract,
+                    )
+                });
                 plan.budget_snapshot.planned_input_tokens =
                     context_tokens_with_observed_prefix_and_total(
                         &plan.messages,
@@ -1632,28 +1773,6 @@ where
                     .to_owned(),
                 };
 
-                // 意图投影会让常见首请求保持精简。模型若确实调用了首轮未加载、
-                // 但仍在批准工具面内的工具，则在下一请求补入该能力，并使已观测的
-                // 前缀计数失效，因为工具 schema 也是前缀的一部分。
-                if !provider_response.tool_calls.is_empty()
-                    && !objective_disables_tools(&current_objective)
-                    && expand_provider_tools_for_calls(
-                        &mut provider_tools,
-                        &all_provider_tools,
-                        &provider_response.tool_calls,
-                        &current_task_contract,
-                        current_tool_profile,
-                        self.tool_executor.registry(),
-                    )
-                {
-                    (
-                        provider_tool_schema_digests,
-                        planned_tool_tokens,
-                        provider_tool_digest,
-                    ) = provider_tool_snapshot(&provider_tools);
-                    observed_context_usage = None;
-                }
-
                 if let Some(content) = provider_response
                     .message
                     .as_ref()
@@ -1811,314 +1930,347 @@ where
                     },
                     &mut message_token_total,
                 );
-                let parallel_read_candidate = provider_batch_is_parallel_read_candidate(
-                    &provider_response.tool_calls,
-                    replay_context.is_some(),
-                    current_governor
-                        .limits()
-                        .max_failed_tool_calls
-                        .saturating_sub(consecutive_failed_tool_call_count),
-                    current_tool_profile,
-                    self.tool_executor.registry(),
-                );
-                let mut parallel_read_outcomes = VecDeque::new();
-                if parallel_read_candidate {
-                    control.wait_until_runnable().await?;
-                    let mut prepared = Vec::with_capacity(provider_response.tool_calls.len());
-                    let mut parallel_failure_signatures = HashSet::new();
-                    for (offset, tool_call) in provider_response.tool_calls.iter().enumerate() {
-                        let provider_tool_call_id = tool_call.tool_call_id.clone();
-                        let failure_signature =
-                            format!("{}:{}", tool_call.tool_name, tool_call.arguments);
-                        let failure_family =
-                            semantic_failure_family(&tool_call.tool_name, &tool_call.arguments);
-                        let blocked_family_failures = failure_families.failures(&failure_family);
-                        if blocked_family_failures > 0
-                            || !parallel_failure_signatures.insert(failure_signature.clone())
-                        {
-                            prepared.clear();
-                            break;
-                        }
-                        let request = ToolRequest {
-                            tool_call_id: golutra_core::ToolCallId::new(),
-                            provider_tool_call_id: Some(provider_tool_call_id.clone()),
-                            session_id: request.session_id,
-                            turn_id: Some(current_turn_id),
-                            tool_name: tool_call.tool_name.clone(),
-                            arguments: tool_call.arguments.clone(),
-                        };
-                        if tool_profile_rejection_reason(
-                            &request,
+                // 只并行相邻且明确无副作用的读取。文件变更或进程操作是严格的
+                // 顺序边界，两侧读取不能互相竞态；结果仍按 provider 原顺序提交，
+                // 只消除混合工具批次中可避免的等待。
+                let replay_context_active = replay_context
+                    .as_ref()
+                    .is_some_and(|context| !context.allow_parallel_reads);
+                let mut pending_tool_calls = provider_response.tool_calls.into_iter().peekable();
+                let mut stop_after_parallel_read_batch = false;
+                while let Some(first_tool_call) = pending_tool_calls.next() {
+                    let mut batch_tool_calls = vec![first_tool_call];
+                    if !replay_context_active
+                        && provider_tool_call_is_parallel_read_safe(
+                            &batch_tool_calls[0],
                             current_tool_profile,
                             self.tool_executor.registry(),
                         )
-                        .is_some()
-                        {
-                            prepared.clear();
-                            break;
+                    {
+                        loop {
+                            if batch_tool_calls.len() >= PARALLEL_READ_CONCURRENCY_LIMIT {
+                                break;
+                            }
+                            let Some(next_tool_call) = pending_tool_calls.peek() else {
+                                break;
+                            };
+                            if !provider_tool_call_is_parallel_read_safe(
+                                next_tool_call,
+                                current_tool_profile,
+                                self.tool_executor.registry(),
+                            ) {
+                                break;
+                            }
+                            batch_tool_calls.push(
+                                pending_tool_calls
+                                    .next()
+                                    .expect("peeked tool call must remain available"),
+                            );
                         }
-                        let Ok(policy) = self.tool_executor.evaluate(&request) else {
-                            prepared.clear();
-                            break;
-                        };
-                        if policy.decision != PolicyDecision::Allow {
-                            prepared.clear();
-                            break;
+                    }
+
+                    let mut parallel_read_outcomes = VecDeque::new();
+                    if batch_tool_calls.len() > 1 {
+                        control.wait_until_runnable().await?;
+                        let mut prepared = Vec::with_capacity(batch_tool_calls.len());
+                        let mut parallel_failure_signatures = HashSet::new();
+                        for (offset, tool_call) in batch_tool_calls.iter().enumerate() {
+                            let provider_tool_call_id = tool_call.tool_call_id.clone();
+                            let failure_signature =
+                                tool_attempt_signature(&tool_call.tool_name, &tool_call.arguments);
+                            let failure_family =
+                                semantic_failure_family(&tool_call.tool_name, &tool_call.arguments);
+                            let blocked_family_failures =
+                                failure_families.failures(&failure_family);
+                            if blocked_family_failures > 0
+                                || !parallel_failure_signatures.insert(failure_signature.clone())
+                            {
+                                prepared.clear();
+                                break;
+                            }
+                            let request = ToolRequest {
+                                tool_call_id: golutra_core::ToolCallId::new(),
+                                provider_tool_call_id: Some(provider_tool_call_id.clone()),
+                                session_id: request.session_id,
+                                turn_id: Some(current_turn_id),
+                                tool_name: tool_call.tool_name.clone(),
+                                arguments: tool_call.arguments.clone(),
+                            };
+                            if tool_profile_rejection_reason(
+                                &request,
+                                current_tool_profile,
+                                self.tool_executor.registry(),
+                            )
+                            .is_some()
+                            {
+                                prepared.clear();
+                                break;
+                            }
+                            let Ok(policy) = self.tool_executor.evaluate(&request) else {
+                                prepared.clear();
+                                break;
+                            };
+                            if policy.decision != PolicyDecision::Allow {
+                                prepared.clear();
+                                break;
+                            }
+                            let offset =
+                                u32::try_from(offset).unwrap_or(u32::MAX).saturating_add(1);
+                            let batch_tool_call_count = tool_call_count.saturating_add(offset);
+                            let governance = current_governor.evaluate(
+                                &goal_ledger,
+                                &GovernorObservation {
+                                    phase: GovernorPhase::Tool,
+                                    iteration: iteration.saturating_add(1),
+                                    tool_calls: batch_tool_call_count,
+                                    failed_tool_calls: failed_tool_call_count,
+                                    consecutive_failed_tool_calls:
+                                        consecutive_failed_tool_call_count,
+                                    planned_input_tokens: plan.budget_snapshot.planned_input_tokens,
+                                    elapsed_ms: elapsed_millis(current_turn_started_at),
+                                    latest_action: format!(
+                                        "{} {}",
+                                        tool_call.tool_name, tool_call.arguments
+                                    ),
+                                    estimated_cost_microusd,
+                                    policy_decision: None,
+                                    policy_block_disposition: None,
+                                    security_risk: "medium".to_owned(),
+                                },
+                            );
+                            if !governance.permits_execution() {
+                                prepared.clear();
+                                break;
+                            }
+                            prepared.push(PreparedParallelReadCall {
+                                provider_tool_call_id,
+                                failure_signature,
+                                failure_family,
+                                blocked_family_failures,
+                                request,
+                                policy,
+                                governance,
+                                tool_call_count: batch_tool_call_count,
+                            });
                         }
-                        let offset = u32::try_from(offset).unwrap_or(u32::MAX).saturating_add(1);
-                        let batch_tool_call_count = tool_call_count.saturating_add(offset);
-                        let governance = current_governor.evaluate(
-                            &goal_ledger,
-                            &GovernorObservation {
-                                phase: GovernorPhase::Tool,
-                                iteration: iteration.saturating_add(1),
-                                tool_calls: batch_tool_call_count,
-                                failed_tool_calls: failed_tool_call_count,
-                                consecutive_failed_tool_calls: consecutive_failed_tool_call_count,
-                                planned_input_tokens: plan.budget_snapshot.planned_input_tokens,
-                                elapsed_ms: elapsed_millis(current_turn_started_at),
-                                latest_action: format!(
-                                    "{} {}",
-                                    tool_call.tool_name, tool_call.arguments
-                                ),
-                                estimated_cost_microusd,
-                                policy_decision: None,
-                                policy_block_disposition: None,
-                                security_risk: "medium".to_owned(),
-                            },
-                        );
-                        if !governance.permits_execution() {
-                            prepared.clear();
-                            break;
+                        if prepared.len() == batch_tool_calls.len() {
+                            for prepared_call in &prepared {
+                                trace(AgentLoopTraceEvent::GovernorDecided(
+                                    prepared_call.governance.clone(),
+                                ));
+                                let recovery_policy = self
+                                    .tool_executor
+                                    .registry()
+                                    .contract(&prepared_call.request.tool_name)
+                                    .map(ToolRecoveryPolicy::from)
+                                    .unwrap_or_default();
+                                trace(AgentLoopTraceEvent::ToolStarted {
+                                    tool_call_id: prepared_call.request.tool_call_id,
+                                    provider_tool_call_id: Some(
+                                        prepared_call.provider_tool_call_id.clone(),
+                                    ),
+                                    tool_name: prepared_call.request.tool_name.clone(),
+                                    display_arguments: redact_tool_arguments(
+                                        &prepared_call.request.arguments,
+                                    ),
+                                    recovery_policy,
+                                });
+                                trace(AgentLoopTraceEvent::PolicyEvaluated(
+                                    prepared_call.policy.clone(),
+                                ));
+                            }
+                            tool_call_count = prepared
+                                .last()
+                                .map_or(tool_call_count, |call| call.tool_call_count);
+                            parallel_read_outcomes = invoke_parallel_read_calls(
+                                &self.tool_executor,
+                                prepared,
+                                control.cancellation.clone(),
+                                runtime_deadline,
+                            )
+                            .await;
                         }
-                        prepared.push(PreparedParallelReadCall {
+                    }
+                    let parallel_read_batch = !parallel_read_outcomes.is_empty();
+                    for tool_call in batch_tool_calls {
+                        let (
                             provider_tool_call_id,
                             failure_signature,
                             failure_family,
                             blocked_family_failures,
-                            request,
-                            policy,
-                            governance,
-                            tool_call_count: batch_tool_call_count,
-                        });
-                    }
-                    if prepared.len() == provider_response.tool_calls.len() {
-                        for prepared_call in &prepared {
-                            trace(AgentLoopTraceEvent::GovernorDecided(
-                                prepared_call.governance.clone(),
-                            ));
+                            strategy_was_blocked,
+                            prepared_objective_validation,
+                            result_tool_call_count,
+                            mut report,
+                        ) = if let Some(outcome) = parallel_read_outcomes.pop_front() {
+                            debug_assert_eq!(
+                                outcome.provider_tool_call_id, tool_call.tool_call_id,
+                                "parallel read outcomes retain provider source order"
+                            );
+                            debug_assert_eq!(
+                                outcome.report.envelope.tool_name, tool_call.tool_name,
+                                "parallel read outcome matches its source call"
+                            );
+                            for progress in outcome.progress {
+                                trace(AgentLoopTraceEvent::ToolProgress(progress));
+                            }
+                            (
+                                outcome.provider_tool_call_id,
+                                outcome.failure_signature,
+                                outcome.failure_family,
+                                outcome.blocked_family_failures,
+                                false,
+                                None,
+                                outcome.tool_call_count,
+                                outcome.report,
+                            )
+                        } else {
+                            control.wait_until_runnable().await?;
+                            let tool_action =
+                                format!("{} {}", tool_call.tool_name, tool_call.arguments);
+                            let governance = current_governor.evaluate(
+                                &goal_ledger,
+                                &GovernorObservation {
+                                    phase: GovernorPhase::Tool,
+                                    iteration: iteration.saturating_add(1),
+                                    tool_calls: tool_call_count.saturating_add(1),
+                                    failed_tool_calls: failed_tool_call_count,
+                                    consecutive_failed_tool_calls:
+                                        consecutive_failed_tool_call_count,
+                                    planned_input_tokens: plan.budget_snapshot.planned_input_tokens,
+                                    elapsed_ms: elapsed_millis(current_turn_started_at),
+                                    latest_action: tool_action,
+                                    estimated_cost_microusd,
+                                    policy_decision: None,
+                                    policy_block_disposition: None,
+                                    security_risk: "medium".to_owned(),
+                                },
+                            );
+                            let permits_execution = governance.permits_execution();
+                            if !permits_execution {
+                                guard_reason = Some(governance.reason.clone());
+                                governor_action = Some(governance.action);
+                            }
+                            trace(AgentLoopTraceEvent::GovernorDecided(governance));
+                            if !permits_execution {
+                                finish_runtime_step(
+                                    &mut step_machine,
+                                    step_snapshot.clone(),
+                                    step_fingerprint.clone(),
+                                    false,
+                                    elapsed_millis(current_turn_started_at),
+                                    &mut trace,
+                                );
+                                break 'agent_loop;
+                            }
+                            tool_call_count = tool_call_count.saturating_add(1);
+                            let provider_tool_call_id = tool_call.tool_call_id.clone();
+                            let failure_signature =
+                                tool_attempt_signature(&tool_call.tool_name, &tool_call.arguments);
+                            let failure_family =
+                                semantic_failure_family(&tool_call.tool_name, &tool_call.arguments);
+                            let blocked_family_failures =
+                                failure_families.failures(&failure_family);
+                            let mut tool_request = ToolRequest {
+                                tool_call_id: golutra_core::ToolCallId::new(),
+                                provider_tool_call_id: Some(provider_tool_call_id.clone()),
+                                session_id: request.session_id,
+                                turn_id: Some(current_turn_id),
+                                tool_name: tool_call.tool_name,
+                                arguments: tool_call.arguments,
+                            };
+                            let prepared_objective_validation =
+                                prepare_objective_validation_metadata(&tool_request);
                             let recovery_policy = self
                                 .tool_executor
                                 .registry()
-                                .contract(&prepared_call.request.tool_name)
+                                .contract(&tool_request.tool_name)
                                 .map(ToolRecoveryPolicy::from)
                                 .unwrap_or_default();
                             trace(AgentLoopTraceEvent::ToolStarted {
-                                tool_call_id: prepared_call.request.tool_call_id,
-                                provider_tool_call_id: Some(
-                                    prepared_call.provider_tool_call_id.clone(),
-                                ),
-                                tool_name: prepared_call.request.tool_name.clone(),
-                                display_arguments: redact_tool_arguments(
-                                    &prepared_call.request.arguments,
-                                ),
+                                tool_call_id: tool_request.tool_call_id,
+                                provider_tool_call_id: Some(provider_tool_call_id.clone()),
+                                tool_name: tool_request.tool_name.clone(),
+                                display_arguments: redact_tool_arguments(&tool_request.arguments),
                                 recovery_policy,
                             });
-                            trace(AgentLoopTraceEvent::PolicyEvaluated(
-                                prepared_call.policy.clone(),
-                            ));
-                        }
-                        tool_call_count = prepared
-                            .last()
-                            .map_or(tool_call_count, |call| call.tool_call_count);
-                        parallel_read_outcomes = invoke_parallel_read_calls(
-                            &self.tool_executor,
-                            prepared,
-                            control.cancellation.clone(),
-                            runtime_deadline,
-                        )
-                        .await;
-                    }
-                }
-                let parallel_read_batch = !parallel_read_outcomes.is_empty();
-                let mut stop_after_parallel_read_batch = false;
-                for tool_call in provider_response.tool_calls {
-                    let (
-                        provider_tool_call_id,
-                        failure_signature,
-                        failure_family,
-                        blocked_family_failures,
-                        strategy_was_blocked,
-                        prepared_objective_validation,
-                        result_tool_call_count,
-                        mut report,
-                    ) = if let Some(outcome) = parallel_read_outcomes.pop_front() {
-                        debug_assert_eq!(
-                            outcome.provider_tool_call_id, tool_call.tool_call_id,
-                            "parallel read outcomes retain provider source order"
-                        );
-                        debug_assert_eq!(
-                            outcome.report.envelope.tool_name, tool_call.tool_name,
-                            "parallel read outcome matches its source call"
-                        );
-                        for progress in outcome.progress {
-                            trace(AgentLoopTraceEvent::ToolProgress(progress));
-                        }
-                        (
-                            outcome.provider_tool_call_id,
-                            outcome.failure_signature,
-                            outcome.failure_family,
-                            outcome.blocked_family_failures,
-                            false,
-                            None,
-                            outcome.tool_call_count,
-                            outcome.report,
-                        )
-                    } else {
-                        control.wait_until_runnable().await?;
-                        let tool_action =
-                            format!("{} {}", tool_call.tool_name, tool_call.arguments);
-                        let governance = current_governor.evaluate(
-                            &goal_ledger,
-                            &GovernorObservation {
-                                phase: GovernorPhase::Tool,
-                                iteration: iteration.saturating_add(1),
-                                tool_calls: tool_call_count.saturating_add(1),
-                                failed_tool_calls: failed_tool_call_count,
-                                consecutive_failed_tool_calls: consecutive_failed_tool_call_count,
-                                planned_input_tokens: plan.budget_snapshot.planned_input_tokens,
-                                elapsed_ms: elapsed_millis(current_turn_started_at),
-                                latest_action: tool_action,
-                                estimated_cost_microusd,
-                                policy_decision: None,
-                                policy_block_disposition: None,
-                                security_risk: "medium".to_owned(),
-                            },
-                        );
-                        let permits_execution = governance.permits_execution();
-                        if !permits_execution {
-                            guard_reason = Some(governance.reason.clone());
-                            governor_action = Some(governance.action);
-                        }
-                        trace(AgentLoopTraceEvent::GovernorDecided(governance));
-                        if !permits_execution {
-                            finish_runtime_step(
-                                &mut step_machine,
-                                step_snapshot.clone(),
-                                step_fingerprint.clone(),
-                                false,
-                                elapsed_millis(current_turn_started_at),
-                                &mut trace,
-                            );
-                            break 'agent_loop;
-                        }
-                        tool_call_count = tool_call_count.saturating_add(1);
-                        let provider_tool_call_id = tool_call.tool_call_id.clone();
-                        let failure_signature =
-                            format!("{}:{}", tool_call.tool_name, tool_call.arguments);
-                        let failure_family =
-                            semantic_failure_family(&tool_call.tool_name, &tool_call.arguments);
-                        let blocked_family_failures = failure_families.failures(&failure_family);
-                        let mut tool_request = ToolRequest {
-                            tool_call_id: golutra_core::ToolCallId::new(),
-                            provider_tool_call_id: Some(provider_tool_call_id.clone()),
-                            session_id: request.session_id,
-                            turn_id: Some(current_turn_id),
-                            tool_name: tool_call.tool_name,
-                            arguments: tool_call.arguments,
-                        };
-                        let prepared_objective_validation =
-                            prepare_objective_validation_metadata(&tool_request);
-                        let recovery_policy = self
-                            .tool_executor
-                            .registry()
-                            .contract(&tool_request.tool_name)
-                            .map(ToolRecoveryPolicy::from)
-                            .unwrap_or_default();
-                        trace(AgentLoopTraceEvent::ToolStarted {
-                            tool_call_id: tool_request.tool_call_id,
-                            provider_tool_call_id: Some(provider_tool_call_id.clone()),
-                            tool_name: tool_request.tool_name.clone(),
-                            display_arguments: redact_tool_arguments(&tool_request.arguments),
-                            recovery_policy,
-                        });
-                        let question_report = if tool_request.tool_name == "ask_user" {
-                            match tool_request
-                                .arguments
-                                .get("questions")
-                                .cloned()
-                                .map(serde_json::from_value::<Vec<UserQuestionPrompt>>)
-                                .transpose()
-                            {
-                                Ok(Some(questions)) => {
-                                    let question = UserQuestionRequest {
-                                        question_id: golutra_core::QuestionId::new(),
-                                        task_id: request.task_id,
-                                        turn_id: current_turn_id,
-                                        tool_call_id: tool_request.tool_call_id,
-                                        questions,
-                                    };
-                                    match question.validate() {
-                                        Ok(()) => {
-                                            trace(AgentLoopTraceEvent::UserQuestionRequested(
-                                                question.clone(),
-                                            ));
-                                            let resolution =
-                                                control.wait_for_question(&question).await?;
-                                            trace(AgentLoopTraceEvent::UserQuestionResolved(
-                                                resolution.clone(),
-                                            ));
-                                            Some(user_question_report(
-                                                tool_request.clone(),
-                                                resolution,
-                                            ))
-                                        }
-                                        Err(error) => {
-                                            Some(self.tool_executor.invalid_request_report(
-                                                tool_request.clone(),
-                                                error,
-                                            ))
+                            let question_report = if tool_request.tool_name == "ask_user" {
+                                match tool_request
+                                    .arguments
+                                    .get("questions")
+                                    .cloned()
+                                    .map(serde_json::from_value::<Vec<UserQuestionPrompt>>)
+                                    .transpose()
+                                {
+                                    Ok(Some(questions)) => {
+                                        let question = UserQuestionRequest {
+                                            question_id: golutra_core::QuestionId::new(),
+                                            task_id: request.task_id,
+                                            turn_id: current_turn_id,
+                                            tool_call_id: tool_request.tool_call_id,
+                                            questions,
+                                        };
+                                        match question.validate() {
+                                            Ok(()) => {
+                                                trace(AgentLoopTraceEvent::UserQuestionRequested(
+                                                    question.clone(),
+                                                ));
+                                                let resolution =
+                                                    control.wait_for_question(&question).await?;
+                                                trace(AgentLoopTraceEvent::UserQuestionResolved(
+                                                    resolution.clone(),
+                                                ));
+                                                Some(user_question_report(
+                                                    tool_request.clone(),
+                                                    resolution,
+                                                ))
+                                            }
+                                            Err(error) => {
+                                                Some(self.tool_executor.invalid_request_report(
+                                                    tool_request.clone(),
+                                                    error,
+                                                ))
+                                            }
                                         }
                                     }
+                                    Ok(None) => Some(self.tool_executor.invalid_request_report(
+                                        tool_request.clone(),
+                                        "ask_user requires questions",
+                                    )),
+                                    Err(error) => Some(self.tool_executor.invalid_request_report(
+                                        tool_request.clone(),
+                                        format!("invalid ask_user questions: {error}"),
+                                    )),
                                 }
-                                Ok(None) => Some(self.tool_executor.invalid_request_report(
-                                    tool_request.clone(),
-                                    "ask_user requires questions",
-                                )),
-                                Err(error) => Some(self.tool_executor.invalid_request_report(
-                                    tool_request.clone(),
-                                    format!("invalid ask_user questions: {error}"),
-                                )),
-                            }
-                        } else {
-                            None
-                        };
-                        let profile_blocked_report = tool_profile_rejection_reason(
-                            &tool_request,
-                            current_tool_profile,
-                            self.tool_executor.registry(),
-                        )
-                        .map(|reason| {
-                            self.tool_executor
-                                .invalid_request_report(tool_request.clone(), reason)
-                        });
-                        let contract_blocked_report = self
-                            .tool_executor
-                            .registry()
-                            .contract(&tool_request.tool_name)
-                            .filter(|contract| {
-                                matches!(
-                                    current_task_contract.workspace_change,
-                                    WorkspaceChangeRequirement::Forbidden
-                                ) && contract.side_effect_type != SideEffectType::None
-                            })
-                            .map(|_| {
-                                self.tool_executor.invalid_request_report(
-                                    tool_request.clone(),
-                                    "task contract forbids side-effecting tools",
-                                )
+                            } else {
+                                None
+                            };
+                            let profile_blocked_report = tool_profile_rejection_reason(
+                                &tool_request,
+                                current_tool_profile,
+                                self.tool_executor.registry(),
+                            )
+                            .map(|reason| {
+                                self.tool_executor
+                                    .invalid_request_report(tool_request.clone(), reason)
                             });
-                        let strategy_blocked_report = (blocked_family_failures >= 2).then(|| {
+                            let contract_blocked_report = self
+                                .tool_executor
+                                .registry()
+                                .contract(&tool_request.tool_name)
+                                .filter(|contract| {
+                                    matches!(
+                                        current_task_contract.workspace_change,
+                                        WorkspaceChangeRequirement::Forbidden
+                                    ) && contract.side_effect_type != SideEffectType::None
+                                })
+                                .map(|_| {
+                                    self.tool_executor.invalid_request_report(
+                                        tool_request.clone(),
+                                        "task contract forbids side-effecting tools",
+                                    )
+                                });
+                            let strategy_blocked_report = (blocked_family_failures >= 2).then(|| {
                         self.tool_executor.invalid_request_report(
                             tool_request.clone(),
                             format!(
@@ -2126,115 +2278,120 @@ where
                             ),
                         )
                     });
-                        let strategy_was_blocked = strategy_blocked_report.is_some();
-                        let report = if let Some(report) = question_report {
-                            trace(AgentLoopTraceEvent::PolicyEvaluated(
-                                report.policy_evaluation.clone(),
-                            ));
-                            trace(AgentLoopTraceEvent::ToolProgress(ToolProgress {
-                                tool_call_id: report.envelope.tool_call_id,
-                                tool_name: report.envelope.tool_name.clone(),
-                                phase: ToolProgressPhase::Completed,
-                                elapsed_ms: report.metrics.duration_ms,
-                                output_bytes: report.metrics.output_bytes,
-                                output_lines: report.metrics.output_lines,
-                                detail: Some("answered".to_owned()),
-                                output_excerpt: report.envelope.model_visible_excerpt.clone(),
-                            }));
-                            report
-                        } else if let Some(report) = profile_blocked_report {
-                            trace(AgentLoopTraceEvent::PolicyEvaluated(
-                                report.policy_evaluation.clone(),
-                            ));
-                            trace(AgentLoopTraceEvent::ToolProgress(ToolProgress {
-                                tool_call_id: report.envelope.tool_call_id,
-                                tool_name: report.envelope.tool_name.clone(),
-                                phase: ToolProgressPhase::Completed,
-                                elapsed_ms: report.metrics.duration_ms,
-                                output_bytes: report.metrics.output_bytes,
-                                output_lines: report.metrics.output_lines,
-                                detail: Some("profile_blocked".to_owned()),
-                                output_excerpt: None,
-                            }));
-                            report
-                        } else if let Some(report) = strategy_blocked_report {
-                            trace(AgentLoopTraceEvent::PolicyEvaluated(
-                                report.policy_evaluation.clone(),
-                            ));
-                            trace(AgentLoopTraceEvent::ToolProgress(ToolProgress {
-                                tool_call_id: report.envelope.tool_call_id,
-                                tool_name: report.envelope.tool_name.clone(),
-                                phase: ToolProgressPhase::Completed,
-                                elapsed_ms: report.metrics.duration_ms,
-                                output_bytes: report.metrics.output_bytes,
-                                output_lines: report.metrics.output_lines,
-                                detail: Some("strategy_blocked".to_owned()),
-                                output_excerpt: None,
-                            }));
-                            report
-                        } else if let Some(report) = contract_blocked_report {
-                            trace(AgentLoopTraceEvent::PolicyEvaluated(
-                                report.policy_evaluation.clone(),
-                            ));
-                            trace(AgentLoopTraceEvent::ToolProgress(ToolProgress {
-                                tool_call_id: report.envelope.tool_call_id,
-                                tool_name: report.envelope.tool_name.clone(),
-                                phase: ToolProgressPhase::Completed,
-                                elapsed_ms: report.metrics.duration_ms,
-                                output_bytes: report.metrics.output_bytes,
-                                output_lines: report.metrics.output_lines,
-                                detail: Some("blocked".to_owned()),
-                                output_excerpt: None,
-                            }));
-                            report
-                        } else {
-                            match self.tool_executor.evaluate(&tool_request) {
-                                Ok(policy) => {
-                                    trace(AgentLoopTraceEvent::PolicyEvaluated(policy.clone()));
-                                    let approved = if policy.decision == PolicyDecision::Ask {
-                                        let approval = ApprovalRequest {
-                                            approval_id: ApprovalId::new(),
-                                            task_id: request.task_id,
-                                            turn_id: current_turn_id,
-                                            tool_call_id: tool_request.tool_call_id,
-                                            tool_name: tool_request.tool_name.clone(),
-                                            resource: policy.resource.clone(),
-                                            reason: policy.reason.clone(),
+                            let strategy_was_blocked = strategy_blocked_report.is_some();
+                            let report = if let Some(report) = question_report {
+                                trace(AgentLoopTraceEvent::PolicyEvaluated(
+                                    report.policy_evaluation.clone(),
+                                ));
+                                trace(AgentLoopTraceEvent::ToolProgress(ToolProgress {
+                                    tool_call_id: report.envelope.tool_call_id,
+                                    tool_name: report.envelope.tool_name.clone(),
+                                    phase: ToolProgressPhase::Completed,
+                                    elapsed_ms: report.metrics.duration_ms,
+                                    output_bytes: report.metrics.output_bytes,
+                                    output_lines: report.metrics.output_lines,
+                                    detail: Some("answered".to_owned()),
+                                    output_excerpt: report.envelope.model_visible_excerpt.clone(),
+                                }));
+                                report
+                            } else if let Some(report) = profile_blocked_report {
+                                trace(AgentLoopTraceEvent::PolicyEvaluated(
+                                    report.policy_evaluation.clone(),
+                                ));
+                                trace(AgentLoopTraceEvent::ToolProgress(ToolProgress {
+                                    tool_call_id: report.envelope.tool_call_id,
+                                    tool_name: report.envelope.tool_name.clone(),
+                                    phase: ToolProgressPhase::Completed,
+                                    elapsed_ms: report.metrics.duration_ms,
+                                    output_bytes: report.metrics.output_bytes,
+                                    output_lines: report.metrics.output_lines,
+                                    detail: Some("profile_blocked".to_owned()),
+                                    output_excerpt: None,
+                                }));
+                                report
+                            } else if let Some(report) = strategy_blocked_report {
+                                trace(AgentLoopTraceEvent::PolicyEvaluated(
+                                    report.policy_evaluation.clone(),
+                                ));
+                                trace(AgentLoopTraceEvent::ToolProgress(ToolProgress {
+                                    tool_call_id: report.envelope.tool_call_id,
+                                    tool_name: report.envelope.tool_name.clone(),
+                                    phase: ToolProgressPhase::Completed,
+                                    elapsed_ms: report.metrics.duration_ms,
+                                    output_bytes: report.metrics.output_bytes,
+                                    output_lines: report.metrics.output_lines,
+                                    detail: Some("strategy_blocked".to_owned()),
+                                    output_excerpt: None,
+                                }));
+                                report
+                            } else if let Some(report) = contract_blocked_report {
+                                trace(AgentLoopTraceEvent::PolicyEvaluated(
+                                    report.policy_evaluation.clone(),
+                                ));
+                                trace(AgentLoopTraceEvent::ToolProgress(ToolProgress {
+                                    tool_call_id: report.envelope.tool_call_id,
+                                    tool_name: report.envelope.tool_name.clone(),
+                                    phase: ToolProgressPhase::Completed,
+                                    elapsed_ms: report.metrics.duration_ms,
+                                    output_bytes: report.metrics.output_bytes,
+                                    output_lines: report.metrics.output_lines,
+                                    detail: Some("blocked".to_owned()),
+                                    output_excerpt: None,
+                                }));
+                                report
+                            } else {
+                                match self.tool_executor.evaluate(&tool_request) {
+                                    Ok(policy) => {
+                                        trace(AgentLoopTraceEvent::PolicyEvaluated(policy.clone()));
+                                        let approved = if policy.decision == PolicyDecision::Ask {
+                                            let approval = ApprovalRequest {
+                                                approval_id: ApprovalId::new(),
+                                                task_id: request.task_id,
+                                                turn_id: current_turn_id,
+                                                tool_call_id: tool_request.tool_call_id,
+                                                tool_name: tool_request.tool_name.clone(),
+                                                resource: policy.resource.clone(),
+                                                reason: policy.reason.clone(),
+                                            };
+                                            trace(AgentLoopTraceEvent::ApprovalRequested(
+                                                approval.clone(),
+                                            ));
+                                            let resolution =
+                                                match control.scoped_approval(&approval) {
+                                                    Some(resolution) => resolution,
+                                                    None => {
+                                                        control.wait_for_approval(&approval).await?
+                                                    }
+                                                };
+                                            let approved =
+                                                resolution.decision == ApprovalDecision::Approved;
+                                            trace(AgentLoopTraceEvent::ApprovalResolved(
+                                                resolution,
+                                            ));
+                                            approved
+                                        } else {
+                                            false
                                         };
-                                        trace(AgentLoopTraceEvent::ApprovalRequested(
-                                            approval.clone(),
-                                        ));
-                                        let resolution = match control.scoped_approval(&approval) {
-                                            Some(resolution) => resolution,
-                                            None => control.wait_for_approval(&approval).await?,
+                                        control.wait_until_runnable().await?;
+                                        let may_execute = match policy.decision {
+                                            PolicyDecision::Allow => true,
+                                            PolicyDecision::Ask => approved,
+                                            PolicyDecision::Deny | PolicyDecision::Block => false,
                                         };
-                                        let approved =
-                                            resolution.decision == ApprovalDecision::Approved;
-                                        trace(AgentLoopTraceEvent::ApprovalResolved(resolution));
-                                        approved
-                                    } else {
-                                        false
-                                    };
-                                    control.wait_until_runnable().await?;
-                                    let may_execute = match policy.decision {
-                                        PolicyDecision::Allow => true,
-                                        PolicyDecision::Ask => approved,
-                                        PolicyDecision::Deny | PolicyDecision::Block => false,
-                                    };
-                                    let preparation = if may_execute {
-                                        await_runtime_operation(
-                                            self.tool_executor
-                                                .prepare_side_effect_snapshot(&tool_request),
-                                            &control.cancellation,
-                                            runtime_deadline,
-                                        )
-                                        .await
-                                    } else {
-                                        RuntimeOperationOutcome::Completed(Ok(
-                                            golutra_tools::SideEffectPreparation::default(),
-                                        ))
-                                    };
-                                    match preparation {
+                                        let preparation = if may_execute {
+                                            await_runtime_operation(
+                                                self.tool_executor
+                                                    .prepare_side_effect_snapshot(&tool_request),
+                                                &control.cancellation,
+                                                runtime_deadline,
+                                            )
+                                            .await
+                                        } else {
+                                            RuntimeOperationOutcome::Completed(Ok(
+                                                golutra_tools::SideEffectPreparation::default(),
+                                            ))
+                                        };
+                                        match preparation {
                                         RuntimeOperationOutcome::Cancelled => self
                                             .tool_executor
                                             .cancelled_execution_report(
@@ -2273,8 +2430,10 @@ where
                                             let checkpoint = if may_execute
                                                 && (matches!(
                                                     tool_request.tool_name.as_str(),
-                                                    "shell" | "subagent"
-                                                ) || !preparation.before_images.is_empty())
+                                                    "subagent"
+                                                )
+                                                    || preparation.tracks_workspace_changes()
+                                                    || !preparation.before_images.is_empty())
                                                 && let Some(recorder) =
                                                     &self.before_side_effect_recorder
                                             {
@@ -2370,152 +2529,172 @@ where
                                             }
                                         }
                                     }
+                                    }
+                                    Err(error) => {
+                                        let report = self.tool_executor.invalid_request_report(
+                                            tool_request,
+                                            error.to_string(),
+                                        );
+                                        trace(AgentLoopTraceEvent::PolicyEvaluated(
+                                            report.policy_evaluation.clone(),
+                                        ));
+                                        trace(AgentLoopTraceEvent::ToolProgress(ToolProgress {
+                                            tool_call_id: report.envelope.tool_call_id,
+                                            tool_name: report.envelope.tool_name.clone(),
+                                            phase: ToolProgressPhase::Completed,
+                                            elapsed_ms: report.metrics.duration_ms,
+                                            output_bytes: report.metrics.output_bytes,
+                                            output_lines: report.metrics.output_lines,
+                                            detail: Some("error".to_owned()),
+                                            output_excerpt: None,
+                                        }));
+                                        report
+                                    }
                                 }
-                                Err(error) => {
-                                    let report = self
-                                        .tool_executor
-                                        .invalid_request_report(tool_request, error.to_string());
-                                    trace(AgentLoopTraceEvent::PolicyEvaluated(
-                                        report.policy_evaluation.clone(),
-                                    ));
-                                    trace(AgentLoopTraceEvent::ToolProgress(ToolProgress {
-                                        tool_call_id: report.envelope.tool_call_id,
-                                        tool_name: report.envelope.tool_name.clone(),
-                                        phase: ToolProgressPhase::Completed,
-                                        elapsed_ms: report.metrics.duration_ms,
-                                        output_bytes: report.metrics.output_bytes,
-                                        output_lines: report.metrics.output_lines,
-                                        detail: Some("error".to_owned()),
-                                        output_excerpt: None,
-                                    }));
-                                    report
-                                }
-                            }
+                            };
+                            (
+                                provider_tool_call_id,
+                                failure_signature,
+                                failure_family,
+                                blocked_family_failures,
+                                strategy_was_blocked,
+                                prepared_objective_validation,
+                                tool_call_count,
+                                report,
+                            )
                         };
-                        (
-                            provider_tool_call_id,
-                            failure_signature,
-                            failure_family,
-                            blocked_family_failures,
-                            strategy_was_blocked,
+                        attach_prepared_objective_validation(
+                            &mut report,
                             prepared_objective_validation,
-                            tool_call_count,
-                            report,
-                        )
-                    };
-                    attach_prepared_objective_validation(
-                        &mut report,
-                        prepared_objective_validation,
-                    );
-                    trace(AgentLoopTraceEvent::ToolCompleted(report.clone()));
-                    update_tool_failure_counts(
-                        report.envelope.status,
-                        &mut failed_tool_call_count,
-                        &mut consecutive_failed_tool_call_count,
-                    );
-                    failure_families.observe(&failure_family, report.envelope.status);
-                    if report.envelope.status == ToolResultStatus::Ok {
-                        successful_signatures_this_step.insert(failure_signature);
-                    } else {
-                        failed_signatures_this_step.insert(failure_signature);
-                    }
-                    let tool_result_elapsed_ms = elapsed_millis(current_turn_started_at);
-                    let result_governance = current_governor.evaluate(
-                        &goal_ledger,
-                        &GovernorObservation {
-                            phase: GovernorPhase::ToolResult,
-                            iteration: iteration.saturating_add(1),
-                            tool_calls: result_tool_call_count,
-                            failed_tool_calls: failed_tool_call_count,
-                            consecutive_failed_tool_calls: consecutive_failed_tool_call_count,
-                            planned_input_tokens: plan.budget_snapshot.planned_input_tokens,
-                            elapsed_ms: tool_result_elapsed_ms,
-                            latest_action: report.envelope.summary.clone(),
-                            estimated_cost_microusd,
-                            policy_decision: Some(report.policy_evaluation.decision),
-                            policy_block_disposition: report
-                                .policy_evaluation
-                                .effective_block_disposition(),
-                            security_risk: report.envelope.risk.clone(),
-                        },
-                    );
-                    let permits_continuation = result_governance.permits_execution();
-                    if !permits_continuation {
-                        guard_reason = Some(result_governance.reason.clone());
-                        governor_action = Some(result_governance.action);
-                    }
-                    trace(AgentLoopTraceEvent::GovernorDecided(result_governance));
-                    if !permits_continuation
-                        && !runtime_deadline_guard_emitted
-                        && tool_result_elapsed_ms >= current_max_elapsed_ms
-                    {
-                        trace(AgentLoopTraceEvent::LoopGuardTriggered {
-                            trigger: golutra_core::LoopGuardTrigger::RuntimeDeadline,
-                            reason: guard_reason
-                                .clone()
-                                .unwrap_or_else(|| "runtime wall-clock budget exceeded".to_owned()),
-                        });
-                        runtime_deadline_guard_emitted = true;
-                    }
-                    append_plan_message(
-                        &mut plan,
-                        ProviderMessage {
-                            role: ProviderRole::Tool,
-                            content: model_visible_tool_result(&report.envelope),
-                            tool_call_id: Some(provider_tool_call_id),
-                            tool_name: Some(report.envelope.tool_name.clone()),
-                            tool_calls: Vec::new(),
-                            metadata: Default::default(),
-                        },
-                        ContextMessageSource {
-                            contributor: "tool_result_excerpt".to_owned(),
-                            source_refs: vec![format!(
-                                "tool-call:{}",
-                                report.envelope.tool_call_id
-                            )],
-                            origin: "tool_result".to_owned(),
-                            visibility: ModelInputVisibility::ModelVisible,
-                        },
-                        &mut message_token_total,
-                    );
-                    tool_reports.push(report);
-                    if strategy_was_blocked && blocked_family_failures >= 3 {
-                        let reason = format!(
-                            "strategy `{failure_family}` remained selected after a bounded correction"
                         );
-                        trace(AgentLoopTraceEvent::LoopGuardTriggered {
-                            trigger: golutra_core::LoopGuardTrigger::RepeatedToolFailure,
-                            reason: reason.clone(),
+                        trace(AgentLoopTraceEvent::ToolCompleted(report.clone()));
+                        tool_attempts.push(ToolAttemptMetadata {
+                            tool_call_id: report.envelope.tool_call_id,
+                            signature: failure_signature.clone(),
+                            step_no: step_snapshot.step_no,
+                            status: report.envelope.status,
+                            recoverable_failure: tool_failure_is_recoverable(&report),
                         });
-                        guard_reason = Some(reason);
-                        if parallel_read_batch {
-                            stop_after_parallel_read_batch = true;
+                        update_tool_failure_counts(
+                            report.envelope.status,
+                            &mut failed_tool_call_count,
+                            &mut consecutive_failed_tool_call_count,
+                        );
+                        failure_families.observe(&failure_family, report.envelope.status);
+                        if report.envelope.status == ToolResultStatus::Ok {
+                            successful_signatures_this_step.insert(failure_signature);
                         } else {
-                            finish_runtime_step(
-                                &mut step_machine,
-                                step_snapshot.clone(),
-                                step_fingerprint.clone(),
-                                false,
-                                elapsed_millis(current_turn_started_at),
-                                &mut trace,
+                            failed_signatures_this_step.insert(failure_signature);
+                        }
+                        let tool_result_elapsed_ms = elapsed_millis(current_turn_started_at);
+                        let result_governance = current_governor.evaluate(
+                            &goal_ledger,
+                            &GovernorObservation {
+                                phase: GovernorPhase::ToolResult,
+                                iteration: iteration.saturating_add(1),
+                                tool_calls: result_tool_call_count,
+                                failed_tool_calls: failed_tool_call_count,
+                                consecutive_failed_tool_calls: consecutive_failed_tool_call_count,
+                                planned_input_tokens: plan.budget_snapshot.planned_input_tokens,
+                                elapsed_ms: tool_result_elapsed_ms,
+                                latest_action: report.envelope.summary.clone(),
+                                estimated_cost_microusd,
+                                policy_decision: Some(report.policy_evaluation.decision),
+                                policy_block_disposition: report
+                                    .policy_evaluation
+                                    .effective_block_disposition(),
+                                security_risk: report.envelope.risk.clone(),
+                            },
+                        );
+                        let permits_continuation = result_governance.permits_execution();
+                        if !permits_continuation {
+                            guard_reason = Some(result_governance.reason.clone());
+                            governor_action = Some(result_governance.action);
+                        }
+                        trace(AgentLoopTraceEvent::GovernorDecided(result_governance));
+                        if !permits_continuation
+                            && !runtime_deadline_guard_emitted
+                            && tool_result_elapsed_ms >= current_max_elapsed_ms
+                        {
+                            trace(AgentLoopTraceEvent::LoopGuardTriggered {
+                                trigger: golutra_core::LoopGuardTrigger::RuntimeDeadline,
+                                reason: guard_reason.clone().unwrap_or_else(|| {
+                                    "runtime wall-clock budget exceeded".to_owned()
+                                }),
+                            });
+                            runtime_deadline_guard_emitted = true;
+                        }
+                        let tool_result_token_budget = active_tool_result_token_budget(
+                            &plan,
+                            message_token_total,
+                            planned_tool_tokens,
+                        );
+                        append_plan_message(
+                            &mut plan,
+                            ProviderMessage {
+                                role: ProviderRole::Tool,
+                                content: model_visible_tool_result_with_token_budget(
+                                    &report.envelope,
+                                    tool_result_token_budget,
+                                ),
+                                tool_call_id: Some(provider_tool_call_id),
+                                tool_name: Some(report.envelope.tool_name.clone()),
+                                tool_calls: Vec::new(),
+                                metadata: Default::default(),
+                            },
+                            ContextMessageSource {
+                                contributor: "tool_result_excerpt".to_owned(),
+                                source_refs: vec![format!(
+                                    "tool-call:{}",
+                                    report.envelope.tool_call_id
+                                )],
+                                origin: "tool_result".to_owned(),
+                                visibility: ModelInputVisibility::ModelVisible,
+                            },
+                            &mut message_token_total,
+                        );
+                        tool_reports.push(report);
+                        if strategy_was_blocked && blocked_family_failures >= 3 {
+                            let reason = format!(
+                                "strategy `{failure_family}` remained selected after a bounded correction"
                             );
-                            break 'agent_loop;
+                            trace(AgentLoopTraceEvent::LoopGuardTriggered {
+                                trigger: golutra_core::LoopGuardTrigger::RepeatedToolFailure,
+                                reason: reason.clone(),
+                            });
+                            guard_reason = Some(reason);
+                            if parallel_read_batch {
+                                stop_after_parallel_read_batch = true;
+                            } else {
+                                finish_runtime_step(
+                                    &mut step_machine,
+                                    step_snapshot.clone(),
+                                    step_fingerprint.clone(),
+                                    false,
+                                    elapsed_millis(current_turn_started_at),
+                                    &mut trace,
+                                );
+                                break 'agent_loop;
+                            }
+                        }
+                        if !permits_continuation {
+                            if parallel_read_batch {
+                                stop_after_parallel_read_batch = true;
+                            } else {
+                                finish_runtime_step(
+                                    &mut step_machine,
+                                    step_snapshot.clone(),
+                                    step_fingerprint.clone(),
+                                    false,
+                                    elapsed_millis(current_turn_started_at),
+                                    &mut trace,
+                                );
+                                break 'agent_loop;
+                            }
                         }
                     }
-                    if !permits_continuation {
-                        if parallel_read_batch {
-                            stop_after_parallel_read_batch = true;
-                        } else {
-                            finish_runtime_step(
-                                &mut step_machine,
-                                step_snapshot.clone(),
-                                step_fingerprint.clone(),
-                                false,
-                                elapsed_millis(current_turn_started_at),
-                                &mut trace,
-                            );
-                            break 'agent_loop;
-                        }
+                    if stop_after_parallel_read_batch {
+                        break;
                     }
                 }
                 if stop_after_parallel_read_batch {
@@ -2842,15 +3021,52 @@ where
                 .iter()
                 .flat_map(|report| report.evidence.iter().map(|evidence| evidence.evidence_id))
                 .collect::<Vec<_>>();
+            let objective_recovery = ObjectiveValidationRecoveryContext {
+                objective: &current_objective,
+                completion_criteria: &current_completion_criteria,
+                contract: &current_task_contract,
+                workspace_root: self.tool_executor.workspace_root(),
+                reports: &tool_reports,
+                attempts: &tool_attempts,
+            };
             let mut command_checks = tool_reports
                 .iter()
-                .map(|report| VerificationCheck {
-                    kind: VerificationCheckKind::ToolExecution,
-                    name: format!("tool:{}", report.envelope.tool_name),
-                    command: None,
-                    passed: report.envelope.status == ToolResultStatus::Ok,
-                    evidence_refs: report.envelope.evidence_refs.clone(),
-                    message: report.envelope.summary.clone(),
+                .map(|report| {
+                    let (mut passed, mut recovered) =
+                        tool_execution_check_status(report, &tool_attempts);
+                    // A corrected read path can be semantically equivalent even
+                    // when its raw tool arguments differ.  Reuse the same
+                    // objective recovery gate for the execution check so a
+                    // transient first attempt cannot poison a completed read.
+                    if !passed
+                        && let Some(validation) =
+                            objective_validation_for_report(report, &objective_recovery)
+                    {
+                        let (_, objective_recovered) = objective_validation_check_status(
+                            report,
+                            &validation,
+                            &objective_recovery,
+                        );
+                        if objective_recovered {
+                            passed = true;
+                            recovered = true;
+                        }
+                    }
+                    VerificationCheck {
+                        kind: VerificationCheckKind::ToolExecution,
+                        name: format!("tool:{}", report.envelope.tool_name),
+                        command: None,
+                        passed,
+                        evidence_refs: report.envelope.evidence_refs.clone(),
+                        message: if recovered {
+                            format!(
+                                "{} (recovered by a later equivalent retry; original error evidence retained)",
+                                report.envelope.summary
+                            )
+                        } else {
+                            report.envelope.summary.clone()
+                        },
+                    }
                 })
                 .collect::<Vec<_>>();
             command_checks.extend(contract_path_checks);
@@ -2926,15 +3142,11 @@ where
                     });
                     continue;
                 }
-                if let Some(validation) = objective_validation_report(report).or_else(|| {
-                    explicitly_requested_inspection_validation(
-                        report,
-                        &current_objective,
-                        &current_completion_criteria,
-                        &current_task_contract,
-                        self.tool_executor.workspace_root(),
-                    )
-                }) {
+                if let Some(validation) =
+                    objective_validation_for_report(report, &objective_recovery)
+                {
+                    let (passed, recovered) =
+                        objective_validation_check_status(report, &validation, &objective_recovery);
                     command_checks.push(VerificationCheck {
                         kind: VerificationCheckKind::ObjectiveValidation,
                         name: format!(
@@ -2949,9 +3161,16 @@ where
                             .get("command")
                             .and_then(serde_json::Value::as_str)
                             .map(ToOwned::to_owned),
-                        passed: validation.passed,
+                        passed,
                         evidence_refs: report.envelope.evidence_refs.clone(),
-                        message: validation.message,
+                        message: if recovered {
+                            format!(
+                                "{} (recovered by a later equivalent retry; original error evidence retained)",
+                                validation.message
+                            )
+                        } else {
+                            validation.message
+                        },
                     });
                 }
             }
@@ -3501,6 +3720,185 @@ fn semantic_failure_family(tool_name: &str, arguments: &Value) -> String {
         .unwrap_or_else(|| format!("{tool_name}:{}", digest_value(arguments)))
 }
 
+/// 构造与 JSON 对象插入顺序无关的参数身份。provider 可能以不同键顺序
+/// 序列化同一调用；若将其误判为新策略，合法重试就无法结束原始失败事件。
+fn tool_attempt_signature(tool_name: &str, arguments: &Value) -> String {
+    let canonical = canonical_json_value(arguments);
+    let mut digest = Sha256::new();
+    digest.update(tool_name.as_bytes());
+    digest.update([0]);
+    digest.update(serde_json::to_vec(&canonical).unwrap_or_default());
+    format!("{tool_name}:{:x}", digest.finalize())
+}
+
+fn canonical_json_value(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut entries = object.iter().collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(right.0));
+            let mut canonical = serde_json::Map::new();
+            for (key, value) in entries {
+                canonical.insert(key.clone(), canonical_json_value(value));
+            }
+            Value::Object(canonical)
+        }
+        Value::Array(values) => Value::Array(values.iter().map(canonical_json_value).collect()),
+        _ => value.clone(),
+    }
+}
+
+/// 只有后续等价成功才能覆盖一次失败的 provider 工具尝试。终态策略阻断、
+/// 取消、超时和不受信任的外部工具失败即使遇到其他工具成功，也仍是硬失败。
+fn tool_failure_is_recoverable(report: &ToolExecutionReport) -> bool {
+    match report.envelope.status {
+        ToolResultStatus::Blocked => {
+            report.policy_evaluation.effective_block_disposition()
+                == Some(PolicyBlockDisposition::Recoverable)
+        }
+        ToolResultStatus::Error => {
+            report.envelope.risk != "external_mcp_tool"
+                && report.policy_evaluation.effective_block_disposition()
+                    != Some(PolicyBlockDisposition::Terminal)
+                && !report
+                    .envelope
+                    .structured_facts
+                    .get("hard_failure")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                && !report
+                    .envelope
+                    .structured_facts
+                    .get("cancelled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                && !report
+                    .envelope
+                    .structured_facts
+                    .get("timed_out")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+        }
+        ToolResultStatus::Ok | ToolResultStatus::Cancelled | ToolResultStatus::Timeout => false,
+    }
+}
+
+/// 返回 provider 工具报告对应验收项的 `(passed, recovered)`。报告本身永不修改；
+/// 只有后续 provider 回合中的等价成功重试，才能覆盖派生验收结果。
+fn tool_execution_check_status(
+    report: &ToolExecutionReport,
+    attempts: &[ToolAttemptMetadata],
+) -> (bool, bool) {
+    if report.envelope.status == ToolResultStatus::Ok {
+        return (true, false);
+    }
+    let Some(index) = attempts
+        .iter()
+        .position(|attempt| attempt.tool_call_id == report.envelope.tool_call_id)
+    else {
+        return (false, false);
+    };
+    let attempt = &attempts[index];
+    if !attempt.recoverable_failure {
+        return (false, false);
+    }
+    let recovered = attempts.iter().skip(index.saturating_add(1)).any(|later| {
+        later.step_no > attempt.step_no
+            && later.status == ToolResultStatus::Ok
+            && later.signature == attempt.signature
+    });
+    (recovered, recovered)
+}
+
+/// Context used while materializing objective checks.  Keeping recovery
+/// lookup here, after all provider rounds have completed, lets the runtime
+/// retain every original error while still recognizing a later equivalent
+/// success as the authoritative outcome.
+struct ObjectiveValidationRecoveryContext<'a> {
+    objective: &'a str,
+    completion_criteria: &'a [String],
+    contract: &'a TaskContract,
+    workspace_root: &'a Path,
+    reports: &'a [ToolExecutionReport],
+    attempts: &'a [ToolAttemptMetadata],
+}
+
+fn objective_validation_for_report(
+    report: &ToolExecutionReport,
+    context: &ObjectiveValidationRecoveryContext<'_>,
+) -> Option<ObjectiveValidationOutcome> {
+    objective_validation_report(report).or_else(|| {
+        explicitly_requested_inspection_validation(
+            report,
+            context.objective,
+            context.completion_criteria,
+            context.contract,
+            context.workspace_root,
+        )
+    })
+}
+
+/// Return `(passed, recovered)` for one objective validation report.
+///
+/// A failed report is recoverable only when its own provider attempt is a
+/// transient failure and a strictly later step contains the same objective
+/// identity with a successful provider attempt.  This intentionally permits
+/// a corrected path spelling to recover a read inspection after canonical
+/// workspace normalization, while unrelated files, hard failures, and
+/// same-step parallel results remain failures.
+fn objective_validation_check_status(
+    report: &ToolExecutionReport,
+    validation: &ObjectiveValidationOutcome,
+    context: &ObjectiveValidationRecoveryContext<'_>,
+) -> (bool, bool) {
+    if validation.passed {
+        return (true, false);
+    }
+    let Some(attempt_index) = context
+        .attempts
+        .iter()
+        .position(|attempt| attempt.tool_call_id == report.envelope.tool_call_id)
+    else {
+        return (false, false);
+    };
+    let attempt = &context.attempts[attempt_index];
+    if !attempt.recoverable_failure {
+        return (false, false);
+    }
+    let recovered = context.reports.iter().any(|later_report| {
+        if later_report.envelope.tool_name != report.envelope.tool_name
+            || later_report.envelope.status != ToolResultStatus::Ok
+        {
+            return false;
+        }
+        let Some(later_attempt) = context
+            .attempts
+            .iter()
+            .find(|candidate| candidate.tool_call_id == later_report.envelope.tool_call_id)
+        else {
+            return false;
+        };
+        if later_attempt.step_no <= attempt.step_no || later_attempt.status != ToolResultStatus::Ok
+        {
+            return false;
+        }
+        let later_validation = objective_validation_report(later_report).or_else(|| {
+            explicitly_requested_inspection_validation(
+                later_report,
+                context.objective,
+                context.completion_criteria,
+                context.contract,
+                context.workspace_root,
+            )
+        });
+        later_validation.is_some_and(|candidate| {
+            candidate.passed
+                && candidate.kind == validation.kind
+                && candidate.identity == validation.identity
+        })
+    });
+    (recovered, recovered)
+}
+
 fn digest_value(value: &Value) -> String {
     let mut digest = Sha256::new();
     digest.update(serde_json::to_vec(value).unwrap_or_default());
@@ -3767,8 +4165,9 @@ use objective_evidence::{
     shell_command_is_read_only,
 };
 use objective_evidence::{
-    attach_prepared_objective_validation, explicitly_requested_inspection_validation,
-    objective_validation_report, prepare_objective_validation_metadata,
+    ObjectiveValidationOutcome, attach_prepared_objective_validation,
+    explicitly_requested_inspection_validation, objective_validation_report,
+    prepare_objective_validation_metadata,
 };
 fn output_schema_check(schema: &Value, message: Option<&str>) -> VerificationCheck {
     let (passed, detail) = match message {
@@ -3948,202 +4347,6 @@ fn provider_tools_for_turn(
     tools
 }
 
-/// Select the smallest useful provider surface for the first request of a
-/// turn.  The executor still owns the complete registry: this is only a wire
-/// optimization, and an unexpected tool call expands the surface before the
-/// call is executed.  Keeping the initial catalog small materially reduces
-/// prompt tokens for focused tasks while preserving the full coding profile
-/// for ambiguous requests and explicit `full` turns.
-fn provider_tools_for_objective(
-    tools: &[ToolContract],
-    contract: &TaskContract,
-    profile: AgentToolProfile,
-    registry: &ToolRegistry,
-    objective: &str,
-) -> Vec<ToolContract> {
-    let available = provider_tools_for_turn(tools, contract, profile, registry);
-    if available.is_empty() || matches!(profile, AgentToolProfile::Full) {
-        return available;
-    }
-    if objective_disables_tools(objective) {
-        return Vec::new();
-    }
-
-    let normalized = objective.trim().to_ascii_lowercase();
-    let has_file_signal = contains_any(
-        &normalized,
-        &[
-            "file", "path", "read", "write", "edit", "replace", "update", "create", "文件", "路径",
-            "读取", "写入", "编辑", "修改", "创建",
-        ],
-    );
-    let has_shell_signal = contains_any(
-        &normalized,
-        &[
-            "shell", "bash", "command", "terminal", "run", "test", "命令", "终端", "运行", "测试",
-        ],
-    );
-    let has_search_signal = contains_any(
-        &normalized,
-        &[
-            "web", "internet", "online", "search", "联网", "网络", "搜索",
-        ],
-    );
-    let has_background_signal = contains_any(
-        &normalized,
-        &[
-            "background",
-            "wait",
-            "process",
-            "shell_session",
-            "后台",
-            "等待",
-            "进程",
-        ],
-    );
-    let has_delegate_signal = contains_any(
-        &normalized,
-        &["subagent", "delegate", "child agent", "子代理", "委派"],
-    );
-
-    // No reliable intent signal means the model should retain the complete
-    // catalog rather than losing a capability because of an overly aggressive
-    // lexical guess.
-    if !(has_file_signal
-        || has_shell_signal
-        || has_search_signal
-        || has_background_signal
-        || has_delegate_signal)
-    {
-        return available;
-    }
-
-    let mut wanted = HashSet::<&str>::new();
-    if has_file_signal {
-        // Reading is the safe common first step for both edits and writes.
-        wanted.insert("read_file");
-        if contains_any(&normalized, &["write", "create", "写入", "创建", "生成"]) {
-            wanted.insert("write_file");
-        }
-        if contains_any(
-            &normalized,
-            &["edit", "replace", "update", "修改", "编辑", "替换", "更新"],
-        ) {
-            // 意图分类无法可靠区分整文件替换与局部编辑，因此同时保留两种写入原语，
-            // 避免已给出完整内容的任务被迫增加一次读取往返。
-            wanted.insert("write_file");
-            wanted.insert("edit_file");
-        }
-        if contains_any(&normalized, &["patch", "diff", "补丁"]) {
-            wanted.insert("apply_patch");
-        }
-    }
-    if has_shell_signal {
-        wanted.insert("shell");
-    }
-    if has_background_signal {
-        wanted.insert("shell");
-        wanted.insert("shell_session");
-    }
-    if has_search_signal {
-        wanted.insert("web_search");
-    }
-    if has_delegate_signal {
-        wanted.insert("subagent");
-    }
-
-    let selected = available
-        .into_iter()
-        .filter(|tool| wanted.contains(tool.tool_name.as_str()))
-        .collect::<Vec<_>>();
-    if selected.is_empty() {
-        // Keep a usable fallback if the objective mentions a capability that
-        // the current registry/profile does not expose.
-        provider_tools_for_turn(tools, contract, profile, registry)
-    } else {
-        selected
-    }
-}
-
-/// 补入初始意图投影遗漏、但实际被模型调用的合法工具。
-/// registry 仍是执行和 profile 过滤的唯一权威；此函数只改变下一回合发送给
-/// provider 的工具目录。
-fn expand_provider_tools_for_calls(
-    provider_tools: &mut Vec<ToolContract>,
-    all_provider_tools: &[ToolContract],
-    tool_calls: &[ProviderToolCall],
-    contract: &TaskContract,
-    profile: AgentToolProfile,
-    registry: &ToolRegistry,
-) -> bool {
-    if matches!(profile, AgentToolProfile::None) {
-        return false;
-    }
-
-    let mut changed = false;
-    for tool_call in tool_calls {
-        if provider_tools
-            .iter()
-            .any(|tool| tool.tool_name == tool_call.tool_name)
-        {
-            continue;
-        }
-        let Some(contract_ref) = all_provider_tools
-            .iter()
-            .find(|tool| tool.tool_name == tool_call.tool_name)
-            .or_else(|| registry.contract(&tool_call.tool_name))
-        else {
-            continue;
-        };
-        if !is_pi_plus_tool(&contract_ref.tool_name)
-            || !tool_allowed_for_profile(&contract_ref.tool_name, profile, registry)
-            || (matches!(
-                contract.workspace_change,
-                WorkspaceChangeRequirement::Forbidden
-            ) && contract_ref.side_effect_type != SideEffectType::None)
-        {
-            continue;
-        }
-
-        // 复用统一的 profile 投影，确保 coding profile 隐藏参数的处理与首轮一致。
-        let mut projected = provider_tools_for_turn(
-            std::slice::from_ref(contract_ref),
-            contract,
-            profile,
-            registry,
-        );
-        if let Some(projected) = projected.pop() {
-            provider_tools.push(projected);
-            changed = true;
-        }
-    }
-    if changed {
-        provider_tools.sort_by(|left, right| left.tool_name.cmp(&right.tool_name));
-    }
-    changed
-}
-
-fn contains_any(value: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| {
-        if needle.is_ascii() {
-            value.match_indices(needle).any(|(start, matched)| {
-                let end = start + matched.len();
-                let begins_at_boundary = value[..start]
-                    .chars()
-                    .next_back()
-                    .is_none_or(|character| !character.is_ascii_alphanumeric());
-                let ends_at_boundary = value[end..]
-                    .chars()
-                    .next()
-                    .is_none_or(|character| !character.is_ascii_alphanumeric());
-                begins_at_boundary && ends_at_boundary
-            })
-        } else {
-            value.contains(needle)
-        }
-    })
-}
-
 /// A user can explicitly request a pure response.  In that case sending the
 /// complete tool catalog only adds prompt tokens and gives the model a
 /// capability it was told not to use.  This fast path is deliberately
@@ -4211,33 +4414,47 @@ fn tool_profile_rejection_reason(
     None
 }
 
+#[cfg(test)]
 fn provider_batch_is_parallel_read_candidate(
     tool_calls: &[ProviderToolCall],
     replay_context_active: bool,
-    remaining_failure_budget: u32,
     profile: AgentToolProfile,
     registry: &ToolRegistry,
 ) -> bool {
     !replay_context_active
         && tool_calls.len() > 1
-        && u32::try_from(tool_calls.len()).is_ok_and(|count| count <= remaining_failure_budget)
-        && tool_calls.iter().all(|tool_call| {
-            is_pi_plus_tool(&tool_call.tool_name)
-                && tool_allowed_for_profile(&tool_call.tool_name, profile, registry)
-                && registry
-                    .capabilities(&tool_call.tool_name)
-                    .is_some_and(|capabilities| {
-                        capabilities.parallel_read_safe
-                            && (matches!(profile, AgentToolProfile::Full)
-                                || capabilities
-                                    .coding_profile_hidden_arguments
-                                    .iter()
-                                    .all(|argument| tool_call.arguments.get(argument).is_none()))
-                    })
-                && registry
-                    .contract(&tool_call.tool_name)
-                    .is_some_and(|contract| contract.side_effect_type == SideEffectType::None)
-        })
+        && tool_calls.len() <= PARALLEL_READ_CONCURRENCY_LIMIT
+        && tool_calls
+            .iter()
+            .all(|tool_call| provider_tool_call_is_parallel_read_safe(tool_call, profile, registry))
+}
+
+fn provider_tool_call_is_parallel_read_safe(
+    tool_call: &ProviderToolCall,
+    profile: AgentToolProfile,
+    registry: &ToolRegistry,
+) -> bool {
+    is_pi_plus_tool(&tool_call.tool_name)
+        && tool_allowed_for_profile(&tool_call.tool_name, profile, registry)
+        && registry
+            .capabilities(&tool_call.tool_name)
+            .is_some_and(|capabilities| {
+                (capabilities.parallel_read_safe
+                    || (tool_call.tool_name == "shell"
+                        && shell_request_is_strictly_read_only(&tool_call.arguments)))
+                    && (matches!(profile, AgentToolProfile::Full)
+                        || capabilities
+                            .coding_profile_hidden_arguments
+                            .iter()
+                            .all(|argument| tool_call.arguments.get(argument).is_none()))
+            })
+        && registry
+            .contract(&tool_call.tool_name)
+            .is_some_and(|contract| {
+                contract.side_effect_type == SideEffectType::None
+                    || (tool_call.tool_name == "shell"
+                        && shell_request_is_strictly_read_only(&tool_call.arguments))
+            })
 }
 
 async fn invoke_parallel_read_calls(

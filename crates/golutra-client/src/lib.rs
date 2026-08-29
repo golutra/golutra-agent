@@ -37,8 +37,7 @@ use golutra_eval::{
 };
 use golutra_evolution::{EvolutionError, EvolutionStore};
 use golutra_llm::{
-    ConfiguredProvider, LlmProvider, ProviderError, ProviderMessage, ProviderRole,
-    protocol_capabilities,
+    ConfiguredProvider, LlmProvider, ProviderError, ProviderMessage, protocol_capabilities,
 };
 use golutra_mcp::McpToolBackend;
 use golutra_memory::{MemoryError, MemoryFeedbackKind, MemoryScope, MemoryStore};
@@ -53,12 +52,13 @@ use golutra_protocol::{
 };
 use golutra_runtime::{
     AgentExecutionControl, AgentExecutionHandle, AgentGovernorUsage, AgentHarness, AgentLoopError,
-    AgentLoopTraceEvent, AgentTaskRequest, BeforeSideEffectRecorder, ConfiguredAgentRun,
-    ConfiguredPendingAgentTurn, PendingAgentTurn, PendingTurnExecutionOptions, RuntimeLaneError,
-    RuntimeLaneManager, RuntimeObservation, RuntimeObservationSink, RuntimeVerificationService,
-    WorkspaceCheckpointManager, agent_execution_channel_with_cancellation,
-    auxiliary_provider_usage_record, compaction_summary_context_snapshot,
-    compaction_summary_request, default_agent_max_elapsed_ms, is_active_status,
+    AgentLoopTraceEvent, AgentReplayContext, AgentTaskRequest, BeforeSideEffectRecorder,
+    ConfiguredAgentRun, ConfiguredPendingAgentTurn, PendingAgentTurn, PendingTurnExecutionOptions,
+    RuntimeLaneError, RuntimeLaneManager, RuntimeObservation, RuntimeObservationSink,
+    RuntimeVerificationService, WorkspaceCheckpointManager,
+    agent_execution_channel_with_cancellation, auxiliary_provider_usage_record,
+    compaction_summary_context_snapshot, compaction_summary_request, default_agent_max_elapsed_ms,
+    is_active_status,
 };
 use golutra_store::{CommandClaim, RuntimeRepositories, RuntimeStore, StoreError, ThreadRecord};
 use golutra_tools::{

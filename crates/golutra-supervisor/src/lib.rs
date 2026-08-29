@@ -2097,6 +2097,7 @@ mod tests {
                     action_if_exceeded: BudgetOverflowAction::Block,
                 },
                 canonical_request_digest: "sha256:request".to_owned(),
+                cache_scope_key: None,
                 redacted_request_artifact_ref: None,
                 restricted_request_artifact_ref: None,
                 estimate_source: "test".to_owned(),

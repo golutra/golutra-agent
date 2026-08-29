@@ -2,7 +2,10 @@
 
 use super::*;
 use golutra_context::{estimate_tokens, fit_compaction_context_content};
-use golutra_llm::ProviderGenerationConfig;
+use golutra_llm::{
+    LlmProvider, PromptCacheScope, ProviderGenerationConfig, ProviderMessage, ProviderRequest,
+    ProviderRole,
+};
 use tokio::{runtime::Handle, task::JoinHandle};
 
 const ABNORMAL_RECORDER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -19,6 +22,8 @@ const MAX_SKILL_CONTEXT_TOKENS: u64 = 1_024;
 const MIN_RECENT_HISTORY_TOKENS: u64 = 1_024;
 const MAX_WORKING_SUMMARY_TOKENS: u64 = 2_048;
 const ACTIVE_PATH_COMPACTION_MAX_DEPTH: u32 = 65_536;
+const MAX_RESUME_PROVIDER_REQUEST_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_RESUME_PROVIDER_MESSAGES: usize = 16_384;
 
 fn memory_candidate_limit(context_budget: u64) -> usize {
     if context_budget == 0 {
@@ -103,6 +108,97 @@ impl RuntimeObservationSink for ChannelObservationSink {
 }
 
 impl RuntimeHost {
+    /// 读取最近一次主 provider 请求，只有完整 wire 和当前稳定前缀均匹配时
+    /// 才用于跨进程 resume；任何损坏、过期或协议不一致都静默回退普通投影。
+    async fn resume_provider_context(
+        &self,
+        session_id: SessionId,
+        current_task_id: TaskId,
+        objective: &str,
+        provider: &ConfiguredProvider,
+        cache_scope: &PromptCacheScope,
+    ) -> Result<Option<AgentReplayContext>, ClientError> {
+        if objective.trim().is_empty() {
+            return Ok(None);
+        }
+        let Some(snapshot) = self
+            .storage
+            .repositories
+            .artifacts
+            .latest_context(session_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if snapshot.budget_snapshot.budget_policy == "auxiliary_compaction_summary"
+            || snapshot.session_id != session_id
+            || snapshot.provider_request_id.0.is_nil()
+        {
+            return Ok(None);
+        }
+        let Some(artifact_id) = snapshot.restricted_request_artifact_ref else {
+            return Ok(None);
+        };
+        let Some(artifact) = self.storage.repositories.artifacts.get(artifact_id).await? else {
+            return Ok(None);
+        };
+        if artifact.session_id != session_id
+            || artifact.artifact_type != "provider_request_replay"
+            || artifact.redaction_status != RedactionStatus::Raw
+        {
+            return Ok(None);
+        }
+        let Some(bytes) = self
+            .storage
+            .store
+            .load_artifact_bytes_bounded(&artifact, MAX_RESUME_PROVIDER_REQUEST_BYTES)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Ok(previous) = serde_json::from_slice::<ProviderRequest>(&bytes) else {
+            return Ok(None);
+        };
+        let contract = provider.contract();
+        if previous.request_id != snapshot.provider_request_id
+            || previous.session_id != Some(session_id)
+            || previous.provider_id != contract.provider_id
+            || previous.model_id != contract.model_id
+            || previous.cache_policy != golutra_core::PromptCachePolicy::Auto
+            || previous
+                .cache_scope
+                .as_ref()
+                .is_none_or(|scope| scope.key() != cache_scope.key())
+            || previous.messages.len() > MAX_RESUME_PROVIDER_MESSAGES
+            || !provider_transcript_is_replayable(&previous.messages)
+        {
+            return Ok(None);
+        }
+
+        let mut messages = previous.messages;
+        let objective = objective.trim();
+        let already_current_objective = messages.last().is_some_and(|message| {
+            message.role == ProviderRole::User && message.content == objective
+        });
+        if previous.task_id != current_task_id || !already_current_objective {
+            messages.push(ProviderMessage {
+                role: ProviderRole::User,
+                content: objective.to_owned(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+                metadata: Default::default(),
+            });
+        }
+        if messages.len() > MAX_RESUME_PROVIDER_MESSAGES {
+            return Ok(None);
+        }
+        Ok(Some(AgentReplayContext::for_resume(
+            messages,
+            previous.tools,
+        )))
+    }
+
     /// Cancel every host-owned task and delegation operation, then wait until
     /// their supervisors have released the in-process ownership maps. The
     /// process supervisor is shut down by `RuntimeHost::close` after this
@@ -261,6 +357,46 @@ impl RuntimeHost {
             }
         }
     }
+}
+
+pub(crate) fn provider_transcript_is_replayable(messages: &[ProviderMessage]) -> bool {
+    let mut pending_tool_calls = std::collections::HashSet::<String>::new();
+    let mut seen_tool_call_ids = std::collections::HashSet::<String>::new();
+    for message in messages {
+        match message.role {
+            ProviderRole::Assistant => {
+                if !pending_tool_calls.is_empty() {
+                    return false;
+                }
+                for call in &message.tool_calls {
+                    if call.tool_call_id.trim().is_empty()
+                        || !seen_tool_call_ids.insert(call.tool_call_id.clone())
+                        || !pending_tool_calls.insert(call.tool_call_id.clone())
+                    {
+                        return false;
+                    }
+                }
+            }
+            ProviderRole::Tool => {
+                let Some(tool_call_id) = message
+                    .tool_call_id
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                else {
+                    return false;
+                };
+                if !pending_tool_calls.remove(tool_call_id) {
+                    return false;
+                }
+            }
+            ProviderRole::System | ProviderRole::User => {
+                if !pending_tool_calls.is_empty() {
+                    return false;
+                }
+            }
+        }
+    }
+    pending_tool_calls.is_empty()
 }
 
 pub(crate) struct HostedObservationRecorder {
@@ -1221,6 +1357,15 @@ impl RuntimeHost {
             provider_session_policy,
         } = provider_plan;
         let context_budget = context_builder.budget_limit();
+        let resume_context = self
+            .resume_provider_context(
+                task.session_id,
+                task.task_id,
+                &objective,
+                &provider,
+                &prompt_cache_scope,
+            )
+            .await?;
         let legacy_task = LegacyTaskAdapter::new(&task.payload, &objective);
         if !has_explicit_task_contract && should_apply_legacy_adapter(&task.payload, execution_mode)
         {
@@ -1291,6 +1436,10 @@ impl RuntimeHost {
         .with_tool_profile(tool_profile)
         .with_deferred_external_verification(defer_external_verification)
         .with_governor_usage(governor_usage);
+        let run = match resume_context {
+            Some(replay_context) => run.with_replay_context(replay_context),
+            None => run,
+        };
         let run = match max_elapsed_ms {
             Some(max_elapsed_ms) => run.with_max_elapsed_ms(max_elapsed_ms),
             None => run,

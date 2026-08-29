@@ -960,10 +960,10 @@ impl RuntimeHost {
                     .map(|contract| contract.tool_name.clone())
                     .collect(),
             })
-            .with_replay_context(AgentReplayContext {
-                initial_messages: first_request.messages,
-                tools: replay_tools,
-            })
+            .with_replay_context(AgentReplayContext::for_replay(
+                first_request.messages,
+                replay_tools,
+            ))
             .with_task_contract(task_contract)
             .with_execution_mode(execution_mode.explicit())
             .with_tool_profile(tool_profile)
@@ -2413,10 +2413,10 @@ mod tests {
             contributors: Vec::new(),
             tools: Vec::new(),
         })
-        .with_replay_context(AgentReplayContext {
-            initial_messages: initial_request.messages,
-            tools: Vec::new(),
-        })
+        .with_replay_context(AgentReplayContext::for_replay(
+            initial_request.messages,
+            Vec::new(),
+        ))
         .with_task_contract(TaskContract::conversational(Vec::new()))
         .with_tool_profile(AgentToolProfile::Coding);
 

@@ -118,7 +118,9 @@ impl RuntimeHost {
                     }
                 }
                 (
-                    AgentLoopTraceEvent::ContextSnapshot(snapshot),
+                    // 保留 request 的非敏感路由/cache 元数据到 codec；正文仍只进入
+                    // 已脱敏或 owner-only artifact，不能把原始请求放进事件 payload。
+                    AgentLoopTraceEvent::ContextSnapshotCaptured { snapshot, request },
                     vec![
                         (
                             redacted_artifact,
@@ -142,7 +144,9 @@ impl RuntimeHost {
             }
             trace_event => (trace_event, Vec::new()),
         };
-        if let AgentLoopTraceEvent::ContextSnapshot(snapshot) = &trace_event {
+        if let AgentLoopTraceEvent::ContextSnapshot(snapshot)
+        | AgentLoopTraceEvent::ContextSnapshotCaptured { snapshot, .. } = &trace_event
+        {
             self.storage
                 .repositories
                 .artifacts

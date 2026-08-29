@@ -720,17 +720,53 @@ pub fn parse_shell_command_with_input(command: &str) -> Option<ParsedShellComman
     if let Some(parsed) = parse_direct_quoted_python_heredoc(command) {
         return Some(parsed);
     }
-    if let Some((parts, quote)) = parse_explicit_wrapper_raw(command)
-        && quote == '\''
-    {
-        // A single-quoted script is intentionally opaque to the outer argv
-        // parser.  Keeping it verbatim preserves heredoc delimiters and
-        // embedded Python/JSON quotes produced by model callers.
-        return Some(ParsedShellCommand { parts, stdin: None });
+    let decoded = shlex::split(command);
+    if let Some((raw_parts, quote)) = parse_explicit_wrapper_raw(command) {
+        let raw_script = explicit_shell_script(&raw_parts)?;
+        if quote == '\'' {
+            // 合法的 POSIX quote-dance 必须先由 shlex 解码；保留原始标记会改变
+            // 实际传给子进程的脚本内容。
+            if raw_script.contains("'\"'\"'") {
+                return decoded
+                    .filter(|parts| {
+                        explicit_shell_script(parts).is_some_and(explicit_script_is_complete)
+                    })
+                    .map(|parts| ParsedShellCommand { parts, stdin: None });
+            }
+            // 某些模型会用单引号包住含普通单引号的脚本。只有 AST 完整时才保留
+            // 这个不透明参数，避免静默执行 shlex 的有损解析结果。
+            return explicit_script_is_complete(raw_script).then_some(ParsedShellCommand {
+                parts: raw_parts,
+                stdin: None,
+            });
+        }
+        if let Some(parts) = decoded
+            && explicit_shell_script(&parts).is_some_and(explicit_script_is_complete)
+        {
+            return Some(ParsedShellCommand { parts, stdin: None });
+        }
+        return explicit_script_is_complete(raw_script).then_some(ParsedShellCommand {
+            parts: raw_parts,
+            stdin: None,
+        });
     }
-    shlex::split(command)
-        .or_else(|| parse_explicit_wrapper_raw(command).map(|(parts, _)| parts))
-        .map(|parts| ParsedShellCommand { parts, stdin: None })
+    decoded.map(|parts| ParsedShellCommand { parts, stdin: None })
+}
+
+fn explicit_script_is_complete(script: &str) -> bool {
+    if script.trim().is_empty() {
+        return false;
+    }
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_bash::LANGUAGE.into())
+        .is_err()
+    {
+        return false;
+    }
+    parser
+        .parse(script, None)
+        .is_some_and(|tree| !tree.root_node().has_error())
 }
 
 fn parse_direct_quoted_python_heredoc(command: &str) -> Option<ParsedShellCommand> {
@@ -843,6 +879,159 @@ pub fn explicit_shell_script(parts: &[String]) -> Option<&str> {
     matches!(parts[1].as_str(), "-c" | "-lc").then_some(parts[2].as_str())
 }
 
+/// 判断一个已经解析的 argv 是否可以安全地走只读执行快路径。
+///
+/// 这里的判定故意比普通的“没有明显写操作”更窄：只接受直接调用的
+/// 系统读取命令，拒绝解释器、命令包装器、外部 diff、重定向选项和会
+/// 执行回调的参数。调用方仍必须单独检查 stdin、后台标记和 workspace
+/// policy；这个函数只描述 argv 本身，不替代权限判断。
+#[must_use]
+pub fn shell_command_is_strictly_read_only(parts: &[String]) -> bool {
+    let Some(program) = parts.first() else {
+        return false;
+    };
+    if !bare_program_name_is_safe(program)
+        || program.contains('\0')
+        || parts.iter().skip(1).any(|argument| argument.contains('\0'))
+    {
+        return false;
+    }
+
+    let arguments = &parts[1..];
+    match program.as_str() {
+        "cat" | "cut" | "du" | "file" | "grep" | "head" | "ls" | "printf" | "pwd" | "readlink"
+        | "sort" | "strings" | "tail" | "tr" | "uniq" | "wc" => {
+            simple_read_command_is_safe(program, arguments)
+        }
+        "rg" => ripgrep_read_command_is_safe(arguments),
+        "find" => find_read_command_is_safe(arguments),
+        "git" => git_read_command_is_safe(arguments),
+        _ => false,
+    }
+}
+
+fn bare_program_name_is_safe(program: &str) -> bool {
+    !program.is_empty()
+        && !program.contains(['/', '\\'])
+        && !is_shell_variable_assignment(program)
+        && !matches!(program, "bash" | "sh" | "zsh" | "env" | "command" | "sudo")
+}
+
+fn simple_read_command_is_safe(program: &str, arguments: &[String]) -> bool {
+    match program {
+        // sort 可能把中间结果写入临时文件；输出文件和外部压缩器更不能
+        // 进入只读快路径。短选项允许把目标直接附在 -o 后面。
+        "sort" => !arguments.iter().any(|argument| {
+            argument == "-o"
+                || argument.starts_with("-o") && argument.len() > 2
+                || argument == "--output"
+                || argument.starts_with("--output=")
+                || argument == "--compress-program"
+                || argument.starts_with("--compress-program=")
+                || argument == "--temporary-directory"
+                || argument.starts_with("--temporary-directory=")
+        }),
+        _ => true,
+    }
+}
+
+fn ripgrep_read_command_is_safe(arguments: &[String]) -> bool {
+    // ripgrep preprocessors are arbitrary child programs and therefore do not
+    // satisfy the direct-read contract, even when the final output is text.
+    !arguments.iter().any(|argument| {
+        argument == "--pre"
+            || argument.starts_with("--pre=")
+            || argument == "--pre-glob"
+            || argument.starts_with("--pre-glob=")
+    })
+}
+
+fn find_read_command_is_safe(arguments: &[String]) -> bool {
+    arguments.iter().all(|argument| {
+        !find_argument_can_write_or_follow_links(argument)
+            && !argument_contains_workspace_escape_hint(argument)
+    })
+}
+
+fn find_argument_can_write_or_follow_links(argument: &str) -> bool {
+    matches!(
+        argument,
+        "-delete"
+            | "-exec"
+            | "-execdir"
+            | "-ok"
+            | "-okdir"
+            | "-fls"
+            | "-fprint"
+            | "-fprint0"
+            | "-fprintf"
+            | "-H"
+            | "-L"
+            | "-follow"
+    ) || argument.starts_with("-exec")
+        || argument.starts_with("-ok")
+        || argument.starts_with("-fprint")
+        || argument.starts_with("-fls")
+}
+
+fn git_read_command_is_safe(arguments: &[String]) -> bool {
+    let Some(subcommand) = arguments.first().map(String::as_str) else {
+        return false;
+    };
+    if !matches!(
+        subcommand,
+        "branch" | "diff" | "log" | "merge-base" | "rev-parse" | "show"
+    ) {
+        return false;
+    }
+    if subcommand == "branch" {
+        return arguments.len() == 2 && arguments[1] == "--show-current";
+    }
+
+    let mut index = 1;
+    while let Some(argument) = arguments.get(index) {
+        if git_argument_can_execute_or_write(argument) {
+            return false;
+        }
+        if argument == "-o"
+            || argument.starts_with("-o") && argument.len() > 2
+            || argument == "--output"
+        {
+            return false;
+        }
+        index = index.saturating_add(1);
+    }
+    true
+}
+
+fn git_argument_can_execute_or_write(argument: &str) -> bool {
+    matches!(
+        argument,
+        "--ext-diff"
+            | "--textconv"
+            | "--no-index"
+            | "--paginate"
+            | "--pager"
+            | "--upload-pack"
+            | "--receive-pack"
+            | "--exec-path"
+            | "-c"
+            | "--config"
+            | "--config-env"
+    ) || argument.starts_with("--output=")
+        || argument.starts_with("--upload-pack=")
+        || argument.starts_with("--receive-pack=")
+        || argument.starts_with("--pager=")
+}
+
+fn argument_contains_workspace_escape_hint(argument: &str) -> bool {
+    argument.starts_with('/')
+        || argument == "~"
+        || argument.starts_with("~/")
+        || argument.split('/').any(|component| component == "..")
+        || argument.contains(['$', '`'])
+}
+
 fn parse_explicit_wrapper_raw(command: &str) -> Option<(Vec<String>, char)> {
     let trimmed = command.trim();
     let program_end = trimmed.find(char::is_whitespace)?;
@@ -881,7 +1070,7 @@ pub fn contains_shell_metacharacter(command: &str) -> bool {
     let mut escaped = false;
 
     for character in command.chars() {
-        if character == '\n' {
+        if character == '\n' && quote.is_none() {
             return true;
         }
         if escaped {
@@ -1395,6 +1584,25 @@ mod tests {
     }
 
     #[test]
+    fn newlines_inside_quoted_argv_values_are_inert() {
+        let workspace = tempdir().expect("workspace");
+        let policy = WorkspacePolicy::new(workspace.path()).expect("policy");
+
+        assert_eq!(
+            policy
+                .evaluate_shell("printf '%s' 'line-one\nline-two'")
+                .decision,
+            PolicyDecision::Ask
+        );
+        assert_eq!(
+            policy
+                .evaluate_shell("printf '%s' line-one\nline-two")
+                .decision,
+            PolicyDecision::Block
+        );
+    }
+
+    #[test]
     fn explicit_shell_wrappers_allow_pipelines_and_multiline_scripts() {
         let workspace = tempdir().expect("workspace");
         let policy = WorkspacePolicy::new(workspace.path()).expect("policy");
@@ -1705,6 +1913,21 @@ mod tests {
     }
 
     #[test]
+    fn shell_safe_quote_dance_is_decoded_before_wrapper_fallback() {
+        let command = "bash -lc 'python3 - <<'\"'\"'PY'\"'\"'\nprint('\"'\"'ok'\"'\"')\nPY'";
+        let parsed = parse_shell_command(command).expect("valid shell-safe wrapper");
+
+        assert_eq!(
+            parsed,
+            vec![
+                "bash".to_owned(),
+                "-lc".to_owned(),
+                "python3 - <<'PY'\nprint('ok')\nPY".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
     fn malformed_outer_quotes_are_recovered_for_explicit_wrappers_only() {
         let parsed = parse_shell_command("bash -lc 'python - <<'PY'\nprint('ok')\nPY'")
             .expect("wrapper parser should preserve the script");
@@ -1745,6 +1968,45 @@ mod tests {
                 policy.evaluate_shell(command).decision,
                 PolicyDecision::Ask,
                 "{command} can execute workspace-controlled code or configuration"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_read_only_argv_contract_rejects_execution_escape_hatches() {
+        let parse = |command: &str| parse_shell_command(command).expect("argv");
+        for command in [
+            "cat README.md",
+            "rg --line-number token src",
+            "find . -name '*.rs' -print",
+            "git diff --stat",
+            "git log --oneline -3",
+            "git branch --show-current",
+        ] {
+            assert!(
+                shell_command_is_strictly_read_only(&parse(command)),
+                "expected strict read-only command: {command}"
+            );
+        }
+
+        for command in [
+            "git status --short",
+            "git diff --ext-diff",
+            "git diff -oout.patch",
+            "git show --output=out.patch",
+            "sort -o result.txt",
+            "sort -oresult.txt",
+            "sort --compress-program=custom-filter",
+            "sort --temporary-directory=tmp",
+            "rg --pre 'cat input' token .",
+            "find . -exec cat {} +",
+            "find ../outside -name '*.rs'",
+            "bash -lc 'cat README.md'",
+            "python3 -c 'print(1)'",
+        ] {
+            assert!(
+                !shell_command_is_strictly_read_only(&parse(command)),
+                "expected conservative serial command: {command}"
             );
         }
     }

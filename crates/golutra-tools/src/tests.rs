@@ -966,6 +966,135 @@ fn model_visible_tool_result_bounds_large_facts_and_output() {
     assert!(serialized.contains("_golutra_truncated") || serialized.contains("omitted"));
 }
 
+#[test]
+fn model_visible_tool_result_respects_a_tighter_budget_without_losing_status() {
+    let envelope = projection_envelope(
+        "read_file",
+        ToolResultStatus::Ok,
+        "file read",
+        json!({
+            "path": "src/lib.rs",
+            "bytes": 128,
+            "continuation": {"next_cursor": 128},
+            "has_more": true,
+        }),
+        Some(&"line ".repeat(4 * 1024)),
+    );
+
+    let serialized = model_visible_tool_result_with_limit(&envelope, 1_024);
+    let projection: Value = serde_json::from_str(&serialized).expect("bounded projection");
+    assert!(serialized.len() <= 1_024);
+    assert_eq!(projection["status"], "ok");
+    assert_eq!(projection["structured_facts"]["path"], "src/lib.rs");
+    assert_eq!(
+        projection["structured_facts"]["continuation"]["next_cursor"],
+        128
+    );
+}
+
+#[test]
+fn token_budget_projection_keeps_read_continuation_facts() {
+    let envelope = projection_envelope(
+        "read_file",
+        ToolResultStatus::Ok,
+        "file read",
+        json!({
+            "path": "src/lib.rs",
+            "continuation": {"next_offset": 256, "next_cursor": 9},
+            "has_more": true,
+            "content": "line ".repeat(16 * 1024),
+        }),
+        Some(&"line ".repeat(16 * 1024)),
+    );
+
+    let serialized = model_visible_tool_result_with_token_budget(&envelope, 256);
+    let projection: Value = serde_json::from_str(&serialized).expect("token-bounded projection");
+    assert!(serialized.len() <= 1_024);
+    assert_eq!(projection["status"], "ok");
+    assert_eq!(projection["structured_facts"]["path"], "src/lib.rs");
+    assert_eq!(
+        projection["structured_facts"]["continuation"]["next_offset"],
+        256
+    );
+}
+
+#[test]
+fn tight_projection_prioritizes_error_and_continuation_over_large_optional_facts() {
+    let mut facts = serde_json::Map::new();
+    facts.insert("path".to_owned(), Value::String("资料/说明.txt".to_owned()));
+    facts.insert(
+        "continuation".to_owned(),
+        json!({"next_offset": 512, "next_cursor": 17, "has_more": true}),
+    );
+    facts.insert(
+        "error".to_owned(),
+        Value::String("读取失败：文件暂时不可用".repeat(256)),
+    );
+    facts.insert("reason".to_owned(), Value::String("retryable".to_owned()));
+    for index in 0..64 {
+        facts.insert(
+            format!("optional_{index}"),
+            Value::String("大段无关输出".repeat(512)),
+        );
+    }
+    let envelope = projection_envelope(
+        "read_file",
+        ToolResultStatus::Error,
+        "读取失败，请使用 continuation 继续",
+        Value::Object(facts),
+        Some(&"无关输出".repeat(4 * 1024)),
+    );
+
+    let serialized = model_visible_tool_result_with_limit(&envelope, 1_024);
+    assert!(serialized.len() <= 1_024);
+    let projection: Value = serde_json::from_str(&serialized).expect("valid projection");
+    assert_eq!(projection["tool_name"], "read_file");
+    assert_eq!(projection["status"], "error");
+    assert_eq!(
+        projection["structured_facts"]["continuation"]["next_offset"],
+        512
+    );
+    assert!(
+        projection["structured_facts"]["error"]
+            .as_str()
+            .is_some_and(|error| error.starts_with("读取失败：文件暂时不可用"))
+    );
+}
+
+#[test]
+fn tight_mutation_projection_always_keeps_success_summary() {
+    let mut facts = serde_json::Map::new();
+    facts.insert(
+        "changed_files".to_owned(),
+        Value::Array(
+            (0..128)
+                .map(|index| Value::String(format!("src/{index}-{}.rs", "x".repeat(256))))
+                .collect(),
+        ),
+    );
+    facts.insert("changed_file_count".to_owned(), json!(128));
+    for index in 0..64 {
+        facts.insert(
+            format!("optional_{index}"),
+            Value::String("无关字段".repeat(512)),
+        );
+    }
+    let envelope = projection_envelope(
+        "apply_patch",
+        ToolResultStatus::Ok,
+        "已原子应用 128 个文件变更",
+        Value::Object(facts),
+        Some(&"完整 patch 输出".repeat(4 * 1024)),
+    );
+
+    let serialized = model_visible_tool_result_with_limit(&envelope, 1_024);
+    assert!(serialized.len() <= 1_024);
+    let projection: Value = serde_json::from_str(&serialized).expect("valid mutation projection");
+    assert_eq!(projection["status"], "ok");
+    assert_eq!(projection["summary"], "已原子应用 128 个文件变更");
+    assert_eq!(projection["structured_facts"]["changed_file_count"], 128);
+}
+
 #[tokio::test]
 async fn shell_policy_and_structured_facts_do_not_persist_secret_arguments() {
     let workspace = tempdir().expect("workspace");
@@ -1017,6 +1146,67 @@ async fn read_file_returns_envelope_artifact_and_evidence() {
 }
 
 #[tokio::test]
+async fn read_file_returns_bounded_windows_with_a_stable_continuation_offset() {
+    let workspace = tempdir().expect("workspace");
+    let content = (1..=205)
+        .map(|line| format!("line-{line}\n"))
+        .collect::<String>();
+    fs::write(workspace.path().join("large.txt"), &content).expect("fixture");
+    let executor = executor(workspace.path());
+
+    let first = executor
+        .execute(
+            request("read_file", json!({"path": "large.txt"})),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("first window");
+    assert_eq!(first.envelope.structured_facts["offset"], 1);
+    assert_eq!(first.envelope.structured_facts["limit"], 200);
+    assert_eq!(first.envelope.structured_facts["total_lines"], 205);
+    assert_eq!(first.envelope.structured_facts["has_more"], true);
+    assert_eq!(first.envelope.structured_facts["truncated"], true);
+    assert_eq!(
+        first.envelope.structured_facts["continuation"]["next_offset"],
+        201
+    );
+    assert!(artifact_text(&first).contains("line-200"));
+    assert!(!artifact_text(&first).contains("line-201"));
+
+    let second = executor
+        .execute(
+            request(
+                "read_file",
+                json!({"path": "large.txt", "offset": 201, "limit": 20}),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("continuation window");
+    assert_eq!(second.envelope.structured_facts["offset"], 201);
+    assert_eq!(second.envelope.structured_facts["lines"], 5);
+    assert_eq!(second.envelope.structured_facts["has_more"], false);
+    assert_eq!(second.envelope.structured_facts["truncated"], false);
+    assert_eq!(second.envelope.structured_facts["eof"], true);
+    assert!(artifact_text(&second).contains("line-205"));
+}
+
+#[tokio::test]
+async fn read_file_rejects_zero_based_offsets() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(workspace.path().join("src.txt"), "content").expect("fixture");
+    let executor = executor(workspace.path());
+
+    let result = executor
+        .execute(
+            request("read_file", json!({"path": "src.txt", "offset": 0})),
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(result, Err(ToolError::InvalidArguments(_))));
+}
+
+#[tokio::test]
 async fn write_file_records_changed_file() {
     let workspace = tempdir().expect("workspace");
     let executor = executor(workspace.path());
@@ -1064,7 +1254,10 @@ async fn mutation_results_keep_content_in_artifacts_but_not_model_excerpt() {
         .execute(
             request(
                 "edit_file",
-                json!({"path": "src.txt", "search": "before", "replace": "after"}),
+                json!({
+                    "path": "src.txt",
+                    "edits": [{"old_text": "before", "new_text": "after"}]
+                }),
             ),
             CancellationToken::new(),
         )
@@ -1084,6 +1277,118 @@ async fn mutation_results_keep_content_in_artifacts_but_not_model_excerpt() {
             .as_deref()
             .is_some_and(|excerpt| excerpt.contains("after"))
     );
+}
+
+#[tokio::test]
+async fn edit_file_applies_multiple_non_overlapping_replacements_atomically() {
+    let workspace = tempdir().expect("workspace");
+    let path = workspace.path().join("src.txt");
+    fs::write(&path, "alpha beta gamma").expect("fixture");
+    let executor = executor(workspace.path());
+
+    let report = executor
+        .execute(
+            request(
+                "edit_file",
+                json!({
+                    "path": "src.txt",
+                    "edits": [
+                        {"old_text": "gamma", "new_text": "GAMMA"},
+                        {"old_text": "alpha", "new_text": "ALPHA"}
+                    ]
+                }),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("multi-edit execution");
+
+    assert_eq!(report.envelope.status, ToolResultStatus::Ok);
+    assert_eq!(report.envelope.structured_facts["edit_count"], 2);
+    assert_eq!(report.envelope.structured_facts["replacements"], 2);
+    assert_eq!(
+        fs::read_to_string(path).expect("edited file"),
+        "ALPHA beta GAMMA"
+    );
+}
+
+#[tokio::test]
+async fn edit_file_rejects_overlapping_edits_without_partial_writes() {
+    let workspace = tempdir().expect("workspace");
+    let path = workspace.path().join("src.txt");
+    fs::write(&path, "alpha beta").expect("fixture");
+    let executor = executor(workspace.path());
+
+    let report = executor
+        .execute(
+            request(
+                "edit_file",
+                json!({
+                    "path": "src.txt",
+                    "edits": [
+                        {"old_text": "alpha", "new_text": "ALPHA"},
+                        {"old_text": "pha beta", "new_text": "changed"}
+                    ]
+                }),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("overlap report");
+
+    assert_eq!(report.envelope.status, ToolResultStatus::Error);
+    assert_eq!(report.envelope.structured_facts["overlap"], true);
+    assert_eq!(
+        fs::read_to_string(path).expect("unchanged file"),
+        "alpha beta"
+    );
+}
+
+#[tokio::test]
+async fn edit_file_rejects_non_unique_whitespace_targets_without_partial_writes() {
+    let workspace = tempdir().expect("workspace");
+    let path = workspace.path().join("src.txt");
+    fs::write(&path, "left  right  tail").expect("fixture");
+    let executor = executor(workspace.path());
+
+    let report = executor
+        .execute(
+            request(
+                "edit_file",
+                json!({
+                    "path": "src.txt",
+                    "edits": [{"old_text": "  ", "new_text": "\t"}]
+                }),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("whitespace target report");
+
+    assert_eq!(report.envelope.status, ToolResultStatus::Error);
+    assert_eq!(report.envelope.structured_facts["search_found"], true);
+    assert_eq!(
+        fs::read_to_string(path).expect("unchanged file"),
+        "left  right  tail"
+    );
+}
+
+#[tokio::test]
+async fn edit_file_requires_the_canonical_edits_array() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(workspace.path().join("src.txt"), "before").expect("fixture");
+    let executor = executor(workspace.path());
+
+    let result = executor
+        .execute(
+            request(
+                "edit_file",
+                json!({"path": "src.txt", "search": "before", "replace": "after"}),
+            ),
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(result, Err(ToolError::InvalidArguments(_))));
 }
 
 #[tokio::test]
@@ -1124,7 +1429,7 @@ async fn unrestricted_runtime_writes_outside_workspace_without_disabling_validat
 
     let pipeline = request(
         "shell",
-        json!({"command": "pip install sample-package 2>&1 | tail -60"}),
+        json!({"command": "printf 'one\\ntwo\\n' | tail -1"}),
     );
     assert_eq!(
         runtime
@@ -1133,11 +1438,15 @@ async fn unrestricted_runtime_writes_outside_workspace_without_disabling_validat
             .decision,
         PolicyDecision::Allow
     );
-    assert!(matches!(
-        runtime.execute(pipeline, CancellationToken::new()).await,
-        Err(ToolError::InvalidArguments(message))
-            if message.contains("explicit bash -lc wrapper")
-    ));
+    let report = runtime
+        .execute(pipeline, CancellationToken::new())
+        .await
+        .expect("unrestricted compound shell command");
+    assert_eq!(report.envelope.status, ToolResultStatus::Ok);
+    assert_eq!(
+        report.envelope.model_visible_excerpt.as_deref(),
+        Some("two\n")
+    );
 }
 
 #[tokio::test]
@@ -1206,6 +1515,445 @@ async fn apply_patch_changes_multiple_files_through_one_atomic_tool_call() {
     assert_eq!(report.changed_files.len(), 2);
     assert_eq!(report.before_images.len(), 2);
     assert_eq!(report.after_images.len(), 2);
+}
+
+#[tokio::test]
+async fn apply_patch_accepts_model_begin_patch_format_atomically() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(workspace.path().join("one.txt"), "old\nkeep\n").expect("fixture");
+    let executor = executor(workspace.path());
+    let patch = concat!(
+        "*** Begin Patch\n",
+        "*** Update File: one.txt\n",
+        "@@\n",
+        " old\n",
+        "-keep\n",
+        "+changed\n",
+        "*** Add File: two.txt\n",
+        "+second\n",
+        "*** End Patch\n",
+    );
+
+    let report = executor
+        .execute(
+            request("apply_patch", json!({"patch": patch})),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("model patch execution");
+
+    assert_eq!(report.envelope.status, ToolResultStatus::Ok);
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("one.txt")).expect("one"),
+        "old\nchanged\n"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("two.txt")).expect("two"),
+        "second\n"
+    );
+    assert_eq!(report.changed_files.len(), 2);
+}
+
+#[tokio::test]
+async fn apply_patch_rejects_ambiguous_model_context_without_partial_writes() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(workspace.path().join("one.txt"), "same\nother\nsame\n").expect("fixture");
+    let executor = executor(workspace.path());
+    let patch = concat!(
+        "*** Begin Patch\n",
+        "*** Update File: one.txt\n",
+        "@@\n",
+        "-same\n",
+        "+changed\n",
+        "*** End Patch\n",
+    );
+
+    let error = executor
+        .execute(
+            request("apply_patch", json!({"patch": patch})),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("ambiguous model context must be rejected");
+
+    assert!(error.to_string().contains("ambiguous"));
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("one.txt")).expect("unchanged"),
+        "same\nother\nsame\n"
+    );
+}
+
+#[tokio::test]
+async fn apply_patch_supports_model_add_and_delete_entries() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(workspace.path().join("remove.txt"), "remove me\n").expect("fixture");
+    let executor = executor(workspace.path());
+    let patch = concat!(
+        "*** Begin Patch\n",
+        "*** Add File: empty.txt\n",
+        "*** Delete File: remove.txt\n",
+        "*** End Patch\n",
+    );
+
+    let report = executor
+        .execute(
+            request("apply_patch", json!({"patch": patch})),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("add/delete patch execution");
+
+    assert_eq!(report.envelope.status, ToolResultStatus::Ok);
+    assert!(workspace.path().join("empty.txt").is_file());
+    assert!(!workspace.path().join("remove.txt").exists());
+    assert_eq!(report.changed_files.len(), 2);
+}
+
+#[tokio::test]
+async fn apply_patch_preserves_model_whitespace_and_outer_padding() {
+    let workspace = tempdir().expect("workspace");
+    let executor = executor(workspace.path());
+    let patch = concat!(
+        "\n  *** Begin Patch\n",
+        "*** Add File:whitespace.txt\n",
+        "+  trailing spaces  \n",
+        "*** End Patch   \n\n",
+    );
+
+    executor
+        .execute(
+            request("apply_patch", json!({"patch": patch})),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("padded model patch execution");
+
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("whitespace.txt")).expect("file"),
+        "  trailing spaces  \n"
+    );
+}
+
+#[tokio::test]
+async fn apply_patch_rejects_model_add_when_target_exists() {
+    let workspace = tempdir().expect("workspace");
+    let path = workspace.path().join("existing.txt");
+    fs::write(&path, "original\n").expect("fixture");
+    let executor = executor(workspace.path());
+    let patch = concat!(
+        "*** Begin Patch\n",
+        "*** Add File: existing.txt\n",
+        "+replacement\n",
+        "*** End Patch\n",
+    );
+
+    let error = executor
+        .execute(
+            request("apply_patch", json!({"patch": patch})),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("existing add target must be rejected");
+
+    assert!(error.to_string().contains("already exists"));
+    assert_eq!(
+        fs::read_to_string(path).expect("unchanged file"),
+        "original\n"
+    );
+}
+
+#[tokio::test]
+async fn apply_patch_rejects_model_move_when_destination_exists() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(workspace.path().join("source.txt"), "source\n").expect("source fixture");
+    fs::write(workspace.path().join("destination.txt"), "destination\n")
+        .expect("destination fixture");
+    let executor = executor(workspace.path());
+    let patch = concat!(
+        "*** Begin Patch\n",
+        "*** Update File: source.txt\n",
+        "*** Move to: destination.txt\n",
+        "@@\n",
+        "-source\n",
+        "+changed\n",
+        "*** End Patch\n",
+    );
+
+    let error = executor
+        .execute(
+            request("apply_patch", json!({"patch": patch})),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("existing move destination must be rejected");
+
+    assert!(error.to_string().contains("destination already exists"));
+    assert!(workspace.path().join("source.txt").is_file());
+    assert!(workspace.path().join("destination.txt").is_file());
+}
+
+#[test]
+fn model_patch_rejects_lexical_path_alias_collisions() {
+    let patches = [
+        concat!(
+            "*** Begin Patch\n",
+            "*** Update File: a.txt\n",
+            "@@\n",
+            "-old\n",
+            "+new\n",
+            "*** Add File: ./a.txt\n",
+            "+other\n",
+            "*** End Patch\n",
+        ),
+        concat!(
+            "*** Begin Patch\n",
+            "*** Update File: dir/../a.txt\n",
+            "@@\n",
+            "-old\n",
+            "+new\n",
+            "*** Add File: a.txt\n",
+            "+other\n",
+            "*** End Patch\n",
+        ),
+        concat!(
+            "*** Begin Patch\n",
+            "*** Update File: a.txt\n",
+            "*** Move to: ./a.txt\n",
+            "@@\n",
+            "-old\n",
+            "+new\n",
+            "*** End Patch\n",
+        ),
+    ];
+
+    for patch in patches {
+        let error = super::model_patch::parse(patch).expect_err("path aliases must conflict");
+        assert!(
+            error.contains("more than once"),
+            "unexpected alias error: {error}"
+        );
+    }
+}
+
+#[test]
+fn model_patch_render_rejects_lexical_move_self_collision() {
+    let patch = super::model_patch::ModelPatch {
+        files: vec![super::model_patch::ModelPatchFile {
+            path: PathBuf::from("a.txt"),
+            move_path: Some(PathBuf::from("./a.txt")),
+            kind: super::model_patch::ModelPatchFileKind::Update(vec![
+                super::model_patch::ModelPatchHunk {
+                    header: "@@".to_owned(),
+                    context: None,
+                    lines: vec!["-old".to_owned(), "+new".to_owned()],
+                    end_of_file: false,
+                    new_no_newline: false,
+                },
+            ]),
+        }],
+    };
+    let originals = std::collections::BTreeMap::from([(PathBuf::from("a.txt"), b"old\n".to_vec())]);
+
+    let error = super::model_patch::render(&patch, &originals)
+        .expect_err("lexical move aliases must be rejected by the renderer");
+    assert!(
+        error.contains("move destination must differ"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn model_patch_rejects_hunks_without_a_change() {
+    let patch = concat!(
+        "*** Begin Patch\n",
+        "*** Update File: a.txt\n",
+        "@@\n",
+        " context only\n",
+        "*** End Patch\n",
+    );
+    let error = super::model_patch::parse(patch).expect_err("context-only hunk must be rejected");
+    assert!(error.contains("does not change"));
+}
+
+#[tokio::test]
+async fn apply_patch_allows_an_explicit_empty_add_file() {
+    let workspace = tempdir().expect("workspace");
+    let executor = executor(workspace.path());
+    let patch = concat!(
+        "*** Begin Patch\n",
+        "*** Add File: empty.txt\n",
+        "*** End Patch\n",
+    );
+
+    let report = executor
+        .execute(
+            request("apply_patch", json!({"patch": patch})),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("empty add execution");
+    assert_eq!(report.envelope.status, ToolResultStatus::Ok);
+    assert_eq!(
+        fs::read(workspace.path().join("empty.txt")).expect("empty file"),
+        b""
+    );
+}
+
+#[tokio::test]
+async fn apply_patch_treats_an_unprefixed_blank_hunk_line_as_context() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(workspace.path().join("blank.txt"), "before\n\nafter\n").expect("fixture");
+    let executor = executor(workspace.path());
+    let patch = concat!(
+        "*** Begin Patch\n",
+        "*** Update File: blank.txt\n",
+        "@@\n",
+        " before\n",
+        "\n",
+        "-after\n",
+        "+changed\n",
+        "*** End Patch\n",
+    );
+
+    executor
+        .execute(
+            request("apply_patch", json!({"patch": patch})),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("blank context patch execution");
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("blank.txt")).expect("patched file"),
+        "before\n\nchanged\n"
+    );
+}
+
+#[tokio::test]
+async fn apply_patch_alias_collision_leaves_workspace_unchanged() {
+    let workspace = tempdir().expect("workspace");
+    let path = workspace.path().join("a.txt");
+    fs::write(&path, "old\n").expect("fixture");
+    let executor = executor(workspace.path());
+    let patch = concat!(
+        "*** Begin Patch\n",
+        "*** Update File: a.txt\n",
+        "@@\n",
+        "-old\n",
+        "+changed\n",
+        "*** Add File: dir/../a.txt\n",
+        "+conflict\n",
+        "*** End Patch\n",
+    );
+
+    let error = executor
+        .execute(
+            request("apply_patch", json!({"patch": patch})),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("alias collision must be rejected before writing");
+    assert!(error.to_string().contains("more than once"));
+    assert_eq!(fs::read_to_string(path).expect("unchanged file"), "old\n");
+}
+
+#[tokio::test]
+async fn apply_patch_supports_model_move_and_context_anchor() {
+    let workspace = tempdir().expect("workspace");
+    fs::create_dir_all(workspace.path().join("src")).expect("source directory");
+    fs::create_dir_all(workspace.path().join("dst")).expect("destination directory");
+    fs::write(
+        workspace.path().join("src/module.txt"),
+        "section a\nvalue\nsection b\nvalue\n",
+    )
+    .expect("source fixture");
+    let executor = executor(workspace.path());
+    let patch = concat!(
+        "*** Begin Patch\n",
+        "*** Update File: src/module.txt\n",
+        "*** Move to: dst/module.txt\n",
+        "@@ section b\n",
+        "-value\n",
+        "+changed\n",
+        "*** End Patch\n",
+    );
+
+    let report = executor
+        .execute(
+            request("apply_patch", json!({"patch": patch})),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("move patch execution");
+
+    assert_eq!(report.envelope.status, ToolResultStatus::Ok);
+    assert!(!workspace.path().join("src/module.txt").exists());
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("dst/module.txt")).expect("destination"),
+        "section a\nvalue\nsection b\nchanged\n"
+    );
+    assert_eq!(report.changed_files.len(), 2);
+}
+
+#[tokio::test]
+async fn apply_patch_uses_end_of_file_for_append_hunks() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(workspace.path().join("tail.txt"), "first\nlast\n").expect("fixture");
+    let executor = executor(workspace.path());
+    let patch = concat!(
+        "*** Begin Patch\n",
+        "*** Update File: tail.txt\n",
+        "@@\n",
+        "+appended\n",
+        "*** End of File\n",
+        "*** End Patch\n",
+    );
+
+    let report = executor
+        .execute(
+            request("apply_patch", json!({"patch": patch})),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("EOF patch execution");
+
+    assert_eq!(report.envelope.status, ToolResultStatus::Ok);
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("tail.txt")).expect("tail"),
+        "first\nlast\nappended\n"
+    );
+}
+
+#[tokio::test]
+async fn apply_patch_add_eof_marker_preserves_trailing_newline_semantics() {
+    let workspace = tempdir().expect("workspace");
+    let executor = executor(workspace.path());
+    let patch = concat!(
+        "*** Begin Patch\n",
+        "*** Add File: with-eof-marker.txt\n",
+        "+line\n",
+        "*** End of File\n",
+        "*** Add File: without-newline.txt\n",
+        "+line\n",
+        "\\ No newline at end of file\n",
+        "*** End Patch\n",
+    );
+
+    let report = executor
+        .execute(
+            request("apply_patch", json!({"patch": patch})),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("add patch execution");
+    assert_eq!(report.envelope.status, ToolResultStatus::Ok);
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("with-eof-marker.txt")).expect("eof file"),
+        "line\n"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("without-newline.txt")).expect("no-newline file"),
+        "line"
+    );
 }
 
 #[tokio::test]
@@ -1562,7 +2310,10 @@ async fn edit_file_refuses_to_overwrite_changes_made_after_before_image() {
     let executor = executor(workspace.path());
     let request = request(
         "edit_file",
-        json!({"path": "src.txt", "search": "before", "replace": "agent"}),
+        json!({
+            "path": "src.txt",
+            "edits": [{"old_text": "before", "new_text": "agent"}]
+        }),
     );
     let policy = executor.evaluate(&request).expect("policy");
     let before_images = executor
@@ -1598,7 +2349,10 @@ async fn edit_file_checkpoints_even_when_the_initial_search_does_not_match() {
     let executor = executor(workspace.path());
     let request = request(
         "edit_file",
-        json!({"path": "src.txt", "search": "later", "replace": "agent"}),
+        json!({
+            "path": "src.txt",
+            "edits": [{"old_text": "later", "new_text": "agent"}]
+        }),
     );
     let policy = executor.evaluate(&request).expect("policy");
     let before_images = executor
@@ -1798,6 +2552,63 @@ async fn shell_runs_simple_command_without_shell_interpreter() {
     );
 }
 
+#[test]
+fn shell_request_read_only_fast_path_is_conservative() {
+    assert!(shell_request_is_strictly_read_only(
+        &json!({"command": "cat README.md"})
+    ));
+    assert!(shell_request_is_strictly_read_only(
+        &json!({"argv": ["rg", "token", "src"]})
+    ));
+    for arguments in [
+        json!({"command": "bash -lc 'cat README.md'"}),
+        json!({"command": "printf ok | tr o O"}),
+        json!({"command": "cat README.md", "background": true}),
+        json!({"command": "find . -exec cat {} +"}),
+        json!({"command": "sort -o result.txt"}),
+    ] {
+        assert!(!shell_request_is_strictly_read_only(&arguments));
+    }
+}
+
+#[tokio::test]
+async fn strict_read_only_shell_skips_workspace_snapshot_and_reports_zero_changes() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(workspace.path().join("README.md"), "read-only\n").expect("fixture");
+    let executor = executor(workspace.path());
+    let request = request("shell", json!({"command": "cat README.md"}));
+    let policy = executor.evaluate(&request).expect("policy evaluates");
+    let preparation = executor
+        .prepare_side_effect_snapshot(&request)
+        .await
+        .expect("read-only preparation");
+
+    assert!(preparation.before_images.is_empty());
+    assert!(preparation.complete);
+    assert!(!preparation.tracks_workspace_changes());
+
+    let report = executor
+        .invoke(
+            ToolInvocation::new(request, policy, true).with_preparation(preparation),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .expect("read-only shell executes");
+    assert_eq!(report.envelope.status, ToolResultStatus::Ok);
+    assert_eq!(
+        report.envelope.structured_facts["workspace_changes_known"],
+        true
+    );
+    assert_eq!(
+        report.envelope.structured_facts["workspace_change_count"],
+        0
+    );
+    assert!(report.before_images.is_empty());
+    assert!(report.after_images.is_empty());
+    assert!(report.changed_files.is_empty());
+}
+
 #[tokio::test]
 async fn shell_facts_record_the_executor_network_capability() {
     let workspace = tempdir().expect("workspace");
@@ -1864,6 +2675,22 @@ fn shell_parser_rejects_unwrapped_compound_commands() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn shell_parser_implicitly_wraps_compound_commands_only_for_unrestricted_execution() {
+    let command = CommandLine::parse_for_execution("printf ok | tr o O", true)
+        .expect("unrestricted compound command");
+
+    assert_eq!(command.program, "bash");
+    assert_eq!(command.args, ["-lc", "printf ok | tr o O"]);
+    assert_eq!(command.stdin, None);
+    assert!(matches!(
+        CommandLine::parse_for_execution("printf ok | tr o O", false),
+        Err(ToolError::InvalidArguments(message))
+            if message.contains("explicit bash -lc wrapper")
+    ));
+}
+
 #[test]
 fn shell_parser_preserves_multiline_explicit_wrapper_scripts() {
     let command = CommandLine::parse("bash -lc 'python - <<'PY'\nprint('ok')\nPY'")
@@ -1911,6 +2738,71 @@ async fn foreground_python_heredoc_executes_its_body_without_a_shell() {
     assert_eq!(
         report.envelope.model_visible_excerpt.as_deref(),
         Some("done\n")
+    );
+}
+
+#[tokio::test]
+async fn shell_accepts_direct_argv_and_a_redundant_command_prefix() {
+    let workspace = tempdir().expect("workspace");
+    let executor = executor(workspace.path());
+    let report = execute_approved(
+        &executor,
+        request(
+            "shell",
+            json!({
+                "command": "printf",
+                "argv": ["printf", "%s", "argv-ok"]
+            }),
+        ),
+        CancellationToken::new(),
+    )
+    .await;
+
+    assert_eq!(report.envelope.status, ToolResultStatus::Ok);
+    assert_eq!(
+        report.envelope.model_visible_excerpt.as_deref(),
+        Some("argv-ok")
+    );
+}
+
+#[tokio::test]
+async fn shell_rejects_conflicting_command_and_argv_without_launching() {
+    let workspace = tempdir().expect("workspace");
+    let executor = executor(workspace.path());
+    let error = executor
+        .execute(
+            request(
+                "shell",
+                json!({
+                    "command": "printf",
+                    "argv": ["echo", "should-not-run"]
+                }),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("conflicting command and argv must be rejected");
+
+    assert!(error.to_string().contains("different commands"));
+}
+
+#[tokio::test]
+async fn shell_direct_argv_preserves_newlines_without_shell_interpretation() {
+    let workspace = tempdir().expect("workspace");
+    let report = execute_approved(
+        &executor(workspace.path()),
+        request(
+            "shell",
+            json!({"argv": ["printf", "%s", "line-one\nline-two"]}),
+        ),
+        CancellationToken::new(),
+    )
+    .await;
+
+    assert_eq!(report.envelope.status, ToolResultStatus::Ok);
+    assert_eq!(
+        report.envelope.model_visible_excerpt.as_deref(),
+        Some("line-one\nline-two")
     );
 }
 
@@ -2163,6 +3055,10 @@ async fn background_process_supports_cursor_reconnect_stdin_and_terminal_diff() 
         start.envelope.structured_facts["wait_strategy"],
         "event_driven_cursor"
     );
+    let authoritative_pid = start.envelope.structured_facts["authoritative_pid"]
+        .as_u64()
+        .expect("authoritative pid");
+    assert!(authoritative_pid > 0);
     assert!(start.envelope.summary.contains("post-runtime consumers"));
     assert!(start.envelope.summary.contains("detached process"));
     let process_id = start.envelope.structured_facts["process_id"]
@@ -2179,6 +3075,10 @@ async fn background_process_supports_cursor_reconnect_stdin_and_terminal_diff() 
     assert_eq!(
         start.envelope.structured_facts["next_action"]["cursor"],
         first_cursor
+    );
+    assert_eq!(
+        start.envelope.structured_facts["next_action"]["authoritative_pid"],
+        authoritative_pid
     );
     assert!(first_cursor > 0);
     assert!(artifact_text(&start).contains("first"));
@@ -2266,9 +3166,38 @@ async fn background_process_supports_cursor_reconnect_stdin_and_terminal_diff() 
         false
     );
     assert_eq!(terminal.envelope.structured_facts["terminal"], true);
+    let terminal_event_id = terminal.envelope.structured_facts["terminal_event_id"]
+        .as_u64()
+        .expect("terminal event id");
+    assert!(terminal_event_id > 0);
     assert_eq!(
         terminal.envelope.structured_facts["next_action"]["kind"],
         "terminal"
+    );
+    assert_eq!(
+        terminal.envelope.structured_facts["next_action"]["terminal_event_id"],
+        terminal_event_id
+    );
+    let reconnected = executor
+        .execute(
+            request_for_session(
+                session_id,
+                "shell_session",
+                json!({
+                    "action": "wait",
+                    "process_id": process_id,
+                    "authoritative_pid": authoritative_pid,
+                    "cursor": cursor,
+                    "wait_ms": 0,
+                }),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("reconnect terminal process");
+    assert_eq!(
+        reconnected.envelope.structured_facts["terminal_event_id"],
+        terminal_event_id
     );
     assert!(
         terminal
@@ -2306,9 +3235,48 @@ async fn shell_session_unifies_event_wait_write_and_terminate() {
         .as_str()
         .expect("process id")
         .to_owned();
+    let authoritative_pid = start.envelope.structured_facts["authoritative_pid"]
+        .as_u64()
+        .expect("authoritative pid");
     let cursor = start.envelope.structured_facts["output_cursor"]
         .as_u64()
         .expect("cursor");
+    let wrong_pid = authoritative_pid.saturating_add(1);
+    let rejected = executor
+        .execute(
+            request_for_session(
+                session_id,
+                "shell_session",
+                json!({
+                    "action": "wait",
+                    "process_id": process_id,
+                    "authoritative_pid": wrong_pid,
+                    "cursor": cursor,
+                    "wait_ms": 0,
+                }),
+            ),
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(
+        matches!(rejected, Err(ToolError::Execution(message)) if message.contains("authoritative PID mismatch"))
+    );
+    let missing_pid = executor
+        .execute(
+            request_for_session(
+                session_id,
+                "shell_session",
+                json!({
+                    "action": "wait",
+                    "process_id": process_id,
+                    "cursor": cursor,
+                    "wait_ms": 0,
+                }),
+            ),
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(missing_pid, Err(ToolError::InvalidArguments(_))));
     let waited = executor
         .execute(
             request_for_session(
@@ -2317,6 +3285,7 @@ async fn shell_session_unifies_event_wait_write_and_terminate() {
                 json!({
                     "action": "wait",
                     "process_id": process_id,
+                    "authoritative_pid": authoritative_pid,
                     "cursor": cursor,
                     "wait_ms": 0,
                 }),
@@ -2337,6 +3306,7 @@ async fn shell_session_unifies_event_wait_write_and_terminate() {
                 json!({
                     "action": "write",
                     "process_id": process_id,
+                    "authoritative_pid": authoritative_pid,
                     "cursor": next_cursor,
                     "input": "done\n",
                     "wait_ms": 1_000,
@@ -2355,6 +3325,7 @@ async fn shell_session_unifies_event_wait_write_and_terminate() {
                 json!({
                     "action": "wait",
                     "process_id": process_id,
+                    "authoritative_pid": authoritative_pid,
                     "cursor": written.envelope.structured_facts["output_cursor"],
                     "wait_ms": 1_000,
                 }),
@@ -2739,6 +3710,90 @@ async fn process_supervisor_terminal_terminate_does_not_signal_stale_pid() {
         bait_is_running,
         "terminate after terminal must not signal a stale/recycled PID"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn process_supervisor_reaped_window_does_not_signal_an_injected_pid() {
+    let workspace = tempdir().expect("workspace");
+    let supervisor = ProcessSupervisor::new();
+    let sandbox = SystemSandbox::process_only();
+    let session_id = SessionId::new();
+    let process_id = "reaped-window";
+    let (entered, release) = supervisor.install_reap_window_hook_for_test(process_id);
+    let args = vec!["-c".to_owned(), "exit 0".to_owned()];
+    let workspace_before = workspace_scan::capture(workspace.path()).await;
+    let started = supervisor
+        .start(ProcessStartRequest {
+            process_id: process_id.to_owned(),
+            session_id,
+            program: "/bin/sh",
+            args: &args,
+            command_display: "reaped window fixture".to_owned(),
+            cwd: workspace.path(),
+            workspace_root: workspace.path(),
+            timeout_ms: 5_000,
+            wait_ms: 0,
+            cancellation: CancellationToken::new(),
+            sandbox: &sandbox,
+            workspace_access: WorkspaceAccess::ReadWrite,
+            allow_network: false,
+            workspace_before,
+        })
+        .await
+        .expect("process starts");
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .expect("reaped window is reached");
+
+    let mut bait = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn bait process");
+    let bait_pid = bait.id();
+    assert!(
+        supervisor
+            .inject_reaped_pid_for_test(session_id, process_id, bait_pid)
+            .await,
+        "the fixture must expose a reaped lifecycle before terminal publication"
+    );
+    supervisor
+        .request_termination_for_test(session_id, process_id)
+        .await
+        .expect("request termination");
+
+    let bait_status = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &bait_pid.to_string()])
+        .output()
+        .expect("inspect bait status");
+    let bait_is_running = bait_status.status.success()
+        && String::from_utf8_lossy(&bait_status.stdout)
+            .lines()
+            .any(|line| !line.trim().is_empty() && !line.trim_start().starts_with('Z'));
+    assert!(
+        bait_is_running,
+        "termination after child reap must not signal an injected PID"
+    );
+
+    release.notify_one();
+    let terminal = tokio::time::timeout(
+        Duration::from_secs(2),
+        supervisor.poll(session_id, process_id, started.output_cursor, 2_000),
+    )
+    .await
+    .expect("terminal bookkeeping remains bounded")
+    .expect("terminal snapshot");
+    assert_eq!(terminal.state, ProcessState::Terminated);
+    assert!(terminal.terminal_event_id.is_some());
+    assert_eq!(
+        supervisor
+            .retained_pid_for_test(session_id, process_id)
+            .await,
+        None
+    );
+
+    let _ = bait.kill();
+    let _ = bait.wait();
 }
 
 #[cfg(unix)]
@@ -3669,7 +4724,10 @@ async fn required_paths_patterns_and_edit_search_must_not_be_empty() {
         request("write_file", json!({"path": "", "content": ""})),
         request(
             "edit_file",
-            json!({"path": "src.txt", "search": "", "replace": "replacement"}),
+            json!({
+                "path": "src.txt",
+                "edits": [{"old_text": "", "new_text": "replacement"}]
+            }),
         ),
         request("rg_search", json!({"pattern": ""})),
     ] {

@@ -3,7 +3,12 @@
 //! AgentLoop consumes the bounded outcomes exposed here; shell/Python compatibility
 //! heuristics stay local to this module and do not participate in loop orchestration.
 
-use std::{collections::HashSet, path::Path, sync::LazyLock};
+use std::{
+    collections::HashSet,
+    fs,
+    path::{Path, PathBuf},
+    sync::LazyLock,
+};
 
 use golutra_core::{TaskContract, ToolResultStatus, VerificationRequirement};
 use golutra_policy::parse_shell_command_with_input;
@@ -203,12 +208,7 @@ pub(super) fn explicitly_requested_inspection_validation(
         .get("path")
         .and_then(Value::as_str)
         .unwrap_or(&report.policy_evaluation.resource);
-    let resource_path = Path::new(resource);
-    let relative = resource_path
-        .strip_prefix(workspace_root)
-        .unwrap_or(resource_path)
-        .to_string_lossy()
-        .replace('\\', "/");
+    let relative = canonical_inspection_relative_path(resource, workspace_root)?;
     if relative.is_empty() || relative == "." {
         return None;
     }
@@ -240,6 +240,118 @@ pub(super) fn explicitly_requested_inspection_validation(
             format!("explicitly requested workspace input could not be inspected: {relative}")
         },
     })
+}
+
+/// Return the stable workspace-relative identity for a read/list inspection.
+///
+/// Tool policy reports can contain either an absolute path or the original
+/// relative argument.  Existing paths are resolved through the workspace
+/// canonical root so `./foo` and `/workspace/foo` share one identity.  A
+/// missing one-component path is only associated with a nested path when the
+/// basename has exactly one non-symlink match in the workspace; ambiguous
+/// names remain distinct and therefore cannot accidentally recover one another.
+fn canonical_inspection_relative_path(resource: &str, workspace_root: &Path) -> Option<String> {
+    let resource_path = Path::new(resource);
+    let canonical_root = fs::canonicalize(workspace_root).ok();
+    let candidate = if resource_path.is_absolute() {
+        resource_path.to_path_buf()
+    } else {
+        workspace_root.join(resource_path)
+    };
+
+    if let (Some(root), Ok(canonical)) = (canonical_root.as_ref(), fs::canonicalize(&candidate))
+        && let Ok(relative) = canonical.strip_prefix(root)
+        && let Some(relative) = normalize_relative_path(relative)
+    {
+        return Some(relative);
+    }
+
+    let relative = if resource_path.is_absolute() {
+        resource_path
+            .strip_prefix(workspace_root)
+            .or_else(|_| {
+                canonical_root
+                    .as_deref()
+                    .and_then(|root| resource_path.strip_prefix(root).ok())
+                    .ok_or(())
+            })
+            .ok()?
+    } else {
+        resource_path
+    };
+    let relative = normalize_relative_path(relative)?;
+
+    // A failed short read is common when a model omits a package directory.
+    // Resolve it only when the workspace proves there is one unambiguous target.
+    if Path::new(&relative).components().count() == 1
+        && let Some(basename) = Path::new(&relative).file_name()
+        && let Some(match_path) = unique_workspace_basename_match(workspace_root, basename)
+        && let Some(root) = canonical_root.as_ref()
+        && let Ok(canonical_match) = fs::canonicalize(match_path)
+        && let Ok(match_relative) = canonical_match.strip_prefix(root)
+        && let Some(match_relative) = normalize_relative_path(match_relative)
+    {
+        return Some(match_relative);
+    }
+    Some(relative)
+}
+
+fn normalize_relative_path(path: &Path) -> Option<String> {
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(value) => {
+                components.push(value.to_string_lossy().into_owned());
+            }
+            std::path::Component::ParentDir => {
+                components.pop()?;
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    (!components.is_empty()).then(|| components.join("/"))
+}
+
+const MAX_INSPECTION_INDEX_ENTRIES: usize = 16_384;
+
+fn unique_workspace_basename_match(
+    workspace_root: &Path,
+    basename: &std::ffi::OsStr,
+) -> Option<PathBuf> {
+    let mut pending = vec![workspace_root.to_path_buf()];
+    let mut match_path = None;
+    let mut inspected = 0_usize;
+    while let Some(directory) = pending.pop() {
+        let entries = fs::read_dir(directory).ok()?;
+        for entry in entries {
+            inspected = inspected.saturating_add(1);
+            if inspected > MAX_INSPECTION_INDEX_ENTRIES {
+                return None;
+            }
+            let entry = entry.ok()?;
+            let file_type = entry.file_type().ok()?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                pending.push(entry.path());
+                continue;
+            }
+            if file_type.is_file()
+                && entry
+                    .file_name()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&basename.to_string_lossy())
+            {
+                if match_path.is_some() {
+                    return None;
+                }
+                match_path = Some(entry.path());
+            }
+        }
+    }
+    match_path
 }
 
 #[cfg(test)]

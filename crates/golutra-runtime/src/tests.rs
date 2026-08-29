@@ -22,7 +22,7 @@ use golutra_governor::GovernorLimits;
 use golutra_llm::{
     LlmProvider, MockProvider, ProviderError, ProviderFinishReason, ProviderMessage,
     ProviderRequest, ProviderResponse, ProviderStreamEvent, ProviderToolCall, ProviderUsage,
-    UsageSource, estimate_provider_tool_tokens,
+    UsageSource, estimate_provider_tool_tokens, provider_tool_wire_digest,
 };
 use golutra_policy::WorkspacePolicy;
 use golutra_protocol::{
@@ -94,6 +94,186 @@ fn objective_test_report_with_output(command: &str, output: &str) -> ToolExecuti
             bytes: output.as_bytes().to_vec(),
         });
     report
+}
+
+#[test]
+fn active_tool_result_budget_is_large_until_context_is_tight() {
+    let mut plan = ContextBuilder::default()
+        .build(TaskId::new(), TurnId::new(), Vec::new())
+        .expect("context plan");
+    plan.budget_snapshot.budget_limit = 4_096;
+
+    assert_eq!(active_tool_result_token_budget(&plan, 0, 0), 2_048);
+    assert_eq!(active_tool_result_token_budget(&plan, 3_000, 0), 840);
+    assert_eq!(active_tool_result_token_budget(&plan, 4_096, 0), 256);
+}
+
+#[test]
+fn provider_tool_schema_change_invalidates_observed_prefix() {
+    let plan = ContextBuilder::default()
+        .build(
+            golutra_core::TaskId::new(),
+            golutra_core::TurnId::new(),
+            vec![ContextContributor {
+                name: "system".to_owned(),
+                role: golutra_llm::ProviderRole::System,
+                content: "stable prefix".to_owned(),
+                token_budget_hint: 0,
+                source_refs: vec!["test:prefix".to_owned()],
+            }],
+        )
+        .expect("context plan");
+    let contract = MockProvider::text_response("ok").contract();
+    let first_tool = golutra_core::ToolContract {
+        tool_name: "read_file".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"]
+        }),
+        output_schema: json!({}),
+        error_schema: json!({}),
+        side_effect_type: golutra_core::SideEffectType::None,
+        idempotency_key_policy: "none".to_owned(),
+        timeout_policy: "bounded".to_owned(),
+        cancellation_policy: "supported".to_owned(),
+        retry_policy: "none".to_owned(),
+        artifact_policy: "none".to_owned(),
+        permission_policy_ref: None,
+    };
+    let first_tool_digest = provider_tool_wire_digest(&first_tool);
+    let observed = ObservedContextUsage {
+        message_count: 1,
+        input_tokens: 12,
+        message_prefix_digest: context_message_prefix_digest(&plan, 1).expect("prefix digest"),
+        tool_digest: first_tool_digest.to_owned(),
+        provider_id: contract.provider_id.clone(),
+        model_id: contract.model_id.clone(),
+    };
+
+    assert!(reusable_observed_prefix(&plan, &observed, &first_tool_digest, &contract).is_some());
+    assert!(
+        reusable_observed_prefix(
+            &plan,
+            &observed,
+            &provider_tool_wire_digest(&golutra_core::ToolContract {
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "integer"}},
+                    "required": ["path"]
+                }),
+                ..first_tool.clone()
+            }),
+            &contract
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn recoverable_tool_failure_is_superseded_only_by_a_later_equivalent_success() {
+    let mut failed = objective_test_report("shell", Some("echo retry"));
+    failed.envelope.status = ToolResultStatus::Error;
+    let mut succeeded = objective_test_report("shell", Some("echo retry"));
+    succeeded.envelope.status = ToolResultStatus::Ok;
+    let failed_id = failed.envelope.tool_call_id;
+    let succeeded_id = succeeded.envelope.tool_call_id;
+    let signature = tool_attempt_signature("shell", &json!({"command": "echo retry"}));
+    let attempts = vec![
+        ToolAttemptMetadata {
+            tool_call_id: failed_id,
+            signature: signature.clone(),
+            step_no: 1,
+            status: ToolResultStatus::Error,
+            recoverable_failure: true,
+        },
+        ToolAttemptMetadata {
+            tool_call_id: succeeded_id,
+            signature,
+            step_no: 2,
+            status: ToolResultStatus::Ok,
+            recoverable_failure: false,
+        },
+    ];
+
+    assert_eq!(
+        tool_execution_check_status(&failed, &attempts),
+        (true, true)
+    );
+    assert_eq!(
+        failed.envelope.status,
+        ToolResultStatus::Error,
+        "the original report remains error evidence"
+    );
+}
+
+#[test]
+fn a_later_failure_does_not_recover_the_final_equivalent_attempt() {
+    let mut first = objective_test_report("shell", Some("echo retry"));
+    first.envelope.status = ToolResultStatus::Error;
+    let middle = objective_test_report("shell", Some("echo retry"));
+    let mut last = objective_test_report("shell", Some("echo retry"));
+    last.envelope.status = ToolResultStatus::Error;
+    let signature = tool_attempt_signature("shell", &json!({"command": "echo retry"}));
+    let attempts = vec![
+        ToolAttemptMetadata {
+            tool_call_id: first.envelope.tool_call_id,
+            signature: signature.clone(),
+            step_no: 1,
+            status: ToolResultStatus::Error,
+            recoverable_failure: true,
+        },
+        ToolAttemptMetadata {
+            tool_call_id: middle.envelope.tool_call_id,
+            signature: signature.clone(),
+            step_no: 2,
+            status: ToolResultStatus::Ok,
+            recoverable_failure: false,
+        },
+        ToolAttemptMetadata {
+            tool_call_id: last.envelope.tool_call_id,
+            signature,
+            step_no: 3,
+            status: ToolResultStatus::Error,
+            recoverable_failure: true,
+        },
+    ];
+
+    assert_eq!(tool_execution_check_status(&first, &attempts), (true, true));
+    assert_eq!(
+        tool_execution_check_status(&last, &attempts),
+        (false, false)
+    );
+}
+
+#[test]
+fn hard_tool_failure_remains_failed_even_after_an_equivalent_success() {
+    let mut failed = objective_test_report("shell", Some("echo retry"));
+    failed.envelope.status = ToolResultStatus::Error;
+    failed.envelope.structured_facts = json!({"hard_failure": true});
+    let succeeded = objective_test_report("shell", Some("echo retry"));
+    let signature = tool_attempt_signature("shell", &json!({"command": "echo retry"}));
+    let attempts = vec![
+        ToolAttemptMetadata {
+            tool_call_id: failed.envelope.tool_call_id,
+            signature: signature.clone(),
+            step_no: 1,
+            status: ToolResultStatus::Error,
+            recoverable_failure: false,
+        },
+        ToolAttemptMetadata {
+            tool_call_id: succeeded.envelope.tool_call_id,
+            signature,
+            step_no: 2,
+            status: ToolResultStatus::Ok,
+            recoverable_failure: false,
+        },
+    ];
+
+    assert_eq!(
+        tool_execution_check_status(&failed, &attempts),
+        (false, false)
+    );
 }
 
 #[test]
@@ -398,6 +578,142 @@ fn inspection_validation_is_limited_to_pure_analysis_contracts() {
     }
 }
 
+fn inspection_report(path: &Path, status: ToolResultStatus) -> ToolExecutionReport {
+    let mut report = objective_test_report("read_file", None);
+    report.envelope.status = status;
+    report.envelope.structured_facts = json!({"path": path.display().to_string()});
+    report.policy_evaluation.resource = path.display().to_string();
+    report
+}
+
+#[test]
+fn inspection_identity_normalizes_a_unique_nested_retry_target() {
+    let workspace = tempdir().expect("workspace");
+    let nested = workspace.path().join("jobledger/model.py");
+    fs::create_dir_all(nested.parent().expect("nested parent")).expect("parent");
+    fs::write(&nested, "source").expect("nested file");
+
+    let mut failed = inspection_report(&workspace.path().join("model.py"), ToolResultStatus::Error);
+    failed.envelope.structured_facts = json!({"path": workspace.path().join("model.py")});
+    let succeeded = inspection_report(&nested, ToolResultStatus::Ok);
+    let objective = "inspect model.py";
+    let contract = TaskContract::default();
+    let failed_validation = explicitly_requested_inspection_validation(
+        &failed,
+        objective,
+        &[],
+        &contract,
+        workspace.path(),
+    )
+    .expect("failed inspection validation");
+    let succeeded_validation = explicitly_requested_inspection_validation(
+        &succeeded,
+        objective,
+        &[],
+        &contract,
+        workspace.path(),
+    )
+    .expect("successful inspection validation");
+
+    assert_eq!(failed_validation.identity, succeeded_validation.identity);
+    assert!(!failed_validation.passed);
+    assert!(succeeded_validation.passed);
+}
+
+#[test]
+fn ambiguous_inspection_basenames_do_not_share_an_identity() {
+    let workspace = tempdir().expect("workspace");
+    for directory in ["one", "two"] {
+        let directory = workspace.path().join(directory);
+        fs::create_dir_all(&directory).expect("directory");
+        fs::write(directory.join("model.py"), "source").expect("file");
+    }
+
+    let failed = inspection_report(&workspace.path().join("model.py"), ToolResultStatus::Error);
+    let succeeded = inspection_report(&workspace.path().join("one/model.py"), ToolResultStatus::Ok);
+    let objective = "inspect model.py";
+    let contract = TaskContract::default();
+    let failed_validation = explicitly_requested_inspection_validation(
+        &failed,
+        objective,
+        &[],
+        &contract,
+        workspace.path(),
+    )
+    .expect("failed inspection validation");
+    let succeeded_validation = explicitly_requested_inspection_validation(
+        &succeeded,
+        objective,
+        &[],
+        &contract,
+        workspace.path(),
+    )
+    .expect("successful inspection validation");
+
+    assert_ne!(failed_validation.identity, succeeded_validation.identity);
+}
+
+#[test]
+fn objective_inspection_recovery_requires_a_later_equivalent_provider_step() {
+    let workspace = tempdir().expect("workspace");
+    let nested = workspace.path().join("jobledger/model.py");
+    fs::create_dir_all(nested.parent().expect("nested parent")).expect("parent");
+    fs::write(&nested, "source").expect("nested file");
+    let failed = inspection_report(&workspace.path().join("model.py"), ToolResultStatus::Error);
+    let succeeded = inspection_report(&nested, ToolResultStatus::Ok);
+    let objective = "inspect model.py";
+    let contract = TaskContract::default();
+    let failed_validation = explicitly_requested_inspection_validation(
+        &failed,
+        objective,
+        &[],
+        &contract,
+        workspace.path(),
+    )
+    .expect("failed inspection validation");
+    let failed_id = failed.envelope.tool_call_id;
+    let succeeded_id = succeeded.envelope.tool_call_id;
+    let context = ObjectiveValidationRecoveryContext {
+        objective,
+        completion_criteria: &[],
+        contract: &contract,
+        workspace_root: workspace.path(),
+        reports: &[failed.clone(), succeeded.clone()],
+        attempts: &[
+            ToolAttemptMetadata {
+                tool_call_id: failed_id,
+                signature: "short-path".to_owned(),
+                step_no: 1,
+                status: ToolResultStatus::Error,
+                recoverable_failure: true,
+            },
+            ToolAttemptMetadata {
+                tool_call_id: succeeded_id,
+                signature: "nested-path".to_owned(),
+                step_no: 2,
+                status: ToolResultStatus::Ok,
+                recoverable_failure: false,
+            },
+        ],
+    };
+
+    assert_eq!(
+        objective_validation_check_status(&failed, &failed_validation, &context),
+        (true, true)
+    );
+
+    let mut hard_attempts = context.attempts.to_vec();
+    hard_attempts[0].recoverable_failure = false;
+    let hard_context = ObjectiveValidationRecoveryContext {
+        attempts: &hard_attempts,
+        ..context
+    };
+    assert_eq!(
+        objective_validation_check_status(&failed, &failed_validation, &hard_context),
+        (false, false)
+    );
+}
+
 #[test]
 fn tool_results_are_compacted_by_the_context_window_manager() {
     let large_result = serde_json::to_string(&json!({
@@ -619,6 +935,12 @@ struct RequiredReadProvider {
 }
 
 #[derive(Debug, Clone)]
+struct CorrectedReadProvider {
+    calls: Arc<AtomicUsize>,
+    contract: golutra_core::ProviderContract,
+}
+
+#[derive(Debug, Clone)]
 struct EndlessProgressProvider {
     contract: golutra_core::ProviderContract,
 }
@@ -719,6 +1041,7 @@ impl LlmProvider for PrefixContractProvider {
 struct ParallelReadProvider {
     calls: Arc<AtomicUsize>,
     saw_source_order: Arc<AtomicBool>,
+    mixed_batch: bool,
     contract: golutra_core::ProviderContract,
 }
 
@@ -728,8 +1051,36 @@ impl LlmProvider for ParallelReadProvider {
     async fn complete(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
         let (message, tool_calls, finish_reason) = if call == 0 {
-            (
-                None,
+            let tool_calls = if self.mixed_batch {
+                vec![
+                    ProviderToolCall {
+                        tool_call_id: "mixed-read-first".to_owned(),
+                        tool_name: "read_file".to_owned(),
+                        arguments: json!({"path": "first.txt"}),
+                    },
+                    ProviderToolCall {
+                        tool_call_id: "mixed-read-second".to_owned(),
+                        tool_name: "read_file".to_owned(),
+                        arguments: json!({"path": "second.txt"}),
+                    },
+                    ProviderToolCall {
+                        tool_call_id: "mixed-mutation".to_owned(),
+                        tool_name: "write_file".to_owned(),
+                        // 无效 mutation 仍是顺序边界，但该测试不需要交互式审批。
+                        arguments: json!({}),
+                    },
+                    ProviderToolCall {
+                        tool_call_id: "mixed-read-third".to_owned(),
+                        tool_name: "read_file".to_owned(),
+                        arguments: json!({"path": "third.txt"}),
+                    },
+                    ProviderToolCall {
+                        tool_call_id: "mixed-read-fourth".to_owned(),
+                        tool_name: "read_file".to_owned(),
+                        arguments: json!({"path": "fourth.txt"}),
+                    },
+                ]
+            } else {
                 vec![
                     ProviderToolCall {
                         tool_call_id: "parallel-read-first".to_owned(),
@@ -741,9 +1092,9 @@ impl LlmProvider for ParallelReadProvider {
                         tool_name: "read_file".to_owned(),
                         arguments: json!({"path": "second.txt"}),
                     },
-                ],
-                ProviderFinishReason::ToolCalls,
-            )
+                ]
+            };
+            (None, tool_calls, ProviderFinishReason::ToolCalls)
         } else {
             let result_ids = request
                 .messages
@@ -751,10 +1102,24 @@ impl LlmProvider for ParallelReadProvider {
                 .filter(|message| message.role == ProviderRole::Tool)
                 .filter_map(|message| message.tool_call_id.as_deref())
                 .collect::<Vec<_>>();
-            self.saw_source_order.store(
-                result_ids == ["parallel-read-first", "parallel-read-second"],
-                Ordering::SeqCst,
-            );
+            let expected = if self.mixed_batch {
+                [
+                    "mixed-read-first",
+                    "mixed-read-second",
+                    "mixed-mutation",
+                    "mixed-read-third",
+                    "mixed-read-fourth",
+                ]
+            } else {
+                ["parallel-read-first", "parallel-read-second", "", "", ""]
+            };
+            let expected = if self.mixed_batch {
+                expected.to_vec()
+            } else {
+                expected[..2].to_vec()
+            };
+            self.saw_source_order
+                .store(result_ids == expected, Ordering::SeqCst);
             (
                 Some(ProviderMessage {
                     role: ProviderRole::Assistant,
@@ -1056,6 +1421,65 @@ impl LlmProvider for RequiredReadProvider {
                 Vec::new(),
                 ProviderFinishReason::Stop,
             )
+        };
+        Ok(ProviderResponse {
+            response_id: golutra_core::ProviderResponseId::new(),
+            message,
+            tool_calls,
+            usage: ProviderUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                reasoning_tokens: None,
+                cached_input_tokens: None,
+                total_tokens: Some(15),
+                usage_source: UsageSource::Estimated,
+                raw: json!({"round": call}),
+            },
+            finish_reason,
+            raw_metadata: json!({"round": call}),
+        })
+    }
+
+    fn contract(&self) -> golutra_core::ProviderContract {
+        self.contract.clone()
+    }
+}
+
+#[async_trait]
+impl LlmProvider for CorrectedReadProvider {
+    async fn complete(&self, _request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let (message, tool_calls, finish_reason) = match call {
+            0 => (
+                None,
+                vec![ProviderToolCall {
+                    tool_call_id: "short-read".to_owned(),
+                    tool_name: "read_file".to_owned(),
+                    arguments: json!({"path": "model.py"}),
+                }],
+                ProviderFinishReason::ToolCalls,
+            ),
+            1 => (
+                None,
+                vec![ProviderToolCall {
+                    tool_call_id: "nested-read".to_owned(),
+                    tool_name: "read_file".to_owned(),
+                    arguments: json!({"path": "jobledger/model.py"}),
+                }],
+                ProviderFinishReason::ToolCalls,
+            ),
+            _ => (
+                Some(ProviderMessage {
+                    role: ProviderRole::Assistant,
+                    content: "inspection finished".to_owned(),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: Vec::new(),
+                    metadata: Default::default(),
+                }),
+                Vec::new(),
+                ProviderFinishReason::Stop,
+            ),
         };
         Ok(ProviderResponse {
             response_id: golutra_core::ProviderResponseId::new(),
@@ -2629,7 +3053,7 @@ async fn accumulated_tool_messages_are_compacted_and_the_turn_continues() {
     let context_builder = ContextBuilder::new(ContextBudgetPolicy {
         context_window: initial_tokens.saturating_add(1_024),
         max_output: 64,
-        budget_limit: initial_tokens.saturating_add(256),
+        budget_limit: initial_tokens.saturating_add(150),
         action_if_exceeded: BudgetOverflowAction::Trim,
     });
     let agent_loop = AgentLoop::new(
@@ -2669,7 +3093,7 @@ async fn accumulated_tool_messages_are_compacted_and_the_turn_continues() {
     assert!(
         trace
             .iter()
-            .any(|event| matches!(event, AgentLoopTraceEvent::ContextAutoCompacted(_)))
+            .any(|event| matches!(event, AgentLoopTraceEvent::ContextAutoCompacted(_))),
     );
     assert!(!trace.iter().any(|event| matches!(
         event,
@@ -4877,28 +5301,24 @@ fn parallel_read_candidate_uses_registry_capabilities_and_read_contracts() {
             read("external", "external_workspace_inspect"),
         ],
         false,
-        8,
         AgentToolProfile::Coding,
         registry,
     ));
     assert!(!provider_batch_is_parallel_read_candidate(
         &[read("only", "read_file")],
         false,
-        8,
         AgentToolProfile::Coding,
         registry,
     ));
     assert!(!provider_batch_is_parallel_read_candidate(
         &[read("read", "read_file"), read("write", "write_file")],
         false,
-        8,
         AgentToolProfile::Coding,
         registry,
     ));
     assert!(!provider_batch_is_parallel_read_candidate(
         &[read("read", "read_file"), read("process", "process_poll"),],
         false,
-        8,
         AgentToolProfile::Coding,
         registry,
     ));
@@ -4908,24 +5328,69 @@ fn parallel_read_candidate_uses_registry_capabilities_and_read_contracts() {
             read("external", "external_workspace_inspect_serial"),
         ],
         false,
-        8,
         AgentToolProfile::Coding,
         registry,
     ));
     assert!(!provider_batch_is_parallel_read_candidate(
         &[read("first", "read_file"), read("second", "list_dir")],
         true,
-        8,
         AgentToolProfile::Coding,
         registry,
     ));
-    assert!(!provider_batch_is_parallel_read_candidate(
-        &[read("first", "read_file"), read("second", "list_dir")],
+    assert!(provider_batch_is_parallel_read_candidate(
+        &[read("first", "read_file"), read("second", "read_file")],
         false,
-        1,
         AgentToolProfile::Coding,
         registry,
     ));
+}
+
+#[test]
+fn parallel_read_candidate_allows_only_strict_read_only_shell_requests() {
+    let registry = ToolRegistry::p0_default();
+    let call = |id: &str, arguments| ProviderToolCall {
+        tool_call_id: id.to_owned(),
+        tool_name: "shell".to_owned(),
+        arguments,
+    };
+    let read_file = ProviderToolCall {
+        tool_call_id: "read".to_owned(),
+        tool_name: "read_file".to_owned(),
+        arguments: json!({"path": "README.md"}),
+    };
+
+    assert!(provider_batch_is_parallel_read_candidate(
+        &[
+            call("shell", json!({"command": "cat README.md"})),
+            read_file.clone(),
+        ],
+        false,
+        AgentToolProfile::Coding,
+        &registry,
+    ));
+    assert!(provider_batch_is_parallel_read_candidate(
+        &[
+            call("shell", json!({"argv": ["rg", "token", "src"]})),
+            read_file.clone(),
+        ],
+        false,
+        AgentToolProfile::Coding,
+        &registry,
+    ));
+
+    for arguments in [
+        json!({"command": "bash -lc 'cat README.md'"}),
+        json!({"command": "cat README.md", "background": true}),
+        json!({"command": "git status --short"}),
+        json!({"command": "sort -o result.txt"}),
+    ] {
+        assert!(!provider_batch_is_parallel_read_candidate(
+            &[call("shell", arguments), read_file.clone()],
+            false,
+            AgentToolProfile::Coding,
+            &registry,
+        ));
+    }
 }
 
 #[test]
@@ -4977,7 +5442,6 @@ fn parallel_read_candidate_enforces_the_active_tool_profile() {
             call("full", "external_full_only_read", json!({})),
         ],
         false,
-        8,
         AgentToolProfile::Coding,
         executor.registry(),
     ));
@@ -4991,7 +5455,6 @@ fn parallel_read_candidate_enforces_the_active_tool_profile() {
             ),
         ],
         false,
-        8,
         AgentToolProfile::Coding,
         executor.registry(),
     ));
@@ -5001,7 +5464,6 @@ fn parallel_read_candidate_enforces_the_active_tool_profile() {
             call("full", "external_full_only_read", json!({})),
         ],
         false,
-        8,
         AgentToolProfile::Full,
         executor.registry(),
     ));
@@ -5039,7 +5501,7 @@ fn parallel_read_candidate_enforces_the_active_tool_profile() {
 }
 
 #[test]
-fn objective_tool_projection_expands_on_an_unplanned_valid_call() {
+fn provider_tool_surface_stays_stable_across_objectives() {
     let workspace = tempdir().expect("workspace");
     let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
     let all_tools = executor
@@ -5049,92 +5511,38 @@ fn objective_tool_projection_expands_on_an_unplanned_valid_call() {
         .cloned()
         .collect::<Vec<_>>();
     let contract = TaskContract::conversational(Vec::new());
-    let mut selected = provider_tools_for_objective(
-        &all_tools,
-        &contract,
-        AgentToolProfile::Coding,
-        executor.registry(),
-        "Read bench-read.txt with the file tool",
-    );
-    assert_eq!(
-        selected
-            .iter()
-            .map(|tool| tool.tool_name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["read_file"]
-    );
-
-    let mutation_tools = provider_tools_for_objective(
-        &all_tools,
-        &contract,
-        AgentToolProfile::Coding,
-        executor.registry(),
-        "Use file tools to update both files",
-    );
-    assert_eq!(
-        mutation_tools
-            .iter()
-            .map(|tool| tool.tool_name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["edit_file", "read_file", "write_file"]
-    );
-
-    let unclassified = provider_tools_for_objective(
-        &all_tools,
-        &contract,
-        AgentToolProfile::Coding,
-        executor.registry(),
-        "Start with the coding profile",
-    );
-    assert_eq!(unclassified.len(), 8);
-
-    let explicit_background_tool = provider_tools_for_objective(
-        &all_tools,
-        &contract,
-        AgentToolProfile::Coding,
-        executor.registry(),
-        "Use shell_session",
-    );
-    assert_eq!(
-        explicit_background_tool
-            .iter()
-            .map(|tool| tool.tool_name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["shell", "shell_session"]
-    );
-
-    let expanded = expand_provider_tools_for_calls(
-        &mut selected,
-        &all_tools,
-        &[ProviderToolCall {
-            tool_call_id: "call-1".to_owned(),
-            tool_name: "edit_file".to_owned(),
-            arguments: json!({}),
-        }],
-        &contract,
-        AgentToolProfile::Coding,
-        executor.registry(),
-    );
-    assert!(expanded);
-    assert_eq!(
-        selected
-            .iter()
-            .map(|tool| tool.tool_name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["edit_file", "read_file"]
-    );
-    assert!(!expand_provider_tools_for_calls(
-        &mut selected,
-        &all_tools,
-        &[ProviderToolCall {
-            tool_call_id: "call-1".to_owned(),
-            tool_name: "edit_file".to_owned(),
-            arguments: json!({}),
-        }],
-        &contract,
-        AgentToolProfile::Coding,
-        executor.registry(),
-    ));
+    let expected = vec![
+        "apply_patch",
+        "edit_file",
+        "read_file",
+        "shell",
+        "shell_session",
+        "subagent",
+        "web_search",
+        "write_file",
+    ];
+    for objective in [
+        "Read a file",
+        "update several files",
+        "run tests in the shell",
+        "search the web and delegate a check",
+        "an ambiguous coding task",
+    ] {
+        let selected = provider_tools_for_turn(
+            &all_tools,
+            &contract,
+            AgentToolProfile::Coding,
+            executor.registry(),
+        );
+        assert_eq!(
+            selected
+                .iter()
+                .map(|tool| tool.tool_name.as_str())
+                .collect::<Vec<_>>(),
+            expected,
+            "objective must not alter the provider tool schema: {objective}"
+        );
+    }
 }
 
 #[test]
@@ -5275,10 +5683,16 @@ async fn pure_read_batch_executes_concurrently_and_commits_results_in_source_ord
     let provider = ParallelReadProvider {
         calls: calls.clone(),
         saw_source_order: saw_source_order.clone(),
+        mixed_batch: false,
         contract: MockProvider::text_response("unused").contract(),
     };
     let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
-    let agent_loop = AgentLoop::new(provider, ContextBuilder::default(), executor);
+    let governor = RuntimeGovernor::new(GovernorLimits {
+        max_failed_tool_calls: 1,
+        ..GovernorLimits::default()
+    });
+    let agent_loop =
+        AgentLoop::new(provider, ContextBuilder::default(), executor).with_governor(governor);
     let mut trace = Vec::new();
 
     let outcome = tokio::time::timeout(
@@ -5319,6 +5733,18 @@ async fn pure_read_batch_executes_concurrently_and_commits_results_in_source_ord
         })
         .collect::<Vec<_>>();
     assert_eq!(started, ["parallel-read-first", "parallel-read-second"]);
+    let first_completion = trace
+        .iter()
+        .position(|event| matches!(event, AgentLoopTraceEvent::ToolCompleted(_)))
+        .expect("first tool completion");
+    let starts_before_completion = trace[..first_completion]
+        .iter()
+        .filter(|event| matches!(event, AgentLoopTraceEvent::ToolStarted { .. }))
+        .count();
+    assert_eq!(
+        starts_before_completion, 2,
+        "failure limits must not serialize a valid read batch"
+    );
     assert_eq!(
         outcome
             .tool_reports
@@ -5326,6 +5752,108 @@ async fn pure_read_batch_executes_concurrently_and_commits_results_in_source_ord
             .map(|report| report.envelope.model_visible_excerpt.as_deref())
             .collect::<Vec<_>>(),
         [Some("first\n"), Some("second\n")]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mixed_tool_batch_parallelizes_adjacent_reads_around_side_effects() {
+    let workspace = tempdir().expect("workspace");
+    for (name, content) in [
+        ("first.txt", "first\n"),
+        ("second.txt", "second\n"),
+        ("third.txt", "third\n"),
+        ("fourth.txt", "fourth\n"),
+    ] {
+        fs::write(workspace.path().join(name), content).expect("fixture");
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let saw_source_order = Arc::new(AtomicBool::new(false));
+    let provider = ParallelReadProvider {
+        calls: calls.clone(),
+        saw_source_order: saw_source_order.clone(),
+        mixed_batch: true,
+        contract: MockProvider::text_response("unused").contract(),
+    };
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+    let agent_loop = AgentLoop::new(provider, ContextBuilder::default(), executor);
+    let mut trace = Vec::new();
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        agent_loop.run_with_trace(
+            AgentTaskRequest {
+                session_id: SessionId::new(),
+                task_id: TaskId::new(),
+                turn_id: TurnId::new(),
+                objective: "inspect files and run the middle command".to_owned(),
+                completion_criteria: Vec::new(),
+                output_schema: None,
+                touched_code: false,
+                contributors: Vec::new(),
+                tools: vec!["read_file".to_owned(), "write_file".to_owned()],
+            },
+            |event| trace.push(event),
+        ),
+    )
+    .await
+    .expect("mixed tool batch must not deadlock")
+    .expect("mixed tool batch outcome");
+
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(saw_source_order.load(Ordering::SeqCst));
+    assert_eq!(
+        outcome
+            .tool_reports
+            .iter()
+            .map(|report| report.envelope.tool_name.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "read_file",
+            "read_file",
+            "write_file",
+            "read_file",
+            "read_file"
+        ]
+    );
+    let started = trace
+        .iter()
+        .filter_map(|event| match event {
+            AgentLoopTraceEvent::ToolStarted {
+                provider_tool_call_id,
+                ..
+            } => provider_tool_call_id.as_deref(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        started,
+        [
+            "mixed-read-first",
+            "mixed-read-second",
+            "mixed-mutation",
+            "mixed-read-third",
+            "mixed-read-fourth",
+        ]
+    );
+    let first_completed = trace
+        .iter()
+        .position(|event| matches!(event, AgentLoopTraceEvent::ToolCompleted(_)))
+        .expect("first tool completion");
+    let second_read_start = trace
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                AgentLoopTraceEvent::ToolStarted {
+                    provider_tool_call_id: Some(id),
+                    ..
+                } if id == "mixed-read-third"
+            )
+        })
+        .expect("second read group start");
+    assert!(
+        first_completed < second_read_start,
+        "the side-effect boundary must follow the first read group"
     );
 }
 
@@ -5572,7 +6100,7 @@ async fn appended_turn_uses_the_default_coding_surface() {
 }
 
 #[tokio::test]
-async fn provider_requests_append_messages_and_freeze_tools_within_one_context_segment() {
+async fn provider_next_round_is_previous_request_prefix_and_keeps_static_surface() {
     let workspace = tempdir().expect("workspace");
     fs::write(workspace.path().join("README.md"), "stable prefix fixture").expect("README fixture");
     let calls = Arc::new(AtomicUsize::new(0));
@@ -5652,6 +6180,10 @@ async fn provider_requests_append_messages_and_freeze_tools_within_one_context_s
         assert_eq!(
             &next.messages[..previous.messages.len()],
             previous.messages.as_slice()
+        );
+        assert!(
+            next.messages.len() > previous.messages.len(),
+            "a continuing provider round must append its dynamic history after the prior request"
         );
         assert_eq!(next.tools, previous.tools);
         assert_eq!(next.cache_scope, previous.cache_scope);
@@ -6223,6 +6755,61 @@ async fn failed_required_read_is_not_hidden_by_unrelated_successful_evidence() {
 }
 
 #[tokio::test]
+async fn corrected_nested_read_recovers_a_transient_short_path_failure() {
+    let workspace = tempdir().expect("workspace");
+    let nested = workspace.path().join("jobledger/model.py");
+    fs::create_dir_all(nested.parent().expect("nested parent")).expect("parent");
+    fs::write(&nested, "value = 1\n").expect("nested file");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = CorrectedReadProvider {
+        calls: calls.clone(),
+        contract: MockProvider::text_response("unused").contract(),
+    };
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+    let agent_loop = AgentLoop::new(provider, ContextBuilder::default(), executor);
+
+    let outcome = agent_loop
+        .run(AgentTaskRequest {
+            session_id: SessionId::new(),
+            task_id: TaskId::new(),
+            turn_id: TurnId::new(),
+            objective: "inspect model.py and report its contents".to_owned(),
+            completion_criteria: vec!["model.py is inspected".to_owned()],
+            output_schema: None,
+            touched_code: false,
+            contributors: Vec::new(),
+            tools: vec!["read_file".to_owned()],
+        })
+        .await
+        .expect("corrected read run");
+
+    assert!(calls.load(Ordering::SeqCst) >= 3);
+    assert_eq!(outcome.verification.result, VerificationResult::Pass);
+    assert_eq!(outcome.loop_decision.action, LoopAction::StopSuccess);
+    assert!(
+        outcome.tool_reports.iter().any(|report| {
+            report.envelope.tool_name == "read_file"
+                && report.envelope.status != ToolResultStatus::Ok
+        }),
+        "reports: {:?}",
+        outcome
+            .tool_reports
+            .iter()
+            .map(|report| (
+                &report.envelope.tool_name,
+                report.envelope.status,
+                report.envelope.summary.clone()
+            ))
+            .collect::<Vec<_>>()
+    );
+    assert!(outcome.verification.checks.iter().any(|check| {
+        check.kind == VerificationCheckKind::ToolExecution
+            && check.passed
+            && check.message.contains("original error evidence retained")
+    }));
+}
+
+#[tokio::test]
 async fn agent_loop_returns_recoverable_tool_failure_to_the_provider() {
     let workspace = tempdir().expect("workspace");
     let provider = MockProvider::tool_call("read_file", json!({"path": "missing.md"}));
@@ -6330,6 +6917,18 @@ async fn duplicate_failures_in_one_provider_round_can_recover_on_the_next_round(
     assert_eq!(
         outcome.final_message.as_deref(),
         Some("recovered after duplicate failures")
+    );
+    assert!(
+        outcome
+            .tool_reports
+            .iter()
+            .filter(|report| {
+                report.envelope.tool_name == "shell"
+                    && report.envelope.status != ToolResultStatus::Ok
+            })
+            .count()
+            >= 1,
+        "the original failed attempts must remain in the report"
     );
     assert!(!trace.iter().any(|event| matches!(
         event,

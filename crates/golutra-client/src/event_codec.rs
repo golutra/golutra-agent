@@ -840,22 +840,30 @@ pub(crate) fn trace_event_payload(
                 "reason": reason,
             }),
         )),
-        AgentLoopTraceEvent::ContextSnapshot(snapshot) => Some((
-            RuntimeEventType::ContextSnapshotCreated,
-            RuntimeEventSource::Runtime,
-            json!({
-                "summary": "provider request context snapshot created",
-                "snapshot": snapshot,
-            }),
-        )),
-        AgentLoopTraceEvent::ContextSnapshotCaptured { snapshot, .. } => Some((
-            RuntimeEventType::ContextSnapshotCreated,
-            RuntimeEventSource::Runtime,
-            json!({
-                "summary": "provider request context snapshot created",
-                "snapshot": snapshot,
-            }),
-        )),
+        AgentLoopTraceEvent::ContextSnapshot(snapshot) => {
+            let cache_diagnostics = context_cache_diagnostics(&snapshot, None);
+            Some((
+                RuntimeEventType::ContextSnapshotCreated,
+                RuntimeEventSource::Runtime,
+                json!({
+                    "summary": "provider request context snapshot created",
+                    "snapshot": snapshot,
+                    "cache_diagnostics": cache_diagnostics,
+                }),
+            ))
+        }
+        AgentLoopTraceEvent::ContextSnapshotCaptured { snapshot, request } => {
+            let cache_diagnostics = context_cache_diagnostics(&snapshot, Some(&request));
+            Some((
+                RuntimeEventType::ContextSnapshotCreated,
+                RuntimeEventSource::Runtime,
+                json!({
+                    "summary": "provider request context snapshot created",
+                    "snapshot": snapshot,
+                    "cache_diagnostics": cache_diagnostics,
+                }),
+            ))
+        }
         AgentLoopTraceEvent::CandidateReady {
             turn_id,
             tool_count,
@@ -1182,6 +1190,115 @@ pub(crate) fn trace_event_payload(
     mapped
 }
 
+/// 从已脱敏的上下文清单构造非敏感缓存诊断。只哈希消息 wire 摘要，避免
+/// 序列化提示词正文；工具摘要直接复用快照中已经计算的 provider wire digest。
+fn context_cache_diagnostics(
+    snapshot: &ContextSnapshot,
+    request: Option<&ProviderRequest>,
+) -> Value {
+    let manifest = snapshot
+        .message_manifest
+        .iter()
+        .map(|message| {
+            json!({
+                "index": message.index,
+                "role": message.role,
+                "content_digest": message.content_digest,
+                "wire_digest": message.wire_digest,
+                "tool_call_ids": message.tool_call_ids,
+            })
+        })
+        .collect::<Vec<_>>();
+    let prefix_bytes = serde_json::to_vec(&manifest).unwrap_or_default();
+    let prefix_digest = context_message_wire_prefix_digest(snapshot);
+    let tool_digest = digest_json_value(&snapshot.tool_schema_digests);
+    let provider_id = request
+        .map(|request| request.provider_id.as_str())
+        .unwrap_or(snapshot.provider_id.as_str());
+    let model_id = request
+        .map(|request| request.model_id.as_str())
+        .unwrap_or(snapshot.model_id.as_str());
+    let route_digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(format!("{provider_id}\0{model_id}").as_bytes())
+    );
+    let cache_policy = request
+        .map(|request| json!(request.cache_policy))
+        .unwrap_or_else(|| Value::String("unknown".to_owned()));
+    let message_prefix_token_estimate = snapshot
+        .message_manifest
+        .iter()
+        .map(|message| message.estimated_tokens)
+        .fold(0_u64, u64::saturating_add);
+    json!({
+        "scope_key": snapshot.cache_scope_key,
+        "route": {
+            "provider_id": diagnostic_route_label(provider_id),
+            "model_id": diagnostic_route_label(model_id),
+            "digest": route_digest,
+        },
+        "cache_policy": cache_policy,
+        "message_count": snapshot.message_manifest.len(),
+        "message_prefix_length": snapshot.message_manifest.len(),
+        "message_prefix_bytes": prefix_bytes.len(),
+        "message_prefix_token_estimate": message_prefix_token_estimate,
+        "message_prefix_digest": prefix_digest,
+        "tool_schema_digests": snapshot.tool_schema_digests,
+        "tool_digest": tool_digest,
+        "planned_input_tokens": snapshot.budget_snapshot.planned_input_tokens,
+        "planned_tool_tokens": snapshot.budget_snapshot.planned_tool_tokens,
+        "canonical_request_digest": snapshot.canonical_request_digest,
+    })
+}
+
+fn context_message_wire_prefix_digest(snapshot: &ContextSnapshot) -> String {
+    context_message_wire_prefix_digest_for_count(snapshot, snapshot.message_manifest.len())
+        .expect("full context snapshot prefix is always in range")
+}
+
+fn context_message_wire_prefix_digest_for_count(
+    snapshot: &ContextSnapshot,
+    message_count: usize,
+) -> Option<String> {
+    if message_count > snapshot.message_manifest.len() {
+        return None;
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"golutra-context-prefix-v1\0");
+    digest.update((message_count as u64).to_le_bytes());
+    for message in &snapshot.message_manifest[..message_count] {
+        let wire_digest = if message.wire_digest.is_empty() {
+            &message.content_digest
+        } else {
+            &message.wire_digest
+        };
+        digest.update((wire_digest.len() as u64).to_le_bytes());
+        digest.update(wire_digest.as_bytes());
+    }
+    Some(format!("sha256:{:x}", digest.finalize()))
+}
+
+fn digest_json_value<T: serde::Serialize>(value: &T) -> String {
+    let bytes = serde_json::to_vec(value).unwrap_or_default();
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn diagnostic_route_label(value: &str) -> String {
+    let (redacted, _) = redact_sensitive_text(value);
+    let label = redacted
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':')
+        })
+        .take(96)
+        .collect::<String>();
+    if label.is_empty() {
+        "unknown".to_owned()
+    } else {
+        label
+    }
+}
+
 pub(crate) fn host_event(
     sequence_no: u64,
     session_id: SessionId,
@@ -1269,6 +1386,9 @@ pub(crate) fn with_command_payload(
 
 #[cfg(test)]
 mod tests {
+    use golutra_context::{
+        ContextBuilder, context_snapshot_from_request, provider_request_from_plan,
+    };
     use golutra_core::WorkspaceChangeRequirement;
 
     use super::*;
@@ -1359,6 +1479,177 @@ mod tests {
             assert_eq!(recovered.execution.tool_profile, expected);
             assert_eq!(recovered.pending.task_contract, None);
         }
+    }
+
+    #[test]
+    fn context_cache_diagnostics_are_wire_complete_without_sensitive_content() {
+        let session_id = SessionId::new();
+        let task_id = TaskId::new();
+        let turn_id = TurnId::new();
+        let messages = vec![
+            golutra_llm::ProviderMessage {
+                role: golutra_llm::ProviderRole::System,
+                content: "stable system prompt".to_owned(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+                metadata: Default::default(),
+            },
+            golutra_llm::ProviderMessage {
+                role: golutra_llm::ProviderRole::Assistant,
+                content: "calling a tool".to_owned(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: vec![golutra_llm::ProviderToolCall {
+                    tool_call_id: "call-1".to_owned(),
+                    tool_name: "read_file".to_owned(),
+                    arguments: serde_json::json!({
+                        "path": "private.txt",
+                        "token": "do-not-log"
+                    }),
+                }],
+                metadata: Default::default(),
+            },
+        ];
+        let plan = ContextBuilder::default()
+            .build_from_messages(task_id, turn_id, messages)
+            .expect("context plan");
+        let mut request =
+            provider_request_from_plan(&plan, task_id, turn_id, "mock", "mock-model", Vec::new());
+        request.cache_policy = golutra_core::PromptCachePolicy::Long;
+        request.cache_scope = Some(golutra_llm::PromptCacheScope::session(session_id, None));
+        let snapshot = context_snapshot_from_request(session_id, &plan, &request);
+        let (_, _, payload) =
+            trace_event_payload(AgentLoopTraceEvent::ContextSnapshotCaptured { snapshot, request })
+                .expect("context snapshot event");
+        let diagnostics = &payload["cache_diagnostics"];
+        assert_eq!(diagnostics["message_count"], 2);
+        assert!(diagnostics["scope_key"].is_string());
+        assert_eq!(diagnostics["cache_policy"], "long");
+        assert_eq!(diagnostics["route"]["provider_id"], "mock");
+        assert_eq!(diagnostics["route"]["model_id"], "mock-model");
+        assert!(diagnostics["route"]["digest"].is_string());
+        assert_eq!(diagnostics["message_prefix_length"], 2);
+        assert!(diagnostics["message_prefix_bytes"].as_u64().is_some());
+        assert!(
+            diagnostics["message_prefix_token_estimate"]
+                .as_u64()
+                .is_some()
+        );
+        assert!(diagnostics["message_prefix_digest"].is_string());
+        assert!(diagnostics["canonical_request_digest"].is_string());
+        assert!(diagnostics["tool_schema_digests"].is_array());
+        let encoded = diagnostics.to_string();
+        assert!(!encoded.contains("stable system prompt"));
+        assert!(!encoded.contains("private.txt"));
+        assert!(!encoded.contains("do-not-log"));
+        assert!(payload["snapshot"]["message_manifest"][1]["wire_digest"].is_string());
+    }
+
+    #[test]
+    fn cache_diagnostics_prove_append_only_message_prefix_and_tool_invalidation() {
+        let task_id = TaskId::new();
+        let first_turn = TurnId::new();
+        let second_turn = TurnId::new();
+        let session_id = SessionId::new();
+        let first_messages = vec![
+            golutra_llm::ProviderMessage {
+                role: golutra_llm::ProviderRole::System,
+                content: "stable instructions".to_owned(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+                metadata: Default::default(),
+            },
+            golutra_llm::ProviderMessage {
+                role: golutra_llm::ProviderRole::User,
+                content: "inspect the workspace".to_owned(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+                metadata: Default::default(),
+            },
+        ];
+        let mut second_messages = first_messages.clone();
+        second_messages.push(golutra_llm::ProviderMessage {
+            role: golutra_llm::ProviderRole::Assistant,
+            content: "I will inspect it".to_owned(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+            metadata: Default::default(),
+        });
+        let tool = golutra_core::ToolContract {
+            tool_name: "read_file".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }),
+            output_schema: json!({}),
+            error_schema: json!({}),
+            side_effect_type: golutra_core::SideEffectType::None,
+            idempotency_key_policy: "none".to_owned(),
+            timeout_policy: "bounded".to_owned(),
+            cancellation_policy: "supported".to_owned(),
+            retry_policy: "none".to_owned(),
+            artifact_policy: "none".to_owned(),
+            permission_policy_ref: None,
+        };
+        let first_plan = ContextBuilder::default()
+            .build_from_messages(task_id, first_turn, first_messages)
+            .expect("first plan");
+        let second_plan = ContextBuilder::default()
+            .build_from_messages(task_id, second_turn, second_messages)
+            .expect("second plan");
+        let mut first_request = provider_request_from_plan(
+            &first_plan,
+            task_id,
+            first_turn,
+            "mock",
+            "mock-model",
+            vec![tool.clone()],
+        );
+        let mut second_request = provider_request_from_plan(
+            &second_plan,
+            task_id,
+            second_turn,
+            "mock",
+            "mock-model",
+            vec![tool.clone()],
+        );
+        first_request.cache_scope = Some(golutra_llm::PromptCacheScope::session(session_id, None));
+        second_request.cache_scope = first_request.cache_scope.clone();
+        let first_snapshot = context_snapshot_from_request(session_id, &first_plan, &first_request);
+        let second_snapshot =
+            context_snapshot_from_request(session_id, &second_plan, &second_request);
+        let first_digest = context_message_wire_prefix_digest(&first_snapshot);
+        assert_eq!(
+            first_digest,
+            context_message_wire_prefix_digest_for_count(
+                &second_snapshot,
+                first_snapshot.message_manifest.len(),
+            )
+            .expect("previous request prefix")
+        );
+        let first_diagnostics = context_cache_diagnostics(&first_snapshot, Some(&first_request));
+        let second_diagnostics = context_cache_diagnostics(&second_snapshot, Some(&second_request));
+        assert_eq!(
+            first_diagnostics["tool_digest"],
+            second_diagnostics["tool_digest"]
+        );
+
+        let mut changed_tool = tool;
+        changed_tool.input_schema["properties"]["path"]["type"] = json!("integer");
+        second_request.tools = vec![changed_tool];
+        let changed_snapshot =
+            context_snapshot_from_request(session_id, &second_plan, &second_request);
+        let changed_diagnostics =
+            context_cache_diagnostics(&changed_snapshot, Some(&second_request));
+        assert_ne!(
+            second_diagnostics["tool_digest"],
+            changed_diagnostics["tool_digest"]
+        );
     }
 
     #[test]
