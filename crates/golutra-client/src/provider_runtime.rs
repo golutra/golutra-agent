@@ -302,9 +302,9 @@ fn task_mock_provider(payload: &Value, objective: &str) -> (MockProvider, bool, 
     }
     if lower.contains("sleep") {
         return (
-            // 留出检查点落盘和外部 SIGINT 触发的窗口，同时仍低于 shell
-            // 工具的默认进程生命周期上限，避免生命周期测试依赖机器速度。
-            MockProvider::tool_call("shell", json!({"command": "sleep 5", "timeout_ms": 15_000})),
+            // 留出检查点落盘和外部 SIGINT 触发的窗口；较长的睡眠避免
+            // 低负载差异让生命周期测试偶尔等到自然完成。
+            MockProvider::tool_call("shell", json!({"command": "sleep 30", "timeout_ms": 45_000})),
             false,
             true,
         );
