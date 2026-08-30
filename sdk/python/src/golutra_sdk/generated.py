@@ -364,6 +364,7 @@ class ContextMessageSnapshot(TypedDict, total=False):
     role: Required[str]
     source_refs: NotRequired[list[str]]
     tool_call_ids: Required[list[str]]
+    wire_digest: NotRequired[str]
 
 class ContextProjection(TypedDict, total=False):
     complete: Required[bool]
@@ -375,6 +376,7 @@ class ContextProjection(TypedDict, total=False):
 
 class ContextSnapshot(TypedDict, total=False):
     budget_snapshot: Required[TokenBudgetSnapshot]
+    cache_scope_key: NotRequired[str | None]
     canonical_request_digest: Required[str]
     contributor_manifest: Required[list[ContextContributorSnapshot]]
     created_at: Required[str]
