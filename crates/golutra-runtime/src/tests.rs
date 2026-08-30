@@ -3053,7 +3053,9 @@ async fn accumulated_tool_messages_are_compacted_and_the_turn_continues() {
     let context_builder = ContextBuilder::new(ContextBudgetPolicy {
         context_window: initial_tokens.saturating_add(1_024),
         max_output: 64,
-        budget_limit: initial_tokens.saturating_add(150),
+        // Leave enough margin for platform-specific temporary workspace path
+        // lengths while keeping the first provider request within budget.
+        budget_limit: initial_tokens.saturating_add(137),
         action_if_exceeded: BudgetOverflowAction::Trim,
     });
     let agent_loop = AgentLoop::new(
