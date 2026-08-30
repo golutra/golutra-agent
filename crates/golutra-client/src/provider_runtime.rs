@@ -304,7 +304,10 @@ fn task_mock_provider(payload: &Value, objective: &str) -> (MockProvider, bool, 
         return (
             // 留出检查点落盘和外部 SIGINT 触发的窗口；较长的睡眠避免
             // 低负载差异让生命周期测试偶尔等到自然完成。
-            MockProvider::tool_call("shell", json!({"command": "sleep 30", "timeout_ms": 45_000})),
+            MockProvider::tool_call(
+                "shell",
+                json!({"command": "sleep 30", "timeout_ms": 45_000}),
+            ),
             false,
             true,
         );
