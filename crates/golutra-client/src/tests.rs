@@ -5550,6 +5550,7 @@ async fn prompt_cache_scope_uses_only_trusted_thread_lineage() {
 #[tokio::test]
 async fn prompt_cache_scope_rejects_broken_parent_lineage() {
     let workspace = tempdir().expect("workspace");
+    let _home = IsolatedGlobalMockProvider::empty().await;
     let transport = EmbeddedTransport::for_cwd(workspace.path())
         .await
         .expect("transport");
