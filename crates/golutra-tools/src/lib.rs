@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock},
+    sync::{Arc, LazyLock, RwLock},
     time::{Duration, Instant},
 };
 
@@ -322,6 +322,8 @@ pub trait ToolReplayBackend: std::fmt::Debug + Send + Sync {
 pub struct ToolRegistry {
     contracts: HashMap<String, ToolContract>,
     capabilities: HashMap<String, ToolCapabilities>,
+    /// evaluate/prepare/invoke 共享已编译 schema，避免同一工具轮次重复编译。
+    compiled_validators: Arc<RwLock<HashMap<String, Arc<jsonschema::Validator>>>>,
 }
 
 impl ToolRegistry {
@@ -340,6 +342,7 @@ impl ToolRegistry {
         Self {
             contracts,
             capabilities,
+            compiled_validators: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -370,6 +373,64 @@ impl ToolRegistry {
     #[must_use]
     pub fn capabilities(&self, tool_name: &str) -> Option<&ToolCapabilities> {
         self.capabilities.get(tool_name)
+    }
+
+    fn validate_tool_arguments(
+        &self,
+        contract: &ToolContract,
+        arguments: &Value,
+    ) -> Result<(), ToolError> {
+        let validator = if let Some(validator) = self
+            .compiled_validators
+            .read()
+            .expect("tool validator cache lock poisoned")
+            .get(&contract.tool_name)
+            .cloned()
+        {
+            validator
+        } else {
+            let compiled = Arc::new(jsonschema::validator_for(&contract.input_schema).map_err(
+                |error| {
+                    ToolError::InvalidArguments(format!(
+                        "tool `{}` has an invalid input schema: {error}",
+                        contract.tool_name
+                    ))
+                },
+            )?);
+            let mut cache = self
+                .compiled_validators
+                .write()
+                .expect("tool validator cache lock poisoned");
+            cache
+                .entry(contract.tool_name.clone())
+                .or_insert(compiled)
+                .clone()
+        };
+        let errors = validator
+            .iter_errors(arguments)
+            .map(|error| {
+                bounded_text(
+                    &error.masked_with("<redacted-value>").to_string(),
+                    MAX_TOOL_ERROR_CHARS,
+                )
+            })
+            .collect::<Vec<_>>();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(ToolError::InvalidArguments(format!(
+                "tool `{}` arguments do not match its contract: {}",
+                contract.tool_name,
+                errors.join("; ")
+            )))
+        }
+    }
+
+    fn invalidate_validator(&self, tool_name: &str) {
+        self.compiled_validators
+            .write()
+            .expect("tool validator cache lock poisoned")
+            .remove(tool_name);
     }
 
     fn register_external(
@@ -420,6 +481,7 @@ impl ToolRegistry {
             }
             self.capabilities
                 .insert(contract.tool_name.clone(), capabilities);
+            self.invalidate_validator(&contract.tool_name);
             self.contracts.insert(contract.tool_name.clone(), contract);
         }
         Ok(())
@@ -732,6 +794,7 @@ impl ToolRuntime {
     ) -> Result<Self, ToolError> {
         let tool = BuiltinTool::Subagent;
         if self.registry.contract(tool.name()).is_none() {
+            self.registry.invalidate_validator(tool.name());
             self.registry
                 .contracts
                 .insert(tool.name().to_owned(), tool.contract());
@@ -747,6 +810,7 @@ impl ToolRuntime {
     /// This keeps capability reduction explicit for restricted runtimes and child tasks.
     #[must_use]
     pub fn without_tool(mut self, tool_name: &str) -> Self {
+        self.registry.invalidate_validator(tool_name);
         self.registry.contracts.remove(tool_name);
         self.registry.capabilities.remove(tool_name);
         if matches!(
@@ -1046,7 +1110,8 @@ impl ToolRuntime {
             .registry
             .contract(&request.tool_name)
             .ok_or_else(|| ToolError::UnknownTool(request.tool_name.clone()))?;
-        validate_tool_arguments(contract, &request.arguments)?;
+        self.registry
+            .validate_tool_arguments(contract, &request.arguments)?;
 
         let builtin = BuiltinTool::from_name(&request.tool_name);
         let mut policy = match builtin {
@@ -1154,7 +1219,8 @@ impl ToolRuntime {
             .registry
             .contract(&request.tool_name)
             .ok_or_else(|| ToolError::UnknownTool(request.tool_name.clone()))?;
-        validate_tool_arguments(contract, &request.arguments)?;
+        self.registry
+            .validate_tool_arguments(contract, &request.arguments)?;
 
         match BuiltinTool::from_name(&request.tool_name) {
             Some(BuiltinTool::WriteFile) => {
@@ -1383,7 +1449,8 @@ impl ToolRuntime {
                     .registry
                     .contract(&request.tool_name)
                     .ok_or_else(|| ToolError::UnknownTool(request.tool_name.clone()))?;
-                validate_tool_arguments(contract, &request.arguments)?;
+                self.registry
+                    .validate_tool_arguments(contract, &request.arguments)?;
                 if execution_cancellation.is_cancelled() {
                     return Ok(cancelled_report_with_policy(
                         request,
@@ -1673,7 +1740,7 @@ impl ToolRuntime {
         let total_lines = output_line_count(&content);
         let offset = read_offset(&request.arguments);
         let limit = read_limit(&request.arguments);
-        let window = select_read_window(&content, offset, limit);
+        let window = select_read_window(&content, offset, limit, total_lines);
         let mut structured_facts = json!({
             "path": resolved_path,
             "bytes": window.content.len(),
@@ -3128,7 +3195,7 @@ fn read_limit(arguments: &Value) -> usize {
 
 /// 选择稳定且可按行定位的窗口。默认值有意设置为有界，模型只需文件头部时，
 /// 不必为整个生成文件或 vendor 文件付出输入 token。
-fn select_read_window(content: &str, offset: usize, limit: usize) -> ReadWindow {
+fn select_read_window(content: &str, offset: usize, limit: usize, total_lines: u64) -> ReadWindow {
     if content.is_empty() {
         return ReadWindow {
             content: String::new(),
@@ -3138,15 +3205,26 @@ fn select_read_window(content: &str, offset: usize, limit: usize) -> ReadWindow 
         };
     }
 
-    let lines = content.split_inclusive('\n').collect::<Vec<_>>();
-    let start = offset.saturating_sub(1).min(lines.len());
-    let end = start.saturating_add(limit).min(lines.len());
-    let selected = lines[start..end].concat();
+    let start = offset.saturating_sub(1);
+    let total_lines_usize = usize::try_from(total_lines).unwrap_or(usize::MAX);
+    let end = start.saturating_add(limit).min(total_lines_usize);
+    let mut selected = String::new();
+    let mut selected_lines = 0_usize;
+    for (index, line) in content.split_inclusive('\n').enumerate() {
+        if index < start {
+            continue;
+        }
+        if index >= end {
+            break;
+        }
+        selected.push_str(line);
+        selected_lines = selected_lines.saturating_add(1);
+    }
     ReadWindow {
-        lines: output_line_count(&selected),
+        lines: u64::try_from(selected_lines).unwrap_or(u64::MAX),
         content: selected,
         next_offset: end.saturating_add(1),
-        has_more: end < lines.len(),
+        has_more: end < total_lines_usize,
     }
 }
 
@@ -3256,33 +3334,6 @@ fn apply_file_edits(original: &str, edits: &[FileEdit]) -> Result<(String, usize
     }
     output.push_str(&original[cursor..]);
     Ok((output, edits.len()))
-}
-
-fn validate_tool_arguments(contract: &ToolContract, arguments: &Value) -> Result<(), ToolError> {
-    let validator = jsonschema::validator_for(&contract.input_schema).map_err(|error| {
-        ToolError::InvalidArguments(format!(
-            "tool `{}` has an invalid input schema: {error}",
-            contract.tool_name
-        ))
-    })?;
-    let errors = validator
-        .iter_errors(arguments)
-        .map(|error| {
-            bounded_text(
-                &error.masked_with("<redacted-value>").to_string(),
-                MAX_TOOL_ERROR_CHARS,
-            )
-        })
-        .collect::<Vec<_>>();
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(ToolError::InvalidArguments(format!(
-            "tool `{}` arguments do not match its contract: {}",
-            contract.tool_name,
-            errors.join("; ")
-        )))
-    }
 }
 
 fn success_report(

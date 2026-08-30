@@ -265,6 +265,48 @@ async fn registry_contains_p0_tools() {
     }));
 }
 
+#[test]
+fn tool_schema_validator_is_reused_within_a_registry_clone() {
+    let registry = ToolRegistry::p0_default();
+    let contract = registry
+        .contract("read_file")
+        .expect("built-in contract")
+        .clone();
+
+    assert_eq!(
+        registry
+            .compiled_validators
+            .read()
+            .expect("validator cache lock")
+            .len(),
+        0
+    );
+    registry
+        .validate_tool_arguments(&contract, &json!({"path": "README.md"}))
+        .expect("valid arguments");
+    assert_eq!(
+        registry
+            .compiled_validators
+            .read()
+            .expect("validator cache lock")
+            .len(),
+        1
+    );
+
+    let cloned = registry.clone();
+    cloned
+        .validate_tool_arguments(&contract, &json!({"path": "README.md"}))
+        .expect("valid arguments on clone");
+    assert_eq!(
+        registry
+            .compiled_validators
+            .read()
+            .expect("validator cache lock")
+            .len(),
+        1
+    );
+}
+
 #[tokio::test]
 async fn delegated_task_is_registered_only_with_a_backend_and_tracks_workspace_changes() {
     let workspace = tempdir().expect("workspace");
@@ -1189,6 +1231,23 @@ async fn read_file_returns_bounded_windows_with_a_stable_continuation_offset() {
     assert_eq!(second.envelope.structured_facts["truncated"], false);
     assert_eq!(second.envelope.structured_facts["eof"], true);
     assert!(artifact_text(&second).contains("line-205"));
+}
+
+#[test]
+fn read_window_preserves_cjk_and_unterminated_lines() {
+    let content = "第一行\n第二行\n第三行";
+    let window = select_read_window(content, 2, 2, 3);
+
+    assert_eq!(window.content, "第二行\n第三行");
+    assert_eq!(window.lines, 2);
+    assert_eq!(window.next_offset, 4);
+    assert!(!window.has_more);
+
+    let eof = select_read_window(content, 99, 2, 3);
+    assert!(eof.content.is_empty());
+    assert_eq!(eof.lines, 0);
+    assert_eq!(eof.next_offset, 4);
+    assert!(!eof.has_more);
 }
 
 #[tokio::test]
