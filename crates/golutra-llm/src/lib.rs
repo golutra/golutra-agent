@@ -2001,7 +2001,7 @@ pub fn provider_tool_description(tool_name: &str) -> &'static str {
             "Search the web when network access is enabled; return source-backed results."
         }
         "shell_session" => {
-            "Control a runtime-owned background shell; authoritative_pid must match; use cursor to wait, read, write, or terminate."
+            "Control a runtime-owned background shell; authoritative_pid must match; use cursor to wait/read, set wait_for_terminal for one bounded terminal wait, or write/terminate."
         }
         "subagent" => {
             "Run one isolated child task; it cannot create another child; return a bounded result."

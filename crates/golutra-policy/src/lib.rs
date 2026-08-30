@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+};
 
 use golutra_core::{
     EvidenceId, PolicyBlockDisposition, PolicyDecision, PolicyEvaluation, PolicyId,
@@ -258,14 +261,7 @@ impl WorkspacePolicy {
         if requires_existing_path || candidate.exists() {
             canonicalize_existing(&candidate)
         } else {
-            let parent = candidate
-                .parent()
-                .ok_or_else(|| PolicyError::MissingParent(candidate.display().to_string()))?;
-            let canonical_parent = canonicalize_existing(parent)?;
-            let file_name = candidate
-                .file_name()
-                .ok_or_else(|| PolicyError::MissingParent(candidate.display().to_string()))?;
-            Ok(canonical_parent.join(file_name))
+            canonicalize_nonexistent_target(&candidate)
         }
     }
 
@@ -653,6 +649,28 @@ impl WorkspacePolicy {
             evidence_refs: Vec::new(),
         }
     }
+}
+
+fn canonicalize_nonexistent_target(candidate: &Path) -> Result<PathBuf, PolicyError> {
+    // 允许模型明确创建多级目录，但只把最近的已存在祖先 canonicalize；
+    // 这样既不替 write_file 隐式 mkdir，也不会因父目录暂不存在而丢失
+    // workspace 边界检查或误把路径解析到 symlink 外部。
+    let mut missing = Vec::<OsString>::new();
+    let mut existing = candidate;
+    while !existing.exists() {
+        let name = existing
+            .file_name()
+            .ok_or_else(|| PolicyError::MissingParent(candidate.display().to_string()))?;
+        missing.push(name.to_os_string());
+        existing = existing
+            .parent()
+            .ok_or_else(|| PolicyError::MissingParent(candidate.display().to_string()))?;
+    }
+    let mut resolved = canonicalize_existing(existing)?;
+    for name in missing.iter().rev() {
+        resolved.push(name);
+    }
+    Ok(resolved)
 }
 
 #[must_use]
@@ -1517,6 +1535,39 @@ mod tests {
         let evaluation = policy.evaluate_path("read_file", &file, true);
 
         assert_eq!(evaluation.decision, PolicyDecision::Allow);
+    }
+
+    #[test]
+    fn allows_nested_nonexistent_write_targets_without_creating_directories() {
+        let workspace = tempdir().expect("workspace");
+        let policy = WorkspacePolicy::new(workspace.path()).expect("policy");
+
+        let evaluation = policy.evaluate_path("write_file", "new/nested/file.txt", false);
+
+        assert_eq!(evaluation.decision, PolicyDecision::Allow);
+        assert_eq!(
+            PathBuf::from(evaluation.resource),
+            workspace
+                .path()
+                .canonicalize()
+                .expect("canonical workspace")
+                .join("new/nested/file.txt")
+        );
+        assert!(!workspace.path().join("new").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonexistent_target_under_symlinked_directory_keeps_boundary_check() {
+        let workspace = tempdir().expect("workspace");
+        let outside = tempdir().expect("outside");
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("linked"))
+            .expect("symlink");
+        let policy = WorkspacePolicy::new(workspace.path()).expect("policy");
+
+        let evaluation = policy.evaluate_path("write_file", "linked/new.txt", false);
+
+        assert_eq!(evaluation.decision, PolicyDecision::Block);
     }
 
     #[test]

@@ -437,7 +437,8 @@ fn shell_session_schema() -> Value {
             "authoritative_pid": {"type": "integer", "minimum": 1, "maximum": u32::MAX, "description": "The OS PID returned by the process start response; it must match the managed process exactly."},
             "cursor": {"type": "integer", "minimum": 0, "description": "Last consumed output cursor; pass the returned cursor unchanged on the next call."},
             "input": {"type": "string", "maxLength": MAX_PROCESS_INPUT_CHARS, "description": "Input to the managed process stdin (write action only)."},
-            "wait_ms": {"type": "integer", "minimum": 0, "maximum": max_poll_wait_ms(), "description": "Maximum event-driven wait; returns immediately when output or a terminal state is available."}
+            "wait_ms": {"type": "integer", "minimum": 0, "maximum": max_poll_wait_ms(), "description": "Bounded event-driven wait in milliseconds."},
+            "wait_for_terminal": {"type": "boolean", "description": "For wait action, wait until the process reaches one terminal state or the deadline."}
         },
         "required": ["action", "process_id", "authoritative_pid"]
     })

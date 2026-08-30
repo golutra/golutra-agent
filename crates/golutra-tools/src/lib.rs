@@ -1524,7 +1524,15 @@ impl ToolRuntime {
                         self.web_search(request, policy, execution_cancellation.clone())
                             .await
                     }
-                    Some(BuiltinTool::ShellSession) => self.shell_session(request, policy).await,
+                    Some(BuiltinTool::ShellSession) => {
+                        self.shell_session(
+                            request,
+                            policy,
+                            cancellation.clone(),
+                            execution_cancellation.clone(),
+                        )
+                        .await
+                    }
                     Some(BuiltinTool::Subagent | BuiltinTool::DelegateTask) => {
                         self.delegate_task(
                             request,
@@ -1795,9 +1803,63 @@ impl ToolRuntime {
                 policy,
             ));
         }
-        tokio::fs::write(&resolved_path, content.as_bytes())
-            .await
-            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        let existing_content = before_images
+            .iter()
+            .find(|image| image.path == resolved_path)
+            .and_then(|image| image.content.as_deref());
+        if existing_content == Some(content.as_bytes()) {
+            let digest = checksum(content.as_bytes());
+            let mut report = success_report(
+                request,
+                "file already contains requested content",
+                json!({
+                    "path": resolved_path,
+                    "bytes": content.len(),
+                    "content_digest": digest,
+                    "changed": false,
+                    "idempotent": true,
+                    "workspace_changes_known": true,
+                }),
+                String::new(),
+                Vec::new(),
+                policy,
+            );
+            report.before_images = before_images.clone();
+            report.after_images = before_images;
+            report.metrics.item_count = Some(1);
+            return Ok(report);
+        }
+        if let Err(error) = tokio::fs::write(&resolved_path, content.as_bytes()).await {
+            let parent = resolved_path.parent().map(PathBuf::from);
+            let parent_missing = match parent.as_deref() {
+                Some(parent) => match tokio::fs::metadata(parent).await {
+                    Ok(metadata) => !metadata.is_dir(),
+                    Err(_) => true,
+                },
+                None => false,
+            };
+            let reason = error.to_string();
+            return Ok(error_report(
+                request,
+                "file write failed",
+                json!({
+                    "path": resolved_path,
+                    "parent": parent,
+                    "parent_missing": parent_missing,
+                    "error_kind": io_error_kind_name(error.kind()),
+                    "errno": error.raw_os_error(),
+                    "error": reason,
+                    "action_required": if parent_missing {
+                        "create_parent_directory_explicitly"
+                    } else {
+                        "inspect_write_error"
+                    },
+                    "workspace_changes_known": true,
+                }),
+                reason,
+                policy,
+            ));
+        }
         let mut report = success_report(
             request,
             "file written",
@@ -1805,6 +1867,8 @@ impl ToolRuntime {
                 "path": resolved_path,
                 "bytes": content.len(),
                 "content_digest": checksum(content.as_bytes()),
+                "changed": true,
+                "workspace_changes_known": true,
             }),
             content.clone(),
             vec![resolved_path.clone()],
@@ -1895,9 +1959,37 @@ impl ToolRuntime {
                 policy,
             ));
         }
-        tokio::fs::write(&resolved_path, edited.as_bytes())
-            .await
-            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        if let Err(error) = tokio::fs::write(&resolved_path, edited.as_bytes()).await {
+            let parent = resolved_path.parent().map(PathBuf::from);
+            let parent_missing = match parent.as_deref() {
+                Some(parent) => match tokio::fs::metadata(parent).await {
+                    Ok(metadata) => !metadata.is_dir(),
+                    Err(_) => true,
+                },
+                None => false,
+            };
+            let reason = error.to_string();
+            return Ok(error_report(
+                request,
+                "file edit write failed",
+                json!({
+                    "path": resolved_path,
+                    "parent": parent,
+                    "parent_missing": parent_missing,
+                    "error_kind": io_error_kind_name(error.kind()),
+                    "errno": error.raw_os_error(),
+                    "error": reason,
+                    "action_required": if parent_missing {
+                        "create_parent_directory_explicitly"
+                    } else {
+                        "inspect_write_error"
+                    },
+                    "workspace_changes_known": true,
+                }),
+                reason,
+                policy,
+            ));
+        }
         let mut report = success_report(
             request,
             "file edited",
@@ -1907,6 +1999,8 @@ impl ToolRuntime {
                 "edit_count": edits.len(),
                 "bytes": edited.len(),
                 "content_digest": checksum(edited.as_bytes()),
+                "changed": true,
+                "workspace_changes_known": true,
             }),
             edited.clone(),
             vec![resolved_path.clone()],
@@ -2811,6 +2905,8 @@ impl ToolRuntime {
         &self,
         request: ToolRequest,
         policy: PolicyEvaluation,
+        cancellation: CancellationToken,
+        execution_cancellation: CancellationToken,
     ) -> Result<ToolExecutionReport, ToolError> {
         let action = string_arg(&request.arguments, "action")?;
         let process_id = string_arg(&request.arguments, "process_id")?;
@@ -2827,9 +2923,42 @@ impl ToolRuntime {
         let snapshot = match action.as_str() {
             "wait" => {
                 let wait_ms = process_wait_ms(&request.arguments, default_poll_wait_ms());
-                self.process_supervisor
-                    .poll(request.session_id, &process_id, cursor, wait_ms)
-                    .await?
+                let wait_for_terminal = request
+                    .arguments
+                    .get("wait_for_terminal")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if wait_for_terminal {
+                    let result = self
+                        .process_supervisor
+                        .wait_until_terminal(
+                            request.session_id,
+                            &process_id,
+                            cursor,
+                            wait_ms,
+                            &execution_cancellation,
+                        )
+                        .await?;
+                    if result.cancelled {
+                        if cancellation.is_cancelled() {
+                            return Ok(cancelled_report_with_policy(
+                                request,
+                                policy,
+                                "background terminal wait was cancelled",
+                            ));
+                        }
+                        return Ok(self.deadline_exceeded_report(
+                            request,
+                            policy,
+                            "background terminal wait",
+                        ));
+                    }
+                    result.snapshot
+                } else {
+                    self.process_supervisor
+                        .poll(request.session_id, &process_id, cursor, wait_ms)
+                        .await?
+                }
             }
             "write" => {
                 let input = string_arg(&request.arguments, "input")?;
@@ -3745,6 +3874,21 @@ fn mutation_tool_name(tool_name: &str) -> bool {
     )
 }
 
+fn io_error_kind_name(kind: std::io::ErrorKind) -> &'static str {
+    match kind {
+        std::io::ErrorKind::NotFound => "not_found",
+        std::io::ErrorKind::PermissionDenied => "permission_denied",
+        std::io::ErrorKind::AlreadyExists => "already_exists",
+        std::io::ErrorKind::InvalidInput => "invalid_input",
+        std::io::ErrorKind::InvalidData => "invalid_data",
+        std::io::ErrorKind::TimedOut => "timed_out",
+        std::io::ErrorKind::WouldBlock => "would_block",
+        std::io::ErrorKind::Interrupted => "interrupted",
+        std::io::ErrorKind::WriteZero => "write_zero",
+        _ => "other",
+    }
+}
+
 fn with_metrics(
     mut report: ToolExecutionReport,
     mut metrics: ToolExecutionMetrics,
@@ -4005,6 +4149,7 @@ fn process_next_action(
             "authoritative_pid": authoritative_pid,
             "cursor": cursor,
             "wait_ms": default_poll_wait_ms(),
+            "wait_for_terminal": true,
         })
     } else {
         json!({
@@ -4260,6 +4405,8 @@ const READ_FILE_MODEL_FACTS: &[&str] = &[
 
 const MUTATION_MODEL_FACTS: &[&str] = &[
     "path",
+    "changed",
+    "idempotent",
     "changed_files",
     "changed_file_count",
     "workspace_change_count",
@@ -4276,6 +4423,9 @@ const MUTATION_MODEL_FACTS: &[&str] = &[
     "cancelled",
     "error",
     "reason",
+    "parent",
+    "parent_missing",
+    "action_required",
     "checkpointed_paths",
     "resolved_paths",
     "output_truncated",
@@ -4300,6 +4450,7 @@ const PROCESS_MODEL_FACTS: &[&str] = &[
     "survives_runtime_exit",
     "terminal",
     "wait_strategy",
+    "wait_for_terminal",
     "next_action",
     "error",
     "reason",
@@ -4692,6 +4843,7 @@ fn compact_model_fact_value(key: &str, value: &Value) -> Value {
                     "authoritative_pid",
                     "cursor",
                     "wait_ms",
+                    "wait_for_terminal",
                 ],
                 8,
             ),

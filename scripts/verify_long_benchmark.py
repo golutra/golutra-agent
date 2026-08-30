@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import platform
 import subprocess
 import sys
 from pathlib import Path
@@ -13,12 +15,126 @@ from typing import Callable
 
 
 SENTINEL = "LEDGER-LONG-73X"
+DIAGNOSTIC_SCHEMA_VERSION = 1
+MAX_DIAGNOSTIC_TEXT = 240
+MAX_ARTIFACT_BYTES = 64 * 1024
+
+
+class VerificationFailure(AssertionError):
+    """A strict verifier failure with bounded, machine-readable evidence."""
+
+    def __init__(self, diagnostic: dict[str, object], raw_output: str = "") -> None:
+        self.diagnostic = diagnostic
+        self.raw_output = raw_output
+        super().__init__(str(diagnostic.get("message") or "verification failed"))
+
+
+def bounded_text(value: object, limit: int = MAX_DIAGNOSTIC_TEXT) -> str:
+    text = " ".join(str(value).split())
+    return text if len(text) <= limit else f"{text[:limit]}..."
+
+
+def json_safe(value: object, depth: int = 0) -> object:
+    """Keep diagnostic field values bounded and JSON serializable."""
+    if depth > 2:
+        return "<nested value omitted>"
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return bounded_text(value)
+    if isinstance(value, dict):
+        return {
+            bounded_text(key, 96): json_safe(item, depth + 1)
+            for key, item in list(value.items())[:16]
+        }
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item, depth + 1) for item in list(value)[:16]]
+    return bounded_text(repr(value))
+
+
+def checkpoint_checksum(payload: dict[str, object]) -> str:
+    material = {
+        key: payload.get(key)
+        for key in ("version", "through_sequence", "state_counts", "sentinel")
+    }
+    encoded = json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def checkpoint_failure_diagnostic(workspace: Path, message: str) -> dict[str, object]:
+    """Explain checkpoint contract drift without weakening the contract."""
+    expected: dict[str, object] = {
+        "version": 1,
+        "through_sequence": 4,
+        "state_counts": {"queued": 1, "running": 1},
+        "sentinel": SENTINEL,
+    }
+    expected["checksum"] = checkpoint_checksum(expected)
+    path = workspace / ".long-bench" / "checkpoint.json"
+    actual: object
+    parse_error: str | None = None
+    try:
+        actual = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        actual = None
+        parse_error = bounded_text(error)
+    actual_mapping = actual if isinstance(actual, dict) else {}
+    expected_keys = sorted(expected)
+    actual_keys = sorted(str(key) for key in actual_mapping)
+    differences = {
+        key: {"expected": json_safe(expected.get(key)), "actual": json_safe(actual_mapping.get(key))}
+        for key in expected
+        if actual_mapping.get(key) != expected.get(key)
+    }
+    actual_checksum = actual_mapping.get("checksum")
+    expected_checksum = expected["checksum"]
+    diagnostic: dict[str, object] = {
+        "schema_version": DIAGNOSTIC_SCHEMA_VERSION,
+        "check": "stage_three_checkpoint",
+        "kind": "round_trip_contract",
+        "message": bounded_text(message),
+        "expected_type": "Checkpoint",
+        "actual_type": type(actual).__name__,
+        "expected_keys": expected_keys,
+        "actual_keys": actual_keys,
+        "missing_keys": sorted(set(expected_keys) - set(actual_keys)),
+        "unexpected_keys": sorted(set(actual_keys) - set(expected_keys)),
+        "field_differences": differences,
+        "checksum": {
+            "expected": expected_checksum,
+            "actual": json_safe(actual_checksum),
+            "matches": actual_checksum == expected_checksum,
+        },
+    }
+    if parse_error is not None:
+        diagnostic["parse_error"] = parse_error
+    return diagnostic
+
+
+def failure_diagnostic(workspace: Path, label: str, message: str) -> dict[str, object]:
+    if "checkpoint" in label.lower():
+        return checkpoint_failure_diagnostic(workspace, message)
+    return {
+        "schema_version": DIAGNOSTIC_SCHEMA_VERSION,
+        "check": label,
+        "kind": "assertion",
+        "message": bounded_text(message),
+        "environment": {
+            "python": platform.python_version(),
+            "platform": bounded_text(platform.platform(), 160),
+        },
+    }
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workspace", type=Path, required=True)
     parser.add_argument("--stage", type=int, choices=range(1, 5), required=True)
+    parser.add_argument(
+        "--artifact",
+        type=Path,
+        help="write the bounded raw verifier output to this artifact path",
+    )
     return parser.parse_args()
 
 
@@ -37,7 +153,11 @@ def run_python(workspace: Path, code: str) -> subprocess.CompletedProcess[str]:
 def require_python(workspace: Path, code: str, label: str) -> None:
     result = run_python(workspace, code)
     if result.returncode != 0:
-        raise AssertionError(f"{label} failed:\n{result.stdout[-4000:]}")
+        message = f"{label} failed: {bounded_text(result.stdout[-4000:])}"
+        raise VerificationFailure(
+            failure_diagnostic(workspace, label, message),
+            result.stdout,
+        )
 
 
 def verify_visible_tests(workspace: Path) -> None:
@@ -51,7 +171,11 @@ def verify_visible_tests(workspace: Path) -> None:
         check=False,
     )
     if result.returncode != 0:
-        raise AssertionError(f"visible tests failed:\n{result.stdout[-4000:]}")
+        message = f"visible tests failed: {bounded_text(result.stdout[-4000:])}"
+        raise VerificationFailure(
+            failure_diagnostic(workspace, "visible tests", message),
+            result.stdout,
+        )
 
 
 def verify_stage_one(workspace: Path) -> None:
@@ -339,18 +463,62 @@ def main() -> int:
     workspace = args.workspace.resolve(strict=True)
     checks: list[str] = []
     try:
-        for index, verify in enumerate(STAGES[: args.stage], start=1):
-            verify(workspace)
-            checks.append(f"stage_{index}")
+        # 每次只执行被请求的阶段；调用方负责确认前置阶段已通过，避免
+        # stage 4 为了验证后台语义再次支付 stage 1-3 的完整检查成本。
+        STAGES[args.stage - 1](workspace)
+        checks.append(f"stage_{args.stage}")
+    except VerificationFailure as error:
+        artifact: str | None = None
+        if args.artifact is not None:
+            artifact_path = args.artifact.resolve()
+            artifact_path.parent.mkdir(parents=True, exist_ok=True)
+            raw = error.raw_output.encode("utf-8", errors="replace")[:MAX_ARTIFACT_BYTES]
+            artifact_path.write_bytes(raw)
+            artifact = str(artifact_path)
+        payload = {
+            "schema_version": DIAGNOSTIC_SCHEMA_VERSION,
+            "passed": False,
+            "checks": checks,
+            "diagnostic": error.diagnostic,
+            "artifact": artifact,
+            "error": bounded_text(error),
+        }
+        print(json.dumps(payload, ensure_ascii=True))
+        return 1
     except (AssertionError, OSError, subprocess.SubprocessError, ValueError) as error:
+        diagnostic = failure_diagnostic(workspace, "verifier", str(error))
+        artifact: str | None = None
+        if args.artifact is not None:
+            artifact_path = args.artifact.resolve()
+            artifact_path.parent.mkdir(parents=True, exist_ok=True)
+            raw = str(error).encode("utf-8", errors="replace")[:MAX_ARTIFACT_BYTES]
+            artifact_path.write_bytes(raw)
+            artifact = str(artifact_path)
         print(
             json.dumps(
-                {"passed": False, "checks": checks, "error": str(error)},
+                {
+                    "schema_version": DIAGNOSTIC_SCHEMA_VERSION,
+                    "passed": False,
+                    "checks": checks,
+                    "diagnostic": diagnostic,
+                    "artifact": artifact,
+                    "error": bounded_text(error),
+                },
                 ensure_ascii=True,
             )
         )
         return 1
-    print(json.dumps({"passed": True, "checks": checks}, ensure_ascii=True))
+    print(
+        json.dumps(
+            {
+                "schema_version": DIAGNOSTIC_SCHEMA_VERSION,
+                "passed": True,
+                "checks": checks,
+                "stage": args.stage,
+            },
+            ensure_ascii=True,
+        )
+    )
     return 0
 
 

@@ -1304,6 +1304,61 @@ async fn write_file_records_changed_file() {
 }
 
 #[tokio::test]
+async fn write_file_reports_missing_parent_without_creating_it() {
+    let workspace = tempdir().expect("workspace");
+    let executor = executor(workspace.path());
+    let report = executor
+        .execute_with_policy(
+            request(
+                "write_file",
+                json!({"path": "missing/child.txt", "content": "value"}),
+            ),
+            executor
+                .evaluate(&request(
+                    "write_file",
+                    json!({"path": "missing/child.txt", "content": "value"}),
+                ))
+                .expect("policy evaluates"),
+            true,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("write failure is a structured report");
+
+    assert_eq!(report.envelope.status, ToolResultStatus::Error);
+    assert_eq!(report.envelope.structured_facts["parent_missing"], true);
+    assert_eq!(
+        report.envelope.structured_facts["action_required"],
+        "create_parent_directory_explicitly"
+    );
+    assert!(!workspace.path().join("missing").exists());
+    assert!(report.envelope.raw_artifact_ref.is_some());
+}
+
+#[tokio::test]
+async fn write_file_same_content_is_idempotent_and_skips_workspace_mutation() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(workspace.path().join("same.txt"), "same").expect("fixture");
+    let executor = executor(workspace.path());
+    let report = executor
+        .execute(
+            request("write_file", json!({"path": "same.txt", "content": "same"})),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("idempotent write");
+
+    assert_eq!(report.envelope.status, ToolResultStatus::Ok);
+    assert_eq!(report.envelope.structured_facts["changed"], false);
+    assert_eq!(report.envelope.structured_facts["idempotent"], true);
+    assert!(report.changed_files.is_empty());
+    assert_eq!(
+        report.envelope.model_visible_excerpt.as_deref(),
+        Some("file already contains requested content")
+    );
+}
+
+#[tokio::test]
 async fn mutation_results_keep_content_in_artifacts_but_not_model_excerpt() {
     let workspace = tempdir().expect("workspace");
     fs::write(workspace.path().join("src.txt"), "before").expect("fixture");
@@ -3139,6 +3194,10 @@ async fn background_process_supports_cursor_reconnect_stdin_and_terminal_diff() 
         start.envelope.structured_facts["next_action"]["authoritative_pid"],
         authoritative_pid
     );
+    assert_eq!(
+        start.envelope.structured_facts["next_action"]["wait_for_terminal"],
+        true
+    );
     assert!(first_cursor > 0);
     assert!(artifact_text(&start).contains("first"));
 
@@ -3397,6 +3456,97 @@ async fn shell_session_unifies_event_wait_write_and_terminate() {
         terminal.envelope.structured_facts["process_state"],
         "exited"
     );
+}
+
+#[tokio::test]
+async fn shell_session_wait_for_terminal_returns_one_idempotent_terminal_snapshot() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(
+        workspace.path().join("terminal.sh"),
+        "sleep 0.05\nprintf terminal-output\n",
+    )
+    .expect("terminal script");
+    let executor = executor(workspace.path());
+    let session_id = SessionId::new();
+    let start = execute_approved(
+        &executor,
+        request_for_session(
+            session_id,
+            "shell",
+            json!({
+                "command": "sh terminal.sh",
+                "background": true,
+                "yield_time_ms": 0,
+            }),
+        ),
+        CancellationToken::new(),
+    )
+    .await;
+    let process_id = start.envelope.structured_facts["process_id"]
+        .as_str()
+        .expect("process id")
+        .to_owned();
+    let authoritative_pid = start.envelope.structured_facts["authoritative_pid"]
+        .as_u64()
+        .expect("authoritative pid");
+    let cursor = start.envelope.structured_facts["output_cursor"]
+        .as_u64()
+        .expect("cursor");
+
+    let terminal = executor
+        .execute(
+            request_for_session(
+                session_id,
+                "shell_session",
+                json!({
+                    "action": "wait",
+                    "process_id": process_id,
+                    "authoritative_pid": authoritative_pid,
+                    "cursor": cursor,
+                    "wait_ms": 1_000,
+                    "wait_for_terminal": true,
+                }),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("terminal wait");
+    assert_eq!(
+        terminal.envelope.structured_facts["process_state"],
+        "exited"
+    );
+    assert_eq!(terminal.envelope.structured_facts["terminal"], true);
+    let terminal_event_id = terminal.envelope.structured_facts["terminal_event_id"]
+        .as_u64()
+        .expect("terminal event id");
+    assert!(artifact_text(&terminal).contains("terminal-output"));
+    let terminal_cursor = terminal.envelope.structured_facts["output_cursor"]
+        .as_u64()
+        .expect("terminal cursor");
+
+    let replay = executor
+        .execute(
+            request_for_session(
+                session_id,
+                "shell_session",
+                json!({
+                    "action": "wait",
+                    "process_id": process_id,
+                    "authoritative_pid": authoritative_pid,
+                    "cursor": terminal_cursor,
+                    "wait_ms": 0,
+                    "wait_for_terminal": true,
+                }),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("idempotent terminal wait");
+    assert_eq!(
+        replay.envelope.structured_facts["terminal_event_id"],
+        terminal_event_id
+    );
+    assert!(artifact_text(&replay).is_empty());
 }
 
 #[tokio::test]

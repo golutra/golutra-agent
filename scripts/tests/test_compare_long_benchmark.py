@@ -279,6 +279,267 @@ class CompareLongBenchmarkTest(unittest.TestCase):
             self.assertTrue(provider["models"][0]["reasoning"])
             self.assertEqual(provider["compat"]["sendSessionIdHeader"], True)
 
+    def test_verifier_identity_changes_when_workspace_or_stage_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / "jobledger").mkdir()
+            (workspace / "tests").mkdir()
+            (workspace / "tools").mkdir()
+            (workspace / "jobledger" / "module.py").write_text("value=1\n", encoding="utf-8")
+            (workspace / ".long-bench").mkdir()
+            (workspace / ".long-bench" / "checkpoint.json").write_text("checkpoint-a\n", encoding="utf-8")
+            first, identity = benchmark.verifier_cache_identity(workspace, 3)
+            second, _ = benchmark.verifier_cache_identity(workspace, 3)
+            self.assertEqual(first, second)
+            self.assertEqual(identity["stage"], 3)
+            self.assertIn("jobledger", identity["dependency_paths"])
+            (workspace / "jobledger" / "module.py").write_text("value=2\n", encoding="utf-8")
+            changed, _ = benchmark.verifier_cache_identity(workspace, 3)
+            self.assertNotEqual(first, changed)
+            other_stage, _ = benchmark.verifier_cache_identity(workspace, 4)
+            self.assertNotEqual(changed, other_stage)
+            (workspace / ".long-bench" / "checkpoint.json").write_text("checkpoint-b\n", encoding="utf-8")
+            checkpoint_changed, _ = benchmark.verifier_cache_identity(workspace, 3)
+            self.assertNotEqual(changed, checkpoint_changed)
+
+    def test_verification_feedback_contains_only_bounded_structured_facts(self) -> None:
+        feedback = benchmark.verification_feedback(
+            {
+                "diagnostic": {
+                    "check": "stage_three_checkpoint",
+                    "kind": "round_trip_contract",
+                    "message": "checksum mismatch",
+                    "expected_type": "Checkpoint",
+                    "actual_type": "dict",
+                    "field_differences": {"sentinel": {"expected": "x", "actual": "y"}},
+                    "raw_prompt": "must never be sent",
+                }
+            }
+        )
+        self.assertIn("checksum mismatch", feedback)
+        self.assertNotIn("must never be sent", feedback)
+        self.assertIn("one explicit repair turn", feedback)
+
+    def test_merge_repair_metrics_preserves_unknowns_and_adds_totals(self) -> None:
+        primary = {
+            "prompt_tokens": 100,
+            "uncached_input_tokens": 20,
+            "cache_read_tokens": 80,
+            "cache_write_tokens": 0,
+            "output_tokens": 10,
+            "reasoning_tokens": 2,
+            "provider_total_tokens": 110,
+            "total_tokens": 110,
+            "tool_call_count": 2,
+            "tool_result_count": 2,
+            "request_count": None,
+            "elapsed_ms": 50.0,
+            "first_token_ms": 8.0,
+            "turn_first_token_ms": 8.0,
+            "provider_first_token_ms": None,
+            "terminal_ms": 50.0,
+            "completed": False,
+            "runtime_terminal_success": True,
+            "return_code": 0,
+            "final_message": "initial",
+            "usage_source": "reported",
+            "usage_complete": True,
+        }
+        repair = {
+            "prompt_tokens": 40,
+            "uncached_input_tokens": 10,
+            "cache_read_tokens": 30,
+            "cache_write_tokens": 0,
+            "output_tokens": 5,
+            "reasoning_tokens": 1,
+            "provider_total_tokens": 45,
+            "total_tokens": 45,
+            "tool_call_count": 1,
+            "tool_result_count": 1,
+            "request_count": None,
+            "elapsed_ms": 25.0,
+            "first_token_ms": 6.0,
+            "turn_first_token_ms": 6.0,
+            "provider_first_token_ms": 4.0,
+            "terminal_ms": 25.0,
+            "completed": True,
+            "runtime_terminal_success": True,
+            "return_code": 0,
+            "final_message": "repaired",
+            "usage_source": "reported",
+            "usage_complete": True,
+        }
+        merged = benchmark.merge_repair_metrics(primary, repair)
+        self.assertEqual(merged["prompt_tokens"], 140)
+        self.assertEqual(merged["provider_total_tokens"], 155)
+        self.assertEqual(merged["tool_call_count"], 3)
+        self.assertIsNone(merged["request_count"])
+        self.assertEqual(merged["elapsed_ms"], 75.0)
+        self.assertEqual(merged["final_message"], "repaired")
+        self.assertEqual(merged["repair_attempts"], 1)
+
+    def test_tool_accounting_separates_repeated_calls_and_background_waits(self) -> None:
+        def runtime(event_type: str, event_id: str, payload: dict) -> dict:
+            return {
+                "type": "runtime.event",
+                "event": {
+                    "id": event_id,
+                    "event_type": event_type,
+                    "payload": payload,
+                },
+            }
+
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                runtime("tool_started", "call-1", {"tool_name": "read_file", "arguments": {"path": "a"}}),
+                runtime("tool_completed", "result-1", {"tool_name": "read_file"}),
+                runtime("tool_started", "call-2", {"tool_name": "read_file", "arguments": {"path": "a"}}),
+                runtime("tool_completed", "result-2", {"tool_name": "read_file"}),
+                runtime(
+                    "tool_started",
+                    "call-3",
+                    {
+                        "tool_name": "shell_session",
+                        "arguments": {"action": "wait", "process_id": "p"},
+                    },
+                ),
+            )
+        )
+        metrics = {"tool_call_count": 3, "tool_result_count": 2}
+        benchmark.apply_tool_call_accounting(metrics, "golutra", stdout, None)
+        self.assertEqual(metrics["model_tool_call_count"], 3)
+        self.assertEqual(metrics["repeated_tool_call_count"], 1)
+        self.assertEqual(metrics["necessary_tool_call_count"], 2)
+        self.assertEqual(metrics["background_wait_count"], 1)
+        self.assertNotIn("arguments", json.dumps(metrics["tool_call_ledger"]))
+        self.assertEqual(metrics["tool_call_accounting"]["result_events"], 2)
+
+    def test_tool_accounting_joins_provider_fallback_calls_by_provider_id(self) -> None:
+        def runtime(event_type: str, event_id: str, payload: dict) -> dict:
+            return {
+                "type": "runtime.event",
+                "event": {
+                    "id": event_id,
+                    "event_type": event_type,
+                    "payload": payload,
+                },
+            }
+
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                runtime(
+                    "tool_started",
+                    "tool-event-1",
+                    {
+                        "tool_call_id": "internal-1",
+                        "provider_tool_call_id": "provider-1",
+                        "tool_name": "shell",
+                        "arguments": {"command": "printf one"},
+                    },
+                ),
+                runtime(
+                    "provider_completed",
+                    "provider-event-1",
+                    {
+                        "provider_tool_calls": [
+                            {"provider_tool_call_id": "provider-1", "tool_name": "shell"},
+                            {"provider_tool_call_id": "provider-2", "tool_name": "read_file"},
+                        ]
+                    },
+                ),
+            )
+        )
+        records = benchmark.collect_tool_call_records("golutra", stdout, None)
+        self.assertEqual([record["tool_name"] for record in records], ["shell", "read_file"])
+        self.assertEqual(len(records), 2)
+
+    def test_tool_accounting_keeps_multiple_idless_calls_in_one_event(self) -> None:
+        stdout = json.dumps(
+            {
+                "type": "runtime.event",
+                "event": {
+                    "id": "provider-event-1",
+                    "event_type": "provider_completed",
+                    "payload": {
+                        "provider_tool_calls": [
+                            {"tool_name": "shell", "arguments": {"command": "printf one"}},
+                            {"tool_name": "read_file", "arguments": {"path": "one.txt"}},
+                        ]
+                    },
+                },
+            }
+        )
+        records = benchmark.collect_tool_call_records("golutra", stdout, None)
+        self.assertEqual([record["tool_name"] for record in records], ["shell", "read_file"])
+
+        pi_stdout = json.dumps(
+            {
+                "id": "message-event-1",
+                "type": "message_end",
+                "message": {
+                    "content": [
+                        {"type": "toolCall", "name": "read", "arguments": {"path": "a"}},
+                        {"type": "toolCall", "name": "bash", "arguments": {"command": "pwd"}},
+                    ]
+                },
+            }
+        )
+        pi_records = benchmark.collect_tool_call_records("pi", pi_stdout, None)
+        self.assertEqual([record["tool_name"] for record in pi_records], ["read", "bash"])
+
+    def test_tool_accounting_keeps_idless_same_argument_calls_at_distinct_times(self) -> None:
+        def runtime(timestamp: int) -> dict:
+            return {
+                "type": "runtime.event",
+                "event": {
+                    "event_type": "tool_started",
+                    "timestamp": timestamp,
+                    "payload": {
+                        "tool_name": "read_file",
+                        "arguments": {"path": "same.txt"},
+                    },
+                },
+            }
+
+        stdout = "\n".join(json.dumps(runtime(timestamp)) for timestamp in (10, 20))
+        records = benchmark.collect_tool_call_records("golutra", stdout, None)
+        self.assertEqual(len(records), 2)
+
+    def test_verifier_cache_rejects_an_identity_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            artifact = Path(directory) / "artifacts" / "stage-1"
+            artifact.mkdir(parents=True)
+            cache = artifact.parent / "verifier-cache"
+            cache.mkdir()
+            key, identity = benchmark.verifier_cache_identity(workspace, 1)
+            (cache / f"{key}.json").write_text(
+                json.dumps(
+                    {
+                        "identity": {"stage": 99},
+                        "payload": {"passed": True},
+                        "raw_output": "cached",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            original = benchmark.subprocess.run
+            try:
+                class Result:
+                    returncode = 0
+                    stdout = '{"passed": true}\n'
+
+                benchmark.subprocess.run = lambda *args, **kwargs: Result()
+                result = benchmark.run_verifier(workspace, 1, artifact)
+            finally:
+                benchmark.subprocess.run = original
+            self.assertFalse(result["cached"])
+            self.assertEqual(result["cache_key"], key)
+            self.assertEqual(result["cache_identity"], identity)
+
 
 if __name__ == "__main__":
     unittest.main()

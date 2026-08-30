@@ -164,6 +164,12 @@ pub(crate) struct ProcessSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProcessWaitResult {
+    pub(crate) snapshot: ProcessSnapshot,
+    pub(crate) cancelled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProcessSummary {
     pub(crate) process_id: String,
     pub(crate) authoritative_pid: u32,
@@ -950,6 +956,27 @@ impl ProcessSupervisor {
         self.poll(session_id, process_id, cursor, 0).await
     }
 
+    /// Wait for one managed process to publish its terminal event. Output is
+    /// returned only once at the terminal boundary, while cursor and event id
+    /// remain authoritative for idempotent reconnects.
+    pub(crate) async fn wait_until_terminal(
+        &self,
+        session_id: SessionId,
+        process_id: &str,
+        cursor: u64,
+        wait_ms: u64,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessWaitResult, ToolError> {
+        let entry = self.entry(session_id, process_id).await?;
+        let (snapshot, cancelled) = self
+            .wait_for_terminal_with_cancellation(&entry, cursor, wait_ms, cancellation)
+            .await;
+        Ok(ProcessWaitResult {
+            snapshot,
+            cancelled,
+        })
+    }
+
     /// 校验受管进程启动时返回的不可变 OS PID。逻辑 `process_id` 仍是控制句柄；
     /// 该检查防止调用方等待或操作猜测/复用的 PID，同时允许子进程终态后重连查询。
     pub(crate) async fn validate_authoritative_pid(
@@ -1217,6 +1244,19 @@ impl ProcessSupervisor {
         cursor: u64,
         wait_ms: u64,
     ) -> ProcessSnapshot {
+        let cancellation = CancellationToken::new();
+        self.wait_for_terminal_with_cancellation(entry, cursor, wait_ms, &cancellation)
+            .await
+            .0
+    }
+
+    async fn wait_for_terminal_with_cancellation(
+        &self,
+        entry: &Arc<ManagedProcess>,
+        cursor: u64,
+        wait_ms: u64,
+        cancellation: &CancellationToken,
+    ) -> (ProcessSnapshot, bool) {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms);
         loop {
             self.touch(entry).await;
@@ -1226,11 +1266,15 @@ impl ProcessSupervisor {
             if entry.state.lock().await.state.is_terminal()
                 || tokio::time::Instant::now() >= deadline
             {
-                return snapshot(entry, cursor).await;
+                return (snapshot(entry, cursor).await, false);
+            }
+            if cancellation.is_cancelled() {
+                return (snapshot(entry, cursor).await, true);
             }
             tokio::select! {
                 _ = &mut notification => {}
-                _ = tokio::time::sleep_until(deadline) => return snapshot(entry, cursor).await,
+                _ = tokio::time::sleep_until(deadline) => return (snapshot(entry, cursor).await, false),
+                _ = cancellation.cancelled() => return (snapshot(entry, cursor).await, true),
             }
         }
     }
