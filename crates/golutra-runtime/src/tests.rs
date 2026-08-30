@@ -5755,6 +5755,7 @@ async fn pure_read_batch_executes_concurrently_and_commits_results_in_source_ord
     );
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mixed_tool_batch_parallelizes_adjacent_reads_around_side_effects() {
     let workspace = tempdir().expect("workspace");
