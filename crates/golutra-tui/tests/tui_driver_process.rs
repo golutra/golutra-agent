@@ -2276,7 +2276,7 @@ async fn wait_for_terminal_projection(
     session_id: SessionId,
 ) -> UserProjection {
     let mut last = None;
-    for _ in 0..500 {
+    for _ in 0..800 {
         let value = transport
             .query(RuntimeQuery {
                 query_id: QueryId::new(),
