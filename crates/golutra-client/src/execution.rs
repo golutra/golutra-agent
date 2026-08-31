@@ -1,7 +1,7 @@
 //! Context construction, task supervision, AgentLoop, and provider auth lifecycles.
 
 use super::*;
-use golutra_context::{estimate_tokens, fit_compaction_context_content};
+use golutra_context::{estimate_message_tokens, estimate_tokens, fit_compaction_context_content};
 use golutra_llm::{
     LlmProvider, PromptCacheScope, ProviderGenerationConfig, ProviderMessage, ProviderRequest,
     ProviderRole,
@@ -24,6 +24,27 @@ const MAX_WORKING_SUMMARY_TOKENS: u64 = 2_048;
 const ACTIVE_PATH_COMPACTION_MAX_DEPTH: u32 = 65_536;
 const MAX_RESUME_PROVIDER_REQUEST_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_RESUME_PROVIDER_MESSAGES: usize = 16_384;
+// 精确 replay 只有在能放进当前窗口时才有价值；超出后强行保留会把
+// 动态历史标成稳定前缀，阻止 compaction 并让每个后续请求重复支付全文。
+const RESUME_REPLAY_HEADROOM_TOKENS: u64 = 1_024;
+// 跨任务 resume 不需要把上一轮的完整工具正文再次固定在 provider 前缀中。
+// 32K 是稳定前缀仍有明显缓存价值、而历史投影开始更划算的上限；小窗口按
+// 四分之一窗口收紧，避免把精确 replay 当成长期历史存储。
+const RESUME_REPLAY_SOFT_CAP_TOKENS: u64 = 32_768;
+const RESUME_REPLAY_SOFT_FLOOR_TOKENS: u64 = 8_192;
+
+fn resume_replay_soft_limit(context_budget: u64) -> u64 {
+    if context_budget == u64::MAX {
+        return u64::MAX;
+    }
+    context_budget
+        .saturating_div(4)
+        .clamp(
+            RESUME_REPLAY_SOFT_FLOOR_TOKENS,
+            RESUME_REPLAY_SOFT_CAP_TOKENS,
+        )
+        .min(context_budget.saturating_sub(RESUME_REPLAY_HEADROOM_TOKENS))
+}
 
 fn memory_candidate_limit(context_budget: u64) -> usize {
     if context_budget == 0 {
@@ -117,6 +138,7 @@ impl RuntimeHost {
         objective: &str,
         provider: &ConfiguredProvider,
         cache_scope: &PromptCacheScope,
+        context_budget: u64,
     ) -> Result<Option<AgentReplayContext>, ClientError> {
         if objective.trim().is_empty() {
             return Ok(None);
@@ -191,6 +213,18 @@ impl RuntimeHost {
             });
         }
         if messages.len() > MAX_RESUME_PROVIDER_MESSAGES {
+            return Ok(None);
+        }
+        let replay_tokens = estimate_message_tokens(&messages);
+        let replay_over_hard_limit = context_budget != u64::MAX
+            && replay_tokens > context_budget.saturating_sub(RESUME_REPLAY_HEADROOM_TOKENS);
+        let replay_over_soft_limit = previous.task_id != current_task_id
+            && replay_tokens > resume_replay_soft_limit(context_budget);
+        if replay_over_hard_limit || replay_over_soft_limit {
+            // 普通上下文路径会按活动会话树重新投影，并在需要时触发模型摘要；
+            // 这比把超预算的旧 provider wire 当作不可变前缀更省 token，也保留
+            // 当前任务可用的语义事实。中断中的同一任务仍只在硬上限时回退，
+            // 以免丢失尚未完成的 tool-call/tool-result 配对。
             return Ok(None);
         }
         Ok(Some(AgentReplayContext::for_resume(
@@ -539,7 +573,6 @@ impl RuntimeHost {
                 source_refs: project_instructions.source_refs,
             });
         }
-
         let objective_contributor = ContextContributor {
             name: "objective".to_owned(),
             role: ProviderRole::User,
@@ -1364,6 +1397,7 @@ impl RuntimeHost {
                 &objective,
                 &provider,
                 &prompt_cache_scope,
+                context_budget,
             )
             .await?;
         let legacy_task = LegacyTaskAdapter::new(&task.payload, &objective);
@@ -1709,5 +1743,19 @@ mod lifecycle_tests {
         })
         .await
         .expect("cancelled close must abort the recorder worker");
+    }
+
+    #[test]
+    fn resume_replay_soft_limit_keeps_small_windows_and_caps_large_ones() {
+        assert_eq!(resume_replay_soft_limit(u64::MAX), u64::MAX);
+        assert_eq!(
+            resume_replay_soft_limit(200_000),
+            RESUME_REPLAY_SOFT_CAP_TOKENS
+        );
+        assert_eq!(
+            resume_replay_soft_limit(16_000),
+            RESUME_REPLAY_SOFT_FLOOR_TOKENS
+        );
+        assert_eq!(resume_replay_soft_limit(6_000), 4_976);
     }
 }

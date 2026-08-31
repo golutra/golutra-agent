@@ -20,12 +20,14 @@ use golutra_sandbox::{SystemSandbox, WorkspaceAccess};
 use regex::Regex;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use similar::{ChangeTag, TextDiff};
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_EXCERPT_LIMIT: usize = 2048;
+const DEFAULT_READ_EXCERPT_BYTES: usize = 16 * 1024;
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
 /// Maximum raw content retained by a built-in tool artifact.
 pub const MAX_TOOL_ARTIFACT_CONTENT_BYTES: usize = 16 * 1024 * 1024;
@@ -59,11 +61,15 @@ pub const MAX_MODEL_TOOL_RESULT_BYTES: usize = 16 * 1024;
 const DEFAULT_MODEL_TOOL_RESULT_BYTES: usize = 8 * 1024;
 const MIN_MODEL_TOOL_RESULT_BYTES: usize = 1024;
 const MAX_MODEL_TOOL_RESULT_SUMMARY_CHARS: usize = 2 * 1024;
-const MAX_MODEL_TOOL_RESULT_EXCERPT_CHARS: usize = 4 * 1024;
+const MAX_MODEL_TOOL_RESULT_EXCERPT_BYTES: usize = 16 * 1024;
 const MAX_MODEL_TOOL_RESULT_COMPACT_EXCERPT_CHARS: usize = 512;
 const MAX_MODEL_TOOL_RESULT_FACT_STRING_CHARS: usize = 4 * 1024;
 const MAX_MODEL_TOOL_RESULT_ITEMS: usize = 32;
 const MAX_MODEL_TOOL_RESULT_DEPTH: usize = 5;
+const MAX_MODEL_CHANGE_PREVIEW_BYTES: usize = 3 * 1024;
+const MAX_MODEL_CHANGE_PREVIEW_LINES: usize = 24;
+const MAX_MODEL_CHANGE_PREVIEW_FILES: usize = 8;
+const MAX_MODEL_CHANGE_PREVIEW_LINE_BYTES: usize = 512;
 const MAX_MODEL_TOOL_OUTPUT_CHARS: usize = 2 * 1024;
 const MAX_MODEL_TOOL_REASON_CHARS: usize = 512;
 const MAX_MODEL_TOOL_SEARCH_QUERY_CHARS: usize = 512;
@@ -1668,10 +1674,11 @@ impl ToolRuntime {
         error: impl Into<String>,
     ) -> ToolExecutionReport {
         let reason = bounded_text(&error.into(), MAX_TOOL_ERROR_CHARS);
+        let structured_facts = execution_error_facts(&request, &reason);
         error_report(
             request,
             "tool execution failed",
-            json!({"error": reason}),
+            structured_facts,
             reason,
             policy,
         )
@@ -1746,11 +1753,17 @@ impl ToolRuntime {
             String::from_utf8(content).map_err(|error| ToolError::Execution(error.to_string()))?;
         let total_bytes = content.len();
         let total_lines = output_line_count(&content);
+        let content_digest = checksum(content.as_bytes());
         let offset = read_offset(&request.arguments);
         let limit = read_limit(&request.arguments);
         let window = select_read_window(&content, offset, limit, total_lines);
         let mut structured_facts = json!({
-            "path": resolved_path,
+            // Provider 可见事实使用调用方给出的 workspace 相对路径。解析后的
+            // 绝对路径仍保留为持久执行事实，但每轮重复会浪费 token，并暴露
+            // 对模型决策没有价值的宿主路径前缀。
+            "path": path,
+            "resolved_path": resolved_path,
+            "content_digest": content_digest,
             "bytes": window.content.len(),
             "lines": window.lines,
             "offset": offset,
@@ -1891,6 +1904,7 @@ impl ToolRuntime {
                 true,
             )),
         }];
+        attach_model_visible_change_preview(&mut report, self.policy.workspace_root());
         report.metrics.item_count = Some(1);
         Ok(report)
     }
@@ -2023,6 +2037,7 @@ impl ToolRuntime {
                 true,
             )),
         }];
+        attach_model_visible_change_preview(&mut report, self.policy.workspace_root());
         report.metrics.item_count = Some(1);
         Ok(report)
     }
@@ -2199,6 +2214,7 @@ impl ToolRuntime {
         );
         report.before_images = before_images;
         report.after_images = after_images;
+        attach_model_visible_change_preview(&mut report, self.policy.workspace_root());
         report.metrics = process_metrics(&output);
         report.metrics.item_count = Some(u64::try_from(changed_count).unwrap_or(u64::MAX));
         Ok(report)
@@ -3502,6 +3518,42 @@ fn error_report(
     )
 }
 
+/// 解析失败时只向模型补充下一步可执行的事实，不自动改写请求路径。
+/// 原始错误仍完整进入 artifact，避免为了减少回合而隐藏权限或路径边界。
+fn execution_error_facts(request: &ToolRequest, reason: &str) -> Value {
+    let mut facts = serde_json::Map::new();
+    facts.insert("error".to_owned(), Value::String(reason.to_owned()));
+    if request.tool_name == "read_file"
+        && let Some(path) = request.arguments.get("path").and_then(Value::as_str)
+    {
+        facts.insert(
+            "path".to_owned(),
+            Value::String(bounded_text(path, MAX_PATH_ARGUMENT_CHARS)),
+        );
+        facts.insert(
+            "path_resolution".to_owned(),
+            Value::String(
+                if reason.contains("not a regular file") {
+                    "directory_or_non_regular_file"
+                } else if reason.contains("canonicalization failed") {
+                    "missing_or_unresolvable"
+                } else {
+                    "validation_failed"
+                }
+                .to_owned(),
+            ),
+        );
+        facts.insert(
+            "next_action".to_owned(),
+            Value::String(
+                "run one bounded read-only shell discovery such as rg --files, then read the exact file path"
+                    .to_owned(),
+            ),
+        );
+    }
+    Value::Object(facts)
+}
+
 fn blocked_report(
     request: ToolRequest,
     policy_evaluation: PolicyEvaluation,
@@ -3806,6 +3858,19 @@ fn report(
 ) -> ToolExecutionReport {
     let (redacted_output, redaction_status) = redact_sensitive_text(&raw_output);
     let redacted_summary = redact_sensitive_text(summary).0;
+    let mut structured_facts = structured_facts;
+    if request.tool_name == "read_file"
+        && redacted_output.len() > DEFAULT_READ_EXCERPT_BYTES
+        && let Value::Object(facts) = &mut structured_facts
+    {
+        // 请求的行窗口可能完整，但 provider 可见摘录仍受字节上限约束；显式
+        // 保留这个区别，避免模型把被截断的行误判为 EOF。
+        facts.insert("model_visible_truncated".to_owned(), Value::Bool(true));
+        facts.insert(
+            "model_visible_bytes".to_owned(),
+            Value::Number((DEFAULT_READ_EXCERPT_BYTES as u64).into()),
+        );
+    }
     let structured_facts = redact_sensitive_value(structured_facts);
     let artifact = artifact_for(&request, &redacted_output, redaction_status);
     let evidence = EvidenceRecord {
@@ -3828,6 +3893,11 @@ fn report(
         // 文件副作用的完整内容已经保存在 artifact 中；再次回显会让每个
         // 后续 turn 重复支付相同 token，模型只需状态摘要和结构化 digest。
         Some(redacted_summary.clone())
+    } else if request.tool_name == "read_file" {
+        Some(bounded_text_bytes(
+            &redacted_output,
+            DEFAULT_READ_EXCERPT_BYTES,
+        ))
     } else {
         Some(excerpt(&redacted_output, DEFAULT_EXCERPT_LIMIT))
     };
@@ -3872,6 +3942,142 @@ fn mutation_tool_name(tool_name: &str) -> bool {
         BuiltinTool::from_name(tool_name),
         Some(BuiltinTool::WriteFile | BuiltinTool::EditFile | BuiltinTool::ApplyPatch)
     )
+}
+
+/// 为成功文件变更补充精简的 provider 可见说明。
+///
+/// 完整 diff 仍保存在持久变更 artifact 中。这里利用工具报告尚未释放的前后镜像
+/// 生成有界预览，让下一轮无需重复读取即可决策。缺失文件按空内容处理；不可用
+/// 或二进制镜像不生成预览，避免猜测内容。
+fn attach_model_visible_change_preview(report: &mut ToolExecutionReport, workspace_root: &Path) {
+    if report.envelope.status != ToolResultStatus::Ok
+        || !mutation_tool_name(&report.envelope.tool_name)
+        || report.changed_files.is_empty()
+    {
+        return;
+    }
+
+    let mut previews = Vec::new();
+    let mut retained_bytes = 0_usize;
+    for path in report
+        .changed_files
+        .iter()
+        .take(MAX_MODEL_CHANGE_PREVIEW_FILES)
+    {
+        let before = report
+            .before_images
+            .iter()
+            .find(|image| image.path == *path);
+        let after = report.after_images.iter().find(|image| image.path == *path);
+        let after_image = after;
+        let (Some(before), Some(after_text)) = (preview_text(before), preview_text(after_image))
+        else {
+            continue;
+        };
+
+        let mut added_lines = Vec::new();
+        let mut removed_lines = Vec::new();
+        let mut line_count = 0_usize;
+        let mut truncated = false;
+        for change in TextDiff::from_lines(before.as_str(), after_text.as_str()).iter_all_changes()
+        {
+            let (target, prefix) = match change.tag() {
+                ChangeTag::Insert => (&mut added_lines, '+'),
+                ChangeTag::Delete => (&mut removed_lines, '-'),
+                ChangeTag::Equal => continue,
+            };
+            if line_count >= MAX_MODEL_CHANGE_PREVIEW_LINES {
+                truncated = true;
+                break;
+            }
+            let value = change.value().trim_end_matches(['\r', '\n']);
+            let redacted = redact_sensitive_text(&format!("{prefix}{value}")).0;
+            let line = bounded_text_bytes(&redacted, MAX_MODEL_CHANGE_PREVIEW_LINE_BYTES);
+            let line_bytes = line.len().saturating_add(1);
+            if retained_bytes
+                .saturating_add(line_bytes)
+                .saturating_add(path.to_string_lossy().len())
+                > MAX_MODEL_CHANGE_PREVIEW_BYTES
+            {
+                truncated = true;
+                break;
+            }
+            retained_bytes = retained_bytes.saturating_add(line_bytes);
+            line_count = line_count.saturating_add(1);
+            target.push(line);
+        }
+        if added_lines.is_empty() && removed_lines.is_empty() && !truncated {
+            continue;
+        }
+
+        let mut item = serde_json::Map::new();
+        let model_path = path
+            .strip_prefix(workspace_root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned();
+        item.insert("path".to_owned(), Value::String(model_path));
+        item.insert(
+            "added_lines".to_owned(),
+            Value::Array(added_lines.into_iter().map(Value::String).collect()),
+        );
+        item.insert(
+            "removed_lines".to_owned(),
+            Value::Array(removed_lines.into_iter().map(Value::String).collect()),
+        );
+        item.insert("truncated".to_owned(), Value::Bool(truncated));
+        if let Some(checksum) = after_image
+            .and_then(|image| image.metadata.as_ref())
+            .and_then(|metadata| metadata.checksum.clone())
+        {
+            item.insert("content_digest".to_owned(), Value::String(checksum));
+        }
+        previews.push(redact_sensitive_value(Value::Object(item)));
+        if truncated || retained_bytes >= MAX_MODEL_CHANGE_PREVIEW_BYTES {
+            break;
+        }
+    }
+
+    if let Value::Object(facts) = &mut report.envelope.structured_facts {
+        if let Some(Value::String(path)) = facts.get_mut("path") {
+            let relative = Path::new(path.as_str())
+                .strip_prefix(workspace_root)
+                .unwrap_or_else(|_| Path::new(path.as_str()))
+                .to_string_lossy()
+                .into_owned();
+            *path = relative;
+        }
+        let changed_paths = report
+            .changed_files
+            .iter()
+            .map(|path| {
+                Value::String(
+                    path.strip_prefix(workspace_root)
+                        .unwrap_or(path)
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if !changed_paths.is_empty() {
+            facts.insert("changed_paths".to_owned(), Value::Array(changed_paths));
+        }
+        if !previews.is_empty() {
+            facts.insert("change_preview".to_owned(), Value::Array(previews));
+        }
+    }
+}
+
+fn preview_text(image: Option<&FileBeforeImage>) -> Option<String> {
+    let Some(image) = image else {
+        return Some(String::new());
+    };
+    match (image.content.as_deref(), image.metadata.as_ref()) {
+        (Some(bytes), _) => std::str::from_utf8(bytes).ok().map(ToOwned::to_owned),
+        // 缺失路径没有内容和元数据；存在元数据但内容不可用时，镜像应保持不透明。
+        (None, None) => Some(String::new()),
+        (None, Some(_)) => None,
+    }
 }
 
 fn io_error_kind_name(kind: std::io::ErrorKind) -> &'static str {
@@ -4289,69 +4495,91 @@ pub fn model_visible_tool_result_with_limit(
     );
     let facts = redact_sensitive_value(envelope.structured_facts.clone());
     let excerpt = envelope.model_visible_excerpt.as_deref().map(|value| {
-        bounded_text(
+        bounded_text_bytes(
             &redact_sensitive_text(value).0,
-            MAX_MODEL_TOOL_RESULT_EXCERPT_CHARS,
+            MAX_MODEL_TOOL_RESULT_EXCERPT_BYTES,
         )
     });
     let known = is_pi_plus_tool(&envelope.tool_name);
-    let (facts, summary, excerpt, keep_summary, keep_excerpt) = match envelope.tool_name.as_str() {
-        "read_file" => {
-            let content = excerpt.or_else(|| {
-                facts
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .map(|value| bounded_text(value, MAX_MODEL_TOOL_RESULT_EXCERPT_CHARS))
-            });
-            (
-                selected_model_facts(&facts, READ_FILE_MODEL_FACTS),
+    let (mut facts, summary, mut excerpt, keep_summary, keep_excerpt) =
+        match envelope.tool_name.as_str() {
+            "read_file" => {
+                let content = excerpt.or_else(|| {
+                    facts
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .map(|value| bounded_text_bytes(value, MAX_MODEL_TOOL_RESULT_EXCERPT_BYTES))
+                });
+                (
+                    selected_model_facts(&facts, READ_FILE_MODEL_FACTS),
+                    summary,
+                    content,
+                    envelope.status != ToolResultStatus::Ok,
+                    true,
+                )
+            }
+            "write_file" | "edit_file" | "apply_patch" => (
+                selected_model_facts(&facts, MUTATION_MODEL_FACTS),
                 summary,
-                content,
-                envelope.status != ToolResultStatus::Ok,
+                None,
+                // mutation 的结构化事实只说明路径和计数，短摘要仍是模型判断
+                // 写入是否成功所需的语义；完整内容和 patch 输出继续留在 durable artifact。
                 true,
-            )
-        }
-        "write_file" | "edit_file" | "apply_patch" => (
-            selected_model_facts(&facts, MUTATION_MODEL_FACTS),
-            summary,
-            None,
-            // mutation 的结构化事实只说明路径和计数，短摘要仍是模型判断
-            // 写入是否成功所需的语义；完整内容和 patch 输出继续留在 durable artifact。
-            true,
-            false,
-        ),
-        "shell" | "shell_session" => (
-            selected_model_facts(&facts, PROCESS_MODEL_FACTS),
-            summary,
-            excerpt.map(|value| bounded_text(&value, MAX_MODEL_TOOL_OUTPUT_CHARS)),
-            envelope.status != ToolResultStatus::Ok,
-            true,
-        ),
-        "web_search" => (
-            project_search_model_facts(&facts),
-            summary,
-            None,
-            envelope.status != ToolResultStatus::Ok,
-            false,
-        ),
-        "subagent" => {
-            let keep_excerpt = excerpt.as_deref().is_some_and(|value| value != summary);
-            (
-                project_subagent_model_facts(&facts),
+                false,
+            ),
+            "shell" | "shell_session" => (
+                selected_model_facts(&facts, PROCESS_MODEL_FACTS),
                 summary,
                 excerpt.map(|value| bounded_text(&value, MAX_MODEL_TOOL_OUTPUT_CHARS)),
+                envelope.status != ToolResultStatus::Ok,
                 true,
-                keep_excerpt,
-            )
-        }
-        _ => (
-            project_model_tool_value(&facts, 0),
-            summary,
-            excerpt,
-            !known,
-            !known,
-        ),
-    };
+            ),
+            "web_search" => (
+                project_search_model_facts(&facts),
+                summary,
+                None,
+                envelope.status != ToolResultStatus::Ok,
+                false,
+            ),
+            "subagent" => {
+                let keep_excerpt = excerpt.as_deref().is_some_and(|value| value != summary);
+                (
+                    project_subagent_model_facts(&facts),
+                    summary,
+                    excerpt.map(|value| bounded_text(&value, MAX_MODEL_TOOL_OUTPUT_CHARS)),
+                    true,
+                    keep_excerpt,
+                )
+            }
+            _ => (
+                project_model_tool_value(&facts, 0),
+                summary,
+                excerpt,
+                !known,
+                !known,
+            ),
+        };
+    // mutation 调用方原本将路径列表命名为 `changed_files`；这里提供稳定的
+    // provider 可见 `changed_paths`，但不复制完整持久封套。
+    if matches!(
+        envelope.tool_name.as_str(),
+        "write_file" | "edit_file" | "apply_patch"
+    ) && let Value::Object(object) = &mut facts
+        && !object.contains_key("changed_paths")
+        && let Some(paths) = object.get("changed_files").cloned()
+    {
+        object.insert("changed_paths".to_owned(), paths);
+    }
+    prune_redundant_success_facts(&envelope.tool_name, envelope.status, &mut facts);
+    // 成功文件或进程输出使用纯文本更易消费；先保留精简 JSON 事实头，再原样
+    // 追加摘录，避免把转义换行再次嵌入 JSON 字符串。
+    let inline_excerpt = (keep_excerpt
+        && matches!(
+            envelope.tool_name.as_str(),
+            "read_file" | "shell" | "shell_session"
+        ))
+    .then(|| excerpt.take())
+    .flatten();
     let mut projection = model_tool_result_base(&envelope.tool_name, envelope.status);
     if let Value::Object(object) = &mut projection {
         object.insert("structured_facts".to_owned(), facts);
@@ -4372,17 +4600,21 @@ pub fn model_visible_tool_result_with_limit(
             object.insert("model_visible_excerpt".to_owned(), Value::String(excerpt));
         }
     }
-    serialize_model_tool_projection(
+    let header = serialize_model_tool_projection(
         projection,
         &envelope.tool_name,
         envelope.status,
         &summary,
         max_bytes,
-    )
+    );
+    append_model_visible_excerpt(header, inline_excerpt.as_deref(), max_bytes)
 }
 
 const READ_FILE_MODEL_FACTS: &[&str] = &[
     "path",
+    "content_digest",
+    "path_resolution",
+    "next_action",
     "bytes",
     "lines",
     "truncated",
@@ -4401,17 +4633,22 @@ const READ_FILE_MODEL_FACTS: &[&str] = &[
     "timed_out",
     "cancelled",
     "blocked",
+    "model_visible_truncated",
+    "model_visible_bytes",
 ];
 
 const MUTATION_MODEL_FACTS: &[&str] = &[
     "path",
+    "changed_paths",
     "changed",
     "idempotent",
+    "content_digest",
     "changed_files",
     "changed_file_count",
     "workspace_change_count",
     "workspace_changes_known",
     "workspace_mutation_detected",
+    "change_preview",
     "bytes",
     "replacements",
     "edit_count",
@@ -4475,6 +4712,88 @@ fn selected_model_facts(value: &Value, keys: &[&str]) -> Value {
         }
     }
     Value::Object(projected)
+}
+
+/// 删除已由状态、配对工具参数或保留内容表达的成功态记账字段。失败态保持不变，
+/// 确保恢复流程始终能看到完整且有界的诊断。
+fn prune_redundant_success_facts(tool_name: &str, status: ToolResultStatus, facts: &mut Value) {
+    if status != ToolResultStatus::Ok {
+        return;
+    }
+    let Some(object) = facts.as_object_mut() else {
+        return;
+    };
+    object.retain(|_, value| !value.is_null());
+    match tool_name {
+        "read_file" => {
+            for key in [
+                "bytes",
+                "lines",
+                "offset",
+                "limit",
+                "total_bytes",
+                "total_lines",
+                "model_visible_bytes",
+            ] {
+                object.remove(key);
+            }
+            remove_false_fact(object, "has_more");
+            remove_false_fact(object, "truncated");
+            remove_false_fact(object, "model_visible_truncated");
+            // `has_more` 与 `eof` 互补；只保留正向事实，避免每次完整读取重复付费。
+            if object.get("eof") == Some(&Value::Bool(false)) {
+                object.remove("eof");
+            }
+        }
+        "write_file" | "edit_file" | "apply_patch" => {
+            if object.contains_key("changed_paths") {
+                object.remove("changed_files");
+            }
+            remove_true_fact(object, "changed");
+            remove_true_fact(object, "workspace_changes_known");
+            remove_true_fact(object, "workspace_mutation_detected");
+            if object.get("workspace_change_count") == object.get("changed_file_count") {
+                object.remove("workspace_change_count");
+            }
+        }
+        "shell" | "shell_session" => {
+            object.remove("output_bytes");
+            object.remove("output_lines");
+            remove_false_fact(object, "timed_out");
+            remove_false_fact(object, "cancelled");
+            remove_false_fact(object, "output_truncated");
+            remove_true_fact(object, "workspace_changes_known");
+            if object.get("workspace_change_count") == Some(&Value::from(0_u64)) {
+                object.remove("workspace_change_count");
+            }
+        }
+        _ => {}
+    }
+}
+
+fn remove_false_fact(object: &mut serde_json::Map<String, Value>, key: &str) {
+    if object.get(key) == Some(&Value::Bool(false)) {
+        object.remove(key);
+    }
+}
+
+fn remove_true_fact(object: &mut serde_json::Map<String, Value>, key: &str) {
+    if object.get(key) == Some(&Value::Bool(true)) {
+        object.remove(key);
+    }
+}
+
+fn append_model_visible_excerpt(header: String, excerpt: Option<&str>, max_bytes: usize) -> String {
+    const SEPARATOR: &str = "\n--- output ---\n";
+    let Some(excerpt) = excerpt.filter(|value| !value.is_empty()) else {
+        return header;
+    };
+    let available = max_bytes.saturating_sub(header.len().saturating_add(SEPARATOR.len()));
+    if available == 0 {
+        return header;
+    }
+    let excerpt = bounded_text_bytes(excerpt, available);
+    format!("{header}{SEPARATOR}{excerpt}")
 }
 
 fn project_search_model_facts(value: &Value) -> Value {
@@ -4700,6 +5019,7 @@ fn model_fact_mandatory(tool_name: &str) -> &'static [&'static str] {
     match tool_name {
         "read_file" => &[
             "path",
+            "content_digest",
             "continuation",
             "next_offset",
             "next_cursor",
@@ -4855,6 +5175,7 @@ fn compact_model_fact_value(key: &str, value: &Value) -> Value {
             }
             _ => compact_model_tool_value(value, 0),
         },
+        "change_preview" => compact_change_preview(value),
         // 文件变更列表可非常大；保留少量路径样本和截断标记，把预算留给
         // changed_file_count、conflict 等能决定下一步动作的标量事实。
         "changed_files" | "checkpointed_paths" | "resolved_paths" => match value {
@@ -4879,6 +5200,48 @@ fn compact_model_fact_value(key: &str, value: &Value) -> Value {
         },
         _ => compact_model_tool_value(value, 0),
     }
+}
+
+fn compact_change_preview(value: &Value) -> Value {
+    let Some(items) = value.as_array() else {
+        return compact_model_tool_value(value, 0);
+    };
+    Value::Array(
+        items
+            .iter()
+            .take(MAX_MODEL_CHANGE_PREVIEW_FILES)
+            .filter_map(|item| {
+                let object = item.as_object()?;
+                let mut compact = serde_json::Map::new();
+                for key in ["path", "content_digest", "truncated"] {
+                    if let Some(value) = object.get(key) {
+                        compact.insert(key.to_owned(), compact_model_tool_value(value, 0));
+                    }
+                }
+                for key in ["added_lines", "removed_lines"] {
+                    if let Some(Value::Array(lines)) = object.get(key) {
+                        compact.insert(
+                            key.to_owned(),
+                            Value::Array(
+                                lines
+                                    .iter()
+                                    .take(12)
+                                    .map(|line| match line {
+                                        Value::String(line) => Value::String(bounded_text_bytes(
+                                            line,
+                                            MAX_MODEL_CHANGE_PREVIEW_LINE_BYTES,
+                                        )),
+                                        other => compact_model_tool_value(other, 0),
+                                    })
+                                    .collect(),
+                            ),
+                        );
+                    }
+                }
+                Some(Value::Object(compact))
+            })
+            .collect(),
+    )
 }
 
 fn compact_priority_model_object(

@@ -1288,6 +1288,7 @@ fn is_dynamic_context_source(source: &ContextMessageSource) -> bool {
     matches!(
         contributor,
         "memory"
+            | "workspace_entries"
             | "conversation_history"
             | "project_skills"
             | "objective"
@@ -2543,6 +2544,58 @@ mod tests {
 
         // schema 与 skill 是任务级动态输入，不能切断可跨任务复用的静态前缀。
         assert_eq!(builder.stable_prefix_len(&messages, &sources), 2);
+    }
+
+    #[test]
+    fn workspace_entry_snapshot_is_dynamic_for_prefix_accounting() {
+        let builder = ContextBuilder::default();
+        let messages = vec![
+            ProviderMessage {
+                role: ProviderRole::System,
+                content: "system".to_owned(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+                metadata: Default::default(),
+            },
+            ProviderMessage {
+                role: ProviderRole::User,
+                content: "entries".to_owned(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+                metadata: Default::default(),
+            },
+            ProviderMessage {
+                role: ProviderRole::User,
+                content: "objective".to_owned(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+                metadata: Default::default(),
+            },
+        ];
+        let sources = vec![
+            ContextMessageSource {
+                contributor: "system".to_owned(),
+                source_refs: Vec::new(),
+                origin: "initial_contributor".to_owned(),
+                visibility: ModelInputVisibility::ModelVisible,
+            },
+            ContextMessageSource {
+                contributor: "workspace_entries".to_owned(),
+                source_refs: Vec::new(),
+                origin: "initial_contributor".to_owned(),
+                visibility: ModelInputVisibility::ModelVisible,
+            },
+            ContextMessageSource {
+                contributor: "objective".to_owned(),
+                source_refs: Vec::new(),
+                origin: "initial_contributor".to_owned(),
+                visibility: ModelInputVisibility::ModelVisible,
+            },
+        ];
+        assert_eq!(builder.stable_prefix_len(&messages, &sources), 1);
     }
 
     #[test]

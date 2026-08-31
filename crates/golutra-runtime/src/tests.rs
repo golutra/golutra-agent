@@ -109,6 +109,27 @@ fn active_tool_result_budget_is_large_until_context_is_tight() {
 }
 
 #[test]
+fn active_tool_result_budget_caps_repetitive_outputs_by_kind() {
+    let mut plan = ContextBuilder::default()
+        .build(TaskId::new(), TurnId::new(), Vec::new())
+        .expect("context plan");
+    plan.budget_snapshot.budget_limit = u64::MAX;
+
+    assert_eq!(
+        active_tool_result_token_budget_for_tool(&plan, 0, 0, "read_file"),
+        2_048
+    );
+    assert_eq!(
+        active_tool_result_token_budget_for_tool(&plan, 0, 0, "shell_session"),
+        1_536
+    );
+    assert_eq!(
+        active_tool_result_token_budget_for_tool(&plan, 0, 0, "apply_patch"),
+        1_024
+    );
+}
+
+#[test]
 fn provider_tool_schema_change_invalidates_observed_prefix() {
     let plan = ContextBuilder::default()
         .build(
@@ -1695,11 +1716,18 @@ impl LlmProvider for ToolResultProjectionProvider {
                 .rev()
                 .find(|message| message.role == ProviderRole::Tool)
         {
-            let projection = serde_json::from_str::<serde_json::Value>(&tool_message.content)
-                .expect("model-visible tool result is JSON");
+            let (header, output) = tool_message
+                .content
+                .split_once("\n--- output ---\n")
+                .expect("model-visible read result has a fact header and raw output");
+            let projection = serde_json::from_str::<serde_json::Value>(header)
+                .expect("model-visible tool fact header is JSON");
             self.saw_operational_facts.store(
-                projection["structured_facts"]["bytes"] == 2
-                    && projection["model_visible_excerpt"] == "ok",
+                projection["structured_facts"]["path"] == "input.txt"
+                    && projection["structured_facts"]["content_digest"]
+                        .as_str()
+                        .is_some_and(|digest| digest.starts_with("sha256:"))
+                    && output == "ok",
                 Ordering::SeqCst,
             );
             self.saw_governance_metadata.store(
@@ -5480,13 +5508,14 @@ fn parallel_read_candidate_enforces_the_active_tool_profile() {
         &TaskContract::conversational(Vec::new()),
         AgentToolProfile::Coding,
         executor.registry(),
+        "update files and run tests",
     );
     assert!(
         !coding_tools
             .iter()
             .any(|tool| tool.tool_name == "external_hidden_read")
     );
-    assert_eq!(coding_tools.len(), 8);
+    assert_eq!(coding_tools.len(), 6);
 
     let none_tools = provider_tools_for_turn(
         &executor
@@ -5498,12 +5527,13 @@ fn parallel_read_candidate_enforces_the_active_tool_profile() {
         &TaskContract::conversational(Vec::new()),
         AgentToolProfile::None,
         executor.registry(),
+        "update files",
     );
     assert!(none_tools.is_empty());
 }
 
 #[test]
-fn provider_tool_surface_stays_stable_across_objectives() {
+fn coding_tool_surface_adds_optional_capabilities_only_when_requested() {
     let workspace = tempdir().expect("workspace");
     let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
     let all_tools = executor
@@ -5513,38 +5543,177 @@ fn provider_tool_surface_stays_stable_across_objectives() {
         .cloned()
         .collect::<Vec<_>>();
     let contract = TaskContract::conversational(Vec::new());
-    let expected = vec![
+    let core = vec![
         "apply_patch",
         "edit_file",
         "read_file",
         "shell",
         "shell_session",
-        "subagent",
-        "web_search",
         "write_file",
     ];
-    for objective in [
-        "Read a file",
+    let selected = provider_tools_for_turn(
+        &all_tools,
+        &contract,
+        AgentToolProfile::Coding,
+        executor.registry(),
         "update several files",
-        "run tests in the shell",
-        "search the web and delegate a check",
+    );
+    assert_eq!(
+        selected
+            .iter()
+            .map(|tool| tool.tool_name.as_str())
+            .collect::<Vec<_>>(),
+        core
+    );
+
+    let optional = provider_tools_for_turn(
+        &all_tools,
+        &contract,
+        AgentToolProfile::Coding,
+        executor.registry(),
+        "search the web and delegate a check in the background",
+    );
+    assert!(optional.iter().any(|tool| tool.tool_name == "web_search"));
+    assert!(optional.iter().any(|tool| tool.tool_name == "subagent"));
+    assert!(
+        optional
+            .iter()
+            .any(|tool| tool.tool_name == "shell_session")
+    );
+
+    let full = provider_tools_for_turn(
+        &all_tools,
+        &contract,
+        AgentToolProfile::Full,
+        executor.registry(),
         "an ambiguous coding task",
-    ] {
-        let selected = provider_tools_for_turn(
+    );
+    assert!(full.iter().any(|tool| tool.tool_name == "web_search"));
+    assert!(full.iter().any(|tool| tool.tool_name == "subagent"));
+    assert!(full.iter().any(|tool| tool.tool_name == "shell_session"));
+}
+
+#[test]
+fn coding_tool_surface_keeps_background_capability_stable_without_inferencing_other_options() {
+    let workspace = tempdir().expect("workspace");
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+    let all_tools = executor
+        .registry()
+        .provider_contracts()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let contract = TaskContract::conversational(Vec::new());
+
+    let generic = provider_tools_for_turn(
+        &all_tools,
+        &contract,
+        AgentToolProfile::Coding,
+        executor.registry(),
+        "implement the long-running task and keep the code maintainable",
+    );
+    assert!(
+        generic.iter().any(|tool| tool.tool_name == "shell_session"),
+        "background session must remain available across coding turns"
+    );
+    assert!(!generic.iter().any(|tool| tool.tool_name == "web_search"));
+    assert!(!generic.iter().any(|tool| tool.tool_name == "subagent"));
+
+    let explicit = provider_tools_for_turn(
+        &all_tools,
+        &contract,
+        AgentToolProfile::Coding,
+        executor.registry(),
+        "run the test suite as a background process and wait for the process state",
+    );
+    assert!(
+        explicit
+            .iter()
+            .any(|tool| tool.tool_name == "shell_session")
+    );
+}
+
+#[test]
+fn stable_tool_surface_expands_once_and_does_not_shrink_with_objective_text() {
+    let workspace = tempdir().expect("workspace");
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+    let all_tools = executor
+        .registry()
+        .provider_contracts()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let contract = TaskContract::conversational(Vec::new());
+
+    let initial = provider_tools_for_turn(
+        &all_tools,
+        &contract,
+        AgentToolProfile::Coding,
+        executor.registry(),
+        "update the ledger files",
+    );
+    assert_eq!(initial.len(), 6);
+
+    let expanded_candidate = provider_tools_for_turn(
+        &all_tools,
+        &contract,
+        AgentToolProfile::Coding,
+        executor.registry(),
+        "search the web, delegate a check, and wait for a background process",
+    );
+    let expanded = stable_provider_tools_for_turn(
+        &initial,
+        expanded_candidate,
+        &contract,
+        AgentToolProfile::Coding,
+        executor.registry(),
+        true,
+    );
+    assert_eq!(expanded.len(), 8);
+    let expanded_digest = provider_tool_snapshot(&expanded).2;
+
+    let narrowed_candidate = provider_tools_for_turn(
+        &all_tools,
+        &contract,
+        AgentToolProfile::Coding,
+        executor.registry(),
+        "continue the implementation",
+    );
+    let retained = stable_provider_tools_for_turn(
+        &expanded,
+        narrowed_candidate,
+        &contract,
+        AgentToolProfile::Coding,
+        executor.registry(),
+        true,
+    );
+    assert_eq!(retained.len(), 8);
+    assert_eq!(provider_tool_snapshot(&retained).2, expanded_digest);
+
+    let forbidden = TaskContract {
+        workspace_change: WorkspaceChangeRequirement::Forbidden,
+        ..contract
+    };
+    let read_only = stable_provider_tools_for_turn(
+        &expanded,
+        provider_tools_for_turn(
             &all_tools,
-            &contract,
+            &forbidden,
             AgentToolProfile::Coding,
             executor.registry(),
-        );
-        assert_eq!(
-            selected
-                .iter()
-                .map(|tool| tool.tool_name.as_str())
-                .collect::<Vec<_>>(),
-            expected,
-            "objective must not alter the provider tool schema: {objective}"
-        );
-    }
+            "inspect the workspace",
+        ),
+        &forbidden,
+        AgentToolProfile::Coding,
+        executor.registry(),
+        true,
+    );
+    assert!(
+        read_only
+            .iter()
+            .all(|tool| { tool.side_effect_type == SideEffectType::None })
+    );
+    assert!(!read_only.iter().any(|tool| tool.tool_name == "shell"));
 }
 
 #[test]
@@ -5574,12 +5743,14 @@ fn coding_profile_keeps_builtin_coding_capabilities_and_hides_undeclared_extensi
         &TaskContract::conversational(Vec::new()),
         AgentToolProfile::Coding,
         executor.registry(),
+        "update files",
     );
     let full = provider_tools_for_turn(
         &all_tools,
         &TaskContract::conversational(Vec::new()),
         AgentToolProfile::Full,
         executor.registry(),
+        "update files",
     );
 
     assert!(!coding.iter().any(|tool| tool.tool_name == "process_list"));

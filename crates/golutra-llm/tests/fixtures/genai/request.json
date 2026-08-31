@@ -33,7 +33,7 @@
         "type": "function",
         "function": {
           "name": "read_file",
-          "description": "Read a UTF-8 workspace file by line window; use offset/limit and continuation.next_offset for more.",
+          "description": "Read workspace file contents by line window; use offset/limit and continuation.next_offset.",
           "parameters": {
             "type": "object",
             "properties": {"path": {"type": "string"}},

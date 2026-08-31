@@ -26,11 +26,12 @@ use super::{
     MAX_PROVIDER_TOOL_NAME_BYTES, ProviderCacheProfile, ProviderError, ProviderErrorMetadata,
     ProviderFinishReason, ProviderGenerationConfig, ProviderHttpHeaders, ProviderMessage,
     ProviderMessageMetadata, ProviderProbeResult, ProviderProtocol, ProviderRequest,
-    ProviderResponse, ProviderRole, ProviderStreamEvent, ProviderUsage, configured_or_first_env,
-    custom_headers_from_reader, env_mapping, first_env, generation_config_from_reader,
-    missing_env_error, protocol_capabilities, provider_credential_error, provider_http_client,
-    provider_http_error_with_headers, provider_transport_error, response_json_or_error,
-    sanitize_provider_error, validate_native_base_url,
+    ProviderResponse, ProviderRole, ProviderStreamEvent, ProviderUsage, RESERVED_AFFINITY_HEADERS,
+    configured_or_first_env, custom_headers_from_reader, env_mapping, first_env,
+    generation_config_from_reader, missing_env_error, protocol_capabilities,
+    provider_credential_error, provider_http_client, provider_http_error_with_headers,
+    provider_transport_error, response_json_or_error, sanitize_provider_error,
+    validate_native_base_url,
 };
 
 const CHATGPT_ACCOUNT_ID_HEADER: &str = "ChatGPT-Account-Id";
@@ -319,12 +320,15 @@ impl OpenAiResponsesProvider {
         headers.insert("originator", HeaderValue::from_static("golutra"));
         headers.extend(self.config.custom_headers.to_header_map());
         // affinity 是 provider 能力，不允许自定义 header 绕过 profile gate。
-        headers.remove(super::SESSION_AFFINITY_HEADER);
-        if let Some(header) = self.cache_profile.affinity_header(request.cache_policy)
-            && let Ok(value) = HeaderValue::from_str(&request.affinity_id())
-            && let Ok(name) = reqwest::header::HeaderName::from_bytes(header.as_bytes())
-        {
-            headers.insert(name, value);
+        for header in RESERVED_AFFINITY_HEADERS {
+            headers.remove(*header);
+        }
+        if let Ok(value) = HeaderValue::from_str(&request.affinity_id()) {
+            for header in self.cache_profile.affinity_headers(request.cache_policy) {
+                if let Ok(name) = reqwest::header::HeaderName::from_bytes(header.as_bytes()) {
+                    headers.insert(name, value.clone());
+                }
+            }
         }
         if let Some(account_id) = account_id
             && let Ok(value) = HeaderValue::from_str(account_id)

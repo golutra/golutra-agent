@@ -124,10 +124,11 @@ pub use verification::RuntimeVerificationService;
 const PARALLEL_READ_CONCURRENCY_LIMIT: usize = 8;
 const DEFAULT_ACTIVE_TOOL_RESULT_TOKENS: u64 = 2_048;
 const MIN_ACTIVE_TOOL_RESULT_TOKENS: u64 = 256;
+const MUTATION_ACTIVE_TOOL_RESULT_TOKENS: u64 = 1_024;
 
-/// 根据剩余 provider 输入预算确定性地选择结果上限。普通回合保持现有 8 KiB
-/// 投影；只有上下文窗口紧张时才收缩，并为下一轮 provider 请求预留少量空间，
-/// 以免过早触发压缩。
+/// 根据剩余 provider 输入预算确定性地选择结果上限。普通回合允许常见读取和
+/// 后台输出一次完整返回；只有上下文窗口紧张时才收缩，并为下一轮 provider
+/// 请求预留少量空间，以免过早触发压缩。
 fn active_tool_result_token_budget(
     plan: &ContextBuildPlan,
     message_token_total: u64,
@@ -145,6 +146,26 @@ fn active_tool_result_token_budget(
             MIN_ACTIVE_TOOL_RESULT_TOKENS,
             DEFAULT_ACTIVE_TOOL_RESULT_TOKENS,
         )
+}
+
+/// 保留下一步决策需要的事实，同时限制后续 provider 回合重复携带的输出量。
+/// mutation 已由路径、摘要和状态表达；读取与进程结果保留更大窗口，因为正文
+/// 仍可能影响下一次工具选择。
+fn active_tool_result_token_budget_for_tool(
+    plan: &ContextBuildPlan,
+    message_token_total: u64,
+    planned_tool_tokens: u64,
+    tool_name: &str,
+) -> u64 {
+    let cap = match tool_name {
+        "write_file" | "edit_file" | "apply_patch" => MUTATION_ACTIVE_TOOL_RESULT_TOKENS,
+        "shell" | "shell_session" => 1_536,
+        "web_search" => 1_024,
+        "read_file" | "subagent" => 2_048,
+        _ => DEFAULT_ACTIVE_TOOL_RESULT_TOKENS,
+    };
+    active_tool_result_token_budget(plan, message_token_total, planned_tool_tokens)
+        .clamp(MIN_ACTIVE_TOOL_RESULT_TOKENS, cap)
 }
 
 #[derive(Debug, Error)]
@@ -1210,15 +1231,28 @@ where
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         };
-        // 普通回合固定发送完整的 canonical 工具面。按用户文本猜测工具会隐藏模型
-        // 能力，并使同一会话的工具 schema 在首轮和后续轮次之间发生变化，破坏缓存
-        // 前缀；显式 None profile 仍由 provider_tools_for_turn 关闭工具。
+        // 首轮仍按目标按需暴露可选能力；resume 会从已记录的 provider
+        // surface 继承工具。后续 turn 使用单向扩展，避免同一线程因目标措辞
+        // 变化而收缩工具目录并打断 provider 前缀缓存。
         let mut provider_tools = provider_tools_for_turn(
             &all_provider_tools,
             &current_task_contract,
             current_tool_profile,
             self.tool_executor.registry(),
+            &current_objective,
         );
+        if let Some(replay_context) = replay_context.as_ref()
+            && replay_context.allow_parallel_reads
+        {
+            provider_tools = stable_provider_tools_for_turn(
+                &replay_context.tools,
+                provider_tools,
+                &current_task_contract,
+                current_tool_profile,
+                self.tool_executor.registry(),
+                !objective_disables_tools(&current_objective),
+            );
+        }
         if objective_disables_tools(&current_objective) {
             provider_tools.clear();
         }
@@ -1243,14 +1277,27 @@ where
                             current_turn_id,
                             replay_context.initial_messages.clone(),
                         );
+                        let mut replay_candidate = provider_tools_for_turn(
+                            &replay_context.tools,
+                            &current_task_contract,
+                            current_tool_profile,
+                            self.tool_executor.registry(),
+                            &current_objective,
+                        );
+                        let tools_disabled = objective_disables_tools(&current_objective);
+                        if tools_disabled {
+                            replay_candidate.clear();
+                        }
+                        let replay_provider_tools = stable_provider_tools_for_turn(
+                            &replay_context.tools,
+                            replay_candidate,
+                            &current_task_contract,
+                            current_tool_profile,
+                            self.tool_executor.registry(),
+                            !tools_disabled,
+                        );
                         let tools_match = provider_tool_digest
-                            == provider_tool_snapshot(&provider_tools_for_turn(
-                                &replay_context.tools,
-                                &current_task_contract,
-                                current_tool_profile,
-                                self.tool_executor.registry(),
-                            ))
-                            .2;
+                            == provider_tool_snapshot(&replay_provider_tools).2;
                         match replay_plan {
                             Ok(replay_plan)
                                 if stable_prefix_len > 0
@@ -1338,6 +1385,7 @@ where
                                 &current_task_contract,
                                 current_tool_profile,
                                 self.tool_executor.registry(),
+                                &current_objective,
                             );
                             if objective_disables_tools(&current_objective) {
                                 provider_tools.clear();
@@ -1351,6 +1399,7 @@ where
                         }
                         turn_state.continue_after_steer(current_turn_id);
                     } else {
+                        let previous_tool_profile = current_tool_profile;
                         if matches!(execution_origin, PendingTurnExecutionOrigin::Legacy)
                             || pending_execution.execution_mode.is_none()
                         {
@@ -1388,13 +1437,26 @@ where
                         current_task_contract
                             .validate()
                             .map_err(AgentLoopError::TaskContract)?;
-                        provider_tools = provider_tools_for_turn(
+                        let mut next_provider_tools = provider_tools_for_turn(
                             &all_provider_tools,
                             &current_task_contract,
                             current_tool_profile,
                             self.tool_executor.registry(),
+                            &current_objective,
                         );
-                        if objective_disables_tools(&current_objective) {
+                        let tools_disabled = objective_disables_tools(&current_objective);
+                        if tools_disabled {
+                            next_provider_tools.clear();
+                        }
+                        provider_tools = stable_provider_tools_for_turn(
+                            &provider_tools,
+                            next_provider_tools,
+                            &current_task_contract,
+                            current_tool_profile,
+                            self.tool_executor.registry(),
+                            previous_tool_profile == current_tool_profile && !tools_disabled,
+                        );
+                        if tools_disabled {
                             provider_tools.clear();
                         }
                         (
@@ -2624,10 +2686,11 @@ where
                             });
                             runtime_deadline_guard_emitted = true;
                         }
-                        let tool_result_token_budget = active_tool_result_token_budget(
+                        let tool_result_token_budget = active_tool_result_token_budget_for_tool(
                             &plan,
                             message_token_total,
                             planned_tool_tokens,
+                            &report.envelope.tool_name,
                         );
                         append_plan_message(
                             &mut plan,
@@ -4297,6 +4360,7 @@ fn provider_tools_for_turn(
     contract: &TaskContract,
     profile: AgentToolProfile,
     registry: &ToolRegistry,
+    objective: &str,
 ) -> Vec<ToolContract> {
     if matches!(profile, AgentToolProfile::None) {
         return Vec::new();
@@ -4306,45 +4370,139 @@ fn provider_tools_for_turn(
         .filter(|tool| {
             is_pi_plus_tool(&tool.tool_name)
                 && tool_allowed_for_profile(&tool.tool_name, profile, registry)
+                && (matches!(profile, AgentToolProfile::Full)
+                    || core_or_requested_optional_tool(&tool.tool_name, objective))
                 && (!matches!(
                     contract.workspace_change,
                     WorkspaceChangeRequirement::Forbidden
                 ) || tool.side_effect_type == SideEffectType::None)
         })
         .cloned()
-        .map(|mut tool| {
-            if matches!(profile, AgentToolProfile::Coding)
-                && let Some(capabilities) = registry.capabilities(&tool.tool_name)
-            {
-                if let Some(properties) = tool
-                    .input_schema
-                    .get_mut("properties")
-                    .and_then(Value::as_object_mut)
-                {
-                    for argument in &capabilities.coding_profile_hidden_arguments {
-                        properties.remove(argument);
-                    }
-                }
-                if let Some(required) = tool
-                    .input_schema
-                    .get_mut("required")
-                    .and_then(Value::as_array_mut)
-                {
-                    required.retain(|required| {
-                        required.as_str().is_none_or(|required| {
-                            !capabilities
-                                .coding_profile_hidden_arguments
-                                .iter()
-                                .any(|hidden| hidden == required)
-                        })
-                    });
-                }
-            }
-            tool
-        })
+        .map(|tool| project_tool_for_profile(tool, profile, registry))
         .collect::<Vec<_>>();
     tools.sort_by(|left, right| left.tool_name.cmp(&right.tool_name));
     tools
+}
+
+fn project_tool_for_profile(
+    mut tool: ToolContract,
+    profile: AgentToolProfile,
+    registry: &ToolRegistry,
+) -> ToolContract {
+    if matches!(profile, AgentToolProfile::Coding)
+        && let Some(capabilities) = registry.capabilities(&tool.tool_name)
+    {
+        if let Some(properties) = tool
+            .input_schema
+            .get_mut("properties")
+            .and_then(Value::as_object_mut)
+        {
+            for argument in &capabilities.coding_profile_hidden_arguments {
+                properties.remove(argument);
+            }
+        }
+        if let Some(required) = tool
+            .input_schema
+            .get_mut("required")
+            .and_then(Value::as_array_mut)
+        {
+            required.retain(|required| {
+                required.as_str().is_none_or(|required| {
+                    !capabilities
+                        .coding_profile_hidden_arguments
+                        .iter()
+                        .any(|hidden| hidden == required)
+                })
+            });
+        }
+    }
+    tool
+}
+
+/// 在单个执行线程内保持 provider 工具目录稳定，同时允许加入目标明确请求的
+/// 可选能力。只有当前 profile 和任务契约仍允许时才保留已有工具；profile
+/// 变化或显式禁用工具仍会形成真实缓存边界。
+fn stable_provider_tools_for_turn(
+    previous: &[ToolContract],
+    mut candidate: Vec<ToolContract>,
+    contract: &TaskContract,
+    profile: AgentToolProfile,
+    registry: &ToolRegistry,
+    preserve_previous: bool,
+) -> Vec<ToolContract> {
+    if !preserve_previous {
+        return candidate;
+    }
+
+    let mut known = previous
+        .iter()
+        .filter(|tool| {
+            candidate
+                .iter()
+                .any(|current| current.tool_name == tool.tool_name)
+        })
+        .map(|tool| tool.tool_name.clone())
+        .collect::<HashSet<_>>();
+    for tool in previous {
+        if known.contains(&tool.tool_name)
+            || !is_pi_plus_tool(&tool.tool_name)
+            || !tool_allowed_for_profile(&tool.tool_name, profile, registry)
+            || (matches!(
+                contract.workspace_change,
+                WorkspaceChangeRequirement::Forbidden
+            ) && tool.side_effect_type != SideEffectType::None)
+        {
+            continue;
+        }
+        known.insert(tool.tool_name.clone());
+        candidate.push(project_tool_for_profile(tool.clone(), profile, registry));
+    }
+    candidate.sort_by(|left, right| left.tool_name.cmp(&right.tool_name));
+    candidate
+}
+
+/// Coding profile 默认发送紧凑的核心工具面，并固定保留后台会话能力；网络
+/// 搜索和子代理仍按目标按需加入且只单向扩展。Full profile 仍完整透传全部工具。
+fn core_or_requested_optional_tool(tool_name: &str, objective: &str) -> bool {
+    match tool_name {
+        "web_search" => objective_mentions_any(
+            objective,
+            &[
+                "web search",
+                "web_search",
+                "search the web",
+                "internet",
+                "online",
+                "联网",
+                "网络搜索",
+                "网页搜索",
+                "网上",
+            ],
+        ),
+        // 后台会话是 Coding surface 的稳定核心：它让模型在任何阶段都能
+        // 观察已启动的进程，避免跨进程 resume 因目标措辞变化而改写目录。
+        "shell_session" => true,
+        "subagent" => objective_mentions_any(
+            objective,
+            &[
+                "subagent",
+                "sub-agent",
+                "child agent",
+                "delegate",
+                "delegat",
+                "parallel agent",
+                "子代理",
+                "子任务",
+                "委托",
+            ],
+        ),
+        _ => true,
+    }
+}
+
+fn objective_mentions_any(objective: &str, phrases: &[&str]) -> bool {
+    let normalized = objective.to_ascii_lowercase();
+    phrases.iter().any(|phrase| normalized.contains(phrase))
 }
 
 /// A user can explicitly request a pure response.  In that case sending the

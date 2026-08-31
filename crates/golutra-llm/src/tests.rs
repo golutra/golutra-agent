@@ -298,14 +298,17 @@ fn shell_provider_description_distinguishes_lifetime_from_initial_wait() {
     assert!(description.contains("timeout_ms"));
     assert!(description.contains("yield_time_ms"));
     assert!(description.contains("background"));
-    assert!(description.len() < 240);
+    assert!(description.contains("omit timeout_ms"));
+    assert!(description.contains("hard lifetime"));
+    assert!(description.contains("initial return"));
+    assert!(description.len() < 260);
 }
 
 #[test]
 fn provider_tool_descriptions_own_file_and_question_usage_details() {
     let write_file = provider_tool_description("write_file");
-    assert!(write_file.contains("complete UTF-8 content"));
-    assert!(write_file.contains("workspace file"));
+    assert!(write_file.contains("Create a new UTF-8 file"));
+    assert!(write_file.contains("completely rewrite"));
 
     let read_file = provider_tool_description("read_file");
     assert!(read_file.contains("offset/limit"));
@@ -315,8 +318,10 @@ fn provider_tool_descriptions_own_file_and_question_usage_details() {
     assert!(edit_file.contains("edits[]"));
 
     let apply_patch = provider_tool_description("apply_patch");
+    assert!(apply_patch.contains("Atomically"));
     assert!(apply_patch.contains("unified"));
     assert!(apply_patch.contains("Begin/Update/Add/Delete"));
+    assert!(apply_patch.contains("related multi-file"));
 
     let ask_user = provider_tool_description("ask_user");
     assert!(ask_user.contains("consequential decision"));
@@ -358,9 +363,17 @@ fn provider_tool_descriptions_own_file_and_question_usage_details() {
 fn provider_surface_descriptions_are_bounded_without_dropping_capability_terms() {
     let required_terms = [
         ("read_file", &["offset/limit", "next_offset"][..]),
-        ("write_file", &["complete UTF-8", "workspace file"][..]),
+        ("write_file", &["new UTF-8 file", "completely rewrite"][..]),
         ("edit_file", &["edits[]", "non-overlapping"][..]),
-        ("apply_patch", &["unified", "Begin/Update/Add/Delete"][..]),
+        (
+            "apply_patch",
+            &[
+                "Atomically",
+                "unified",
+                "Begin/Update/Add/Delete",
+                "multi-file",
+            ][..],
+        ),
         ("shell", &["argv", "command", "heredoc", "background"][..]),
         ("web_search", &["network"][..]),
         ("shell_session", &["authoritative_pid", "cursor"][..]),
@@ -1402,8 +1415,28 @@ fn provider_cache_profile_gates_compatible_gateway_fields() {
     );
     assert!(golutra.prompt_cache_key(golutra_core::PromptCachePolicy::Auto));
     assert_eq!(
-        golutra.affinity_header(golutra_core::PromptCachePolicy::Auto),
-        Some(SESSION_AFFINITY_HEADER)
+        golutra.affinity_headers(golutra_core::PromptCachePolicy::Auto),
+        COMPATIBLE_AFFINITY_HEADERS
+    );
+    assert!(golutra.supports_long_retention(golutra_core::PromptCachePolicy::Long));
+
+    let codex = ProviderCacheProfile::for_route(
+        ProviderProtocol::OpenAiResponses,
+        "https://chatgpt.com/backend-api/codex",
+    );
+    assert_eq!(
+        codex.affinity_headers(golutra_core::PromptCachePolicy::Auto),
+        CODEX_AFFINITY_HEADERS
+    );
+
+    let anthropic = ProviderCacheProfile::for_route(
+        ProviderProtocol::Anthropic,
+        "https://api.anthropic.com/v1",
+    );
+    assert!(
+        anthropic
+            .affinity_headers(golutra_core::PromptCachePolicy::Auto)
+            .is_empty()
     );
 
     let unknown = ProviderCacheProfile::for_route(
@@ -1413,8 +1446,8 @@ fn provider_cache_profile_gates_compatible_gateway_fields() {
     assert!(!unknown.prompt_cache_key(golutra_core::PromptCachePolicy::Long));
     assert!(
         unknown
-            .affinity_header(golutra_core::PromptCachePolicy::Long)
-            .is_none()
+            .affinity_headers(golutra_core::PromptCachePolicy::Long)
+            .is_empty()
     );
 
     let disabled = ProviderCacheProfile::for_route(
@@ -1424,8 +1457,8 @@ fn provider_cache_profile_gates_compatible_gateway_fields() {
     assert!(!disabled.prompt_cache_key(golutra_core::PromptCachePolicy::None));
     assert!(
         disabled
-            .affinity_header(golutra_core::PromptCachePolicy::None)
-            .is_none()
+            .affinity_headers(golutra_core::PromptCachePolicy::None)
+            .is_empty()
     );
 }
 

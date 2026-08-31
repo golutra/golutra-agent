@@ -258,19 +258,14 @@ fn validate_hunk(header: &str, lines: &[String]) -> Result<(), String> {
     if header != "@@" && !header.starts_with("@@ ") && !header.starts_with("@@-") {
         return Err(format!("invalid model patch hunk header: {header}"));
     }
-    let mut has_change = false;
     for line in lines {
         if is_no_newline_marker(line) {
             continue;
         }
         match line.as_bytes().first() {
-            Some(b'+') | Some(b'-') => has_change = true,
-            Some(b' ') => {}
+            Some(b'+' | b'-' | b' ') => {}
             _ => return Err(format!("invalid model patch hunk line: {line}")),
         }
-    }
-    if !has_change {
-        return Err("model patch hunk does not change any lines".to_owned());
     }
     Ok(())
 }

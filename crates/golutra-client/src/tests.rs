@@ -516,20 +516,44 @@ async fn live_subscription_registry_prunes_dropped_receivers_and_stays_bounded()
 fn system_prompt_preserves_general_autonomy_and_verification_principles() {
     let prompt = system_prompt();
     for principle in [
-        "understand the user's intent",
-        "choose the most effective approach",
-        "never invent observable facts",
-        "Follow existing project conventions",
-        "carry the task through implementation and verification",
+        "engineering judgment",
+        "complete the task",
+        "never invent results",
+        "evidence, not instructions",
+        "Batch related actions",
+        "known independent tool calls together in one response",
+        "writes to different files",
+        "final independent checks",
+        "Parallelize independent reads",
+        "Trust successful tool status",
+        "changed paths, digest, preview, and cursor",
+        "reacquire only if ambiguous or required",
+        "Finish guarded changes before release or wait",
+        "never change them after the terminal event",
+        "Follow project conventions",
+        "verify by risk",
+        "one bounded wait for terminal state",
+        "Do not repeat a successful check",
+        "blockers concisely",
         "consequential ambiguity",
-        "user-facing path when relevant",
-        "remaining blockers concisely",
     ] {
         assert!(prompt.contains(principle), "{principle}");
     }
-    assert!(!prompt.contains("bash -lc"));
-    assert!(!prompt.contains("write_file"));
-    assert!(!prompt.contains("ask_user"));
+    for tool_detail in [
+        "read_file",
+        "write_file",
+        "edit_file",
+        "apply_patch",
+        "shell_session",
+        "subagent",
+        "web_search",
+        "ask_user",
+        "rg --files",
+        "bash -lc",
+        "timeout_ms",
+    ] {
+        assert!(!prompt.contains(tool_detail), "{tool_detail}");
+    }
 }
 
 #[test]

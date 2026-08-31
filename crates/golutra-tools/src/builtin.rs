@@ -175,18 +175,18 @@ pub(super) fn contract(tool_name: &str, side_effect_type: SideEffectType) -> Too
                     "type": "string",
                     "minLength": 1,
                     "maxLength": MAX_PATH_ARGUMENT_CHARS,
-                    "description": "Workspace-relative or absolute file path."
+                    "description": "Workspace-relative or absolute path."
                 },
                 "offset": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "1-based line to start reading from; use the continuation next_offset for the next chunk."
+                    "description": "1-based start line; continue with next_offset."
                 },
                 "limit": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": MAX_READ_LINES,
-                    "description": "Maximum number of lines to return."
+                    "description": "Maximum lines to return."
                 }
             },
             "required": ["path"]
@@ -207,13 +207,13 @@ pub(super) fn contract(tool_name: &str, side_effect_type: SideEffectType) -> Too
                     "type": "string",
                     "minLength": 1,
                     "maxLength": MAX_PATH_ARGUMENT_CHARS,
-                    "description": "Workspace-relative or absolute file path."
+                    "description": "Workspace-relative or absolute path."
                 },
                 "edits": {
                     "type": "array",
                     "minItems": 1,
                     "maxItems": MAX_FILE_EDITS,
-                    "description": "Exact replacements matched against the original file; combine independent changes in one call and do not overlap them.",
+                    "description": "Unique exact replacements; combine independent edits and do not overlap.",
                     "items": {
                         "type": "object",
                         "additionalProperties": false,
@@ -222,12 +222,12 @@ pub(super) fn contract(tool_name: &str, side_effect_type: SideEffectType) -> Too
                                 "type": "string",
                                 "minLength": 1,
                                 "maxLength": MAX_FILE_CONTENT_BYTES,
-                                "description": "Unique exact text in the original file, including whitespace and newlines."
+                                "description": "Unique exact original text, including whitespace/newlines."
                             },
                             "new_text": {
                                 "type": "string",
                                 "maxLength": MAX_FILE_CONTENT_BYTES,
-                                "description": "Replacement text for this edit."
+                                "description": "Replacement text."
                             }
                         },
                         "required": ["old_text", "new_text"]
@@ -244,7 +244,7 @@ pub(super) fn contract(tool_name: &str, side_effect_type: SideEffectType) -> Too
                     "type": "string",
                     "minLength": 1,
                     "maxLength": MAX_PATCH_BYTES,
-                    "description": "A unified diff or a Begin/Update/Add/Delete patch; all file changes are applied atomically."
+                    "description": "Unified or Begin/Update/Add/Delete patch; apply atomically."
                 }
             },
             "required": ["patch"]
@@ -320,18 +320,18 @@ pub(super) fn contract(tool_name: &str, side_effect_type: SideEffectType) -> Too
                     "type": "string",
                     "minLength": 1,
                     "maxLength": MAX_DELEGATED_TASK_CHARS,
-                    "description": "A complete, self-contained task for one child agent. Include the relevant goal, constraints, and expected result; the child does not receive the parent conversation history."
+                    "description": "Self-contained child task; child has no parent history."
                 },
                 "model": {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 256,
-                    "description": "Optional model override. Omit it to inherit the parent agent's effective model."
+                    "description": "Optional model override; omit to inherit."
                 },
                 "reasoning_effort": {
                     "type": "string",
                     "enum": ["low", "medium", "high", "xhigh"],
-                    "description": "Optional reasoning effort override. Omit it to inherit the parent agent's effective setting."
+                    "description": "Optional reasoning override; omit to inherit."
                 }
             },
             "required": ["task"]
@@ -344,7 +344,7 @@ pub(super) fn contract(tool_name: &str, side_effect_type: SideEffectType) -> Too
                     "type": "string",
                     "minLength": 1,
                     "maxLength": MAX_SHELL_COMMAND_CHARS,
-                    "description": "A shell-safe command string. A Python heredoc such as python - <<'PY' is passed on stdin. Unquoted operators (|, >, &&, ;) are rejected; use bash -lc for pipelines, redirection, or compound scripts."
+                    "description": "Shell-safe command; heredoc is supported. Use bash -lc for pipes, redirects, or compound commands."
                 },
                 "argv": {
                     "type": "array",
@@ -355,29 +355,29 @@ pub(super) fn contract(tool_name: &str, side_effect_type: SideEffectType) -> Too
                         "minLength": 1,
                         "maxLength": MAX_SHELL_COMMAND_CHARS
                     },
-                    "description": "Optional direct argv form. When command is also present it must name the same command or a prefix; argv is then executed without an implicit shell."
+                    "description": "Optional direct argv; when combined, it must match command/prefix."
                 },
                 "workdir": {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": MAX_PATH_ARGUMENT_CHARS,
-                    "description": "Optional workspace-relative working directory."
+                    "description": "Optional workspace-relative directory."
                 },
                 "timeout_ms": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": MAX_BACKGROUND_PROCESS_TIMEOUT_MS,
-                    "description": "The absolute process lifetime in milliseconds; defaults to 5000 foreground or 3600000 background."
+                    "description": "Hard process lifetime in ms. For background work, omit normally; set only to intentionally terminate at this deadline."
                 },
                 "background": {
                     "type": "boolean",
-                    "description": "Start a runtime-scoped process and return process_id after yield_time_ms. It stops when the runtime ends. Use shell_session with the returned next_action to wait, write, or terminate."
+                    "description": "Start a runtime-owned process and return after yield_time_ms. Normally omit timeout_ms; use shell_session to wait, write, or terminate."
                 },
                 "yield_time_ms": {
                     "type": "integer",
                     "minimum": 0,
                     "maximum": max_poll_wait_ms(),
-                    "description": "Initial wait for output or exit; does not extend timeout_ms."
+                    "description": "Initial output/exit wait before returning process_id; it does not set or extend the process lifetime."
                 }
             },
             "required": []
@@ -432,13 +432,13 @@ fn shell_session_schema() -> Value {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "action": {"type": "string", "enum": ["wait", "write", "terminate"], "description": "wait for new output or exit; write stdin; or terminate the process group"},
-            "process_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "The process_id returned by shell(background=true)."},
-            "authoritative_pid": {"type": "integer", "minimum": 1, "maximum": u32::MAX, "description": "The OS PID returned by the process start response; it must match the managed process exactly."},
-            "cursor": {"type": "integer", "minimum": 0, "description": "Last consumed output cursor; pass the returned cursor unchanged on the next call."},
-            "input": {"type": "string", "maxLength": MAX_PROCESS_INPUT_CHARS, "description": "Input to the managed process stdin (write action only)."},
-            "wait_ms": {"type": "integer", "minimum": 0, "maximum": max_poll_wait_ms(), "description": "Bounded event-driven wait in milliseconds."},
-            "wait_for_terminal": {"type": "boolean", "description": "For wait action, wait until the process reaches one terminal state or the deadline."}
+            "action": {"type": "string", "enum": ["wait", "write", "terminate"], "description": "Wait/read, write stdin, or terminate."},
+            "process_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "ID returned by shell(background=true)."},
+            "authoritative_pid": {"type": "integer", "minimum": 1, "maximum": u32::MAX, "description": "Required OS PID; must match the start response."},
+            "cursor": {"type": "integer", "minimum": 0, "description": "Last output cursor; reuse the returned value."},
+            "input": {"type": "string", "maxLength": MAX_PROCESS_INPUT_CHARS, "description": "Stdin text for write."},
+            "wait_ms": {"type": "integer", "minimum": 0, "maximum": max_poll_wait_ms(), "description": "Bounded event-driven wait in ms."},
+            "wait_for_terminal": {"type": "boolean", "description": "Wait for one terminal state or the deadline."}
         },
         "required": ["action", "process_id", "authoritative_pid"]
     })

@@ -453,8 +453,8 @@ fn shell_contract_explains_how_to_submit_compound_commands() {
         .expect("shell command description");
 
     assert!(description.contains("bash -lc"));
-    assert!(description.contains("Unquoted operators"));
-    assert!(description.contains("Python heredoc"));
+    assert!(description.contains("pipes"));
+    assert!(description.contains("heredoc"));
     let timeout = contract.input_schema["properties"]["timeout_ms"]["description"]
         .as_str()
         .expect("timeout description");
@@ -467,14 +467,18 @@ fn shell_contract_explains_how_to_submit_compound_commands() {
     let workdir = contract.input_schema["properties"]["workdir"]["description"]
         .as_str()
         .expect("workdir description");
-    assert!(timeout.contains("absolute process lifetime"));
-    assert!(background.contains("runtime-scoped"));
-    assert!(background.contains("stops when the runtime ends"));
+    assert!(timeout.contains("process lifetime"));
+    assert!(timeout.contains("omit normally"));
+    assert!(timeout.contains("intentionally terminate"));
+    assert!(background.contains("runtime-owned"));
+    assert!(background.contains("timeout_ms"));
+    assert!(background.contains("Normally omit"));
+    assert!(background.contains("yield_time_ms"));
     assert!(background.contains("shell_session"));
     let yield_time_lower = yield_time.to_ascii_lowercase();
-    assert!(yield_time_lower.contains("initial wait"));
-    assert!(yield_time_lower.contains("does not extend"));
-    assert!(workdir.contains("working directory"));
+    assert!(yield_time_lower.contains("initial"));
+    assert!(yield_time_lower.contains("does not set or extend"));
+    assert!(workdir.contains("directory"));
     assert!(workdir.contains("workspace-relative"));
 }
 
@@ -811,7 +815,7 @@ fn model_visible_tool_result_excludes_governance_and_artifact_metadata() {
     };
 
     let serialized = model_visible_tool_result(&envelope);
-    let projection: Value = serde_json::from_str(&serialized).expect("projection JSON");
+    let (projection, output) = parse_model_visible_tool_result(&serialized);
 
     assert_eq!(projection["status"], "ok");
     assert_eq!(projection["structured_facts"]["exit_code"], 0);
@@ -821,6 +825,7 @@ fn model_visible_tool_result_excludes_governance_and_artifact_metadata() {
     assert!(projection.get("verification_hint").is_none());
     assert!(!serialized.contains("high-risk-internal-value"));
     assert!(!serialized.contains("internal governance hint"));
+    assert_eq!(output.as_deref(), Some("ok 1 test"));
     assert!(serialized.len() <= MAX_MODEL_TOOL_RESULT_BYTES);
 }
 
@@ -845,27 +850,41 @@ fn projection_envelope(
     }
 }
 
+fn parse_model_visible_tool_result(serialized: &str) -> (Value, Option<String>) {
+    const SEPARATOR: &str = "\n--- output ---\n";
+    let (header, output) = serialized
+        .split_once(SEPARATOR)
+        .map_or((serialized, None), |(header, output)| {
+            (header, Some(output.to_owned()))
+        });
+    (
+        serde_json::from_str(header).expect("model-visible fact header is JSON"),
+        output,
+    )
+}
+
 #[test]
 fn model_visible_tool_result_projects_provider_tools_without_duplicate_payloads() {
-    let read: Value = serde_json::from_str(&model_visible_tool_result(&projection_envelope(
-        "read_file",
-        ToolResultStatus::Ok,
-        "file read",
-        json!({
-            "path": "src/lib.rs",
-            "bytes": 12,
-            "continuation": {"next_cursor": 12},
-            "content": "duplicate-content",
-            "content_digest": "drop-me",
-        }),
-        Some("file content"),
-    )))
-    .expect("read projection");
+    let (read, read_output) =
+        parse_model_visible_tool_result(&model_visible_tool_result(&projection_envelope(
+            "read_file",
+            ToolResultStatus::Ok,
+            "file read",
+            json!({
+                "path": "src/lib.rs",
+                "bytes": 12,
+                "continuation": {"next_cursor": 12},
+                "content": "duplicate-content",
+                "content_digest": "drop-me",
+            }),
+            Some("file content"),
+        )));
     assert_eq!(read["structured_facts"]["path"], "src/lib.rs");
     assert_eq!(read["structured_facts"]["continuation"]["next_cursor"], 12);
     assert!(read["structured_facts"].get("content").is_none());
-    assert!(read["structured_facts"].get("content_digest").is_none());
-    assert_eq!(read["model_visible_excerpt"], "file content");
+    assert_eq!(read["structured_facts"]["content_digest"], "drop-me");
+    assert_eq!(read_output.as_deref(), Some("file content"));
+    assert!(read.get("model_visible_excerpt").is_none());
     assert!(read.get("summary").is_none());
 
     let mutation: Value = serde_json::from_str(&model_visible_tool_result(&projection_envelope(
@@ -875,6 +894,7 @@ fn model_visible_tool_result_projects_provider_tools_without_duplicate_payloads(
         json!({
             "changed_files": ["src/lib.rs"],
             "changed_file_count": 1,
+            "content_digest": "sha256:final-content",
             "patch_digest": "drop-me",
             "summary": "drop-me-too",
         }),
@@ -882,28 +902,37 @@ fn model_visible_tool_result_projects_provider_tools_without_duplicate_payloads(
     )))
     .expect("mutation projection");
     assert_eq!(mutation["structured_facts"]["changed_file_count"], 1);
+    assert_eq!(
+        mutation["structured_facts"]["changed_paths"],
+        json!(["src/lib.rs"])
+    );
+    assert_eq!(
+        mutation["structured_facts"]["content_digest"],
+        "sha256:final-content"
+    );
     assert!(mutation["structured_facts"].get("patch_digest").is_none());
     assert_eq!(mutation["summary"], "patch applied");
     assert!(mutation.get("model_visible_excerpt").is_none());
 
-    let shell: Value = serde_json::from_str(&model_visible_tool_result(&projection_envelope(
-        "shell_session",
-        ToolResultStatus::Ok,
-        "background process is running",
-        json!({
-            "process_id": "proc-1",
-            "process_state": "running",
-            "output_cursor": 42,
-            "exit_code": null,
-            "command": "drop-command",
-        }),
-        Some("new output"),
-    )))
-    .expect("shell projection");
+    let (shell, shell_output) =
+        parse_model_visible_tool_result(&model_visible_tool_result(&projection_envelope(
+            "shell_session",
+            ToolResultStatus::Ok,
+            "background process is running",
+            json!({
+                "process_id": "proc-1",
+                "process_state": "running",
+                "output_cursor": 42,
+                "exit_code": null,
+                "command": "drop-command",
+            }),
+            Some("new output"),
+        )));
     assert_eq!(shell["structured_facts"]["process_id"], "proc-1");
     assert_eq!(shell["structured_facts"]["output_cursor"], 42);
     assert!(shell["structured_facts"].get("command").is_none());
-    assert_eq!(shell["model_visible_excerpt"], "new output");
+    assert_eq!(shell_output.as_deref(), Some("new output"));
+    assert!(shell.get("model_visible_excerpt").is_none());
     assert!(shell.get("summary").is_none());
 
     let search: Value = serde_json::from_str(&model_visible_tool_result(&projection_envelope(
@@ -956,6 +985,44 @@ fn model_visible_tool_result_projects_provider_tools_without_duplicate_payloads(
 }
 
 #[test]
+fn model_visible_read_output_keeps_raw_newlines_and_beats_json_embedding() {
+    let output = (0..64)
+        .map(|index| format!("line {index}: value\n"))
+        .collect::<String>();
+    let envelope = projection_envelope(
+        "read_file",
+        ToolResultStatus::Ok,
+        "file read",
+        json!({
+            "path": "src/lib.rs",
+            "content_digest": "sha256:content",
+            "eof": true,
+        }),
+        Some(&output),
+    );
+
+    let serialized = model_visible_tool_result(&envelope);
+    let (header, projected_output) = parse_model_visible_tool_result(&serialized);
+    let legacy = json!({
+        "tool_name": "read_file",
+        "status": "ok",
+        "structured_facts": {
+            "path": "src/lib.rs",
+            "content_digest": "sha256:content",
+            "eof": true,
+        },
+        "model_visible_excerpt": output,
+    })
+    .to_string();
+
+    assert_eq!(header["status"], "ok");
+    assert_eq!(projected_output.as_deref(), Some(output.as_str()));
+    assert!(serialized.contains("line 0: value\nline 1: value"));
+    assert!(!serialized.contains("line 0: value\\nline 1: value"));
+    assert!(serialized.len() < legacy.len());
+}
+
+#[test]
 fn model_visible_tool_result_keeps_failure_facts_and_size_bound() {
     let envelope = projection_envelope(
         "shell",
@@ -970,7 +1037,7 @@ fn model_visible_tool_result_keeps_failure_facts_and_size_bound() {
         Some(&"partial output ".repeat(8 * 1024)),
     );
     let serialized = model_visible_tool_result(&envelope);
-    let projection: Value = serde_json::from_str(&serialized).expect("failure projection");
+    let (projection, output) = parse_model_visible_tool_result(&serialized);
     assert_eq!(projection["status"], "timeout");
     assert_eq!(projection["structured_facts"]["timed_out"], true);
     assert_eq!(
@@ -981,7 +1048,26 @@ fn model_visible_tool_result_keeps_failure_facts_and_size_bound() {
         projection["summary"],
         "process timed out while waiting for output"
     );
+    assert!(
+        output
+            .as_deref()
+            .is_some_and(|output| output.starts_with("partial output"))
+    );
     assert!(serialized.len() <= MAX_MODEL_TOOL_RESULT_BYTES);
+}
+
+#[test]
+fn read_file_path_failure_exposes_bounded_discovery_action() {
+    let request = request("read_file", json!({"path": "model.py"}));
+    let facts = execution_error_facts(
+        &request,
+        "path policy rejected tool execution: path canonicalization failed",
+    );
+    assert_eq!(facts["path"], "model.py");
+    assert_eq!(facts["path_resolution"], "missing_or_unresolvable");
+    assert!(facts["next_action"].as_str().is_some_and(|action| {
+        action.contains("bounded read-only shell discovery") && action.contains("rg --files")
+    }));
 }
 
 #[test]
@@ -1024,7 +1110,7 @@ fn model_visible_tool_result_respects_a_tighter_budget_without_losing_status() {
     );
 
     let serialized = model_visible_tool_result_with_limit(&envelope, 1_024);
-    let projection: Value = serde_json::from_str(&serialized).expect("bounded projection");
+    let (projection, _) = parse_model_visible_tool_result(&serialized);
     assert!(serialized.len() <= 1_024);
     assert_eq!(projection["status"], "ok");
     assert_eq!(projection["structured_facts"]["path"], "src/lib.rs");
@@ -1050,7 +1136,7 @@ fn token_budget_projection_keeps_read_continuation_facts() {
     );
 
     let serialized = model_visible_tool_result_with_token_budget(&envelope, 256);
-    let projection: Value = serde_json::from_str(&serialized).expect("token-bounded projection");
+    let (projection, _) = parse_model_visible_tool_result(&serialized);
     assert!(serialized.len() <= 1_024);
     assert_eq!(projection["status"], "ok");
     assert_eq!(projection["structured_facts"]["path"], "src/lib.rs");
@@ -1089,7 +1175,7 @@ fn tight_projection_prioritizes_error_and_continuation_over_large_optional_facts
 
     let serialized = model_visible_tool_result_with_limit(&envelope, 1_024);
     assert!(serialized.len() <= 1_024);
-    let projection: Value = serde_json::from_str(&serialized).expect("valid projection");
+    let (projection, _) = parse_model_visible_tool_result(&serialized);
     assert_eq!(projection["tool_name"], "read_file");
     assert_eq!(projection["status"], "error");
     assert_eq!(
@@ -1185,6 +1271,26 @@ async fn read_file_returns_envelope_artifact_and_evidence() {
     assert_eq!(report.envelope.status, ToolResultStatus::Ok);
     assert_eq!(report.artifacts.len(), 1);
     assert_eq!(report.evidence.len(), 1);
+    assert!(
+        report.envelope.structured_facts["content_digest"]
+            .as_str()
+            .is_some_and(|digest| digest.starts_with("sha256:"))
+    );
+    assert_eq!(report.envelope.structured_facts["path"], "README.md");
+    assert_eq!(
+        report.envelope.structured_facts["resolved_path"],
+        fs::canonicalize(workspace.path().join("README.md"))
+            .expect("canonical read path")
+            .to_string_lossy()
+            .as_ref()
+    );
+    let (projected, output) =
+        parse_model_visible_tool_result(&model_visible_tool_result(&report.envelope));
+    assert_eq!(
+        projected["structured_facts"]["content_digest"],
+        report.envelope.structured_facts["content_digest"]
+    );
+    assert_eq!(output.as_deref(), Some("hello"));
 }
 
 #[tokio::test]
@@ -1231,6 +1337,69 @@ async fn read_file_returns_bounded_windows_with_a_stable_continuation_offset() {
     assert_eq!(second.envelope.structured_facts["truncated"], false);
     assert_eq!(second.envelope.structured_facts["eof"], true);
     assert!(artifact_text(&second).contains("line-205"));
+}
+
+#[tokio::test]
+async fn read_file_provider_excerpt_keeps_complete_common_files() {
+    let workspace = tempdir().expect("workspace");
+    let content = (1..=240)
+        .map(|line| format!("line-{line}: {}\n", "x".repeat(24)))
+        .collect::<String>();
+    assert!(content.len() > 4 * 1024);
+    fs::write(workspace.path().join("common.py"), &content).expect("fixture");
+    let executor = executor(workspace.path());
+
+    let report = executor
+        .execute(
+            request("read_file", json!({"path": "common.py", "limit": 400})),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("read file");
+
+    assert_eq!(report.envelope.structured_facts["has_more"], false);
+    assert_eq!(
+        report.envelope.structured_facts["model_visible_truncated"],
+        Value::Null
+    );
+    assert_eq!(
+        report.envelope.model_visible_excerpt.as_deref(),
+        Some(content.as_str())
+    );
+}
+
+#[tokio::test]
+async fn read_file_provider_excerpt_marks_a_byte_clipped_window() {
+    let workspace = tempdir().expect("workspace");
+    let content = "x".repeat(20 * 1024);
+    fs::write(workspace.path().join("long-line.txt"), &content).expect("fixture");
+    let executor = executor(workspace.path());
+
+    let report = executor
+        .execute(
+            request("read_file", json!({"path": "long-line.txt"})),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("read file");
+
+    assert_eq!(report.envelope.structured_facts["has_more"], false);
+    assert_eq!(
+        report.envelope.structured_facts["model_visible_truncated"],
+        true
+    );
+    assert_eq!(
+        report.envelope.structured_facts["model_visible_bytes"],
+        16 * 1024
+    );
+    assert_eq!(
+        report
+            .envelope
+            .model_visible_excerpt
+            .as_ref()
+            .map(String::len),
+        Some(16 * 1024)
+    );
 }
 
 #[test]
@@ -1300,6 +1469,23 @@ async fn write_file_records_changed_file() {
             .model_visible_excerpt
             .as_deref()
             .is_some_and(|excerpt| excerpt.contains("new"))
+    );
+    assert_eq!(
+        report.envelope.structured_facts["change_preview"][0]["added_lines"],
+        json!(["+new"])
+    );
+    assert_eq!(
+        report.envelope.structured_facts["change_preview"][0]["path"],
+        "src.txt"
+    );
+    assert_eq!(
+        report.envelope.structured_facts["changed_paths"],
+        json!(["src.txt"])
+    );
+    assert!(
+        report.envelope.structured_facts["change_preview"][0]["removed_lines"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
     );
 }
 
@@ -1424,6 +1610,9 @@ async fn edit_file_applies_multiple_non_overlapping_replacements_atomically() {
         fs::read_to_string(path).expect("edited file"),
         "ALPHA beta GAMMA"
     );
+    let preview = &report.envelope.structured_facts["change_preview"][0];
+    assert_eq!(preview["added_lines"], json!(["+ALPHA beta GAMMA"]));
+    assert_eq!(preview["removed_lines"], json!(["-alpha beta gamma"]));
 }
 
 #[tokio::test]
@@ -1629,6 +1818,15 @@ async fn apply_patch_changes_multiple_files_through_one_atomic_tool_call() {
     assert_eq!(report.changed_files.len(), 2);
     assert_eq!(report.before_images.len(), 2);
     assert_eq!(report.after_images.len(), 2);
+    assert_eq!(
+        report.envelope.structured_facts["change_preview"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+    let preview_text = report.envelope.structured_facts["change_preview"].to_string();
+    assert!(preview_text.contains("+new"));
+    assert!(preview_text.contains("+second"));
 }
 
 #[tokio::test]
@@ -1877,7 +2075,7 @@ fn model_patch_render_rejects_lexical_move_self_collision() {
 }
 
 #[test]
-fn model_patch_rejects_hunks_without_a_change() {
+fn model_patch_rejects_a_file_without_a_change_after_rendering() {
     let patch = concat!(
         "*** Begin Patch\n",
         "*** Update File: a.txt\n",
@@ -1885,8 +2083,34 @@ fn model_patch_rejects_hunks_without_a_change() {
         " context only\n",
         "*** End Patch\n",
     );
-    let error = super::model_patch::parse(patch).expect_err("context-only hunk must be rejected");
+    let parsed = super::model_patch::parse(patch).expect("context-only anchor must parse");
+    let originals =
+        std::collections::BTreeMap::from([(PathBuf::from("a.txt"), b"context only\n".to_vec())]);
+    let error = super::model_patch::render(&parsed, &originals)
+        .expect_err("a file-level no-op must still be rejected");
     assert!(error.contains("does not change"));
+}
+
+#[test]
+fn model_patch_allows_a_noop_anchor_before_a_real_change() {
+    let patch = concat!(
+        "*** Begin Patch\n",
+        "*** Update File: a.txt\n",
+        "@@\n",
+        "-first\n",
+        "+first\n",
+        "@@\n",
+        "-old\n",
+        "+new\n",
+        "*** End Patch\n",
+    );
+    let parsed = super::model_patch::parse(patch).expect("redundant anchor must parse");
+    let originals =
+        std::collections::BTreeMap::from([(PathBuf::from("a.txt"), b"first\nold\n".to_vec())]);
+    let rendered =
+        super::model_patch::render(&parsed, &originals).expect("the real change must still render");
+    assert!(rendered.contains("-old"));
+    assert!(rendered.contains("+new"));
 }
 
 #[tokio::test]

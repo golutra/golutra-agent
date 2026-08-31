@@ -574,18 +574,24 @@ pub(crate) fn genai_chat_options(
     }
     options = match (cache_profile.mode, cache_policy) {
         (_, PromptCachePolicy::None) | (ProviderCacheMode::Disabled, _) => options,
-        (ProviderCacheMode::Responses, PromptCachePolicy::Long) => {
+        (ProviderCacheMode::Responses, PromptCachePolicy::Long)
+            if cache_profile.supports_long_retention(cache_policy) =>
+        {
             options.with_cache_control(CacheControl::Ephemeral24h)
         }
         (ProviderCacheMode::Responses, PromptCachePolicy::Auto | PromptCachePolicy::Short) => {
             options
         }
-        (ProviderCacheMode::Anthropic, PromptCachePolicy::Long) => {
+        (ProviderCacheMode::Responses, PromptCachePolicy::Long) => options,
+        (ProviderCacheMode::Anthropic, PromptCachePolicy::Long)
+            if cache_profile.supports_long_retention(cache_policy) =>
+        {
             options.with_cache_control(CacheControl::Ephemeral1h)
         }
         (ProviderCacheMode::Anthropic, PromptCachePolicy::Auto | PromptCachePolicy::Short) => {
             options.with_cache_control(CacheControl::Ephemeral5m)
         }
+        (ProviderCacheMode::Anthropic, PromptCachePolicy::Long) => options,
     };
     if streaming {
         options = options

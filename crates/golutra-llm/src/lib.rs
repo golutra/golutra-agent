@@ -76,6 +76,24 @@ const MAX_PROVIDER_TOOL_NAME_BYTES: usize = 128;
 const MAX_PROVIDER_CUSTOM_HEADERS: usize = 32;
 const MAX_PROVIDER_HEADER_VALUE_BYTES: usize = 8 * 1024;
 const SESSION_AFFINITY_HEADER: &str = "session-id";
+const SESSION_ID_HEADER: &str = "session_id";
+const CLIENT_REQUEST_ID_HEADER: &str = "x-client-request-id";
+const SESSION_AFFINITY_ALIAS_HEADER: &str = "x-session-affinity";
+const EMPTY_AFFINITY_HEADERS: &[&str] = &[];
+const CODEX_AFFINITY_HEADERS: &[&str] = &[SESSION_AFFINITY_HEADER, CLIENT_REQUEST_ID_HEADER];
+const RESPONSES_AFFINITY_HEADERS: &[&str] = &[SESSION_ID_HEADER, CLIENT_REQUEST_ID_HEADER];
+const COMPATIBLE_AFFINITY_HEADERS: &[&str] = &[
+    SESSION_ID_HEADER,
+    CLIENT_REQUEST_ID_HEADER,
+    SESSION_AFFINITY_ALIAS_HEADER,
+];
+const ANTHROPIC_AFFINITY_HEADERS: &[&str] = &[SESSION_AFFINITY_ALIAS_HEADER];
+const RESERVED_AFFINITY_HEADERS: &[&str] = &[
+    SESSION_AFFINITY_HEADER,
+    SESSION_ID_HEADER,
+    CLIENT_REQUEST_ID_HEADER,
+    SESSION_AFFINITY_ALIAS_HEADER,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProviderCacheMode {
@@ -87,7 +105,8 @@ pub(crate) enum ProviderCacheMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProviderCacheProfile {
     pub(crate) mode: ProviderCacheMode,
-    affinity_header: Option<&'static str>,
+    affinity_headers: &'static [&'static str],
+    supports_long_retention: bool,
 }
 
 impl ProviderCacheProfile {
@@ -95,28 +114,65 @@ impl ProviderCacheProfile {
         let host = reqwest::Url::parse(base_url)
             .ok()
             .and_then(|url| url.host_str().map(str::to_ascii_lowercase));
-        let mode = match protocol {
-            ProviderProtocol::Anthropic => ProviderCacheMode::Anthropic,
-            ProviderProtocol::OpenAiResponses => ProviderCacheMode::Responses,
+        let (mode, affinity_headers, supports_long_retention) = match protocol {
+            ProviderProtocol::Anthropic => (
+                ProviderCacheMode::Anthropic,
+                // 原生 Anthropic 不需要路由亲和；明确支持该约定的兼容网关才启用。
+                if host.as_deref().is_some_and(|host| {
+                    matches!(
+                        host,
+                        "api.fireworks.ai" | "gateway.ai.cloudflare.com" | "api.groq.com"
+                    )
+                }) {
+                    ANTHROPIC_AFFINITY_HEADERS
+                } else {
+                    EMPTY_AFFINITY_HEADERS
+                },
+                true,
+            ),
+            ProviderProtocol::OpenAiResponses => (
+                ProviderCacheMode::Responses,
+                // 通用 Responses 网关使用下划线 session_id，ChatGPT 后端使用
+                // 连字符 session-id；两类路由都需要客户端请求标识才能让上游
+                // 把连续回合分配到同一缓存副本。
+                if host
+                    .as_deref()
+                    .is_some_and(|host| matches!(host, "chatgpt.com" | "chat.openai.com"))
+                {
+                    CODEX_AFFINITY_HEADERS
+                } else if host
+                    .as_deref()
+                    .is_some_and(|host| matches!(host, "api.openai.com" | "api.golutra.cn"))
+                {
+                    RESPONSES_AFFINITY_HEADERS
+                } else {
+                    // 原生 Responses 协议已经声明了缓存能力；未知的原生
+                    // endpoint 保持既有连字符 header，避免静默改变认证路由。
+                    CODEX_AFFINITY_HEADERS
+                },
+                true,
+            ),
             ProviderProtocol::OpenAiCompatible
                 if host
                     .as_deref()
                     .is_some_and(|host| matches!(host, "api.openai.com" | "api.golutra.cn")) =>
             {
-                ProviderCacheMode::Responses
+                (
+                    ProviderCacheMode::Responses,
+                    if host.as_deref() == Some("api.golutra.cn") {
+                        COMPATIBLE_AFFINITY_HEADERS
+                    } else {
+                        RESPONSES_AFFINITY_HEADERS
+                    },
+                    true,
+                )
             }
-            _ => ProviderCacheMode::Disabled,
-        };
-        let affinity_header = match (protocol, host.as_deref()) {
-            (ProviderProtocol::OpenAiResponses, _) => Some(SESSION_AFFINITY_HEADER),
-            (ProviderProtocol::OpenAiCompatible, Some("api.golutra.cn")) => {
-                Some(SESSION_AFFINITY_HEADER)
-            }
-            _ => None,
+            _ => (ProviderCacheMode::Disabled, EMPTY_AFFINITY_HEADERS, false),
         };
         Self {
             mode,
-            affinity_header,
+            affinity_headers,
+            supports_long_retention,
         }
     }
 
@@ -124,10 +180,16 @@ impl ProviderCacheProfile {
         policy != PromptCachePolicy::None && self.mode == ProviderCacheMode::Responses
     }
 
-    fn affinity_header(self, policy: PromptCachePolicy) -> Option<&'static str> {
-        (policy != PromptCachePolicy::None)
-            .then_some(self.affinity_header)
-            .flatten()
+    fn affinity_headers(self, policy: PromptCachePolicy) -> &'static [&'static str] {
+        if policy == PromptCachePolicy::None {
+            EMPTY_AFFINITY_HEADERS
+        } else {
+            self.affinity_headers
+        }
+    }
+
+    fn supports_long_retention(self, policy: PromptCachePolicy) -> bool {
+        policy == PromptCachePolicy::Long && self.supports_long_retention
     }
 }
 
@@ -1011,7 +1073,7 @@ impl OpenAiCompatibleProvider {
         builder: reqwest::RequestBuilder,
         token: &str,
         initiator: &str,
-        affinity: Option<(&str, &str)>,
+        affinity_headers: &HeaderMap,
     ) -> reqwest::RequestBuilder {
         let builder = builder.bearer_auth(token);
         let builder = if self.provider_id == "github-copilot" {
@@ -1028,13 +1090,25 @@ impl OpenAiCompatibleProvider {
         };
         let mut custom_headers = self.custom_headers.to_header_map();
         // affinity 是 provider 能力，不允许自定义 header 绕过 profile gate。
-        custom_headers.remove(SESSION_AFFINITY_HEADER);
-        let builder = builder.headers(custom_headers);
-        if let Some((header, value)) = affinity {
-            builder.header(header, value)
-        } else {
-            builder
+        for header in RESERVED_AFFINITY_HEADERS {
+            custom_headers.remove(*header);
         }
+        builder
+            .headers(custom_headers)
+            .headers(affinity_headers.clone())
+    }
+
+    fn affinity_headers(&self, request: &ProviderRequest) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        let affinity_id = request.affinity_id();
+        if let Ok(value) = reqwest::header::HeaderValue::from_str(&affinity_id) {
+            for header in self.cache_profile.affinity_headers(request.cache_policy) {
+                if let Ok(name) = reqwest::header::HeaderName::from_bytes(header.as_bytes()) {
+                    headers.insert(name, value.clone());
+                }
+            }
+        }
+        headers
     }
 
     #[must_use]
@@ -1169,7 +1243,12 @@ impl OpenAiCompatibleProvider {
             .await
             .map_err(provider_credential_error)?;
         let response = self
-            .authenticated_request(self.client.get(url), token.expose_secret(), "user", None)
+            .authenticated_request(
+                self.client.get(url),
+                token.expose_secret(),
+                "user",
+                &HeaderMap::new(),
+            )
             .send()
             .await
             .map_err(provider_transport_error)?;
@@ -1181,17 +1260,22 @@ impl OpenAiCompatibleProvider {
             .credential(true)
             .await
             .map_err(provider_credential_error)?;
-        self.authenticated_request(self.client.get(url), token.expose_secret(), "user", None)
-            .send()
-            .await
-            .map_err(provider_transport_error)
+        self.authenticated_request(
+            self.client.get(url),
+            token.expose_secret(),
+            "user",
+            &HeaderMap::new(),
+        )
+        .send()
+        .await
+        .map_err(provider_transport_error)
     }
 
     async fn post_with_auth_retry(
         &self,
         url: &str,
         body: &Value,
-        affinity: Option<(&str, &str)>,
+        affinity_headers: &HeaderMap,
     ) -> Result<reqwest::Response, ProviderError> {
         let token = self
             .credential
@@ -1204,7 +1288,7 @@ impl OpenAiCompatibleProvider {
                 self.client.post(url).json(body),
                 token.expose_secret(),
                 initiator,
-                affinity,
+                affinity_headers,
             )
             .send()
             .await
@@ -1221,7 +1305,7 @@ impl OpenAiCompatibleProvider {
             self.client.post(url).json(body),
             token.expose_secret(),
             initiator,
-            affinity,
+            affinity_headers,
         )
         .send()
         .await
@@ -1286,13 +1370,10 @@ impl LlmProvider for OpenAiCompatibleProvider {
             self.cache_profile,
             cache_identity.as_ref(),
         );
-        let affinity_id = request.affinity_id();
-        let affinity = self
-            .cache_profile
-            .affinity_header(request.cache_policy)
-            .map(|header| (header, affinity_id.as_str()));
-
-        let response = self.post_with_auth_retry(&url, &body, affinity).await?;
+        let affinity_headers = self.affinity_headers(&request);
+        let response = self
+            .post_with_auth_retry(&url, &body, &affinity_headers)
+            .await?;
         let status = response.status();
         let headers = response.headers().clone();
         let value = response_json_or_error(response).await?;
@@ -1325,12 +1406,10 @@ impl LlmProvider for OpenAiCompatibleProvider {
             self.cache_profile,
             cache_identity.as_ref(),
         );
-        let affinity_id = request.affinity_id();
-        let affinity = self
-            .cache_profile
-            .affinity_header(request.cache_policy)
-            .map(|header| (header, affinity_id.as_str()));
-        let response = self.post_with_auth_retry(&url, &body, affinity).await?;
+        let affinity_headers = self.affinity_headers(&request);
+        let response = self
+            .post_with_auth_retry(&url, &body, &affinity_headers)
+            .await?;
         let status = response.status();
         if status.as_u16() == 429 {
             let headers = response.headers().clone();
@@ -1988,14 +2067,16 @@ fn is_sensitive_header(name: &str) -> bool {
 pub fn provider_tool_description(tool_name: &str) -> &'static str {
     match tool_name {
         "read_file" => {
-            "Read a UTF-8 workspace file by line window; use offset/limit and continuation.next_offset for more."
+            "Read workspace file contents by line window; use offset/limit and continuation.next_offset."
         }
-        "write_file" => "Write complete UTF-8 content to a workspace file.",
+        "write_file" => {
+            "Create a new UTF-8 file or completely rewrite one existing file; returns status and digest."
+        }
         "edit_file" => {
-            "Atomically apply exact, unique, non-overlapping edits[] to one UTF-8 workspace file."
+            "Precisely change one existing UTF-8 file with exact, unique, non-overlapping edits[]; batch disjoint edits in one call; returns status, digest, and preview."
         }
         "apply_patch" => {
-            "Atomically apply a unified or Begin/Update/Add/Delete patch to workspace files."
+            "Atomically apply one unified or Begin/Update/Add/Delete patch for related multi-file, add, delete, or move changes; returns status, digest, and preview."
         }
         "web_search" => {
             "Search the web when network access is enabled; return source-backed results."
@@ -2017,7 +2098,7 @@ pub fn provider_tool_description(tool_name: &str) -> &'static str {
             "Delegate one complete, self-contained task to an isolated child agent and wait for its result. The child does not receive this conversation. Omit model and reasoning_effort to inherit the current agent settings; specify either field only when the task benefits from an explicit override."
         }
         "shell" => {
-            "Run a workspace command via argv or command. argv executes directly; use bash -lc for heredoc, pipes, redirection, or compound scripts. background owns the process until timeout_ms; yield_time_ms is the initial wait."
+            "Run workspace commands via argv or command; use bash -lc for heredoc, pipes, or compound commands. For background, omit timeout_ms unless setting a hard lifetime; yield_time_ms controls the initial return, then use shell_session."
         }
         "process_list" => {
             "List managed background processes owned by the current session, including redacted commands, states, exit codes, and output statistics. This does not consume process output or advance a cursor."
@@ -2482,7 +2563,7 @@ fn openai_completion_body_with_identity(
         && let Some(identity) = cache_identity
     {
         body["prompt_cache_key"] = Value::String(identity.key.clone());
-        if request.cache_policy == golutra_core::PromptCachePolicy::Long {
+        if cache_profile.supports_long_retention(request.cache_policy) {
             body["prompt_cache_retention"] = Value::String("24h".to_owned());
         }
     }
