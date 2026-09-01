@@ -7969,3 +7969,26 @@ fn resume_picker_offset_keeps_selected_item_visible() {
     assert_eq!(resume_picker_offset(19, 5, 20), 15);
     assert_eq!(resume_picker_offset(3, 5, 4), 0);
 }
+
+#[test]
+fn only_visible_provider_deltas_use_the_immediate_frame_lane() {
+    assert!(provider_stream_event_is_meaningful(&json!({
+        "delta": {"kind": "text_delta", "text": "首字"}
+    })));
+    assert!(provider_stream_event_is_meaningful(&json!({
+        "delta": {
+            "kind": "tool_call_delta",
+            "index": 0,
+            "tool_name": "read_file"
+        }
+    })));
+    assert!(!provider_stream_event_is_meaningful(&json!({
+        "delta": {"kind": "text_delta", "text": ""}
+    })));
+    assert!(!provider_stream_event_is_meaningful(&json!({
+        "delta": {"kind": "reasoning_delta", "redacted": true}
+    })));
+    assert!(!provider_stream_event_is_meaningful(&json!({
+        "delta": {"kind": "tool_call_delta", "index": 0}
+    })));
+}

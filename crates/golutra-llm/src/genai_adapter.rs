@@ -20,10 +20,11 @@ use secrecy::ExposeSecret;
 use serde_json::{Value, json};
 
 use super::{
-    LlmProvider, ProviderCacheMode, ProviderCacheProfile, ProviderError, ProviderErrorMetadata,
-    ProviderFinishReason, ProviderGenerationConfig, ProviderHttpHeaders, ProviderMessage,
-    ProviderProbeResult, ProviderProtocol, ProviderRequest, ProviderResponse, ProviderRole,
-    ProviderStreamEvent, ProviderToolCall, ProviderUsage, UsageSource, configured_or_first_env,
+    GOLUTRA_PROVIDER_AUTH_PROVIDER, GOLUTRA_PROVIDER_ROUTE_ID, LlmProvider, ProviderCacheMode,
+    ProviderCacheProfile, ProviderError, ProviderErrorMetadata, ProviderFinishReason,
+    ProviderGenerationConfig, ProviderHttpHeaders, ProviderMessage, ProviderProbeResult,
+    ProviderProtocol, ProviderRequest, ProviderResponse, ProviderRole, ProviderStreamEvent,
+    ProviderToolCall, ProviderUsage, UsageSource, configured_or_first_env,
     custom_headers_from_reader, env_mapping, first_env, generation_config_from_reader,
     missing_env_error, protocol_capabilities, provider_tool_schema_for_contract,
     request_id_from_headers, retry_after_from_headers, sanitize_provider_error,
@@ -34,6 +35,7 @@ use super::{
 pub struct GenaiProviderConfig {
     pub api_key: String,
     pub api_key_env: String,
+    pub provider_id: String,
     pub base_url: String,
     pub model_id: String,
     pub protocol: ProviderProtocol,
@@ -54,6 +56,7 @@ impl fmt::Debug for GenaiProviderConfig {
         formatter
             .debug_struct("GenaiProviderConfig")
             .field("api_key_env", &self.api_key_env)
+            .field("provider_id", &self.provider_id)
             .field("base_url", &self.base_url)
             .field("model_id", &self.model_id)
             .field("protocol", &self.protocol)
@@ -100,7 +103,8 @@ impl GenaiProviderAdapter {
             // way of an active long-running stream.
             .with_timeout(std::time::Duration::from_secs(3_600))
             .with_default_headers(config.custom_headers.to_header_map());
-        let cache_profile = ProviderCacheProfile::for_route(config.protocol, &config.base_url);
+        let cache_profile =
+            ProviderCacheProfile::for_provider(config.protocol, &config.provider_id);
         Self {
             config,
             credential,
@@ -150,9 +154,14 @@ impl GenaiProviderAdapter {
                 message: "provider max_tokens exceeds the supported u32 range".to_owned(),
             });
         }
+        let provider_id = reader(GOLUTRA_PROVIDER_AUTH_PROVIDER)
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| reader(GOLUTRA_PROVIDER_ROUTE_ID).filter(|value| !value.trim().is_empty()))
+            .unwrap_or_else(|| protocol.id().to_owned());
         Ok(GenaiProviderConfig {
             api_key,
             api_key_env,
+            provider_id,
             base_url,
             model_id,
             protocol,
@@ -170,7 +179,7 @@ impl GenaiProviderAdapter {
                 turn_id: TurnId::new(),
                 session_id: None,
                 cache_scope: None,
-                provider_id: self.config.protocol.id().to_owned(),
+                provider_id: self.config.provider_id.clone(),
                 model_id: self.config.model_id.clone(),
                 messages: vec![ProviderMessage {
                     role: ProviderRole::User,
@@ -187,7 +196,7 @@ impl GenaiProviderAdapter {
         )
         .await?;
         Ok(ProviderProbeResult {
-            provider_id: self.config.protocol.id().to_owned(),
+            provider_id: self.config.provider_id.clone(),
             protocol: native_protocol(self.config.protocol).to_owned(),
             base_url: self.config.base_url.clone(),
             model_id: self.config.model_id.clone(),
@@ -377,7 +386,7 @@ impl super::LlmProvider for GenaiProviderAdapter {
 
     fn contract(&self) -> ProviderContract {
         ProviderContract {
-            provider_id: self.config.protocol.id().to_owned(),
+            provider_id: self.config.provider_id.clone(),
             model_id: self.config.model_id.clone(),
             native_protocol: native_protocol(self.config.protocol).to_owned(),
             stream_event_mapping: "genai_normalized_stream".to_owned(),
@@ -1083,6 +1092,7 @@ mod tests {
         let provider = GenaiProviderAdapter::from_config(GenaiProviderConfig {
             api_key: "secret-provider-key".to_owned(),
             api_key_env: crate::GOLUTRA_PROVIDER_API_KEY.to_owned(),
+            provider_id: "anthropic".to_owned(),
             base_url: "https://api.anthropic.com/v1".to_owned(),
             model_id: "claude-test".to_owned(),
             protocol: ProviderProtocol::Anthropic,
@@ -1109,10 +1119,7 @@ mod tests {
             false,
             None,
             PromptCachePolicy::Auto,
-            ProviderCacheProfile::for_route(
-                ProviderProtocol::Genai,
-                "https://compatible.example/v1",
-            ),
+            ProviderCacheProfile::for_provider(ProviderProtocol::Genai, "genai"),
         )
         .expect("generation options");
 
@@ -1139,10 +1146,7 @@ mod tests {
             false,
             Some(&identity),
             PromptCachePolicy::Short,
-            ProviderCacheProfile::for_route(
-                ProviderProtocol::OpenAiResponses,
-                "https://api.golutra.cn/v1",
-            ),
+            ProviderCacheProfile::for_provider(ProviderProtocol::OpenAiResponses, "golutra"),
         )
         .expect("short cache options");
         assert_eq!(short.prompt_cache_key.as_deref(), Some("sha256:test-key"));
@@ -1154,10 +1158,7 @@ mod tests {
             false,
             Some(&identity),
             PromptCachePolicy::Long,
-            ProviderCacheProfile::for_route(
-                ProviderProtocol::OpenAiResponses,
-                "https://api.golutra.cn/v1",
-            ),
+            ProviderCacheProfile::for_provider(ProviderProtocol::OpenAiResponses, "golutra"),
         )
         .expect("long cache options");
         assert_eq!(long.cache_control, Some(CacheControl::Ephemeral24h));
@@ -1168,10 +1169,7 @@ mod tests {
             false,
             None,
             PromptCachePolicy::None,
-            ProviderCacheProfile::for_route(
-                ProviderProtocol::OpenAiResponses,
-                "https://api.golutra.cn/v1",
-            ),
+            ProviderCacheProfile::for_provider(ProviderProtocol::OpenAiResponses, "golutra"),
         )
         .expect("none cache options");
         assert!(none.prompt_cache_key.is_none());
@@ -1183,10 +1181,7 @@ mod tests {
             false,
             Some(&identity),
             PromptCachePolicy::Auto,
-            ProviderCacheProfile::for_route(
-                ProviderProtocol::Anthropic,
-                "https://api.anthropic.com/v1",
-            ),
+            ProviderCacheProfile::for_provider(ProviderProtocol::Anthropic, "anthropic"),
         )
         .expect("Anthropic cache options");
         assert!(anthropic.prompt_cache_key.is_none());
@@ -1198,10 +1193,7 @@ mod tests {
             false,
             Some(&identity),
             PromptCachePolicy::Long,
-            ProviderCacheProfile::for_route(
-                ProviderProtocol::Anthropic,
-                "https://api.anthropic.com/v1",
-            ),
+            ProviderCacheProfile::for_provider(ProviderProtocol::Anthropic, "anthropic"),
         )
         .expect("Anthropic long cache options");
         assert!(anthropic_long.prompt_cache_key.is_none());
@@ -1216,10 +1208,7 @@ mod tests {
             false,
             Some(&identity),
             PromptCachePolicy::Long,
-            ProviderCacheProfile::for_route(
-                ProviderProtocol::Genai,
-                "https://compatible.example/v1",
-            ),
+            ProviderCacheProfile::for_provider(ProviderProtocol::Genai, "custom"),
         )
         .expect("unknown gateway options");
         assert!(unknown.prompt_cache_key.is_none());

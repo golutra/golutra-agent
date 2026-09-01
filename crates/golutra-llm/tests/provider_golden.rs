@@ -981,6 +981,7 @@ async fn live_provider_smoke_is_opt_in_and_never_reads_normal_user_credentials()
         let provider = GenaiProviderAdapter::from_config(GenaiProviderConfig {
             api_key,
             api_key_env: format!("{prefix}_API_KEY"),
+            provider_id: protocol.id().to_owned(),
             base_url,
             model_id: model.clone(),
             protocol,
@@ -1058,6 +1059,7 @@ fn provider(case: ProtocolCase, base_url: String) -> GenaiProviderAdapter {
     GenaiProviderAdapter::from_config(GenaiProviderConfig {
         api_key: TEST_API_KEY.to_owned(),
         api_key_env: "GOLDEN_TEST_API_KEY".to_owned(),
+        provider_id: case.protocol.id().to_owned(),
         base_url,
         model_id: case.model.to_owned(),
         protocol: case.protocol,

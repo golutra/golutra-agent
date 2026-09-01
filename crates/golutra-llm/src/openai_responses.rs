@@ -21,17 +21,17 @@ use super::genai_adapter::{
     restore_wire_tool_name,
 };
 use super::{
-    GOLUTRA_PROVIDER_AUTH_PROVIDER, LlmProvider, MAX_PROVIDER_MESSAGE_BYTES,
-    MAX_PROVIDER_RESPONSE_BYTES, MAX_PROVIDER_TOOL_ARGUMENT_BYTES, MAX_PROVIDER_TOOL_CALL_ID_BYTES,
-    MAX_PROVIDER_TOOL_NAME_BYTES, ProviderCacheProfile, ProviderError, ProviderErrorMetadata,
-    ProviderFinishReason, ProviderGenerationConfig, ProviderHttpHeaders, ProviderMessage,
-    ProviderMessageMetadata, ProviderProbeResult, ProviderProtocol, ProviderRequest,
-    ProviderResponse, ProviderRole, ProviderStreamEvent, ProviderUsage, RESERVED_AFFINITY_HEADERS,
-    configured_or_first_env, custom_headers_from_reader, env_mapping, first_env,
-    generation_config_from_reader, missing_env_error, protocol_capabilities,
-    provider_credential_error, provider_http_client, provider_http_error_with_headers,
-    provider_transport_error, response_json_or_error, sanitize_provider_error,
-    validate_native_base_url,
+    GOLUTRA_PROVIDER_AUTH_PROVIDER, GOLUTRA_PROVIDER_ROUTE_ID, LlmProvider,
+    MAX_PROVIDER_MESSAGE_BYTES, MAX_PROVIDER_RESPONSE_BYTES, MAX_PROVIDER_TOOL_ARGUMENT_BYTES,
+    MAX_PROVIDER_TOOL_CALL_ID_BYTES, MAX_PROVIDER_TOOL_NAME_BYTES, ProviderCacheProfile,
+    ProviderError, ProviderErrorMetadata, ProviderFinishReason, ProviderGenerationConfig,
+    ProviderHttpHeaders, ProviderMessage, ProviderMessageMetadata, ProviderProbeResult,
+    ProviderProtocol, ProviderRequest, ProviderResponse, ProviderRole, ProviderStreamEvent,
+    ProviderUsage, RESERVED_AFFINITY_HEADERS, configured_or_first_env, custom_headers_from_reader,
+    env_mapping, first_env, generation_config_from_reader, missing_env_error,
+    protocol_capabilities, provider_credential_error, provider_http_client,
+    provider_http_error_with_headers, provider_transport_error, response_json_or_error,
+    sanitize_provider_error, validate_native_base_url,
 };
 
 const CHATGPT_ACCOUNT_ID_HEADER: &str = "ChatGPT-Account-Id";
@@ -110,8 +110,10 @@ impl OpenAiResponsesProvider {
         let web_config = WebConfig::default()
             .with_connect_timeout(std::time::Duration::from_secs(10))
             .with_timeout(std::time::Duration::from_secs(3_600));
-        let cache_profile =
-            ProviderCacheProfile::for_route(ProviderProtocol::OpenAiResponses, &config.base_url);
+        let cache_profile = ProviderCacheProfile::for_provider(
+            ProviderProtocol::OpenAiResponses,
+            &config.provider_id,
+        );
         Self {
             credential,
             config,
@@ -149,6 +151,7 @@ impl OpenAiResponsesProvider {
         }
         let provider_id = reader(GOLUTRA_PROVIDER_AUTH_PROVIDER)
             .filter(|value| !value.trim().is_empty())
+            .or_else(|| reader(GOLUTRA_PROVIDER_ROUTE_ID).filter(|value| !value.trim().is_empty()))
             .unwrap_or_else(|| DEFAULT_PROVIDER_ID.to_owned());
         Ok(OpenAiResponsesProviderConfig {
             api_key,
@@ -242,7 +245,10 @@ impl OpenAiResponsesProvider {
         }
         headers.extend(self.config.custom_headers.to_header_map());
         // affinity 是 provider 能力，不允许自定义 header 绕过 profile gate。
-        headers.remove(super::SESSION_AFFINITY_HEADER);
+        // 探测请求也必须遵守同一边界，避免把会话路由状态带到能力发现端点。
+        for header in RESERVED_AFFINITY_HEADERS {
+            headers.remove(*header);
+        }
         builder.bearer_auth(access_token).headers(headers)
     }
 
@@ -789,5 +795,62 @@ mod tests {
         assert_eq!(normalized.cache_read_tokens, Some(64));
         assert_eq!(normalized.cache_write_tokens, Some(0));
         assert_eq!(normalized.input_tokens_non_cached, Some(36));
+    }
+
+    #[test]
+    fn responses_probe_strips_all_reserved_affinity_headers() {
+        let custom_headers = ProviderHttpHeaders::from_resolved(
+            [
+                ("session-id".to_owned(), "custom-session".to_owned()),
+                (
+                    "session_id".to_owned(),
+                    "custom-session-underscore".to_owned(),
+                ),
+                (
+                    "x-client-request-id".to_owned(),
+                    "custom-request".to_owned(),
+                ),
+                (
+                    "x-session-affinity".to_owned(),
+                    "custom-affinity".to_owned(),
+                ),
+                ("x-safe-header".to_owned(), "preserved".to_owned()),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .expect("valid probe headers");
+        let provider = OpenAiResponsesProvider::from_config(OpenAiResponsesProviderConfig {
+            api_key: "probe-key".to_owned(),
+            api_key_env: "PROBE_KEY".to_owned(),
+            provider_id: "openai-chatgpt".to_owned(),
+            base_url: "https://api.openai.com/v1".to_owned(),
+            model_id: "gpt-test".to_owned(),
+            generation_config: ProviderGenerationConfig::default(),
+            custom_headers,
+        });
+
+        let request = provider
+            .authenticated_probe_request(
+                provider.probe_client.get("https://example.test/models"),
+                "access-token",
+                None,
+            )
+            .build()
+            .expect("probe request builds");
+
+        for header in RESERVED_AFFINITY_HEADERS {
+            assert!(
+                !request.headers().contains_key(*header),
+                "probe carried reserved affinity header {header}"
+            );
+        }
+        assert_eq!(
+            request
+                .headers()
+                .get("x-safe-header")
+                .and_then(|value| value.to_str().ok()),
+            Some("preserved")
+        );
     }
 }

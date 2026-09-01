@@ -49,6 +49,8 @@ const GOLUTRA_PROVIDER_MODEL: &str = "GOLUTRA_PROVIDER_MODEL";
 const GOLUTRA_PROVIDER_BASE_URL: &str = "GOLUTRA_PROVIDER_BASE_URL";
 const GOLUTRA_PROVIDER_GENERATION_CONFIG: &str = "GOLUTRA_PROVIDER_GENERATION_CONFIG";
 pub const GOLUTRA_PROVIDER_CUSTOM_HEADERS: &str = "GOLUTRA_PROVIDER_CUSTOM_HEADERS";
+/// 非敏感的 provider route identity；只用于声明能力选择，不包含凭据或用户内容。
+pub const GOLUTRA_PROVIDER_ROUTE_ID: &str = "GOLUTRA_PROVIDER_ROUTE_ID";
 const GOLUTRA_PROVIDER_AUTH_PROVIDER: &str = "GOLUTRA_PROVIDER_AUTH_PROVIDER";
 const OPENAI_API_KEY: &str = "OPENAI_API_KEY";
 const OPENAI_MODEL: &str = "OPENAI_MODEL";
@@ -110,63 +112,50 @@ pub(crate) struct ProviderCacheProfile {
 }
 
 impl ProviderCacheProfile {
-    fn for_route(protocol: ProviderProtocol, base_url: &str) -> Self {
-        let host = reqwest::Url::parse(base_url)
-            .ok()
-            .and_then(|url| url.host_str().map(str::to_ascii_lowercase));
+    /// 按声明的 provider identity 解析缓存能力。
+    ///
+    /// 这里不读取 URL/hostname：路由迁移到其他网关时不会静默改变 wire
+    /// 合约。显式 Responses/Anthropic 协议声明缓存支持；兼容协议必须使用
+    /// 已知 identity，未知网关保持保守关闭。
+    fn for_provider(protocol: ProviderProtocol, provider_id: &str) -> Self {
+        let provider_id = canonical_provider_identity(provider_id);
         let (mode, affinity_headers, supports_long_retention) = match protocol {
             ProviderProtocol::Anthropic => (
                 ProviderCacheMode::Anthropic,
-                // 原生 Anthropic 不需要路由亲和；明确支持该约定的兼容网关才启用。
-                if host.as_deref().is_some_and(|host| {
-                    matches!(
-                        host,
-                        "api.fireworks.ai" | "gateway.ai.cloudflare.com" | "api.groq.com"
-                    )
-                }) {
-                    ANTHROPIC_AFFINITY_HEADERS
-                } else {
-                    EMPTY_AFFINITY_HEADERS
+                match provider_id.as_str() {
+                    "fireworks"
+                    | "fireworks-ai"
+                    | "cloudflare"
+                    | "cloudflare-workers-ai"
+                    | "groq" => ANTHROPIC_AFFINITY_HEADERS,
+                    _ => EMPTY_AFFINITY_HEADERS,
                 },
                 true,
             ),
             ProviderProtocol::OpenAiResponses => (
                 ProviderCacheMode::Responses,
-                // 通用 Responses 网关使用下划线 session_id，ChatGPT 后端使用
-                // 连字符 session-id；两类路由都需要客户端请求标识才能让上游
-                // 把连续回合分配到同一缓存副本。
-                if host
-                    .as_deref()
-                    .is_some_and(|host| matches!(host, "chatgpt.com" | "chat.openai.com"))
-                {
-                    CODEX_AFFINITY_HEADERS
-                } else if host
-                    .as_deref()
-                    .is_some_and(|host| matches!(host, "api.openai.com" | "api.golutra.cn"))
-                {
-                    RESPONSES_AFFINITY_HEADERS
-                } else {
-                    // 原生 Responses 协议已经声明了缓存能力；未知的原生
-                    // endpoint 保持既有连字符 header，避免静默改变认证路由。
-                    CODEX_AFFINITY_HEADERS
+                match provider_id.as_str() {
+                    "openai-chatgpt" | "chatgpt" | "chatgpt-codex" | "codex" => {
+                        CODEX_AFFINITY_HEADERS
+                    }
+                    // 显式 Responses 路由即使使用自定义显示名也具备缓存能力，
+                    // 统一使用通用 header 对。
+                    _ => RESPONSES_AFFINITY_HEADERS,
                 },
                 true,
             ),
-            ProviderProtocol::OpenAiCompatible
-                if host
-                    .as_deref()
-                    .is_some_and(|host| matches!(host, "api.openai.com" | "api.golutra.cn")) =>
-            {
-                (
+            ProviderProtocol::OpenAiCompatible => match provider_id.as_str() {
+                "openai" | "golutra" | "golutra-agent" => (
                     ProviderCacheMode::Responses,
-                    if host.as_deref() == Some("api.golutra.cn") {
+                    if provider_id == "golutra" || provider_id == "golutra-agent" {
                         COMPATIBLE_AFFINITY_HEADERS
                     } else {
                         RESPONSES_AFFINITY_HEADERS
                     },
                     true,
-                )
-            }
+                ),
+                _ => (ProviderCacheMode::Disabled, EMPTY_AFFINITY_HEADERS, false),
+            },
             _ => (ProviderCacheMode::Disabled, EMPTY_AFFINITY_HEADERS, false),
         };
         Self {
@@ -191,6 +180,13 @@ impl ProviderCacheProfile {
     fn supports_long_retention(self, policy: PromptCachePolicy) -> bool {
         policy == PromptCachePolicy::Long && self.supports_long_retention
     }
+}
+
+fn canonical_provider_identity(provider_id: &str) -> String {
+    provider_id
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['_', ' '], "-")
 }
 
 /// 脱敏后的 provider 诊断元数据，只用于重试决策和可行动的观测。
@@ -1126,9 +1122,9 @@ impl OpenAiCompatibleProvider {
             )),
             api_key_env: GOLUTRA_PROVIDER_API_KEY.to_owned(),
             provider_id: "openai-compatible".to_owned(),
-            cache_profile: ProviderCacheProfile::for_route(
+            cache_profile: ProviderCacheProfile::for_provider(
                 ProviderProtocol::OpenAiCompatible,
-                &base_url,
+                "openai-compatible",
             ),
             base_url,
             model_id: model_id.into(),
@@ -1153,11 +1149,13 @@ impl OpenAiCompatibleProvider {
         credential: Arc<dyn CredentialProvider>,
     ) -> Self {
         let base_url = normalize_openai_base_url(&config.base_url);
+        let cache_profile =
+            ProviderCacheProfile::for_provider(config.protocol, &config.provider_id);
         Self {
             credential,
             api_key_env: config.api_key_env,
             provider_id: config.provider_id,
-            cache_profile: ProviderCacheProfile::for_route(config.protocol, &base_url),
+            cache_profile,
             base_url,
             model_id: config.model_id,
             generation_config: config.generation_config,
@@ -1208,6 +1206,9 @@ impl OpenAiCompatibleProvider {
             api_key_env,
             provider_id: reader(GOLUTRA_PROVIDER_AUTH_PROVIDER)
                 .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    reader(GOLUTRA_PROVIDER_ROUTE_ID).filter(|value| !value.trim().is_empty())
+                })
                 .unwrap_or_else(|| "openai-compatible".to_owned()),
             base_url,
             model_id,
@@ -2515,17 +2516,14 @@ fn openai_completion_body(
     prompt_cache_supported: bool,
 ) -> Value {
     let cache_identity = request.cache_identity();
-    let cache_profile = if prompt_cache_supported {
-        ProviderCacheProfile::for_route(
-            ProviderProtocol::OpenAiCompatible,
-            "https://api.golutra.cn/v1",
-        )
-    } else {
-        ProviderCacheProfile::for_route(
-            ProviderProtocol::OpenAiCompatible,
-            "https://compatible.example/v1",
-        )
-    };
+    let cache_profile = ProviderCacheProfile::for_provider(
+        ProviderProtocol::OpenAiCompatible,
+        if prompt_cache_supported {
+            "golutra"
+        } else {
+            "custom"
+        },
+    );
     openai_completion_body_with_identity(
         request,
         model_id,

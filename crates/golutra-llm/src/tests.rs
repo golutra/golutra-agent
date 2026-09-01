@@ -1409,10 +1409,7 @@ fn openai_tools_request_parallel_tool_calls_explicitly() {
 
 #[test]
 fn provider_cache_profile_gates_compatible_gateway_fields() {
-    let golutra = ProviderCacheProfile::for_route(
-        ProviderProtocol::OpenAiCompatible,
-        "https://api.golutra.cn/v1",
-    );
+    let golutra = ProviderCacheProfile::for_provider(ProviderProtocol::OpenAiCompatible, "golutra");
     assert!(golutra.prompt_cache_key(golutra_core::PromptCachePolicy::Auto));
     assert_eq!(
         golutra.affinity_headers(golutra_core::PromptCachePolicy::Auto),
@@ -1420,29 +1417,22 @@ fn provider_cache_profile_gates_compatible_gateway_fields() {
     );
     assert!(golutra.supports_long_retention(golutra_core::PromptCachePolicy::Long));
 
-    let codex = ProviderCacheProfile::for_route(
-        ProviderProtocol::OpenAiResponses,
-        "https://chatgpt.com/backend-api/codex",
-    );
+    let codex =
+        ProviderCacheProfile::for_provider(ProviderProtocol::OpenAiResponses, "openai-chatgpt");
     assert_eq!(
         codex.affinity_headers(golutra_core::PromptCachePolicy::Auto),
         CODEX_AFFINITY_HEADERS
     );
 
-    let anthropic = ProviderCacheProfile::for_route(
-        ProviderProtocol::Anthropic,
-        "https://api.anthropic.com/v1",
-    );
+    let anthropic = ProviderCacheProfile::for_provider(ProviderProtocol::Anthropic, "anthropic");
     assert!(
         anthropic
             .affinity_headers(golutra_core::PromptCachePolicy::Auto)
             .is_empty()
     );
 
-    let unknown = ProviderCacheProfile::for_route(
-        ProviderProtocol::OpenAiCompatible,
-        "https://compatible.example/v1",
-    );
+    let unknown =
+        ProviderCacheProfile::for_provider(ProviderProtocol::OpenAiCompatible, "unknown-gateway");
     assert!(!unknown.prompt_cache_key(golutra_core::PromptCachePolicy::Long));
     assert!(
         unknown
@@ -1450,15 +1440,33 @@ fn provider_cache_profile_gates_compatible_gateway_fields() {
             .is_empty()
     );
 
-    let disabled = ProviderCacheProfile::for_route(
-        ProviderProtocol::OpenAiResponses,
-        "https://responses.example/v1",
-    );
-    assert!(!disabled.prompt_cache_key(golutra_core::PromptCachePolicy::None));
+    let responses_custom =
+        ProviderCacheProfile::for_provider(ProviderProtocol::OpenAiResponses, "custom-responses");
+    assert!(responses_custom.prompt_cache_key(golutra_core::PromptCachePolicy::Long));
     assert!(
-        disabled
+        responses_custom
             .affinity_headers(golutra_core::PromptCachePolicy::None)
             .is_empty()
+    );
+}
+
+#[test]
+fn provider_route_identity_is_read_without_using_endpoint_host() {
+    let config = OpenAiResponsesProvider::config_from_env_reader(|key| match key {
+        "GOLUTRA_PROVIDER_API_KEY" => Some("test-key".to_owned()),
+        "GOLUTRA_PROVIDER_MODEL" => Some("gpt-test".to_owned()),
+        "GOLUTRA_PROVIDER_BASE_URL" => Some("https://arbitrary-gateway.example/v1".to_owned()),
+        GOLUTRA_PROVIDER_ROUTE_ID => Some("golutra".to_owned()),
+        _ => None,
+    })
+    .expect("Responses config");
+    assert_eq!(config.provider_id, "golutra");
+
+    let profile =
+        ProviderCacheProfile::for_provider(ProviderProtocol::OpenAiResponses, &config.provider_id);
+    assert_eq!(
+        profile.affinity_headers(golutra_core::PromptCachePolicy::Auto),
+        RESPONSES_AFFINITY_HEADERS
     );
 }
 

@@ -380,6 +380,7 @@ struct TuiApp {
     activity_snapshot: Option<ActivitySnapshot>,
     activity_snapshot_captured: bool,
     render_metrics: FrameScheduler,
+    immediate_frame_pending: bool,
     change_projection: ChangeProjection,
     transcript: TranscriptState,
     developer_observations_expanded: bool,
@@ -671,6 +672,7 @@ impl TuiApp {
             activity_snapshot: None,
             activity_snapshot_captured: false,
             render_metrics: FrameScheduler::default(),
+            immediate_frame_pending: false,
             change_projection: ChangeProjection::default(),
             transcript: TranscriptState::default(),
             developer_observations_expanded: true,
@@ -1081,6 +1083,10 @@ impl TuiApp {
         }
     }
 
+    fn take_immediate_frame_request(&mut self) -> bool {
+        std::mem::take(&mut self.immediate_frame_pending)
+    }
+
     fn apply_runtime_event(&mut self, event: RuntimeEvent) {
         if self
             .cursor
@@ -1094,12 +1100,7 @@ impl TuiApp {
         if let Some(turn_id) = event.turn_id {
             match event_type {
                 RuntimeEventType::ProviderStreamed
-                    if event
-                        .payload
-                        .get("delta")
-                        .and_then(|delta| delta.get("kind"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some("text_delta") =>
+                    if provider_stream_event_is_meaningful(&event.payload) =>
                 {
                     let stream_sequence_no = event
                         .payload
@@ -1112,11 +1113,13 @@ impl TuiApp {
                                 .and_then(|delta| delta.get("stream_sequence_no"))
                                 .and_then(serde_json::Value::as_u64)
                         });
-                    self.render_metrics.record_delta_at(
+                    if self.render_metrics.record_delta_at(
                         turn_id,
                         stream_sequence_no,
                         Instant::now(),
-                    );
+                    ) {
+                        self.immediate_frame_pending = true;
+                    }
                 }
                 RuntimeEventType::ProviderCompleted => {
                     self.render_metrics.record_stream_completed(turn_id);
@@ -3968,7 +3971,12 @@ async fn run_app(
             }
             runtime_event = controller.recv() => {
                 controller.apply_received(&mut app, runtime_event).await?;
-                app.render_metrics.request_at(Instant::now());
+                let now = Instant::now();
+                if app.take_immediate_frame_request() {
+                    app.render_metrics.request_immediate_at(now);
+                } else {
+                    app.render_metrics.request_at(now);
+                }
             }
             terminal_event = terminal_events.next() => {
                 let event = terminal_event
@@ -4008,11 +4016,14 @@ async fn run_app(
             }
             _ = maintenance.tick() => {
                 let changed = controller.sync_interactive(&mut app).await?;
-                if changed
+                let now = Instant::now();
+                if app.take_immediate_frame_request() {
+                    app.render_metrics.request_immediate_at(now);
+                } else if changed
                     || app.auth_operation.is_some()
                     || app.export_operation.is_some()
                 {
-                    app.render_metrics.request_at(Instant::now());
+                    app.render_metrics.request_at(now);
                 }
             }
             _ = activity_status.tick(), if has_active_task(&app) => {
@@ -4045,6 +4056,30 @@ fn draw_interactive_frame(
         .draw(|frame| draw_ui(frame, app))
         .map_err(|error| miette::miette!("{error}"))?;
     Ok(())
+}
+
+fn provider_stream_event_is_meaningful(payload: &Value) -> bool {
+    let Some(delta) = payload.get("delta") else {
+        return false;
+    };
+    match delta.get("kind").and_then(Value::as_str) {
+        // 空文本和仅包含 reasoning 的事件不可见，不应绕过首帧调度预算。
+        Some("text_delta") => delta
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty()),
+        // 工具调用至少要带索引和一个可识别字段，避免半成品事件触发立即绘制。
+        Some("tool_call_delta") => {
+            delta.get("index").and_then(Value::as_u64).is_some()
+                && ["tool_call_id", "tool_name"].iter().any(|field| {
+                    delta
+                        .get(*field)
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.is_empty())
+                })
+        }
+        _ => false,
+    }
 }
 
 const INTERACTIVE_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(80);
