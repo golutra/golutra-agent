@@ -175,18 +175,18 @@ pub(super) fn contract(tool_name: &str, side_effect_type: SideEffectType) -> Too
                     "type": "string",
                     "minLength": 1,
                     "maxLength": MAX_PATH_ARGUMENT_CHARS,
-                    "description": "Workspace-relative or absolute path."
+                    "description": "Workspace file path."
                 },
                 "offset": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "1-based start line; continue with next_offset."
+                    "description": "1-based line; next_offset continues."
                 },
                 "limit": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": MAX_READ_LINES,
-                    "description": "Maximum lines to return."
+                    "description": "Max lines."
                 }
             },
             "required": ["path"]
@@ -207,13 +207,13 @@ pub(super) fn contract(tool_name: &str, side_effect_type: SideEffectType) -> Too
                     "type": "string",
                     "minLength": 1,
                     "maxLength": MAX_PATH_ARGUMENT_CHARS,
-                    "description": "Workspace-relative or absolute path."
+                    "description": "Workspace file path."
                 },
                 "edits": {
                     "type": "array",
                     "minItems": 1,
                     "maxItems": MAX_FILE_EDITS,
-                    "description": "Unique exact replacements; combine independent edits and do not overlap.",
+                    "description": "Exact non-overlapping replacements; batch disjoint edits.",
                     "items": {
                         "type": "object",
                         "additionalProperties": false,
@@ -222,7 +222,7 @@ pub(super) fn contract(tool_name: &str, side_effect_type: SideEffectType) -> Too
                                 "type": "string",
                                 "minLength": 1,
                                 "maxLength": MAX_FILE_CONTENT_BYTES,
-                                "description": "Unique exact original text, including whitespace/newlines."
+                                "description": "Exact text, including whitespace/newlines."
                             },
                             "new_text": {
                                 "type": "string",
@@ -244,7 +244,7 @@ pub(super) fn contract(tool_name: &str, side_effect_type: SideEffectType) -> Too
                     "type": "string",
                     "minLength": 1,
                     "maxLength": MAX_PATCH_BYTES,
-                    "description": "Unified or Begin/Update/Add/Delete patch; apply atomically."
+                    "description": "Atomic unified or Begin/Update/Add/Delete patch."
                 }
             },
             "required": ["patch"]
@@ -344,7 +344,7 @@ pub(super) fn contract(tool_name: &str, side_effect_type: SideEffectType) -> Too
                     "type": "string",
                     "minLength": 1,
                     "maxLength": MAX_SHELL_COMMAND_CHARS,
-                    "description": "Shell-safe command; heredoc is supported. Use bash -lc for pipes, redirects, or compound commands."
+                    "description": "Command; use bash -lc for pipes, redirects, compound commands, or heredoc."
                 },
                 "argv": {
                     "type": "array",
@@ -355,29 +355,29 @@ pub(super) fn contract(tool_name: &str, side_effect_type: SideEffectType) -> Too
                         "minLength": 1,
                         "maxLength": MAX_SHELL_COMMAND_CHARS
                     },
-                    "description": "Optional direct argv; when combined, it must match command/prefix."
+                    "description": "Direct argv; if combined, match command/prefix."
                 },
                 "workdir": {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": MAX_PATH_ARGUMENT_CHARS,
-                    "description": "Optional workspace-relative directory."
+                    "description": "workspace-relative directory."
                 },
                 "timeout_ms": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": MAX_BACKGROUND_PROCESS_TIMEOUT_MS,
-                    "description": "Hard process lifetime in ms. For background work, omit normally; set only to intentionally terminate at this deadline."
+                    "description": "Hard process lifetime in ms; omit normally, set only to intentionally terminate."
                 },
                 "background": {
                     "type": "boolean",
-                    "description": "Start a runtime-owned process and return after yield_time_ms. Normally omit timeout_ms; use shell_session to wait, write, or terminate."
+                    "description": "Start a runtime-owned process and return immediately after yield_time_ms. Normally omit timeout_ms; use shell_session while it is running."
                 },
                 "yield_time_ms": {
                     "type": "integer",
                     "minimum": 0,
                     "maximum": max_poll_wait_ms(),
-                    "description": "Initial output/exit wait before returning process_id; it does not set or extend the process lifetime."
+                    "description": "Initial output/exit wait (default 0); does not set or extend process lifetime."
                 }
             },
             "required": []
@@ -434,11 +434,11 @@ fn shell_session_schema() -> Value {
         "properties": {
             "action": {"type": "string", "enum": ["wait", "write", "terminate"], "description": "Wait/read, write stdin, or terminate."},
             "process_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "ID returned by shell(background=true)."},
-            "authoritative_pid": {"type": "integer", "minimum": 1, "maximum": u32::MAX, "description": "Required OS PID; must match the start response."},
-            "cursor": {"type": "integer", "minimum": 0, "description": "Last output cursor; reuse the returned value."},
+            "authoritative_pid": {"type": "integer", "minimum": 1, "maximum": u32::MAX, "description": "Required OS PID; must match start."},
+            "cursor": {"type": "integer", "minimum": 0, "description": "Last output cursor; reuse."},
             "input": {"type": "string", "maxLength": MAX_PROCESS_INPUT_CHARS, "description": "Stdin text for write."},
             "wait_ms": {"type": "integer", "minimum": 0, "maximum": max_poll_wait_ms(), "description": "Bounded event-driven wait in ms."},
-            "wait_for_terminal": {"type": "boolean", "description": "Wait for one terminal state or the deadline."}
+            "wait_for_terminal": {"type": "boolean", "description": "Wait for one terminal state or deadline."}
         },
         "required": ["action", "process_id", "authoritative_pid"]
     })

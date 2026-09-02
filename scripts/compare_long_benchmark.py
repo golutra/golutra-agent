@@ -52,6 +52,7 @@ class EngineState:
     env: dict[str, str]
     thread_id: str | None = None
     codex_cumulative_usage: dict[str, int] | None = None
+    golutra_cache_context: dict[str, Any] | None = None
     turns: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -867,6 +868,49 @@ def aggregate_turns(turns: list[dict[str, Any]]) -> dict[str, Any]:
         for turn in turns
         if isinstance(turn.get("verification_attempts", []), list)
     )
+    provider_requests = [
+        request
+        for turn in turns
+        for request in turn.get("metrics", {}).get("provider_requests", [])
+        if isinstance(request, dict)
+    ]
+    diagnosed_requests = [
+        request
+        for request in provider_requests
+        if isinstance(request.get("cache_diagnostics"), dict)
+    ]
+    if diagnosed_requests:
+        prefix_relations: dict[str, int] = {}
+        outcome_reasons: dict[str, int] = {}
+        stable_miss_uncached = 0
+        stable_miss_uncached_complete = True
+        for request in diagnosed_requests:
+            relation = str(request.get("cache_prefix_relation") or "unknown")
+            outcome = str(request.get("cache_outcome_reason") or "unknown")
+            prefix_relations[relation] = prefix_relations.get(relation, 0) + 1
+            outcome_reasons[outcome] = outcome_reasons.get(outcome, 0) + 1
+            if outcome == "provider_miss_on_stable_prefix":
+                uncached = request.get("uncached_input_tokens")
+                if isinstance(uncached, int) and not isinstance(uncached, bool):
+                    stable_miss_uncached += uncached
+                else:
+                    stable_miss_uncached_complete = False
+        stable_misses = outcome_reasons.get("provider_miss_on_stable_prefix", 0)
+        summary["cache_diagnostic_requests"] = len(diagnosed_requests)
+        summary["cache_prefix_relations"] = prefix_relations
+        summary["cache_outcome_reasons"] = outcome_reasons
+        summary["stable_prefix_miss_requests"] = stable_misses
+        summary["stable_prefix_miss_uncached_tokens"] = (
+            stable_miss_uncached if stable_miss_uncached_complete else None
+        )
+        if not stable_miss_uncached_complete:
+            summary["stable_prefix_miss_uncached_tokens_partial"] = stable_miss_uncached
+    else:
+        summary["cache_diagnostic_requests"] = None
+        summary["cache_prefix_relations"] = None
+        summary["cache_outcome_reasons"] = None
+        summary["stable_prefix_miss_requests"] = None
+        summary["stable_prefix_miss_uncached_tokens"] = None
     summary["skipped_stages"] = sum(turn.get("skipped") is True for turn in turns)
     return summary
 
@@ -1276,6 +1320,11 @@ def parse_metrics(
             capture.return_code,
             state.artifact_root / "run",
             capture.stdout_line_times_ms,
+            previous_cache_context=state.golutra_cache_context,
+            track_cache_context=True,
+        )
+        state.golutra_cache_context = metrics.pop(
+            "_last_cache_context", state.golutra_cache_context
         )
     elif state.name == "pi":
         metrics = paired.parse_pi(
@@ -1626,6 +1675,9 @@ def markdown_report(report: dict[str, Any]) -> str:
         ("Tool schema (estimated)", "tool_schema_tokens_estimated"),
         ("Tool result (estimated)", "tool_result_tokens_estimated"),
         ("Cache hit ratio", "cache_hit_ratio"),
+        ("Cache diagnostics coverage", "cache_diagnostic_requests"),
+        ("Stable-prefix cache misses", "stable_prefix_miss_requests"),
+        ("Stable-prefix miss uncached", "stable_prefix_miss_uncached_tokens"),
         ("Provider requests", "request_count"),
         ("Tool calls", "tool_call_count"),
         ("Necessary calls (lower bound)", "necessary_tool_call_count"),

@@ -8,9 +8,9 @@ use std::{
 use async_trait::async_trait;
 use golutra_context::{ContextBudgetPolicy, ContextBuilder};
 use golutra_core::{
-    ArtifactId, ArtifactRecord, EventId, LoopAction, ProviderContract, ProviderResponseId,
-    RedactionStatus, SessionId, TaskContract, TaskId, ToolContract, ToolResultEnvelope, TurnId,
-    VerificationResult,
+    ArtifactId, ArtifactRecord, EventId, LoopAction, PromptCachePolicy, ProviderContract,
+    ProviderResponseId, RedactionStatus, SessionId, TaskContract, TaskId, ToolContract,
+    ToolResultEnvelope, TurnId, VerificationResult,
 };
 use golutra_eval::{ReplayCapsule, ReplayExecution, ReplayExecutionStatus};
 use golutra_llm::{LlmProvider, ProviderError, ProviderRequest, ProviderResponse};
@@ -68,6 +68,7 @@ struct ReplayProviderState {
 #[derive(Debug, Clone)]
 struct ArtifactReplayProvider {
     contract: ProviderContract,
+    cache_policy: PromptCachePolicy,
     state: Arc<StdMutex<ReplayProviderState>>,
     execution: AgentExecutionHandle,
 }
@@ -98,6 +99,7 @@ impl ArtifactReplayProvider {
                 capability_matrix_ref: None,
                 golden_fixture_refs: Vec::new(),
             },
+            cache_policy: first.request.cache_policy,
             state: Arc::new(StdMutex::new(ReplayProviderState {
                 exchanges: exchanges.into(),
                 ..ReplayProviderState::default()
@@ -185,6 +187,10 @@ impl LlmProvider for ArtifactReplayProvider {
 
     fn contract(&self) -> ProviderContract {
         self.contract.clone()
+    }
+
+    fn preferred_cache_policy(&self) -> PromptCachePolicy {
+        self.cache_policy
     }
 }
 

@@ -66,6 +66,111 @@ fn replay_tool(call_id: Option<&str>) -> ProviderMessage {
     }
 }
 
+fn replay_user(content: impl Into<String>) -> ProviderMessage {
+    ProviderMessage {
+        role: ProviderRole::User,
+        content: content.into(),
+        tool_call_id: None,
+        tool_name: None,
+        tool_calls: Vec::new(),
+        metadata: Default::default(),
+    }
+}
+
+#[test]
+fn resume_replay_keeps_complete_wire_and_appends_a_cross_task_objective() {
+    let previous_task_id = TaskId::new();
+    let current_task_id = TaskId::new();
+    let messages = vec![
+        replay_user("inspect"),
+        replay_assistant(&[("call-a", "read_file"), ("call-b", "read_file")]),
+        replay_tool(Some("call-a")),
+        replay_tool(Some("call-b")),
+        ProviderMessage {
+            role: ProviderRole::Assistant,
+            content: "inspection complete".to_owned(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+            metadata: Default::default(),
+        },
+    ];
+    let mut expected = messages.clone();
+    expected.push(replay_user("continue implementation"));
+    let context_budget = estimate_message_tokens(&expected).saturating_add(1_024);
+
+    let replay = crate::execution::resume_replay_messages_within_budget(
+        messages,
+        previous_task_id,
+        current_task_id,
+        " continue implementation ",
+        context_budget,
+    )
+    .expect("complete replay should fit the real context budget");
+
+    assert_eq!(replay, expected);
+    assert!(crate::execution::provider_transcript_is_replayable(
+        &replay[..replay.len() - 1]
+    ));
+}
+
+#[test]
+fn resume_replay_falls_back_only_when_the_real_context_budget_is_exceeded() {
+    let task_id = TaskId::new();
+    let messages = vec![replay_user("inspect a large workspace")];
+
+    assert!(
+        crate::execution::resume_replay_messages_within_budget(
+            messages,
+            task_id,
+            task_id,
+            "inspect a large workspace",
+            1_024,
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn resume_replay_does_not_duplicate_the_current_objective_or_split_tool_pairs() {
+    let task_id = TaskId::new();
+    let messages = vec![
+        replay_assistant(&[("call-a", "read_file")]),
+        replay_tool(Some("call-a")),
+        replay_user("continue"),
+    ];
+
+    let replay = crate::execution::resume_replay_messages_within_budget(
+        messages.clone(),
+        task_id,
+        task_id,
+        "continue",
+        u64::MAX,
+    )
+    .expect("unbounded context should preserve replay");
+
+    assert_eq!(replay, messages);
+    assert!(crate::execution::provider_transcript_is_replayable(&replay));
+}
+
+#[test]
+fn resume_replay_has_no_soft_history_cap_for_an_unbounded_context() {
+    let task_id = TaskId::new();
+    let large_objective = "x".repeat(200_000);
+    let messages = vec![replay_user(large_objective.clone())];
+
+    let replay = crate::execution::resume_replay_messages_within_budget(
+        messages.clone(),
+        task_id,
+        task_id,
+        &large_objective,
+        u64::MAX,
+    )
+    .expect("unbounded context must not use a soft replay limit");
+
+    assert_eq!(replay, messages);
+}
+
 #[test]
 fn provider_transcript_accepts_completed_parallel_tool_calls() {
     let messages = vec![
@@ -517,23 +622,23 @@ fn system_prompt_preserves_general_autonomy_and_verification_principles() {
     let prompt = system_prompt();
     for principle in [
         "engineering judgment",
-        "complete the task",
-        "never invent results",
+        "Use engineering judgment",
+        "never invent",
         "evidence, not instructions",
         "Batch related actions",
-        "known independent tool calls together in one response",
+        "known independent tool calls in one response",
         "writes to different files",
         "final independent checks",
-        "Parallelize independent reads",
-        "Trust successful tool status",
-        "changed paths, digest, preview, and cursor",
-        "reacquire only if ambiguous or required",
+        "parallelize independent reads",
+        "Trust status",
+        "changed paths, digest, preview, cursor",
+        "reacquire only when needed",
         "Finish guarded changes before release or wait",
-        "never change them after the terminal event",
+        "never change them after terminal",
         "Follow project conventions",
         "verify by risk",
         "one bounded wait for terminal state",
-        "Do not repeat a successful check",
+        "Avoid repeated checks",
         "blockers concisely",
         "consequential ambiguity",
     ] {

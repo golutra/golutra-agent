@@ -405,6 +405,10 @@ impl super::LlmProvider for GenaiProviderAdapter {
     fn cache_namespace(&self) -> String {
         super::route_cache_namespace(native_protocol(self.config.protocol), &self.config.base_url)
     }
+
+    fn preferred_cache_policy(&self) -> PromptCachePolicy {
+        self.cache_profile.preferred_cache_policy()
+    }
 }
 
 pub(crate) fn genai_chat_request(
@@ -951,7 +955,12 @@ pub(crate) fn map_genai_error(error: genai::Error) -> ProviderError {
             | genai::Error::NoAuthData { .. } => ProviderError::NotConfigured { message },
             genai::Error::InvalidJsonResponseElement { .. }
             | genai::Error::ChatResponseGeneration { .. }
-            | genai::Error::SerdeJson(_) => ProviderError::Malformed { message },
+            // rust-genai uses StreamParse for both malformed SSE payloads and
+            // explicit provider `response.failed` events. Neither is safe to
+            // replay: the request would produce the same semantic failure.
+            | genai::Error::StreamParse { .. }
+            | genai::Error::ChatResponse { .. }
+            | genai::Error::SerdeJson(_) => ProviderError::Failed { message },
             _ if message.to_ascii_lowercase().contains("timed out") => {
                 ProviderError::Timeout { message }
             }
@@ -1086,6 +1095,28 @@ fn tool_description(tool_name: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_parser_and_provider_error_events_are_hard_failures() {
+        let parser_error = serde_json::from_str::<Value>("not-json").expect_err("invalid JSON");
+        let parser_error = genai::Error::StreamParse {
+            model_iden: ModelIden::new(AdapterKind::OpenAIResp, "gpt-test"),
+            serde_error: parser_error,
+        };
+        assert!(matches!(
+            map_genai_error(parser_error),
+            ProviderError::Failed { .. }
+        ));
+
+        let response_error = genai::Error::ChatResponse {
+            model_iden: ModelIden::new(AdapterKind::OpenAIResp, "gpt-test"),
+            body: json!({"error": {"message": "stream unavailable"}}),
+        };
+        assert!(matches!(
+            map_genai_error(response_error),
+            ProviderError::Failed { .. }
+        ));
+    }
 
     #[test]
     fn config_debug_never_contains_the_api_key() {

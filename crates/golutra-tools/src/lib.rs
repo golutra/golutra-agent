@@ -77,6 +77,11 @@ const MAX_MODEL_TOOL_SEARCH_RESULTS: usize = 8;
 const MAX_MODEL_TOOL_SEARCH_TITLE_CHARS: usize = 160;
 const MAX_MODEL_TOOL_SEARCH_URL_CHARS: usize = 512;
 const MAX_MODEL_TOOL_SEARCH_SNIPPET_CHARS: usize = 320;
+// 缺失文件提示只服务于下一次模型调用，必须有界，不能把错误恢复变成一次
+// 无界的工作区扫描或把宿主目录结构泄漏到 provider。
+const MAX_READ_FILE_HINT_DEPTH: usize = 6;
+const MAX_READ_FILE_HINT_ENTRIES: usize = 2_048;
+const MAX_READ_FILE_HINT_CANDIDATES: usize = 8;
 const EXTERNAL_TOOL_TIMEOUT_MS: u64 = if cfg!(test) { 100 } else { 30_000 };
 const MAX_VERIFIER_TIMEOUT_MS: u64 = 30 * 60 * 1_000;
 const MAX_VERIFIER_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
@@ -1475,7 +1480,7 @@ impl ToolRuntime {
                         ));
                     }
                     PolicyDecision::Deny | PolicyDecision::Block => {
-                        return Ok(blocked_report(request, policy));
+                        return Ok(self.blocked_report_with_hints(request, policy).await);
                     }
                 }
 
@@ -1682,6 +1687,188 @@ impl ToolRuntime {
             reason,
             policy,
         )
+    }
+
+    /// 在真实执行错误上补充有限的 workspace-relative 候选路径。
+    /// 该辅助信息只改变模型可见事实，不改变原始错误、状态或 artifact。
+    pub async fn execution_error_report_with_hints(
+        &self,
+        request: ToolRequest,
+        policy: PolicyEvaluation,
+        error: impl Into<String>,
+    ) -> ToolExecutionReport {
+        let reason = bounded_text(&error.into(), MAX_TOOL_ERROR_CHARS);
+        let structured_facts = self
+            .execution_error_facts_with_hints(&request, &reason)
+            .await;
+        error_report(
+            request,
+            "tool execution failed",
+            structured_facts,
+            reason,
+            policy,
+        )
+    }
+
+    async fn blocked_report_with_hints(
+        &self,
+        request: ToolRequest,
+        policy: PolicyEvaluation,
+    ) -> ToolExecutionReport {
+        let mut report = blocked_report(request.clone(), policy.clone());
+        if request.tool_name != "read_file"
+            || !read_file_hint_reason(&policy.reason)
+            || !self.read_file_hint_request_is_safe(&request)
+        {
+            return report;
+        }
+        let model_reason = "path resolution failed for the requested workspace path".to_owned();
+        report.envelope.summary = model_reason.clone();
+        let Value::Object(facts) = &mut report.envelope.structured_facts else {
+            return report;
+        };
+        facts.insert("reason".to_owned(), Value::String(model_reason));
+        if let Some(path) = request.arguments.get("path").and_then(Value::as_str) {
+            facts.insert(
+                "path".to_owned(),
+                Value::String(bounded_text(
+                    &redact_sensitive_text(path).0,
+                    MAX_PATH_ARGUMENT_CHARS,
+                )),
+            );
+        }
+        facts.insert(
+            "path_resolution".to_owned(),
+            Value::String(read_file_path_resolution(&policy.reason).to_owned()),
+        );
+        if let Some(candidates) = self
+            .read_file_path_candidates(&request, &policy.reason)
+            .await
+        {
+            facts.insert("candidates".to_owned(), json!(candidates));
+            facts.insert(
+                "next_action".to_owned(),
+                Value::String("retry read_file with one of the candidate paths".to_owned()),
+            );
+        } else {
+            facts.insert(
+                "next_action".to_owned(),
+                Value::String(
+                    "run one bounded read-only shell discovery such as rg --files, then read the exact file path"
+                        .to_owned(),
+                ),
+            );
+        }
+        report
+    }
+
+    async fn execution_error_facts_with_hints(&self, request: &ToolRequest, reason: &str) -> Value {
+        let mut facts = execution_error_facts(request, reason);
+        let Some(candidates) = self.read_file_path_candidates(request, reason).await else {
+            return facts;
+        };
+        if let Value::Object(object) = &mut facts {
+            object.insert("candidates".to_owned(), json!(candidates));
+            object.insert(
+                "next_action".to_owned(),
+                Value::String("retry read_file with one of the candidate paths".to_owned()),
+            );
+        }
+        facts
+    }
+
+    async fn read_file_path_candidates(
+        &self,
+        request: &ToolRequest,
+        reason: &str,
+    ) -> Option<Vec<String>> {
+        if request.tool_name != "read_file" || !read_file_hint_reason(reason) {
+            return None;
+        }
+        let requested_path = request.arguments.get("path").and_then(Value::as_str)?;
+        if !self.read_file_hint_request_is_safe(request) {
+            return None;
+        }
+        let basename = Path::new(requested_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty() && *name != "." && *name != "..")?;
+        let workspace_root = self.policy.workspace_root().to_path_buf();
+        let mut pending = vec![(workspace_root.clone(), 0_usize)];
+        let mut visited_entries = 0_usize;
+        let mut candidates = BTreeSet::new();
+
+        while let Some((directory, depth)) = pending.pop() {
+            if visited_entries >= MAX_READ_FILE_HINT_ENTRIES {
+                break;
+            }
+            let mut reader = match tokio::fs::read_dir(&directory).await {
+                Ok(reader) => reader,
+                Err(_) => continue,
+            };
+            let mut entries = Vec::new();
+            while visited_entries < MAX_READ_FILE_HINT_ENTRIES {
+                match reader.next_entry().await {
+                    Ok(Some(entry)) => {
+                        visited_entries = visited_entries.saturating_add(1);
+                        entries.push(entry);
+                    }
+                    Ok(None) | Err(_) => break,
+                }
+            }
+            entries.sort_by_key(|entry| entry.file_name().to_string_lossy().into_owned());
+
+            for entry in entries {
+                let file_name = entry.file_name();
+                let file_name = file_name.to_string_lossy();
+                let file_type = match entry.file_type().await {
+                    Ok(file_type) => file_type,
+                    Err(_) => continue,
+                };
+                if file_type.is_dir() {
+                    if depth < MAX_READ_FILE_HINT_DEPTH
+                        && !read_file_hint_ignored_directory(&file_name)
+                    {
+                        pending.push((entry.path(), depth.saturating_add(1)));
+                    }
+                    continue;
+                }
+                // 不跟随符号链接，避免候选提示跨越 workspace 边界或暴露宿主路径。
+                if !file_type.is_file() || file_type.is_symlink() || file_name != basename {
+                    continue;
+                }
+                let path = entry.path();
+                let Some(relative) = path.strip_prefix(&workspace_root).ok() else {
+                    continue;
+                };
+                let candidate_policy = self.policy.evaluate_path("read_file", relative, true);
+                if candidate_policy.decision != PolicyDecision::Allow {
+                    continue;
+                }
+                let relative = relative.to_string_lossy().replace('\\', "/");
+                if !relative.is_empty() {
+                    candidates.insert(bounded_text(&relative, MAX_PATH_ARGUMENT_CHARS));
+                }
+            }
+        }
+
+        (!candidates.is_empty()).then(|| {
+            candidates
+                .into_iter()
+                .take(MAX_READ_FILE_HINT_CANDIDATES)
+                .collect()
+        })
+    }
+
+    fn read_file_hint_request_is_safe(&self, request: &ToolRequest) -> bool {
+        let Some(requested_path) = request.arguments.get("path").and_then(Value::as_str) else {
+            return false;
+        };
+        let resolved_request = self
+            .policy
+            .evaluate_path("read_file", requested_path, false);
+        resolved_request.decision == PolicyDecision::Allow
+            && Path::new(&resolved_request.resource).starts_with(self.policy.workspace_root())
     }
 
     /// Build the terminal report used when an enclosing runtime deadline wins.
@@ -3523,6 +3710,9 @@ fn error_report(
 fn execution_error_facts(request: &ToolRequest, reason: &str) -> Value {
     let mut facts = serde_json::Map::new();
     facts.insert("error".to_owned(), Value::String(reason.to_owned()));
+    if mutation_tool_name(&request.tool_name) && reason.contains("checkpoint") {
+        add_checkpoint_error_facts(request, reason, &mut facts);
+    }
     if request.tool_name == "read_file"
         && let Some(path) = request.arguments.get("path").and_then(Value::as_str)
     {
@@ -3532,16 +3722,7 @@ fn execution_error_facts(request: &ToolRequest, reason: &str) -> Value {
         );
         facts.insert(
             "path_resolution".to_owned(),
-            Value::String(
-                if reason.contains("not a regular file") {
-                    "directory_or_non_regular_file"
-                } else if reason.contains("canonicalization failed") {
-                    "missing_or_unresolvable"
-                } else {
-                    "validation_failed"
-                }
-                .to_owned(),
-            ),
+            Value::String(read_file_path_resolution(reason).to_owned()),
         );
         facts.insert(
             "next_action".to_owned(),
@@ -3552,6 +3733,107 @@ fn execution_error_facts(request: &ToolRequest, reason: &str) -> Value {
         );
     }
     Value::Object(facts)
+}
+
+/// 将 checkpoint 失败转换为有限、可执行的模型事实。这里只描述下一步所需的
+/// 路径关系，不尝试修复目录或重放请求；完整 provider 错误仍保存在 artifact。
+fn add_checkpoint_error_facts(
+    request: &ToolRequest,
+    reason: &str,
+    facts: &mut serde_json::Map<String, Value>,
+) {
+    let Some(path) = request.arguments.get("path").and_then(Value::as_str) else {
+        facts.insert(
+            "error_kind".to_owned(),
+            Value::String("checkpoint_io".to_owned()),
+        );
+        facts.insert(
+            "action_required".to_owned(),
+            Value::String("inspect_checkpoint_error".to_owned()),
+        );
+        return;
+    };
+
+    let (path, _) = redact_sensitive_text(path);
+    facts.insert(
+        "path".to_owned(),
+        Value::String(bounded_text(&path, MAX_PATH_ARGUMENT_CHARS)),
+    );
+    if let Some(parent) = Path::new(&path).parent()
+        && !parent.as_os_str().is_empty()
+        && parent != Path::new(".")
+    {
+        facts.insert(
+            "parent".to_owned(),
+            Value::String(bounded_text(
+                &parent.to_string_lossy(),
+                MAX_PATH_ARGUMENT_CHARS,
+            )),
+        );
+    }
+
+    let parent_missing = checkpoint_error_mentions_missing_path(reason);
+    facts.insert("parent_missing".to_owned(), Value::Bool(parent_missing));
+    facts.insert(
+        "error_kind".to_owned(),
+        Value::String(
+            if parent_missing {
+                "checkpoint_parent_missing"
+            } else {
+                "checkpoint_io"
+            }
+            .to_owned(),
+        ),
+    );
+    facts.insert(
+        "action_required".to_owned(),
+        Value::String(
+            if parent_missing {
+                "create_parent_directory_explicitly"
+            } else {
+                "inspect_checkpoint_error"
+            }
+            .to_owned(),
+        ),
+    );
+}
+
+fn checkpoint_error_mentions_missing_path(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    lower.contains("no such file or directory")
+        || lower.contains("not found")
+        || lower.contains("cannot find the path")
+}
+
+fn read_file_hint_reason(reason: &str) -> bool {
+    reason.contains("read target does not exist")
+        || reason.contains("path canonicalization failed")
+        || reason.contains("not a regular file")
+}
+
+fn read_file_path_resolution(reason: &str) -> &'static str {
+    if reason.contains("not a regular file") {
+        "directory_or_non_regular_file"
+    } else if reason.contains("canonicalization failed") {
+        "missing_or_unresolvable"
+    } else {
+        "validation_failed"
+    }
+}
+
+fn read_file_hint_ignored_directory(name: &str) -> bool {
+    name.starts_with('.')
+        || matches!(
+            name,
+            "target"
+                | "node_modules"
+                | "dist"
+                | "build"
+                | ".next"
+                | "__pycache__"
+                | ".venv"
+                | "venv"
+        )
 }
 
 fn blocked_report(
@@ -4612,8 +4894,11 @@ pub fn model_visible_tool_result_with_limit(
 
 const READ_FILE_MODEL_FACTS: &[&str] = &[
     "path",
+    "requested_path",
+    "path_normalized",
     "content_digest",
     "path_resolution",
+    "candidates",
     "next_action",
     "bytes",
     "lines",
@@ -4652,6 +4937,7 @@ const MUTATION_MODEL_FACTS: &[&str] = &[
     "bytes",
     "replacements",
     "edit_count",
+    "error_kind",
     "conflict",
     "search_found",
     "max_bytes",
@@ -5034,6 +5320,10 @@ fn model_fact_mandatory(tool_name: &str) -> &'static [&'static str] {
         ],
         "write_file" | "edit_file" | "apply_patch" => &[
             "path",
+            "parent",
+            "parent_missing",
+            "action_required",
+            "error_kind",
             "changed_file_count",
             "workspace_change_count",
             "workspace_changes_known",

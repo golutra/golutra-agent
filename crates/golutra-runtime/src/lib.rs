@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    path::Path,
+    path::{Component, Path},
     sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
 };
@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use golutra_context::{
     ContextBuildPlan, ContextBuilder, ContextCompactionRecord, ContextContributor, ContextError,
-    ContextMessageSource, ModelInputVisibility, ObservedContextPrefix,
+    ContextMessageSource, ContextWindowManager, ModelInputVisibility, ObservedContextPrefix,
     compaction_summary_from_context_content,
     compile_model_input_with_cache_policy_and_estimates_and_tool_digests,
     context_message_prefix_digest, context_snapshot_from_request,
@@ -125,6 +125,28 @@ const PARALLEL_READ_CONCURRENCY_LIMIT: usize = 8;
 const DEFAULT_ACTIVE_TOOL_RESULT_TOKENS: u64 = 2_048;
 const MIN_ACTIVE_TOOL_RESULT_TOKENS: u64 = 256;
 const MUTATION_ACTIVE_TOOL_RESULT_TOKENS: u64 = 1_024;
+// 大窗口只在接近真实输入上限时整理旧消息，避免固定小阈值破坏长任务的
+// 稳定前缀和语义。硬预算仍是最终边界；余量用于吸收估算误差和下一次工具结果。
+const ACTIVE_WORKING_SET_MIN_HARD_BUDGET_TOKENS: u64 = 64 * 1_024;
+const ACTIVE_WORKING_SET_HEADROOM_PERCENT: u64 = 10;
+const ACTIVE_WORKING_SET_MIN_HEADROOM_TOKENS: u64 = 8 * 1_024;
+
+fn active_working_set_soft_limit(hard_budget: u64) -> Option<u64> {
+    if hard_budget == u64::MAX || hard_budget < ACTIVE_WORKING_SET_MIN_HARD_BUDGET_TOKENS {
+        return None;
+    }
+    let percentage_headroom = hard_budget
+        .saturating_mul(ACTIVE_WORKING_SET_HEADROOM_PERCENT)
+        .saturating_div(100);
+    let headroom = percentage_headroom
+        .max(ACTIVE_WORKING_SET_MIN_HEADROOM_TOKENS)
+        .max(MIN_ACTIVE_TOOL_RESULT_TOKENS);
+    Some(
+        hard_budget
+            .saturating_sub(headroom)
+            .max(MIN_ACTIVE_TOOL_RESULT_TOKENS),
+    )
+}
 
 /// 根据剩余 provider 输入预算确定性地选择结果上限。普通回合允许常见读取和
 /// 后台输出一次完整返回；只有上下文窗口紧张时才收缩，并为下一轮 provider
@@ -253,6 +275,16 @@ impl AgentReplayContext {
             tools,
             allow_parallel_reads: true,
         }
+    }
+
+    /// Preserve the last provider tool surface when an exact cross-task
+    /// message replay is too large for the current context window.  The
+    /// runtime deliberately receives no historical messages here; it builds a
+    /// fresh, budgeted context and uses this surface only to avoid an
+    /// unnecessary tool-schema cache boundary.
+    #[must_use]
+    pub fn for_resume_tool_surface(tools: Vec<ToolContract>) -> Self {
+        Self::for_resume(Vec::new(), tools)
     }
 }
 
@@ -408,6 +440,94 @@ struct ToolAttemptMetadata {
     step_no: u32,
     status: ToolResultStatus,
     recoverable_failure: bool,
+}
+
+/// Identity of a successful read fact already projected into the current
+/// activity plan. The requested lexical path is intentional: symlink aliases
+/// remain distinct, while `./` and `..` spelling variants converge. A content
+/// digest and window bounds prevent a changed file or a different continuation
+/// slice from being mistaken for a duplicate.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ReadFactIdentity {
+    path: String,
+    content_digest: String,
+    offset: u64,
+    limit: u64,
+}
+
+fn read_fact_identity(
+    report: &ToolExecutionReport,
+    workspace_root: &Path,
+) -> Option<ReadFactIdentity> {
+    if report.envelope.tool_name != "read_file" || report.envelope.status != ToolResultStatus::Ok {
+        return None;
+    }
+    let facts = report.envelope.structured_facts.as_object()?;
+    let content_digest = facts.get("content_digest").and_then(Value::as_str)?.trim();
+    if content_digest.is_empty() {
+        return None;
+    }
+    let path = facts
+        .get("path")
+        .and_then(Value::as_str)
+        .or_else(|| facts.get("resolved_path").and_then(Value::as_str))?;
+    let path = lexical_workspace_path_key(path, workspace_root);
+    if path.is_empty() {
+        return None;
+    }
+    Some(ReadFactIdentity {
+        path,
+        content_digest: content_digest.to_owned(),
+        offset: facts.get("offset").and_then(Value::as_u64).unwrap_or(0),
+        limit: facts
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::MAX),
+    })
+}
+
+fn lexical_workspace_path_key(path: &str, workspace_root: &Path) -> String {
+    let path = Path::new(path);
+    let path = path
+        .strip_prefix(workspace_root)
+        .unwrap_or(path)
+        .components();
+    let mut components = Vec::<String>::new();
+    for component in path {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => {
+                if components.last().is_some_and(|value| value != "..") {
+                    components.pop();
+                } else {
+                    components.push("..".to_owned());
+                }
+            }
+            Component::Normal(value) => components.push(value.to_string_lossy().into_owned()),
+        }
+    }
+    components.join("/")
+}
+
+/// Project a tool result against the facts already visible in this activity
+/// plan. A repeated successful read keeps status, digest, and continuation
+/// metadata but omits a second copy of the file body. Durable reports remain
+/// untouched and the caller still executes every model-requested read.
+fn model_visible_tool_result_for_active_plan(
+    report: &ToolExecutionReport,
+    max_tokens: u64,
+    seen_read_facts: &mut HashSet<ReadFactIdentity>,
+    workspace_root: &Path,
+) -> String {
+    let repeated_read = read_fact_identity(report, workspace_root)
+        .is_some_and(|identity| !seen_read_facts.insert(identity));
+    if repeated_read {
+        let mut compact_envelope = report.envelope.clone();
+        compact_envelope.model_visible_excerpt = None;
+        model_visible_tool_result_with_token_budget(&compact_envelope, max_tokens)
+    } else {
+        model_visible_tool_result_with_token_budget(&report.envelope, max_tokens)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1144,6 +1264,7 @@ where
             .map_err(AgentLoopError::TaskContract)?;
         let mut tool_reports = Vec::new();
         let mut tool_attempts = Vec::<ToolAttemptMetadata>::new();
+        let mut seen_read_facts = HashSet::<ReadFactIdentity>::new();
         let mut last_assistant_message = None;
         let mut last_emitted_assistant_message = None;
         let mut current_turn_id = request.turn_id;
@@ -1471,6 +1592,7 @@ where
                             current_task_contract.requires_workspace_evidence();
                         tool_reports.clear();
                         tool_attempts.clear();
+                        seen_read_facts.clear();
                         turn_state = TurnState::new(current_turn_id);
                         goal_ledger.original_objective = current_objective.clone();
                         goal_ledger.success_criteria = current_completion_criteria.clone();
@@ -1543,6 +1665,56 @@ where
                         planned_tool_tokens,
                         observed_prefix,
                     );
+                // 接近硬窗口时整理内存中的工作集，避免旧工具结果和 Responses
+                // reasoning 元数据在每轮重复发送；durable event/artifact 仍保留完整证据。
+                // 软路径完全本地执行，不额外消耗 provider 回合。
+                if let Some(soft_limit) =
+                    active_working_set_soft_limit(plan.budget_snapshot.budget_limit)
+                    && plan.budget_snapshot.planned_input_tokens > soft_limit
+                {
+                    trace(AgentLoopTraceEvent::ContextCompactionStarted {
+                        original_input_tokens: plan.budget_snapshot.planned_input_tokens,
+                        budget_limit: soft_limit,
+                    });
+                    let soft_manager = ContextWindowManager::new(soft_limit);
+                    match soft_manager.compact_if_needed_with_observed_prefix(
+                        current_turn_id,
+                        protected_prefix_len,
+                        &plan.messages,
+                        &plan.message_sources,
+                        &plan.message_estimates,
+                        planned_tool_tokens,
+                        observed_prefix,
+                    ) {
+                        Ok(Some(mut record)) => {
+                            // 软工作集记录只用于本地回收；真正超出硬窗口时才请求语义摘要。
+                            record.mode = "active_working_set".to_owned();
+                            record.strategy = "fallback_facts_tail".to_owned();
+                            record.summary_source_messages.clear();
+                            record.summary_source_sources.clear();
+                            record.summary_token_budget = 0;
+                            message_token_total = plan.replace_messages(
+                                record.replacement_messages.clone(),
+                                record.replacement_sources.clone(),
+                            );
+                            plan.budget_snapshot.planned_input_tokens =
+                                record.replacement_estimated_tokens;
+                            plan.budget_snapshot.planned_summary_tokens =
+                                estimate_tokens(&record.summary);
+                            observed_context_usage = None;
+                            seen_read_facts.clear();
+                            trace(AgentLoopTraceEvent::ContextAutoCompacted(record));
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            trace(AgentLoopTraceEvent::ContextCompactionFailed {
+                                planned_input_tokens: plan.budget_snapshot.planned_input_tokens,
+                                budget_limit: soft_limit,
+                                reason: format!("active working-set compaction: {error}"),
+                            });
+                        }
+                    }
+                }
                 if plan.budget_snapshot.planned_input_tokens > plan.budget_snapshot.budget_limit {
                     let compaction_limit = plan.budget_snapshot.budget_limit;
                     trace(AgentLoopTraceEvent::ContextCompactionStarted {
@@ -1559,7 +1731,8 @@ where
                         observed_prefix,
                     ) {
                         Ok(Some(mut record)) => {
-                            if record.supports_model_summary()
+                            if record.mode != "active_working_set"
+                                && record.supports_model_summary()
                                 && primary_contract.native_protocol != "in_memory"
                                 && let Some(summary) = self
                                     .semantic_compaction_summary(
@@ -1585,6 +1758,9 @@ where
                             plan.budget_snapshot.planned_summary_tokens =
                                 estimate_tokens(&record.summary);
                             observed_context_usage = None;
+                            // Compaction may remove the body that justified a prior
+                            // read; allow the next occurrence to provide it again.
+                            seen_read_facts.clear();
                             trace(AgentLoopTraceEvent::ContextAutoCompacted(record));
                         }
                         Ok(None) => {}
@@ -1694,11 +1870,9 @@ where
                         provider_contract.provider_id.clone(),
                         provider_contract.model_id.clone(),
                         provider_tools.clone(),
-                        // Auto keeps the stable session key while allowing each
-                        // adapter to select its native retention behavior.  A
-                        // hard-coded long TTL adds provider-specific fields to
-                        // every request and can disable the gateway default.
-                        golutra_core::PromptCachePolicy::Auto,
+                        // 主会话遵循 provider 的默认缓存保留策略；需要长期保留的
+                        // 专用请求在构造处显式指定 Long，避免每轮污染稳定 wire。
+                        self.provider.preferred_cache_policy(),
                         &plan.message_estimates,
                         &provider_tool_schema_digests,
                     )?;
@@ -2469,11 +2643,14 @@ where
                                                 "side-effect preparation",
                                             ),
                                         RuntimeOperationOutcome::Completed(Err(error)) => {
-                                            let report = self.tool_executor.execution_error_report(
-                                                tool_request,
-                                                policy,
-                                                error.to_string(),
-                                            );
+                                            let report = self
+                                                .tool_executor
+                                                .execution_error_report_with_hints(
+                                                    tool_request,
+                                                    policy,
+                                                    error.to_string(),
+                                                )
+                                                .await;
                                             trace(AgentLoopTraceEvent::ToolProgress(
                                                 ToolProgress {
                                                     tool_call_id: report.envelope.tool_call_id,
@@ -2529,13 +2706,14 @@ where
                                                     ),
                                                 RuntimeOperationOutcome::Completed(Err(error)) => self
                                                     .tool_executor
-                                                    .execution_error_report(
+                                                    .execution_error_report_with_hints(
                                                         tool_request,
                                                         policy,
                                                         format!(
                                                             "before-side-effect checkpoint failed: {error}"
                                                         ),
-                                                    ),
+                                                    )
+                                                    .await,
                                                 RuntimeOperationOutcome::Completed(Ok(())) => {
                                                 control.wait_until_runnable().await?;
                                                 let max_elapsed_ms =
@@ -2580,11 +2758,14 @@ where
                                                 {
                                                     Ok(report) => report,
                                                     Err(error) => {
-                                                        self.tool_executor.execution_error_report(
-                                                            error_request,
-                                                            error_policy,
-                                                            error.to_string(),
-                                                        )
+                                                        self
+                                                            .tool_executor
+                                                            .execution_error_report_with_hints(
+                                                                error_request,
+                                                                error_policy,
+                                                                error.to_string(),
+                                                            )
+                                                            .await
                                                     }
                                                 }
                                                 }
@@ -2696,9 +2877,11 @@ where
                             &mut plan,
                             ProviderMessage {
                                 role: ProviderRole::Tool,
-                                content: model_visible_tool_result_with_token_budget(
-                                    &report.envelope,
+                                content: model_visible_tool_result_for_active_plan(
+                                    &report,
                                     tool_result_token_budget,
+                                    &mut seen_read_facts,
+                                    self.tool_executor.workspace_root(),
                                 ),
                                 tool_call_id: Some(provider_tool_call_id),
                                 tool_name: Some(report.envelope.tool_name.clone()),
@@ -4461,8 +4644,9 @@ fn stable_provider_tools_for_turn(
     candidate
 }
 
-/// Coding profile 默认发送紧凑的核心工具面，并固定保留后台会话能力；网络
-/// 搜索和子代理仍按目标按需加入且只单向扩展。Full profile 仍完整透传全部工具。
+/// Coding profile 默认发送紧凑的核心工具面；网络搜索、子代理和后台会话
+/// 只有在目标明确需要时加入，并且在同一线程内只允许单向扩展。Full profile
+/// 仍完整透传全部工具。
 fn core_or_requested_optional_tool(tool_name: &str, objective: &str) -> bool {
     match tool_name {
         "web_search" => objective_mentions_any(
@@ -4479,9 +4663,25 @@ fn core_or_requested_optional_tool(tool_name: &str, objective: &str) -> bool {
                 "网上",
             ],
         ),
-        // 后台会话是 Coding surface 的稳定核心：它让模型在任何阶段都能
-        // 观察已启动的进程，避免跨进程 resume 因目标措辞变化而改写目录。
-        "shell_session" => true,
+        "shell_session" => objective_mentions_any(
+            objective,
+            &[
+                "background",
+                "background process",
+                "long-running",
+                "long running",
+                "async",
+                "asynchronous",
+                "process session",
+                "wait for the process",
+                "shell_session",
+                "后台",
+                "长运行",
+                "异步",
+                "进程",
+                "等待进程",
+            ],
+        ),
         "subagent" => objective_mentions_any(
             objective,
             &[
@@ -4649,7 +4849,13 @@ async fn invoke_parallel_read_calls(
             {
                 Ok(report) => report,
                 Err(error) => {
-                    executor.execution_error_report(error_request, error_policy, error.to_string())
+                    executor
+                        .execution_error_report_with_hints(
+                            error_request,
+                            error_policy,
+                            error.to_string(),
+                        )
+                        .await
                 }
             };
             ParallelReadOutcome {

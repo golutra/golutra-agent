@@ -823,6 +823,33 @@ async fn openai_responses_projects_stable_cache_identity_and_retention() {
 }
 
 #[tokio::test]
+async fn openai_responses_default_policy_leaves_retention_to_provider() {
+    let response = include_str!("fixtures/openai-responses/text-response.sse");
+    let (base_url, captured) =
+        spawn_provider_sequence(vec![TestProviderResponse::sse(200, response)]).await;
+    let provider = openai_responses_provider(base_url);
+    let session_id = SessionId::new();
+    let mut request = simple_request("gpt-golden");
+    request.session_id = Some(session_id);
+    request.cache_policy = provider.preferred_cache_policy();
+
+    provider
+        .complete(request)
+        .await
+        .expect("automatic cache policy request");
+
+    let requests = captured.await.expect("Responses request capture");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].body["prompt_cache_key"], session_id.to_string());
+    assert!(requests[0].body.get("prompt_cache_retention").is_none());
+    let session_header = session_id.to_string();
+    assert_eq!(
+        requests[0].headers.get("session-id").map(String::as_str),
+        Some(session_header.as_str())
+    );
+}
+
+#[tokio::test]
 async fn openai_responses_rejects_stream_without_completed_response_id() {
     let truncated = concat!(
         "event: response.output_text.delta\n",

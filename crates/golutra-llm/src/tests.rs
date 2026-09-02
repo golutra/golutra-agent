@@ -296,7 +296,6 @@ fn shell_provider_description_distinguishes_lifetime_from_initial_wait() {
     assert!(description.contains("bash -lc"));
     assert!(description.contains("heredoc"));
     assert!(description.contains("timeout_ms"));
-    assert!(description.contains("yield_time_ms"));
     assert!(description.contains("background"));
     assert!(description.contains("omit timeout_ms"));
     assert!(description.contains("hard lifetime"));
@@ -1416,6 +1415,10 @@ fn provider_cache_profile_gates_compatible_gateway_fields() {
         COMPATIBLE_AFFINITY_HEADERS
     );
     assert!(golutra.supports_long_retention(golutra_core::PromptCachePolicy::Long));
+    assert_eq!(
+        golutra.preferred_cache_policy(),
+        golutra_core::PromptCachePolicy::Auto
+    );
 
     let codex =
         ProviderCacheProfile::for_provider(ProviderProtocol::OpenAiResponses, "openai-chatgpt");
@@ -1439,6 +1442,10 @@ fn provider_cache_profile_gates_compatible_gateway_fields() {
             .affinity_headers(golutra_core::PromptCachePolicy::Long)
             .is_empty()
     );
+    assert_eq!(
+        unknown.preferred_cache_policy(),
+        golutra_core::PromptCachePolicy::Auto
+    );
 
     let responses_custom =
         ProviderCacheProfile::for_provider(ProviderProtocol::OpenAiResponses, "custom-responses");
@@ -1447,6 +1454,42 @@ fn provider_cache_profile_gates_compatible_gateway_fields() {
         responses_custom
             .affinity_headers(golutra_core::PromptCachePolicy::None)
             .is_empty()
+    );
+    assert_eq!(
+        responses_custom.preferred_cache_policy(),
+        golutra_core::PromptCachePolicy::Auto
+    );
+}
+
+#[test]
+fn provider_adapters_expose_capability_gated_cache_policy() {
+    let responses = OpenAiResponsesProvider::from_config(OpenAiResponsesProviderConfig {
+        api_key: "test-key".to_owned(),
+        api_key_env: "TEST_KEY".to_owned(),
+        provider_id: "custom-responses".to_owned(),
+        base_url: "https://gateway.example/v1".to_owned(),
+        model_id: "model".to_owned(),
+        generation_config: ProviderGenerationConfig::default(),
+        custom_headers: ProviderHttpHeaders::default(),
+    });
+    assert_eq!(
+        responses.preferred_cache_policy(),
+        golutra_core::PromptCachePolicy::Auto
+    );
+
+    let unknown = OpenAiCompatibleProvider::from_config(OpenAiCompatibleProviderConfig {
+        api_key: "test-key".to_owned(),
+        api_key_env: "TEST_KEY".to_owned(),
+        provider_id: "unknown-gateway".to_owned(),
+        base_url: "https://gateway.example/v1".to_owned(),
+        model_id: "model".to_owned(),
+        protocol: ProviderProtocol::OpenAiCompatible,
+        generation_config: ProviderGenerationConfig::default(),
+        custom_headers: ProviderHttpHeaders::default(),
+    });
+    assert_eq!(
+        unknown.preferred_cache_policy(),
+        golutra_core::PromptCachePolicy::Auto
     );
 }
 

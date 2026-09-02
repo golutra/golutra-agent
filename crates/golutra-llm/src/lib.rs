@@ -180,6 +180,13 @@ impl ProviderCacheProfile {
     fn supports_long_retention(self, policy: PromptCachePolicy) -> bool {
         policy == PromptCachePolicy::Long && self.supports_long_retention
     }
+
+    /// 主会话遵循 provider 的默认 retention。长期保留仍由调用方通过
+    /// `PromptCachePolicy::Long` 显式请求，并在 `supports_long_retention`
+    /// 中做能力门控，避免把长期策略隐式写入每一轮请求。
+    fn preferred_cache_policy(self) -> PromptCachePolicy {
+        PromptCachePolicy::Auto
+    }
 }
 
 fn canonical_provider_identity(provider_id: &str) -> String {
@@ -767,6 +774,12 @@ pub trait LlmProvider: Send + Sync {
     #[must_use]
     fn cache_identity_for_request(&self, request: &ProviderRequest) -> Option<CacheIdentity> {
         request.cache_identity_with_namespace(&self.cache_namespace())
+    }
+
+    /// 返回主会话请求使用的缓存保留策略。辅助请求（例如 compaction）由
+    /// 调用方显式指定策略，不会被该偏好覆盖。
+    fn preferred_cache_policy(&self) -> PromptCachePolicy {
+        PromptCachePolicy::Auto
     }
 
     async fn complete_stream(
@@ -1458,6 +1471,10 @@ impl LlmProvider for OpenAiCompatibleProvider {
     fn cache_namespace(&self) -> String {
         route_cache_namespace("openai_chat_completions", &self.base_url)
     }
+
+    fn preferred_cache_policy(&self) -> PromptCachePolicy {
+        self.cache_profile.preferred_cache_policy()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1678,6 +1695,18 @@ impl LlmProvider for ConfiguredProvider {
             | Self::Gemini(provider)
             | Self::VertexAi(provider)
             | Self::Genai(provider) => provider.cache_namespace(),
+        }
+    }
+
+    fn preferred_cache_policy(&self) -> PromptCachePolicy {
+        match self {
+            Self::Mock(provider) => provider.preferred_cache_policy(),
+            Self::OpenAiCompatible(provider) => provider.preferred_cache_policy(),
+            Self::OpenAiResponses(provider) => provider.preferred_cache_policy(),
+            Self::Anthropic(provider)
+            | Self::Gemini(provider)
+            | Self::VertexAi(provider)
+            | Self::Genai(provider) => provider.preferred_cache_policy(),
         }
     }
 
@@ -2067,23 +2096,19 @@ fn is_sensitive_header(name: &str) -> bool {
 
 pub fn provider_tool_description(tool_name: &str) -> &'static str {
     match tool_name {
-        "read_file" => {
-            "Read workspace file contents by line window; use offset/limit and continuation.next_offset."
-        }
+        "read_file" => "Read workspace lines; use offset/limit and continuation.next_offset.",
         "write_file" => {
-            "Create a new UTF-8 file or completely rewrite one existing file; returns status and digest."
+            "Create a new UTF-8 file or completely rewrite one; returns status and digest."
         }
         "edit_file" => {
-            "Precisely change one existing UTF-8 file with exact, unique, non-overlapping edits[]; batch disjoint edits in one call; returns status, digest, and preview."
+            "Change one UTF-8 file with exact, non-overlapping edits[]; batch disjoint edits; returns status, digest, preview."
         }
         "apply_patch" => {
-            "Atomically apply one unified or Begin/Update/Add/Delete patch for related multi-file, add, delete, or move changes; returns status, digest, and preview."
+            "Atomically apply a unified or Begin/Update/Add/Delete patch for related multi-file changes; returns status, digest, preview."
         }
-        "web_search" => {
-            "Search the web when network access is enabled; return source-backed results."
-        }
+        "web_search" => "Search the network when enabled; return source-backed results.",
         "shell_session" => {
-            "Control a runtime-owned background shell; authoritative_pid must match; use cursor to wait/read, set wait_for_terminal for one bounded terminal wait, or write/terminate."
+            "Control a background shell; authoritative_pid must match. Reuse cursor; one bounded wait_for_terminal=true, or write/terminate."
         }
         "subagent" => {
             "Run one isolated child task; it cannot create another child; return a bounded result."
@@ -2099,7 +2124,7 @@ pub fn provider_tool_description(tool_name: &str) -> &'static str {
             "Delegate one complete, self-contained task to an isolated child agent and wait for its result. The child does not receive this conversation. Omit model and reasoning_effort to inherit the current agent settings; specify either field only when the task benefits from an explicit override."
         }
         "shell" => {
-            "Run workspace commands via argv or command; use bash -lc for heredoc, pipes, or compound commands. For background, omit timeout_ms unless setting a hard lifetime; yield_time_ms controls the initial return, then use shell_session."
+            "Run via argv or command; use bash -lc for pipes, redirects, heredoc, or compound commands. background=true returns after initial return; shell_session waits. timeout_ms is a hard lifetime; omit timeout_ms normally."
         }
         "process_list" => {
             "List managed background processes owned by the current session, including redacted commands, states, exit codes, and output statistics. This does not consume process output or advance a cursor."

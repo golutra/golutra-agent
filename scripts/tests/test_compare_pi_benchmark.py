@@ -173,6 +173,167 @@ class CompareBenchmarkTest(unittest.TestCase):
         self.assertEqual(metrics["tool_call_count"], 0)
         self.assertEqual(metrics["tool_names"], [])
 
+    def test_golutra_parser_classifies_stable_prefix_cache_miss_without_raw_scope(self) -> None:
+        def item(event_type: str, event_id: str, payload: dict) -> dict:
+            return {
+                "type": "item.updated",
+                "item": {
+                    "data": {
+                        "event_type": event_type,
+                        "id": event_id,
+                        "payload": payload,
+                    }
+                },
+            }
+
+        def snapshot(request_id: str, messages: list[str]) -> dict:
+            return item(
+                "context_snapshot_created",
+                f"snapshot-{request_id}",
+                {
+                    "snapshot": {
+                        "provider_request_id": request_id,
+                        "message_manifest": [
+                            {"wire_digest": digest, "content_digest": digest}
+                            for digest in messages
+                        ],
+                    },
+                    "cache_diagnostics": {
+                        "scope_key": "private-session-id",
+                        "route": {"digest": "route-1"},
+                        "cache_policy": "auto",
+                        "message_count": len(messages),
+                        "message_prefix_token_estimate": 2_048,
+                        "message_prefix_digest": f"prefix-{request_id}",
+                        "tool_digest": "tools-1",
+                        "canonical_request_digest": f"request-{request_id}",
+                    },
+                },
+            )
+
+        def usage(request_id: str, timestamp: int) -> dict:
+            return item(
+                "token_usage_recorded",
+                f"usage-{request_id}",
+                {
+                    "timestamp": timestamp,
+                    "record": {
+                        "request_event_id": request_id,
+                        "input_tokens": 2_048,
+                        "non_cached_input_tokens": 2_048,
+                        "cache_read_tokens": 0,
+                        "cache_write_tokens": 0,
+                        "output_tokens": 1,
+                        "provider_total_tokens": 2_049,
+                        "usage_source": "provider",
+                    },
+                },
+            )
+
+        stdout = "\n".join(
+            json.dumps(event)
+            for event in [
+                snapshot("request-1", ["message-a"]),
+                item("provider_started", "start-1", {"provider_request_id": "request-1"}),
+                usage("request-1", 1_001),
+                snapshot("request-2", ["message-a", "message-b"]),
+                item("provider_started", "start-2", {"provider_request_id": "request-2"}),
+                usage("request-2", 1_002),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            metrics = benchmark.parse_golutra(stdout, 2.0, 0, Path(directory))
+
+        first, second = metrics["provider_requests"]
+        self.assertEqual(first["cache_prefix_relation"], "cold_start")
+        self.assertEqual(first["cache_outcome_reason"], "cold_start")
+        self.assertEqual(second["cache_prefix_relation"], "append_only")
+        self.assertEqual(
+            second["cache_outcome_reason"], "provider_miss_on_stable_prefix"
+        )
+        encoded = json.dumps(metrics["provider_requests"], sort_keys=True)
+        self.assertNotIn("private-session-id", encoded)
+        self.assertIn("scope_digest", second["cache_diagnostics"])
+
+    def test_golutra_parser_carries_cache_prefix_across_stage_batches(self) -> None:
+        def item(event_type: str, event_id: str, payload: dict) -> dict:
+            return {
+                "type": "item.updated",
+                "item": {
+                    "data": {
+                        "event_type": event_type,
+                        "id": event_id,
+                        "payload": payload,
+                    }
+                },
+            }
+
+        def batch(request_id: str, messages: list[str]) -> str:
+            snapshot = item(
+                "context_snapshot_created",
+                f"snapshot-{request_id}",
+                {
+                    "snapshot": {
+                        "provider_request_id": request_id,
+                        "message_manifest": [{"wire_digest": value} for value in messages],
+                    },
+                    "cache_diagnostics": {
+                        "scope_key": "private-session-id",
+                        "route": {"digest": "route-1"},
+                        "cache_policy": "auto",
+                        "message_count": len(messages),
+                        "tool_digest": "tools-1",
+                    },
+                },
+            )
+            started = item(
+                "provider_started",
+                f"started-{request_id}",
+                {"provider_request_id": request_id},
+            )
+            usage = item(
+                "token_usage_recorded",
+                f"usage-{request_id}",
+                {
+                    "record": {
+                        "request_event_id": request_id,
+                        "input_tokens": 2_048,
+                        "non_cached_input_tokens": 2_048,
+                        "cache_read_tokens": 0,
+                        "cache_write_tokens": 0,
+                        "output_tokens": 1,
+                        "provider_total_tokens": 2_049,
+                        "usage_source": "provider",
+                    }
+                },
+            )
+            return "\n".join(json.dumps(event) for event in (snapshot, started, usage))
+
+        with tempfile.TemporaryDirectory() as directory:
+            first = benchmark.parse_golutra(
+                batch("request-1", ["message-a"]),
+                1.0,
+                0,
+                Path(directory),
+                previous_cache_context=None,
+                track_cache_context=True,
+            )
+            second = benchmark.parse_golutra(
+                batch("request-2", ["message-a", "message-b"]),
+                1.0,
+                0,
+                Path(directory),
+                previous_cache_context=first["_last_cache_context"],
+                track_cache_context=True,
+            )
+
+        self.assertEqual(first["provider_requests"][0]["cache_prefix_relation"], "cold_start")
+        self.assertEqual(second["provider_requests"][0]["cache_prefix_relation"], "append_only")
+        self.assertEqual(
+            second["provider_requests"][0]["cache_outcome_reason"],
+            "provider_miss_on_stable_prefix",
+        )
+
     def test_golutra_completed_event_does_not_override_nonzero_exit(self) -> None:
         stdout = json.dumps(
             {

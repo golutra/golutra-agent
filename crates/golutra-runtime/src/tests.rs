@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -127,6 +127,178 @@ fn active_tool_result_budget_caps_repetitive_outputs_by_kind() {
         active_tool_result_token_budget_for_tool(&plan, 0, 0, "apply_patch"),
         1_024
     );
+}
+
+#[test]
+fn active_working_set_soft_limit_requires_a_large_hard_window() {
+    assert_eq!(active_working_set_soft_limit(u64::MAX), None);
+    assert_eq!(
+        active_working_set_soft_limit(ACTIVE_WORKING_SET_MIN_HARD_BUDGET_TOKENS - 1),
+        None
+    );
+    assert_eq!(
+        active_working_set_soft_limit(ACTIVE_WORKING_SET_MIN_HARD_BUDGET_TOKENS),
+        Some(ACTIVE_WORKING_SET_MIN_HARD_BUDGET_TOKENS - ACTIVE_WORKING_SET_MIN_HEADROOM_TOKENS)
+    );
+    assert_eq!(active_working_set_soft_limit(40_000), None);
+    assert!(active_working_set_soft_limit(200_000).is_some_and(|limit| limit > 32_768));
+}
+
+#[test]
+fn active_working_set_compaction_keeps_tool_call_result_groups_together() {
+    let turn_id = TurnId::new();
+    let mut messages = vec![ProviderMessage {
+        role: ProviderRole::System,
+        content: "stable system prefix".to_owned(),
+        tool_call_id: None,
+        tool_name: None,
+        tool_calls: Vec::new(),
+        metadata: Default::default(),
+    }];
+    let mut sources = vec![ContextMessageSource {
+        contributor: "system".to_owned(),
+        source_refs: vec!["system".to_owned()],
+        origin: "system".to_owned(),
+        visibility: ModelInputVisibility::ModelVisible,
+    }];
+    for index in 0..20 {
+        messages.push(ProviderMessage {
+            role: ProviderRole::User,
+            content: format!("history-{index} {}", "detail ".repeat(4_000)),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+            metadata: Default::default(),
+        });
+        sources.push(ContextMessageSource {
+            contributor: "conversation_history".to_owned(),
+            source_refs: vec![format!("history:{index}")],
+            origin: "runtime_history".to_owned(),
+            visibility: ModelInputVisibility::ModelVisible,
+        });
+    }
+    let call_id = "call-build".to_owned();
+    messages.push(ProviderMessage {
+        role: ProviderRole::Assistant,
+        content: String::new(),
+        tool_call_id: None,
+        tool_name: None,
+        tool_calls: vec![ProviderToolCall {
+            tool_call_id: call_id.clone(),
+            tool_name: "shell".to_owned(),
+            arguments: json!({"command": "printf ok"}),
+        }],
+        metadata: Default::default(),
+    });
+    sources.push(ContextMessageSource {
+        contributor: "assistant_recent".to_owned(),
+        source_refs: vec!["tool-call:build".to_owned()],
+        origin: "assistant".to_owned(),
+        visibility: ModelInputVisibility::ModelVisible,
+    });
+    messages.push(ProviderMessage {
+        role: ProviderRole::Tool,
+        content: "ok".to_owned(),
+        tool_call_id: Some(call_id.clone()),
+        tool_name: Some("shell".to_owned()),
+        tool_calls: Vec::new(),
+        metadata: Default::default(),
+    });
+    sources.push(ContextMessageSource {
+        contributor: "tool_result_excerpt".to_owned(),
+        source_refs: vec!["tool-call:build".to_owned()],
+        origin: "tool_result".to_owned(),
+        visibility: ModelInputVisibility::ModelVisible,
+    });
+
+    let record = ContextWindowManager::new(
+        active_working_set_soft_limit(ACTIVE_WORKING_SET_MIN_HARD_BUDGET_TOKENS)
+            .expect("large window has a dynamic soft limit"),
+    )
+    .compact_if_needed(turn_id, 1, &messages, &sources, 0)
+    .expect("soft compaction plan")
+    .expect("history exceeds the soft working-set cap");
+
+    assert_eq!(record.replacement_messages[0].role, ProviderRole::System);
+    let assistant_call_present = record.replacement_messages.iter().any(|message| {
+        message.role == ProviderRole::Assistant
+            && message
+                .tool_calls
+                .iter()
+                .any(|call| call.tool_call_id == call_id)
+    });
+    let tool_result_present = record.replacement_messages.iter().any(|message| {
+        message.role == ProviderRole::Tool && message.tool_call_id.as_deref() == Some(&call_id)
+    });
+    assert_eq!(assistant_call_present, tool_result_present);
+}
+
+fn read_fact_report(
+    path: &str,
+    digest: &str,
+    offset: u64,
+    limit: u64,
+    excerpt: &str,
+) -> ToolExecutionReport {
+    let mut report = objective_test_report("read_file", None);
+    report.envelope.structured_facts = json!({
+        "path": path,
+        "content_digest": digest,
+        "offset": offset,
+        "limit": limit,
+        "has_more": true,
+        "continuation": {"next_offset": offset.saturating_add(limit)},
+    });
+    report.envelope.model_visible_excerpt = Some(excerpt.to_owned());
+    report
+}
+
+#[test]
+fn repeated_read_projection_keeps_facts_but_omits_duplicate_body() {
+    let workspace = Path::new("/workspace");
+    let report = read_fact_report("src/./lib.rs", "sha256:one", 0, 200, "fn main() {}\n");
+    let mut seen = HashSet::new();
+
+    let first = model_visible_tool_result_for_active_plan(&report, 2_048, &mut seen, workspace);
+    let second = model_visible_tool_result_for_active_plan(&report, 2_048, &mut seen, workspace);
+
+    assert!(first.contains("fn main()"));
+    assert!(!second.contains("fn main()"));
+    assert!(second.contains("sha256:one"));
+    assert!(second.contains("next_offset"));
+}
+
+#[test]
+fn repeated_read_projection_reopens_body_for_a_changed_digest_or_window() {
+    let workspace = Path::new("/workspace");
+    let first_report = read_fact_report("src/lib.rs", "sha256:one", 0, 200, "old body");
+    let changed_report = read_fact_report("src/lib.rs", "sha256:two", 0, 200, "new body");
+    let next_window = read_fact_report("src/lib.rs", "sha256:one", 200, 200, "next body");
+    let mut seen = HashSet::new();
+
+    let first =
+        model_visible_tool_result_for_active_plan(&first_report, 2_048, &mut seen, workspace);
+    let changed =
+        model_visible_tool_result_for_active_plan(&changed_report, 2_048, &mut seen, workspace);
+    let next = model_visible_tool_result_for_active_plan(&next_window, 2_048, &mut seen, workspace);
+
+    assert!(first.contains("old body"));
+    assert!(changed.contains("new body"));
+    assert!(next.contains("next body"));
+}
+
+#[test]
+fn repeated_read_projection_preserves_continuation_under_a_tight_budget() {
+    let workspace = Path::new("/workspace");
+    let report = read_fact_report("src/lib.rs", "sha256:one", 0, 200, "body");
+    let mut seen = HashSet::new();
+    let _ = model_visible_tool_result_for_active_plan(&report, 2_048, &mut seen, workspace);
+    let compact = model_visible_tool_result_for_active_plan(&report, 256, &mut seen, workspace);
+
+    assert!(compact.contains("\"status\""));
+    assert!(compact.contains("sha256:one"));
+    assert!(compact.contains("next_offset"));
+    assert!(!compact.contains("body"));
 }
 
 #[test]
@@ -1054,6 +1226,10 @@ impl LlmProvider for PrefixContractProvider {
 
     fn contract(&self) -> golutra_core::ProviderContract {
         self.contract.clone()
+    }
+
+    fn preferred_cache_policy(&self) -> golutra_core::PromptCachePolicy {
+        golutra_core::PromptCachePolicy::Long
     }
 }
 
@@ -5515,7 +5691,7 @@ fn parallel_read_candidate_enforces_the_active_tool_profile() {
             .iter()
             .any(|tool| tool.tool_name == "external_hidden_read")
     );
-    assert_eq!(coding_tools.len(), 6);
+    assert_eq!(coding_tools.len(), 5);
 
     let none_tools = provider_tools_for_turn(
         &executor
@@ -5548,7 +5724,6 @@ fn coding_tool_surface_adds_optional_capabilities_only_when_requested() {
         "edit_file",
         "read_file",
         "shell",
-        "shell_session",
         "write_file",
     ];
     let selected = provider_tools_for_turn(
@@ -5594,7 +5769,7 @@ fn coding_tool_surface_adds_optional_capabilities_only_when_requested() {
 }
 
 #[test]
-fn coding_tool_surface_keeps_background_capability_stable_without_inferencing_other_options() {
+fn coding_tool_surface_adds_background_capability_only_when_requested() {
     let workspace = tempdir().expect("workspace");
     let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
     let all_tools = executor
@@ -5610,12 +5785,9 @@ fn coding_tool_surface_keeps_background_capability_stable_without_inferencing_ot
         &contract,
         AgentToolProfile::Coding,
         executor.registry(),
-        "implement the long-running task and keep the code maintainable",
+        "implement the task and keep the code maintainable",
     );
-    assert!(
-        generic.iter().any(|tool| tool.tool_name == "shell_session"),
-        "background session must remain available across coding turns"
-    );
+    assert!(!generic.iter().any(|tool| tool.tool_name == "shell_session"));
     assert!(!generic.iter().any(|tool| tool.tool_name == "web_search"));
     assert!(!generic.iter().any(|tool| tool.tool_name == "subagent"));
 
@@ -5652,7 +5824,7 @@ fn stable_tool_surface_expands_once_and_does_not_shrink_with_objective_text() {
         executor.registry(),
         "update the ledger files",
     );
-    assert_eq!(initial.len(), 6);
+    assert_eq!(initial.len(), 5);
 
     let expanded_candidate = provider_tools_for_turn(
         &all_tools,
@@ -5714,6 +5886,57 @@ fn stable_tool_surface_expands_once_and_does_not_shrink_with_objective_text() {
             .all(|tool| { tool.side_effect_type == SideEffectType::None })
     );
     assert!(!read_only.iter().any(|tool| tool.tool_name == "shell"));
+}
+
+#[test]
+fn tool_surface_only_resume_preserves_previous_optional_tools_without_history() {
+    let workspace = tempdir().expect("workspace");
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+    let all_tools = executor
+        .registry()
+        .provider_contracts()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let contract = TaskContract::conversational(Vec::new());
+    let previous = provider_tools_for_turn(
+        &all_tools,
+        &contract,
+        AgentToolProfile::Coding,
+        executor.registry(),
+        "run the test suite as a background process and wait for the process state",
+    );
+    assert!(
+        previous
+            .iter()
+            .any(|tool| tool.tool_name == "shell_session")
+    );
+
+    let resume = AgentReplayContext::for_resume_tool_surface(previous.clone());
+    assert!(resume.initial_messages.is_empty());
+    assert!(resume.allow_parallel_reads);
+
+    let next_candidate = provider_tools_for_turn(
+        &all_tools,
+        &contract,
+        AgentToolProfile::Coding,
+        executor.registry(),
+        "continue the implementation",
+    );
+    let retained = stable_provider_tools_for_turn(
+        &resume.tools,
+        next_candidate,
+        &contract,
+        AgentToolProfile::Coding,
+        executor.registry(),
+        true,
+    );
+    assert_eq!(retained, previous);
+    assert!(
+        retained
+            .iter()
+            .any(|tool| tool.tool_name == "shell_session")
+    );
 }
 
 #[test]
@@ -6073,7 +6296,7 @@ async fn steering_turn_is_injected_after_the_complete_tool_batch() {
                 session_id: SessionId::new(),
                 task_id: TaskId::new(),
                 turn_id: TurnId::new(),
-                objective: "inspect the repository".to_owned(),
+                objective: "inspect the repository and wait for a background process".to_owned(),
                 completion_criteria: Vec::new(),
                 output_schema: None,
                 touched_code: false,
@@ -6187,7 +6410,7 @@ async fn queued_turn_applies_its_own_tool_profile() {
         *process_tool_visibility
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
-        vec![true, true]
+        vec![false, true]
     );
     assert_eq!(outcome.final_turn_id, queued_turn_id);
     assert_eq!(
@@ -6257,7 +6480,7 @@ async fn appended_turn_uses_the_default_coding_surface() {
         *process_tool_visibility
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
-        vec![true, true]
+        vec![false, false]
     );
     assert_eq!(outcome.final_turn_id, queued_turn_id);
     assert!(trace.iter().any(|event| matches!(
@@ -6347,6 +6570,11 @@ async fn provider_next_round_is_previous_request_prefix_and_keeps_static_surface
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[0].cache_policy,
+        golutra_core::PromptCachePolicy::Long,
+        "the runtime must use the provider's preferred policy for main rounds"
+    );
     for pair in requests.windows(2) {
         let previous = &pair[0];
         let next = &pair[1];
@@ -6429,7 +6657,7 @@ async fn configured_pending_turn_without_a_mode_uses_the_default_surface() {
         *process_tool_visibility
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
-        vec![true, true]
+        vec![true, false]
     );
     assert_eq!(outcome.final_turn_id, queued_turn_id);
     assert_eq!(
@@ -6504,7 +6732,7 @@ async fn configured_pending_turn_explicit_surface_overrides_the_active_surface()
         *process_tool_visibility
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
-        vec![true, true]
+        vec![true, false]
     );
     assert_eq!(outcome.final_turn_id, queued_turn_id);
     assert_eq!(
@@ -7694,6 +7922,39 @@ fn checkpoint_restore_removes_file_created_by_task() {
         .restore_checkpoint(checkpoint.checkpoint_id)
         .expect("checkpoint restores");
 
+    assert!(!source.exists());
+}
+
+#[test]
+fn checkpoint_supports_missing_nested_parent_without_creating_workspace_dirs() {
+    let workspace = tempdir().expect("workspace");
+    let checkpoint_root = tempdir().expect("checkpoint");
+    let source = workspace.path().join("nested/deep/created.txt");
+    let manager = WorkspaceCheckpointManager::new(workspace.path(), checkpoint_root.path());
+
+    let checkpoint = manager
+        .create_checkpoint(
+            WorkspaceId::new(),
+            TaskId::new(),
+            TurnId::new(),
+            &[FileBeforeImage {
+                path: source.clone(),
+                content: None,
+                unix_mode: None,
+                metadata: None,
+            }],
+            ToolCallId::new(),
+        )
+        .expect("checkpoint records a new nested file");
+
+    assert_eq!(checkpoint.changed_files, vec!["nested/deep/created.txt"]);
+    assert!(!source.parent().expect("source parent").exists());
+
+    fs::create_dir_all(source.parent().expect("source parent")).expect("create task parent");
+    fs::write(&source, "created by task").expect("created source");
+    manager
+        .restore_checkpoint(checkpoint.checkpoint_id)
+        .expect("checkpoint restores");
     assert!(!source.exists());
 }
 

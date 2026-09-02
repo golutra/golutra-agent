@@ -475,11 +475,19 @@ fn shell_contract_explains_how_to_submit_compound_commands() {
     assert!(background.contains("Normally omit"));
     assert!(background.contains("yield_time_ms"));
     assert!(background.contains("shell_session"));
+    assert!(background.contains("return immediately"));
+    assert!(background.contains("while it is running"));
     let yield_time_lower = yield_time.to_ascii_lowercase();
     assert!(yield_time_lower.contains("initial"));
+    assert!(yield_time_lower.contains("default 0"));
     assert!(yield_time_lower.contains("does not set or extend"));
     assert!(workdir.contains("directory"));
     assert!(workdir.contains("workspace-relative"));
+}
+
+#[test]
+fn background_start_default_is_non_blocking() {
+    assert_eq!(super::process_supervisor::default_start_wait_ms(), 0);
 }
 
 #[tokio::test]
@@ -1068,6 +1076,144 @@ fn read_file_path_failure_exposes_bounded_discovery_action() {
     assert!(facts["next_action"].as_str().is_some_and(|action| {
         action.contains("bounded read-only shell discovery") && action.contains("rg --files")
     }));
+}
+
+#[test]
+fn checkpoint_failure_exposes_parent_action_without_hiding_raw_error() {
+    let workspace = tempdir().expect("workspace");
+    let executor = executor(workspace.path());
+    let request = request(
+        "write_file",
+        json!({"path": "nested/deep/checkpoint.json", "content": "{}"}),
+    );
+    let policy = executor.evaluate(&request).expect("policy evaluates");
+    let report = executor.execution_error_report(
+        request,
+        policy,
+        "before-side-effect checkpoint failed: checkpoint persistence failed: checkpoint io failed: No such file or directory (os error 2)",
+    );
+
+    assert_eq!(report.envelope.status, ToolResultStatus::Error);
+    assert_eq!(
+        report.envelope.structured_facts["path"],
+        "nested/deep/checkpoint.json"
+    );
+    assert_eq!(report.envelope.structured_facts["parent"], "nested/deep");
+    assert_eq!(report.envelope.structured_facts["parent_missing"], true);
+    assert_eq!(
+        report.envelope.structured_facts["action_required"],
+        "create_parent_directory_explicitly"
+    );
+    assert_eq!(
+        report.envelope.structured_facts["error_kind"],
+        "checkpoint_parent_missing"
+    );
+    assert!(artifact_text(&report).contains("No such file or directory"));
+
+    let (projection, _) =
+        parse_model_visible_tool_result(&model_visible_tool_result(&report.envelope));
+    assert_eq!(
+        projection["structured_facts"]["action_required"],
+        "create_parent_directory_explicitly"
+    );
+}
+
+#[tokio::test]
+async fn missing_read_file_returns_safe_workspace_relative_candidates() {
+    let workspace = tempdir().expect("workspace");
+    fs::create_dir_all(workspace.path().join("jobledger")).expect("fixture directory");
+    fs::write(workspace.path().join("jobledger/model.py"), "model").expect("candidate");
+    fs::create_dir_all(workspace.path().join("other")).expect("second fixture directory");
+    fs::write(workspace.path().join("other/model.py"), "other").expect("second candidate");
+    fs::create_dir_all(workspace.path().join(".git")).expect("hidden directory");
+    fs::write(workspace.path().join(".git/model.py"), "hidden").expect("hidden candidate");
+    fs::create_dir_all(workspace.path().join("secrets")).expect("sensitive directory");
+    fs::write(workspace.path().join("secrets/model.py"), "sensitive").expect("sensitive candidate");
+    let executor = executor(workspace.path());
+
+    let report = executor
+        .execute(
+            request("read_file", json!({"path": "model.py"})),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("missing read returns a blocked report");
+
+    assert_eq!(report.envelope.status, ToolResultStatus::Blocked);
+    assert_eq!(
+        report.envelope.structured_facts["candidates"],
+        json!(["jobledger/model.py", "other/model.py"])
+    );
+    assert_eq!(
+        report.envelope.structured_facts["path_resolution"],
+        "missing_or_unresolvable"
+    );
+    assert!(
+        report.envelope.structured_facts["next_action"]
+            .as_str()
+            .is_some_and(|action| action.contains("retry read_file"))
+    );
+    let projected = model_visible_tool_result(&report.envelope);
+    assert!(projected.contains("jobledger/model.py"));
+    assert!(!projected.contains(workspace.path().to_string_lossy().as_ref()));
+    assert!(!projected.contains(".git/model.py"));
+    assert!(!projected.contains("secrets/model.py"));
+    assert!(
+        report.envelope.structured_facts["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("path resolution failed"))
+    );
+}
+
+#[tokio::test]
+async fn unique_basename_read_keeps_the_requested_path_and_exposes_a_candidate() {
+    let workspace = tempdir().expect("workspace");
+    fs::create_dir_all(workspace.path().join("jobledger")).expect("fixture directory");
+    fs::write(workspace.path().join("jobledger/model.py"), "model").expect("candidate");
+    let executor = executor(workspace.path());
+    let request = request("read_file", json!({"path": "model.py"}));
+    let policy = executor.evaluate(&request).expect("policy evaluates");
+    assert_eq!(policy.decision, PolicyDecision::Block);
+
+    let report = executor
+        .execute_with_policy(request, policy, false, CancellationToken::new())
+        .await
+        .expect("missing path returns a bounded candidate hint");
+
+    assert_eq!(report.envelope.status, ToolResultStatus::Blocked);
+    assert_eq!(report.envelope.structured_facts["path"], "model.py");
+    assert_eq!(
+        report.envelope.structured_facts["candidates"],
+        json!(["jobledger/model.py"])
+    );
+    assert_eq!(
+        report.envelope.structured_facts["path_resolution"],
+        "missing_or_unresolvable"
+    );
+    assert!(report.envelope.model_visible_excerpt.is_some());
+}
+
+#[tokio::test]
+async fn missing_read_file_without_candidates_keeps_the_discovery_fallback() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(workspace.path().join("README.md"), "readme").expect("fixture");
+    let executor = executor(workspace.path());
+
+    let report = executor
+        .execute(
+            request("read_file", json!({"path": "absent.py"})),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("missing read returns a blocked report");
+
+    assert_eq!(report.envelope.status, ToolResultStatus::Blocked);
+    assert!(report.envelope.structured_facts.get("candidates").is_none());
+    assert!(
+        report.envelope.structured_facts["next_action"]
+            .as_str()
+            .is_some_and(|action| action.contains("bounded read-only shell discovery"))
+    );
 }
 
 #[test]

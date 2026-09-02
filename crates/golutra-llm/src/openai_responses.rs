@@ -10,7 +10,7 @@ use genai::{
     resolver::{AuthData, Endpoint},
 };
 use golutra_auth::{CredentialProvider, FixedCredentialProvider};
-use golutra_core::ProviderContract;
+use golutra_core::{PromptCachePolicy, ProviderContract};
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
 use secrecy::ExposeSecret;
 use serde_json::{Value, json};
@@ -507,6 +507,10 @@ impl super::LlmProvider for OpenAiResponsesProvider {
         super::route_cache_namespace("openai_responses_sse", &self.config.base_url)
     }
 
+    fn preferred_cache_policy(&self) -> PromptCachePolicy {
+        self.cache_profile.preferred_cache_policy()
+    }
+
     fn contract(&self) -> ProviderContract {
         ProviderContract {
             provider_id: self.config.provider_id.clone(),
@@ -686,6 +690,9 @@ fn map_responses_genai_error(error: genai::Error) -> ProviderError {
         Some(429) => ProviderError::RateLimited { message },
         Some(status) if (500..600).contains(&status) => ProviderError::Unavailable { message },
         Some(_) => ProviderError::Failed { message },
+        // Responses maps `response.failed` to StreamParse. Treat all such
+        // parser/business failures as hard errors; transport truncation is
+        // represented separately as WebStream and remains retryable.
         None if matches!(error, genai::Error::StreamParse { .. }) => {
             ProviderError::Failed { message }
         }
@@ -729,6 +736,21 @@ fn chatgpt_account_id(access_token: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn response_failed_stream_event_is_not_replayed() {
+        let parser_error =
+            serde_json::from_str::<Value>("response.failed").expect_err("invalid JSON");
+        let error = genai::Error::StreamParse {
+            model_iden: ModelIden::new(AdapterKind::OpenAIResp, "gpt-test"),
+            serde_error: parser_error,
+        };
+
+        assert!(matches!(
+            map_responses_genai_error(error),
+            ProviderError::Failed { .. }
+        ));
+    }
 
     #[test]
     fn config_debug_never_contains_the_api_key() {

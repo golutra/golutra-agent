@@ -39,7 +39,10 @@ const MAX_TERMINAL_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_POLL_WAIT_MS: u64 = 30_000;
 const DEFAULT_POLL_WAIT_MS: u64 = 5_000;
-const DEFAULT_START_WAIT_MS: u64 = 1_000;
+// 后台启动的默认返回必须是非阻塞的：模型需要先利用真实的 running
+// 状态完成其他前置工作，再显式等待终态。调用方仍可通过 yield_time_ms
+// 请求短暂的初始输出窗口，因而不会牺牲需要即时输出的显式场景。
+const DEFAULT_START_WAIT_MS: u64 = 0;
 const MAX_RETENTION: Duration = Duration::from_secs(15 * 60);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_BUFFER_BYTES: usize = 16 * 1024;

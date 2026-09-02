@@ -27,25 +27,6 @@ const MAX_RESUME_PROVIDER_MESSAGES: usize = 16_384;
 // 精确 replay 只有在能放进当前窗口时才有价值；超出后强行保留会把
 // 动态历史标成稳定前缀，阻止 compaction 并让每个后续请求重复支付全文。
 const RESUME_REPLAY_HEADROOM_TOKENS: u64 = 1_024;
-// 跨任务 resume 不需要把上一轮的完整工具正文再次固定在 provider 前缀中。
-// 32K 是稳定前缀仍有明显缓存价值、而历史投影开始更划算的上限；小窗口按
-// 四分之一窗口收紧，避免把精确 replay 当成长期历史存储。
-const RESUME_REPLAY_SOFT_CAP_TOKENS: u64 = 32_768;
-const RESUME_REPLAY_SOFT_FLOOR_TOKENS: u64 = 8_192;
-
-fn resume_replay_soft_limit(context_budget: u64) -> u64 {
-    if context_budget == u64::MAX {
-        return u64::MAX;
-    }
-    context_budget
-        .saturating_div(4)
-        .clamp(
-            RESUME_REPLAY_SOFT_FLOOR_TOKENS,
-            RESUME_REPLAY_SOFT_CAP_TOKENS,
-        )
-        .min(context_budget.saturating_sub(RESUME_REPLAY_HEADROOM_TOKENS))
-}
-
 fn memory_candidate_limit(context_budget: u64) -> usize {
     if context_budget == 0 {
         return 0;
@@ -182,11 +163,12 @@ impl RuntimeHost {
             return Ok(None);
         };
         let contract = provider.contract();
+        let expected_cache_policy = provider.preferred_cache_policy();
         if previous.request_id != snapshot.provider_request_id
             || previous.session_id != Some(session_id)
             || previous.provider_id != contract.provider_id
             || previous.model_id != contract.model_id
-            || previous.cache_policy != golutra_core::PromptCachePolicy::Auto
+            || previous.cache_policy != expected_cache_policy
             || previous
                 .cache_scope
                 .as_ref()
@@ -197,36 +179,15 @@ impl RuntimeHost {
             return Ok(None);
         }
 
-        let mut messages = previous.messages;
-        let objective = objective.trim();
-        let already_current_objective = messages.last().is_some_and(|message| {
-            message.role == ProviderRole::User && message.content == objective
-        });
-        if previous.task_id != current_task_id || !already_current_objective {
-            messages.push(ProviderMessage {
-                role: ProviderRole::User,
-                content: objective.to_owned(),
-                tool_call_id: None,
-                tool_name: None,
-                tool_calls: Vec::new(),
-                metadata: Default::default(),
-            });
-        }
-        if messages.len() > MAX_RESUME_PROVIDER_MESSAGES {
+        let Some(messages) = resume_replay_messages_within_budget(
+            previous.messages,
+            previous.task_id,
+            current_task_id,
+            objective,
+            context_budget,
+        ) else {
             return Ok(None);
-        }
-        let replay_tokens = estimate_message_tokens(&messages);
-        let replay_over_hard_limit = context_budget != u64::MAX
-            && replay_tokens > context_budget.saturating_sub(RESUME_REPLAY_HEADROOM_TOKENS);
-        let replay_over_soft_limit = previous.task_id != current_task_id
-            && replay_tokens > resume_replay_soft_limit(context_budget);
-        if replay_over_hard_limit || replay_over_soft_limit {
-            // 普通上下文路径会按活动会话树重新投影，并在需要时触发模型摘要；
-            // 这比把超预算的旧 provider wire 当作不可变前缀更省 token，也保留
-            // 当前任务可用的语义事实。中断中的同一任务仍只在硬上限时回退，
-            // 以免丢失尚未完成的 tool-call/tool-result 配对。
-            return Ok(None);
-        }
+        };
         Ok(Some(AgentReplayContext::for_resume(
             messages,
             previous.tools,
@@ -391,6 +352,44 @@ impl RuntimeHost {
             }
         }
     }
+}
+
+/// Build the exact provider transcript used for resume while it fits the real
+/// context budget. No soft history cap is applied: preserving the full prior
+/// wire keeps tool-call/result pairs intact and lets the next request reuse the
+/// previous request as its prefix. Only a true context overflow falls back to
+/// the ordinary activity-tree projection and compaction path.
+pub(crate) fn resume_replay_messages_within_budget(
+    mut messages: Vec<ProviderMessage>,
+    previous_task_id: TaskId,
+    current_task_id: TaskId,
+    objective: &str,
+    context_budget: u64,
+) -> Option<Vec<ProviderMessage>> {
+    let objective = objective.trim();
+    if objective.is_empty() {
+        return None;
+    }
+    let already_current_objective = messages
+        .last()
+        .is_some_and(|message| message.role == ProviderRole::User && message.content == objective);
+    if previous_task_id != current_task_id || !already_current_objective {
+        messages.push(ProviderMessage {
+            role: ProviderRole::User,
+            content: objective.to_owned(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+            metadata: Default::default(),
+        });
+    }
+    if messages.len() > MAX_RESUME_PROVIDER_MESSAGES {
+        return None;
+    }
+    let replay_tokens = estimate_message_tokens(&messages);
+    let replay_over_hard_limit = context_budget != u64::MAX
+        && replay_tokens > context_budget.saturating_sub(RESUME_REPLAY_HEADROOM_TOKENS);
+    (!replay_over_hard_limit).then_some(messages)
 }
 
 pub(crate) fn provider_transcript_is_replayable(messages: &[ProviderMessage]) -> bool {
@@ -1743,19 +1742,5 @@ mod lifecycle_tests {
         })
         .await
         .expect("cancelled close must abort the recorder worker");
-    }
-
-    #[test]
-    fn resume_replay_soft_limit_keeps_small_windows_and_caps_large_ones() {
-        assert_eq!(resume_replay_soft_limit(u64::MAX), u64::MAX);
-        assert_eq!(
-            resume_replay_soft_limit(200_000),
-            RESUME_REPLAY_SOFT_CAP_TOKENS
-        );
-        assert_eq!(
-            resume_replay_soft_limit(16_000),
-            RESUME_REPLAY_SOFT_FLOOR_TOKENS
-        );
-        assert_eq!(resume_replay_soft_limit(6_000), 4_976);
     }
 }

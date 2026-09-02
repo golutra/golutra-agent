@@ -110,6 +110,58 @@ class CompareLongBenchmarkTest(unittest.TestCase):
         self.assertEqual(summary["runtime_terminal_successes"], 2)
         self.assertEqual(summary["strict_passed"], 1)
         self.assertEqual(summary["process_return_codes"], {"0": 1, "1": 1})
+        self.assertIsNone(summary["cache_diagnostic_requests"])
+        self.assertIsNone(summary["stable_prefix_miss_requests"])
+
+    def test_aggregate_turns_summarizes_stable_prefix_cache_misses(self) -> None:
+        turns = [
+            {
+                "process_return_code": 0,
+                "workspace_verifier_pass": True,
+                "runtime_terminal_success": True,
+                "strict_passed": True,
+                "metrics": {
+                    "elapsed_ms": 10,
+                    "provider_requests": [
+                        {
+                            "cache_diagnostics": {"scope_digest": "sha256:scope"},
+                            "cache_prefix_relation": "cold_start",
+                            "cache_outcome_reason": "cold_start",
+                            "uncached_input_tokens": 900,
+                        },
+                        {
+                            "cache_diagnostics": {"scope_digest": "sha256:scope"},
+                            "cache_prefix_relation": "append_only",
+                            "cache_outcome_reason": "provider_miss_on_stable_prefix",
+                            "uncached_input_tokens": 1_200,
+                        },
+                        {
+                            "cache_diagnostics": {"scope_digest": "sha256:scope"},
+                            "cache_prefix_relation": "append_only",
+                            "cache_outcome_reason": "cache_hit",
+                            "uncached_input_tokens": 80,
+                        },
+                    ],
+                },
+            }
+        ]
+
+        summary = benchmark.aggregate_turns(turns)
+
+        self.assertEqual(summary["cache_diagnostic_requests"], 3)
+        self.assertEqual(
+            summary["cache_prefix_relations"], {"cold_start": 1, "append_only": 2}
+        )
+        self.assertEqual(
+            summary["cache_outcome_reasons"],
+            {
+                "cold_start": 1,
+                "provider_miss_on_stable_prefix": 1,
+                "cache_hit": 1,
+            },
+        )
+        self.assertEqual(summary["stable_prefix_miss_requests"], 1)
+        self.assertEqual(summary["stable_prefix_miss_uncached_tokens"], 1_200)
 
     def test_subtract_cumulative_usage(self) -> None:
         current = {

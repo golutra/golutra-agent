@@ -9,6 +9,7 @@ endpoint cannot make the report look more precise than the wire response.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import signal
@@ -897,6 +898,8 @@ def provider_request_metrics(
     request_index: int,
     observation: dict[str, Any],
     usage: dict[str, Any] | None,
+    cache_context: dict[str, Any] | None = None,
+    previous_cache_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """把一个 provider round 投影成独立、可比较的计量记录。"""
     metrics = empty_metrics()
@@ -936,27 +939,147 @@ def provider_request_metrics(
         partial = metrics.get(f"{field}_partial")
         if partial is not None:
             projection[f"{field}_partial"] = partial
+    projection.update(
+        provider_cache_round_diagnostics(
+            cache_context,
+            previous_cache_context,
+            projection.get("prompt_tokens"),
+            projection.get("cache_read_tokens"),
+        )
+    )
     return projection
+
+
+def _diagnostic_identity(value: Any) -> str | None:
+    """只保留路由标识的哈希，避免把原值复制到基准报告。"""
+    if not isinstance(value, str) or not value:
+        return None
+    return f"sha256:{hashlib.sha256(value.encode('utf-8')).hexdigest()}"
+
+
+def provider_cache_context(payload: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    """从上下文快照事件读取不含正文的缓存事实。"""
+    snapshot = payload.get("snapshot")
+    diagnostics = payload.get("cache_diagnostics")
+    if not isinstance(snapshot, dict) or not isinstance(diagnostics, dict):
+        return None
+    request_id = snapshot.get("provider_request_id")
+    if not isinstance(request_id, str) or not request_id:
+        return None
+    message_manifest = snapshot.get("message_manifest")
+    message_manifest = message_manifest if isinstance(message_manifest, list) else []
+    wire_digests = []
+    for message in message_manifest:
+        if not isinstance(message, dict):
+            continue
+        digest = message.get("wire_digest") or message.get("content_digest")
+        if isinstance(digest, str) and digest:
+            wire_digests.append(digest)
+    route = diagnostics.get("route")
+    route = route if isinstance(route, dict) else {}
+    return request_id, {
+        "scope_digest": _diagnostic_identity(diagnostics.get("scope_key")),
+        "route_digest": route.get("digest"),
+        "cache_policy": diagnostics.get("cache_policy"),
+        "message_count": diagnostics.get("message_count"),
+        "message_prefix_token_estimate": diagnostics.get(
+            "message_prefix_token_estimate"
+        ),
+        "message_prefix_digest": diagnostics.get("message_prefix_digest"),
+        "tool_digest": diagnostics.get("tool_digest"),
+        "canonical_request_digest": diagnostics.get("canonical_request_digest"),
+        "_message_wire_digests": wire_digests,
+    }
+
+
+def provider_cache_round_diagnostics(
+    current: dict[str, Any] | None,
+    previous: dict[str, Any] | None,
+    prompt_tokens: Any,
+    cache_read_tokens: Any,
+) -> dict[str, Any]:
+    if current is None:
+        return {
+            "cache_prefix_relation": "unknown",
+            "cache_outcome_reason": "diagnostics_unavailable",
+        }
+
+    if previous is None:
+        relation = "cold_start"
+    elif current.get("scope_digest") != previous.get("scope_digest"):
+        relation = "scope_changed"
+    elif current.get("route_digest") != previous.get("route_digest"):
+        relation = "route_changed"
+    elif current.get("cache_policy") != previous.get("cache_policy"):
+        relation = "cache_policy_changed"
+    elif current.get("tool_digest") != previous.get("tool_digest"):
+        relation = "tool_schema_changed"
+    else:
+        prior_messages = previous.get("_message_wire_digests")
+        current_messages = current.get("_message_wire_digests")
+        if not isinstance(prior_messages, list) or not isinstance(current_messages, list):
+            relation = "unknown"
+        elif current_messages[: len(prior_messages)] == prior_messages:
+            relation = "append_only"
+        else:
+            relation = "message_prefix_rewritten"
+
+    if not isinstance(cache_read_tokens, int):
+        outcome = "usage_unknown"
+    elif cache_read_tokens > 0:
+        outcome = "cache_hit"
+    elif relation == "cold_start":
+        outcome = "cold_start"
+    elif isinstance(prompt_tokens, int) and prompt_tokens < 1_024:
+        outcome = "below_provider_cache_threshold"
+    elif relation == "append_only":
+        outcome = "provider_miss_on_stable_prefix"
+    elif relation == "unknown":
+        outcome = "prefix_relation_unknown"
+    else:
+        outcome = relation
+
+    public_context = {
+        key: value
+        for key, value in current.items()
+        if not key.startswith("_") and value is not None
+    }
+    return {
+        "cache_prefix_relation": relation,
+        "cache_outcome_reason": outcome,
+        "cache_diagnostics": public_context,
+    }
 
 
 def project_provider_requests(
     request_order: Iterable[str],
     observations: dict[str, dict[str, Any]],
     usage_records: dict[str, dict[str, Any]],
+    cache_contexts: dict[str, dict[str, Any]] | None = None,
+    previous_cache_context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     order = list(dict.fromkeys(request_order))
     for request_id in usage_records:
         if request_id not in order:
             order.append(request_id)
-    return [
-        provider_request_metrics(
-            request_id,
-            index,
-            observations.get(request_id, {}),
-            usage_records.get(request_id),
+    contexts = cache_contexts or {}
+    projected = []
+    previous_context = previous_cache_context
+    for index, request_id in enumerate(order):
+        current_context = contexts.get(request_id)
+        projected.append(
+            provider_request_metrics(
+                request_id,
+                index,
+                observations.get(request_id, {}),
+                usage_records.get(request_id),
+                current_context,
+                previous_context,
+            )
         )
-        for index, request_id in enumerate(order)
-    ]
+        if current_context is not None:
+            previous_context = current_context
+    return projected
 
 
 def parse_golutra(
@@ -965,6 +1088,8 @@ def parse_golutra(
     return_code: int,
     run_dir: Path,
     line_times_ms: Iterable[float] | None = None,
+    previous_cache_context: dict[str, Any] | None = None,
+    track_cache_context: bool = False,
 ) -> dict[str, Any]:
     metrics = empty_metrics()
     metrics["return_code"] = return_code
@@ -1006,6 +1131,8 @@ def parse_golutra(
     seen_requests: set[str] = set()
     request_order: list[str] = []
     request_observations: dict[str, dict[str, Any]] = {}
+    request_cache_contexts: dict[str, dict[str, Any]] = {}
+    latest_cache_context = previous_cache_context
     request_tracker = ProviderRequestTracker()
     usage_records: dict[str, dict[str, Any]] = {}
     fallback_usage_records: dict[str, dict[str, Any]] = {}
@@ -1028,6 +1155,12 @@ def parse_golutra(
         event_time = observed_time(event, arrival)
         if event_type == "context_built" and metrics["planned_input_tokens"] is None:
             metrics["planned_input_tokens"] = as_number(payload.get("planned_input_tokens"))
+        if event_type == "context_snapshot_created":
+            context = provider_cache_context(payload)
+            if context is not None:
+                context_request_id, cache_context = context
+                request_cache_contexts[context_request_id] = cache_context
+                latest_cache_context = cache_context
         if event_type in {"turn_completed", "turn.completed"} and terminal is None:
             terminal_success = str(payload.get("status") or "completed").lower() == "completed"
             terminal = event_time
@@ -1118,8 +1251,16 @@ def parse_golutra(
     metrics["request_count"] = len(seen_requests | set(normalized_usage))
     apply_usage_records(metrics, normalized_usage.values(), metrics["request_count"])
     metrics["provider_requests"] = project_provider_requests(
-        request_order, request_observations, normalized_usage
+        request_order,
+        request_observations,
+        normalized_usage,
+        request_cache_contexts,
+        previous_cache_context,
     )
+    if track_cache_context:
+        if latest_cache_context is not None:
+            # 仅供 long benchmark 在进程内延续诊断状态；不进入公开报告。
+            metrics["_last_cache_context"] = latest_cache_context
     metrics["tool_names"] = sorted(tool_names)
     metrics["first_token_ms"] = elapsed_between(first_token, process_origin)
     metrics["turn_first_token_ms"] = elapsed_between(first_token, turn_start)
