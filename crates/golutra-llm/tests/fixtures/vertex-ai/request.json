@@ -32,7 +32,7 @@
         "functionDeclarations": [
           {
             "name": "read_file",
-            "description": "Read a UTF-8 text file in the workspace.",
+            "description": "Read workspace lines; use offset/limit and continuation.next_offset.",
             "parametersJsonSchema": {
               "type": "object",
               "properties": {"path": {"type": "string"}},

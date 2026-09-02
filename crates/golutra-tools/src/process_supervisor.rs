@@ -8,7 +8,9 @@
 
 use std::{
     collections::{HashMap, VecDeque},
+    io,
     path::{Path, PathBuf},
+    process::ExitStatus,
     sync::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicU8, AtomicU64, Ordering},
@@ -18,6 +20,8 @@ use std::{
 
 use golutra_core::SessionId;
 use golutra_sandbox::{SandboxBackendKind, SandboxRequest, SystemSandbox, WorkspaceAccess};
+#[cfg(unix)]
+use nix::libc;
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -35,7 +39,10 @@ const MAX_TERMINAL_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_POLL_WAIT_MS: u64 = 30_000;
 const DEFAULT_POLL_WAIT_MS: u64 = 5_000;
-const DEFAULT_START_WAIT_MS: u64 = 1_000;
+// 后台启动的默认返回必须是非阻塞的：模型需要先利用真实的 running
+// 状态完成其他前置工作，再显式等待终态。调用方仍可通过 yield_time_ms
+// 请求短暂的初始输出窗口，因而不会牺牲需要即时输出的显式场景。
+const DEFAULT_START_WAIT_MS: u64 = 0;
 const MAX_RETENTION: Duration = Duration::from_secs(15 * 60);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const READ_BUFFER_BYTES: usize = 16 * 1024;
@@ -137,6 +144,9 @@ impl TerminationIntent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProcessSnapshot {
     pub(crate) process_id: String,
+    /// 启动时记录的不可变 OS PID，仅用于诊断和校验；调用方仍以 `process_id`
+    /// 作为逻辑控制句柄。
+    pub(crate) authoritative_pid: u32,
     pub(crate) state: ProcessState,
     pub(crate) exit_code: Option<i32>,
     pub(crate) output: String,
@@ -152,11 +162,20 @@ pub(crate) struct ProcessSnapshot {
     pub(crate) before_images: Vec<super::FileBeforeImage>,
     pub(crate) after_images: Vec<super::FileBeforeImage>,
     pub(crate) workspace_changes_known: bool,
+    /// 该进程唯一终态发布事件的稳定身份。子进程仍在运行、回收或记账时为 `None`。
+    pub(crate) terminal_event_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProcessWaitResult {
+    pub(crate) snapshot: ProcessSnapshot,
+    pub(crate) cancelled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProcessSummary {
     pub(crate) process_id: String,
+    pub(crate) authoritative_pid: u32,
     pub(crate) command_display: String,
     pub(crate) state: ProcessState,
     pub(crate) exit_code: Option<i32>,
@@ -164,6 +183,7 @@ pub(crate) struct ProcessSummary {
     pub(crate) output_bytes: u64,
     pub(crate) output_lines: u64,
     pub(crate) output_truncated: bool,
+    pub(crate) terminal_event_id: Option<u64>,
 }
 
 pub(crate) struct ProcessStartRequest<'a> {
@@ -228,6 +248,13 @@ struct ProcessStateRecord {
     exit_code: Option<i32>,
     workspace_scan: Option<workspace_scan::WorkspaceMutationScan>,
     completed_at: Option<Instant>,
+    terminal_event_id: Option<u64>,
+}
+
+#[derive(Debug)]
+struct PidLifecycle {
+    pid: Option<u32>,
+    reaped: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -329,9 +356,9 @@ struct ManagedProcess {
     session_id: SessionId,
     request_identity: ProcessRequestIdentity,
     command_display: String,
-    /// Cleared once the process reaches a terminal state so a recycled OS PID
-    /// cannot be signaled by a late terminate/shutdown path.
-    pid: StdMutex<Option<u32>>,
+    authoritative_pid: u32,
+    /// 终止信号和 child 回收共享同一把锁，避免回收与 PID 复用之间出现信号竞态。
+    pid_lifecycle: Arc<StdMutex<PidLifecycle>>,
     pid_registration: StdMutex<Option<PidRegistration>>,
     termination_intent: Arc<TerminationIntent>,
     stdin: Mutex<Option<ChildStdin>>,
@@ -356,8 +383,13 @@ impl std::fmt::Debug for ManagedProcess {
             .field("command_display", &self.command_display)
             .field(
                 "pid",
-                &self.pid.try_lock().map(|guard| *guard).unwrap_or(None),
+                &self
+                    .pid_lifecycle
+                    .try_lock()
+                    .map(|lifecycle| lifecycle.pid)
+                    .unwrap_or(None),
             )
+            .field("authoritative_pid", &self.authoritative_pid)
             .finish_non_exhaustive()
     }
 }
@@ -369,7 +401,17 @@ struct SupervisorInner {
     // Drop 不能 await Tokio mutex；同步 PID 表保证 runtime 消失时仍能立即清理进程组。
     active_pids: StdMutex<HashMap<u64, PidRegistration>>,
     next_pid_token: AtomicU64,
+    next_terminal_event_id: AtomicU64,
     terminating_sessions: StdMutex<HashMap<SessionId, usize>>,
+    #[cfg(test)]
+    reap_window_hook: StdMutex<Option<ReapWindowHook>>,
+}
+
+#[cfg(test)]
+struct ReapWindowHook {
+    process_id: String,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
 }
 
 #[derive(Debug, Clone)]
@@ -377,6 +419,7 @@ struct PidRegistration {
     token: u64,
     pid: u32,
     termination_intent: Arc<TerminationIntent>,
+    pid_lifecycle: Arc<StdMutex<PidLifecycle>>,
 }
 
 struct TerminatingSessionGuard {
@@ -402,6 +445,7 @@ impl SupervisorInner {
         &self,
         pid: Option<u32>,
         termination_intent: Arc<TerminationIntent>,
+        pid_lifecycle: Arc<StdMutex<PidLifecycle>>,
     ) -> Option<PidRegistration> {
         let pid = pid?;
         let token = self.next_pid_token.fetch_add(1, Ordering::Relaxed);
@@ -409,6 +453,7 @@ impl SupervisorInner {
             token,
             pid,
             termination_intent,
+            pid_lifecycle,
         };
         if let Ok(mut active) = self.active_pids.lock() {
             active.insert(token, registration.clone());
@@ -440,10 +485,37 @@ impl SupervisorInner {
             .active_pids
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for registration in active.values() {
-            registration.termination_intent.request(state);
-            // 持有注册表锁直到发信号，避免 PID 释放与信号发送之间出现复用窗口。
-            process::terminate_process_group(Some(registration.pid));
+        let registrations = active.values().cloned().collect::<Vec<_>>();
+        drop(active);
+        for registration in registrations {
+            let mut lifecycle = registration
+                .pid_lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if lifecycle.reaped {
+                continue;
+            }
+            let Some(pid) = lifecycle.pid.take() else {
+                continue;
+            };
+            let still_registered = self
+                .active_pids
+                .lock()
+                .map(|active| {
+                    active.get(&registration.token).is_some_and(|current| {
+                        current.pid == registration.pid
+                            && Arc::ptr_eq(
+                                &current.termination_intent,
+                                &registration.termination_intent,
+                            )
+                    })
+                })
+                .unwrap_or(false);
+            if still_registered {
+                registration.termination_intent.request(state);
+                // lifecycle 锁和注册表复核共同保证信号不会落到已释放的旧 PID。
+                process::terminate_process_group(Some(pid));
+            }
         }
     }
 
@@ -561,7 +633,10 @@ impl ProcessSupervisor {
                 shutdown: CancellationToken::new(),
                 active_pids: StdMutex::new(HashMap::new()),
                 next_pid_token: AtomicU64::new(1),
+                next_terminal_event_id: AtomicU64::new(1),
                 terminating_sessions: StdMutex::new(HashMap::new()),
+                #[cfg(test)]
+                reap_window_hook: StdMutex::new(None),
             }),
         }
     }
@@ -607,8 +682,7 @@ impl ProcessSupervisor {
                 // Do this synchronously before awaiting terminal bookkeeping so
                 // descendants are terminated even if the shutdown token is
                 // delayed on a nearly-tearing-down runtime.
-                let pid = take_pid(&self.inner, &entry);
-                process::terminate_process_group(pid);
+                terminate_entry_process(&entry);
                 running.push(entry);
             }
         }
@@ -747,6 +821,14 @@ impl ProcessSupervisor {
             .spawn()
             .map_err(|error| ToolError::Execution(error.to_string()))?;
         let pid = child.id();
+        let Some(authoritative_pid) = pid else {
+            return Err(abort_spawned_child(
+                child,
+                pid,
+                "process did not expose an authoritative OS PID",
+            )
+            .await);
+        };
         let stdin = match child.stdin.take() {
             Some(stdin) => stdin,
             None => {
@@ -772,10 +854,15 @@ impl ProcessSupervisor {
             }
         };
         let termination_intent = Arc::new(TerminationIntent::default());
-        let Some(pid_registration) = self
-            .inner
-            .register_pid(pid, Arc::clone(&termination_intent))
-        else {
+        let pid_lifecycle = Arc::new(StdMutex::new(PidLifecycle {
+            pid: Some(authoritative_pid),
+            reaped: false,
+        }));
+        let Some(pid_registration) = self.inner.register_pid(
+            Some(authoritative_pid),
+            Arc::clone(&termination_intent),
+            Arc::clone(&pid_lifecycle),
+        ) else {
             return Err(
                 abort_spawned_child(child, pid, "process PID registry is unavailable").await,
             );
@@ -793,7 +880,8 @@ impl ProcessSupervisor {
             session_id: request.session_id,
             request_identity,
             command_display: request.command_display,
-            pid: StdMutex::new(pid),
+            authoritative_pid,
+            pid_lifecycle,
             pid_registration: StdMutex::new(Some(pid_registration)),
             termination_intent,
             stdin: Mutex::new(Some(stdin)),
@@ -804,6 +892,7 @@ impl ProcessSupervisor {
                 exit_code: None,
                 workspace_scan: None,
                 completed_at: None,
+                terminal_event_id: None,
             }),
             control: CancellationToken::new(),
             notify: Notify::new(),
@@ -870,6 +959,45 @@ impl ProcessSupervisor {
         self.poll(session_id, process_id, cursor, 0).await
     }
 
+    /// Wait for one managed process to publish its terminal event. Output is
+    /// returned only once at the terminal boundary, while cursor and event id
+    /// remain authoritative for idempotent reconnects.
+    pub(crate) async fn wait_until_terminal(
+        &self,
+        session_id: SessionId,
+        process_id: &str,
+        cursor: u64,
+        wait_ms: u64,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessWaitResult, ToolError> {
+        let entry = self.entry(session_id, process_id).await?;
+        let (snapshot, cancelled) = self
+            .wait_for_terminal_with_cancellation(&entry, cursor, wait_ms, cancellation)
+            .await;
+        Ok(ProcessWaitResult {
+            snapshot,
+            cancelled,
+        })
+    }
+
+    /// 校验受管进程启动时返回的不可变 OS PID。逻辑 `process_id` 仍是控制句柄；
+    /// 该检查防止调用方等待或操作猜测/复用的 PID，同时允许子进程终态后重连查询。
+    pub(crate) async fn validate_authoritative_pid(
+        &self,
+        session_id: SessionId,
+        process_id: &str,
+        authoritative_pid: u32,
+    ) -> Result<(), ToolError> {
+        let entry = self.entry(session_id, process_id).await?;
+        if entry.authoritative_pid != authoritative_pid {
+            return Err(ToolError::Execution(format!(
+                "authoritative PID mismatch for process `{process_id}`: expected {}, got {authoritative_pid}",
+                entry.authoritative_pid
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn list(&self, session_id: SessionId) -> Vec<ProcessSummary> {
         self.prune().await;
         let mut entries = self
@@ -894,6 +1022,7 @@ impl ProcessSupervisor {
             let state = entry.state.lock().await;
             summaries.push(ProcessSummary {
                 process_id: entry.id.clone(),
+                authoritative_pid: entry.authoritative_pid,
                 command_display: entry.command_display.clone(),
                 state: state.state,
                 exit_code: state.exit_code,
@@ -901,6 +1030,7 @@ impl ProcessSupervisor {
                 output_bytes,
                 output_lines,
                 output_truncated,
+                terminal_event_id: state.terminal_event_id,
             });
         }
         summaries
@@ -960,8 +1090,7 @@ impl ProcessSupervisor {
             // descendant cannot outlive the wait window while cancellation is
             // still propagating through the supervisor task. take() so a racing
             // terminal publication cannot leave us signaling after release.
-            let pid = take_pid(&self.inner, &entry);
-            process::terminate_process_group(pid);
+            terminate_entry_process(&entry);
         }
         let snapshot = self.wait_for_terminal(&entry, cursor, 5_000).await;
         if snapshot.state.is_terminal() {
@@ -1008,8 +1137,7 @@ impl ProcessSupervisor {
                 // Same eager kill as shutdown_and_wait: do not wait for the
                 // supervisor cancellation branch to schedule before descendants
                 // are terminated.
-                let pid = take_pid(&self.inner, &entry);
-                process::terminate_process_group(pid);
+                terminate_entry_process(&entry);
                 running.push(entry);
             }
         }
@@ -1119,6 +1247,19 @@ impl ProcessSupervisor {
         cursor: u64,
         wait_ms: u64,
     ) -> ProcessSnapshot {
+        let cancellation = CancellationToken::new();
+        self.wait_for_terminal_with_cancellation(entry, cursor, wait_ms, &cancellation)
+            .await
+            .0
+    }
+
+    async fn wait_for_terminal_with_cancellation(
+        &self,
+        entry: &Arc<ManagedProcess>,
+        cursor: u64,
+        wait_ms: u64,
+        cancellation: &CancellationToken,
+    ) -> (ProcessSnapshot, bool) {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms);
         loop {
             self.touch(entry).await;
@@ -1128,11 +1269,15 @@ impl ProcessSupervisor {
             if entry.state.lock().await.state.is_terminal()
                 || tokio::time::Instant::now() >= deadline
             {
-                return snapshot(entry, cursor).await;
+                return (snapshot(entry, cursor).await, false);
+            }
+            if cancellation.is_cancelled() {
+                return (snapshot(entry, cursor).await, true);
             }
             tokio::select! {
                 _ = &mut notification => {}
-                _ = tokio::time::sleep_until(deadline) => return snapshot(entry, cursor).await,
+                _ = tokio::time::sleep_until(deadline) => return (snapshot(entry, cursor).await, false),
+                _ = cancellation.cancelled() => return (snapshot(entry, cursor).await, true),
             }
         }
     }
@@ -1155,21 +1300,33 @@ async fn abort_spawned_child(mut child: Child, pid: Option<u32>, message: &str) 
     ToolError::Execution(message.to_owned())
 }
 
-fn take_pid(inner: &SupervisorInner, entry: &ManagedProcess) -> Option<u32> {
-    let pid = entry.pid.lock().ok().and_then(|mut guard| guard.take());
-    let registration = entry
-        .pid_registration
+fn terminate_entry_process(entry: &ManagedProcess) {
+    let mut lifecycle = entry
+        .pid_lifecycle
         .lock()
-        .ok()
-        .and_then(|mut registration| registration.take());
-    inner.unregister_pid(registration);
-    pid
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if lifecycle.reaped {
+        return;
+    }
+    let pid = lifecycle.pid.take();
+    process::terminate_process_group(pid);
 }
 
-fn clear_pid(entry: &ManagedProcess) {
-    if let Ok(mut guard) = entry.pid.lock() {
-        *guard = None;
-    }
+fn mark_process_reaped(entry: &ManagedProcess) {
+    let mut lifecycle = entry
+        .pid_lifecycle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    lifecycle.reaped = true;
+    lifecycle.pid = None;
+}
+
+fn allocate_terminal_event_id(supervisor_inner: &std::sync::Weak<SupervisorInner>) -> u64 {
+    supervisor_inner
+        .upgrade()
+        .map(|inner| inner.next_terminal_event_id.fetch_add(1, Ordering::Relaxed))
+        .filter(|id| *id != 0)
+        .unwrap_or(1)
 }
 
 fn spawn_reader<R>(
@@ -1192,8 +1349,7 @@ where
             };
             entry.output.lock().await.append(stream, &buffer[..read]);
             entry.notify.notify_waiters();
-            // A continuously readable pipe can otherwise monopolize a current-thread
-            // runtime and delay process cancellation, timeout, and terminal bookkeeping.
+            // 持续可读的管道可能独占单线程 runtime，延迟进程取消、超时和终态记账。
             tokio::task::yield_now().await;
         }
         if let Some(entry) = entry.upgrade() {
@@ -1218,35 +1374,43 @@ async fn supervise_process(
     supervisor_inner: std::sync::Weak<SupervisorInner>,
 ) {
     let child_id = child.id();
-    let mut wait = Box::pin(child.wait());
+    let mut wait = Box::pin(wait_for_child_before_reap(
+        &entry,
+        &mut child,
+        child_id,
+        &supervisor_inner,
+    ));
     let mut timeout_sleep = Box::pin(tokio::time::sleep(timeout));
     let exit_code = tokio::select! {
         biased;
         _ = process_control.cancelled() => {
             entry.termination_intent.request(ProcessState::Terminated);
-            process::terminate_process_group(child_id);
-            wait.await.ok().and_then(|status| status.code())
+            terminate_entry_process(&entry);
+            let result = wait.await;
+            result.as_ref().ok().and_then(|status| status.code())
         }
         _ = task_cancellation.cancelled() => {
             entry.termination_intent.request(ProcessState::Cancelled);
-            process::terminate_process_group(child_id);
-            wait.await.ok().and_then(|status| status.code())
+            terminate_entry_process(&entry);
+            let result = wait.await;
+            result.as_ref().ok().and_then(|status| status.code())
         }
         _ = shutdown.cancelled() => {
             entry.termination_intent.request(ProcessState::Cancelled);
-            process::terminate_process_group(child_id);
-            wait.await.ok().and_then(|status| status.code())
+            terminate_entry_process(&entry);
+            let result = wait.await;
+            result.as_ref().ok().and_then(|status| status.code())
         }
         _ = &mut timeout_sleep => {
             entry.termination_intent.request(ProcessState::TimedOut);
-            process::terminate_process_group(child_id);
-            wait.await.ok().and_then(|status| status.code())
+            terminate_entry_process(&entry);
+            let result = wait.await;
+            result.as_ref().ok().and_then(|status| status.code())
         }
         result = &mut wait => {
-            // 先在同一无 await 路径终止继承管道的后代，随后才允许旧 PID
-            // 被释放和复用；reader drain 不再需要对旧 PID 发信号。
-            let exit_code = result.ok().and_then(|status| status.code());
-            process::terminate_process_group_only(child_id);
+            // 自然退出后不能再使用旧 PID 做任何信号操作；先标记回收并解除注册，
+            // 后续 reader drain 只允许 join/abort，避免 PID 复用误杀无关进程。
+            let exit_code = result.as_ref().ok().and_then(|status| status.code());
             // 取消可能和 child.wait 同时完成；在最终发布前再次锁存已发出的原因。
             if process_control.is_cancelled() {
                 entry.termination_intent.request(ProcessState::Terminated);
@@ -1257,11 +1421,10 @@ async fn supervise_process(
             exit_code
         }
     };
-    release_process_pid(&entry, &supervisor_inner);
     drain_process_readers(stdout_reader, stderr_reader).await;
     let changes = workspace_scan::compare(&workspace_root, workspace_before).await;
-    // Serialize terminal publication with terminate()/write() via the operation
-    // lock. PID ownership was released immediately after child wait above.
+    // 通过 operation 锁串行化终态发布与 terminate()/write()；锁内把状态和事件身份
+    // 作为一次转换提交。
     let _operation_guard = entry.operation.lock().await;
     *entry.stdin.lock().await = None;
     // 在发布锁内再次锁存取消原因，覆盖 child.wait 与终态发布之间的竞态窗口。
@@ -1280,26 +1443,175 @@ async fn supervise_process(
         } else {
             ProcessState::Failed
         });
-    {
+    let published = {
         let mut record = entry.state.lock().await;
-        record.state = state;
-        record.exit_code = exit_code;
-        record.workspace_scan = Some(changes);
-        record.completed_at = Some(Instant::now());
-    }
+        if record.state.is_terminal() {
+            false
+        } else {
+            record.state = state;
+            record.exit_code = exit_code;
+            record.workspace_scan = Some(changes);
+            record.completed_at = Some(Instant::now());
+            record.terminal_event_id = Some(allocate_terminal_event_id(&supervisor_inner));
+            true
+        }
+    };
     drop(_operation_guard);
-    if let Some(inner) = supervisor_inner.upgrade() {
-        inner.prune().await;
+    // 无论是否已有其他路径发布终态，都必须释放本地 PID 注册，避免活动表泄漏。
+    release_process_pid(&entry, &supervisor_inner);
+    if published {
+        if let Some(inner) = supervisor_inner.upgrade() {
+            inner.prune().await;
+        }
+        entry.notify.notify_waiters();
+        entry.terminal_notify.notify_waiters();
     }
-    entry.notify.notify_waiters();
-    entry.terminal_notify.notify_waiters();
+}
+
+#[cfg(test)]
+async fn await_reap_window_hook(
+    entry: &ManagedProcess,
+    supervisor_inner: &std::sync::Weak<SupervisorInner>,
+) {
+    let Some(inner) = supervisor_inner.upgrade() else {
+        return;
+    };
+    let hook = inner.reap_window_hook.lock().ok().and_then(|mut hook| {
+        hook.as_ref()
+            .is_some_and(|candidate| candidate.process_id == entry.id)
+            .then(|| hook.take())
+            .flatten()
+    });
+    if let Some(hook) = hook {
+        hook.entered.notify_one();
+        hook.release.notified().await;
+    }
+}
+
+async fn wait_for_child_before_reap(
+    entry: &ManagedProcess,
+    child: &mut Child,
+    child_id: Option<u32>,
+    supervisor_inner: &std::sync::Weak<SupervisorInner>,
+) -> io::Result<ExitStatus> {
+    wait_for_child_before_reap_raw(entry, child, child_id, supervisor_inner).await
+}
+
+#[cfg(unix)]
+async fn wait_for_child_before_reap_raw(
+    entry: &ManagedProcess,
+    child: &mut Child,
+    child_id: Option<u32>,
+    supervisor_inner: &std::sync::Weak<SupervisorInner>,
+) -> io::Result<ExitStatus> {
+    let Some(pid) = child_id.and_then(|id| libc::pid_t::try_from(id).ok()) else {
+        // 没有可信的原生 PID 时，先使生命周期失效再等待，避免成功回收后仍留下
+        // 可发送信号的陈旧 PID。
+        invalidate_process_before_wait(entry, supervisor_inner);
+        return child.wait().await;
+    };
+    loop {
+        let probe = {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // WNOWAIT 让 leader 保持 zombie，确保进程组 ID 在清理完成前不会复用。
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+                )
+            };
+            if result == 0 {
+                (unsafe { info.si_pid() == pid }, None)
+            } else {
+                (false, io::Error::last_os_error().raw_os_error())
+            }
+        };
+        if probe.0 {
+            process::terminate_process_group_only(Some(pid as u32));
+            // WNOWAIT 已确认 leader 退出但仍保留 zombie；在真正 wait/reap 之前
+            // 先失效 PID 并注销，其他线程此后只能观察到不可发信号的生命周期。
+            invalidate_process_before_wait(entry, supervisor_inner);
+            #[cfg(test)]
+            await_reap_window_hook(entry, supervisor_inner).await;
+            return child.wait().await;
+        }
+        if let Some(error) = probe.1 {
+            match error {
+                error if error == libc::EINTR => {}
+                error if error == libc::ECHILD => {
+                    // 其他运行时组件可能已经回收 child；不再向无法证明归属的 PID 发信号。
+                    invalidate_process_before_wait(entry, supervisor_inner);
+                    return child.wait().await;
+                }
+                _ => {
+                    // waitid 的未知错误无法证明 PID 仍归属于该 child；不要发信号，
+                    // 但必须先让生命周期不可发信号，再由 wait 完成句柄收口。
+                    invalidate_process_before_wait(entry, supervisor_inner);
+                    return child.wait().await;
+                }
+            }
+        } else {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_child_before_reap_raw(
+    entry: &ManagedProcess,
+    child: &mut Child,
+    child_id: Option<u32>,
+    supervisor_inner: &std::sync::Weak<SupervisorInner>,
+) -> io::Result<ExitStatus> {
+    #[cfg(windows)]
+    {
+        // Windows 的 `try_wait` 只读取仍由本任务持有的进程句柄；在句柄仍在手中
+        // 的退出观察点立即执行 taskkill /T，清理可能继续持有 stdout/stderr 的后代，
+        // 再调用 wait 完成 Tokio 的状态收口。取消/超时路径仍由生命周期锁负责。
+        loop {
+            if child.try_wait()?.is_some() {
+                process::terminate_process_group_only(child_id);
+                // 退出句柄仍由本任务持有；先让生命周期对其他线程不可发信号，
+                // 再等待 Tokio 收口，避免 PID 在 wait 之后被复用。
+                invalidate_process_before_wait(entry, supervisor_inner);
+                #[cfg(test)]
+                await_reap_window_hook(entry, supervisor_inner).await;
+                return child.wait().await;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        // 该目标没有可用的 WNOWAIT 等价物；仍先失效生命周期，再等待句柄。
+        invalidate_process_before_wait(entry, supervisor_inner);
+        let result = child.wait().await;
+        result
+    }
+}
+
+fn invalidate_process_before_wait(
+    entry: &ManagedProcess,
+    supervisor_inner: &std::sync::Weak<SupervisorInner>,
+) {
+    mark_process_reaped(entry);
+    release_process_pid(entry, supervisor_inner);
 }
 
 fn release_process_pid(
     entry: &ManagedProcess,
     supervisor_inner: &std::sync::Weak<SupervisorInner>,
 ) {
-    clear_pid(entry);
+    {
+        let mut lifecycle = entry
+            .pid_lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lifecycle.pid = None;
+    }
     let registration = entry
         .pid_registration
         .lock()
@@ -1313,9 +1625,8 @@ fn release_process_pid(
 async fn drain_process_readers(stdout_reader: JoinHandle<()>, stderr_reader: JoinHandle<()>) {
     let mut stdout_reader = stdout_reader;
     let mut stderr_reader = stderr_reader;
-    // The process group has already been terminated before this point. Join
-    // both pipe readers directly and use one deadline as the only fallback;
-    // polling their completion status adds latency without improving safety.
+    // 此时进程组已经终止，直接汇合两个管道读取任务并只使用一个截止时间兜底；
+    // 轮询完成状态只会增加延迟，不会提高安全性。
     let timed_out = tokio::time::timeout(READER_DRAIN_TIMEOUT, async {
         let _ = tokio::join!(&mut stdout_reader, &mut stderr_reader);
     })
@@ -1325,8 +1636,7 @@ async fn drain_process_readers(stdout_reader: JoinHandle<()>, stderr_reader: Joi
         stdout_reader.abort();
         stderr_reader.abort();
     }
-    // A successful join has already polled both handles to completion. Only
-    // await handles that still have work after the timeout/abort branch.
+    // 成功汇合已经把两个句柄推进到完成；只有超时/中止分支后仍有工作时才再次等待。
     if !stdout_reader.is_finished() {
         let _ = stdout_reader.await;
     }
@@ -1363,6 +1673,7 @@ async fn snapshot(entry: &ManagedProcess, cursor: u64) -> ProcessSnapshot {
         );
     ProcessSnapshot {
         process_id: entry.id.clone(),
+        authoritative_pid: entry.authoritative_pid,
         state: state.state,
         exit_code: state.exit_code,
         output,
@@ -1378,6 +1689,7 @@ async fn snapshot(entry: &ManagedProcess, cursor: u64) -> ProcessSnapshot {
         before_images,
         after_images,
         workspace_changes_known,
+        terminal_event_id: state.terminal_event_id,
     }
 }
 
@@ -1406,7 +1718,7 @@ impl ProcessSupervisor {
         process_id: &str,
     ) -> Option<u32> {
         let entry = self.entry(session_id, process_id).await.ok()?;
-        entry.pid.lock().ok().and_then(|guard| *guard)
+        entry.pid_lifecycle.lock().ok().and_then(|guard| guard.pid)
     }
 
     pub(crate) async fn retained_process_count_for_test(&self) -> usize {
@@ -1425,11 +1737,62 @@ impl ProcessSupervisor {
         if !entry.state.lock().await.state.is_terminal() {
             return false;
         }
-        if let Ok(mut guard) = entry.pid.lock() {
-            *guard = Some(pid);
+        if let Ok(mut lifecycle) = entry.pid_lifecycle.lock() {
+            lifecycle.pid = Some(pid);
         } else {
             return false;
         }
         true
+    }
+
+    pub(crate) fn install_reap_window_hook_for_test(
+        &self,
+        process_id: &str,
+    ) -> (std::sync::Arc<Notify>, std::sync::Arc<Notify>) {
+        let entered = std::sync::Arc::new(Notify::new());
+        let release = std::sync::Arc::new(Notify::new());
+        if let Ok(mut hook) = self.inner.reap_window_hook.lock() {
+            *hook = Some(ReapWindowHook {
+                process_id: process_id.to_owned(),
+                entered: std::sync::Arc::clone(&entered),
+                release: std::sync::Arc::clone(&release),
+            });
+        }
+        (entered, release)
+    }
+
+    pub(crate) async fn inject_reaped_pid_for_test(
+        &self,
+        session_id: SessionId,
+        process_id: &str,
+        pid: u32,
+    ) -> bool {
+        let Ok(entry) = self.entry(session_id, process_id).await else {
+            return false;
+        };
+        let Ok(mut lifecycle) = entry.pid_lifecycle.lock() else {
+            return false;
+        };
+        if !lifecycle.reaped {
+            return false;
+        }
+        lifecycle.pid = Some(pid);
+        true
+    }
+
+    pub(crate) async fn request_termination_for_test(
+        &self,
+        session_id: SessionId,
+        process_id: &str,
+    ) -> Result<(), ToolError> {
+        let entry = self.entry(session_id, process_id).await?;
+        let _operation_guard = entry.operation.lock().await;
+        if entry.state.lock().await.state.is_terminal() {
+            return Ok(());
+        }
+        entry.termination_intent.request(ProcessState::Terminated);
+        entry.control.cancel();
+        terminate_entry_process(&entry);
+        Ok(())
     }
 }

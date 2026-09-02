@@ -12,9 +12,9 @@ use golutra_auth::{
     OAuthProviderDescriptor, SecretKind, SecretStore,
 };
 use golutra_llm::{
-    ConfiguredProvider, GOLUTRA_PROVIDER_CUSTOM_HEADERS, ModelCatalog, ProviderGenerationConfig,
-    ProviderHeaderConfig, ProviderHeaderValue, ProviderProtocol, validate_native_base_url,
-    validate_openai_base_url,
+    ConfiguredProvider, GOLUTRA_PROVIDER_CUSTOM_HEADERS, GOLUTRA_PROVIDER_ROUTE_ID, ModelCatalog,
+    ProviderGenerationConfig, ProviderHeaderConfig, ProviderHeaderValue, ProviderProtocol,
+    validate_native_base_url, validate_openai_base_url,
 };
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
@@ -826,6 +826,13 @@ pub fn runtime_env_from_settings(
     let mut values = BTreeMap::new();
     let mut credential = None;
     if let Some(profile) = settings.active_profile() {
+        // route identity 是非敏感声明；OAuth provider 优先，普通 profile 使用其稳定名称。
+        let route_id = profile
+            .oauth
+            .as_ref()
+            .map(|oauth| oauth.provider_id.clone())
+            .unwrap_or_else(|| profile.name.clone());
+        values.insert(GOLUTRA_PROVIDER_ROUTE_ID.to_owned(), route_id);
         values.insert(
             "GOLUTRA_PROVIDER_PROTOCOL".to_owned(),
             profile.protocol.id().to_owned(),

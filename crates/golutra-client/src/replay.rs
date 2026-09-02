@@ -8,9 +8,9 @@ use std::{
 use async_trait::async_trait;
 use golutra_context::{ContextBudgetPolicy, ContextBuilder};
 use golutra_core::{
-    ArtifactId, ArtifactRecord, EventId, LoopAction, ProviderContract, ProviderResponseId,
-    RedactionStatus, SessionId, TaskContract, TaskId, ToolContract, ToolResultEnvelope, TurnId,
-    VerificationResult,
+    ArtifactId, ArtifactRecord, EventId, LoopAction, PromptCachePolicy, ProviderContract,
+    ProviderResponseId, RedactionStatus, SessionId, TaskContract, TaskId, ToolContract,
+    ToolResultEnvelope, TurnId, VerificationResult,
 };
 use golutra_eval::{ReplayCapsule, ReplayExecution, ReplayExecutionStatus};
 use golutra_llm::{LlmProvider, ProviderError, ProviderRequest, ProviderResponse};
@@ -68,6 +68,7 @@ struct ReplayProviderState {
 #[derive(Debug, Clone)]
 struct ArtifactReplayProvider {
     contract: ProviderContract,
+    cache_policy: PromptCachePolicy,
     state: Arc<StdMutex<ReplayProviderState>>,
     execution: AgentExecutionHandle,
 }
@@ -98,6 +99,7 @@ impl ArtifactReplayProvider {
                 capability_matrix_ref: None,
                 golden_fixture_refs: Vec::new(),
             },
+            cache_policy: first.request.cache_policy,
             state: Arc::new(StdMutex::new(ReplayProviderState {
                 exchanges: exchanges.into(),
                 ..ReplayProviderState::default()
@@ -185,6 +187,10 @@ impl LlmProvider for ArtifactReplayProvider {
 
     fn contract(&self) -> ProviderContract {
         self.contract.clone()
+    }
+
+    fn preferred_cache_policy(&self) -> PromptCachePolicy {
+        self.cache_policy
     }
 }
 
@@ -960,10 +966,10 @@ impl RuntimeHost {
                     .map(|contract| contract.tool_name.clone())
                     .collect(),
             })
-            .with_replay_context(AgentReplayContext {
-                initial_messages: first_request.messages,
-                tools: replay_tools,
-            })
+            .with_replay_context(AgentReplayContext::for_replay(
+                first_request.messages,
+                replay_tools,
+            ))
             .with_task_contract(task_contract)
             .with_execution_mode(execution_mode.explicit())
             .with_tool_profile(tool_profile)
@@ -1697,6 +1703,7 @@ mod tests {
             task_id: TaskId::new(),
             turn_id: TurnId::new(),
             session_id: None,
+            cache_scope: None,
             provider_id: provider_id.to_owned(),
             model_id: "test-model".to_owned(),
             messages: vec![ProviderMessage {
@@ -1709,6 +1716,7 @@ mod tests {
             }],
             tools: Vec::new(),
             cache_policy: Default::default(),
+            max_output_tokens: None,
         }
     }
 
@@ -2411,10 +2419,10 @@ mod tests {
             contributors: Vec::new(),
             tools: Vec::new(),
         })
-        .with_replay_context(AgentReplayContext {
-            initial_messages: initial_request.messages,
-            tools: Vec::new(),
-        })
+        .with_replay_context(AgentReplayContext::for_replay(
+            initial_request.messages,
+            Vec::new(),
+        ))
         .with_task_contract(TaskContract::conversational(Vec::new()))
         .with_tool_profile(AgentToolProfile::Coding);
 

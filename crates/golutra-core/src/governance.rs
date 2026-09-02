@@ -53,6 +53,9 @@ pub struct ContextMessageSnapshot {
     pub index: u32,
     pub role: String,
     pub content_digest: String,
+    /// 完整 provider message wire 的摘要，包含工具调用参数和协议元数据。
+    #[serde(default)]
+    pub wire_digest: String,
     pub estimated_tokens: u64,
     pub tool_call_ids: Vec<String>,
     #[serde(default)]
@@ -78,6 +81,10 @@ pub struct ContextSnapshot {
     pub generation_config_digest: Option<String>,
     pub budget_snapshot: TokenBudgetSnapshot,
     pub canonical_request_digest: String,
+    /// provider adapter 使用的稳定且不含敏感信息的缓存作用域。键只能是
+    /// session UUID 或可信的父线程作用域，绝不包含请求正文或凭据。
+    #[serde(default)]
+    pub cache_scope_key: Option<String>,
     pub redacted_request_artifact_ref: Option<ArtifactId>,
     pub restricted_request_artifact_ref: Option<ArtifactId>,
     pub estimate_source: String,

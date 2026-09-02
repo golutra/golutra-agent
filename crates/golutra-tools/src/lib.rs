@@ -1,7 +1,7 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock},
+    sync::{Arc, LazyLock, RwLock},
     time::{Duration, Instant},
 };
 
@@ -12,17 +12,22 @@ use golutra_core::{
     SessionId, SideEffectType, ToolCallId, ToolContract, ToolExecutionMetrics, ToolProgress,
     ToolProgressPhase, ToolResultEnvelope, ToolResultStatus, TurnId,
 };
-use golutra_policy::WorkspacePolicy;
+use golutra_policy::{
+    WorkspacePolicy, contains_shell_metacharacter, explicit_shell_script,
+    parse_shell_command_with_input, shell_command_is_strictly_read_only,
+};
 use golutra_sandbox::{SystemSandbox, WorkspaceAccess};
 use regex::Regex;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use similar::{ChangeTag, TextDiff};
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_EXCERPT_LIMIT: usize = 2048;
+const DEFAULT_READ_EXCERPT_BYTES: usize = 16 * 1024;
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
 /// Maximum raw content retained by a built-in tool artifact.
 pub const MAX_TOOL_ARTIFACT_CONTENT_BYTES: usize = 16 * 1024 * 1024;
@@ -37,9 +42,13 @@ const MAX_DIRECTORY_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_PATH_ARGUMENT_CHARS: usize = 4 * 1024;
 const MAX_PATTERN_ARGUMENT_CHARS: usize = 64 * 1024;
 const MAX_SHELL_COMMAND_CHARS: usize = 64 * 1024;
+const MAX_SHELL_ARGV_ITEMS: usize = 1_024;
 const MAX_PROCESS_INPUT_CHARS: usize = 64 * 1024;
 const MAX_PATCH_BYTES: usize = 16 * 1024 * 1024;
 const MAX_DELEGATED_TASK_CHARS: usize = 64 * 1024;
+const DEFAULT_READ_MAX_LINES: usize = 200;
+const MAX_READ_LINES: usize = 2_000;
+const MAX_FILE_EDITS: usize = 128;
 const MAX_BACKGROUND_PROCESS_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1_000;
 const MAX_TOOL_ERROR_CHARS: usize = 4 * 1024;
 const MAX_AUDIT_RESOURCE_CHARS: usize = 64 * 1024;
@@ -49,12 +58,18 @@ const MAX_TOOL_ARGUMENT_COMPACT_STRING_BYTES: usize = 96;
 const MAX_TOOL_ARGUMENT_DISPLAY_ITEMS: usize = 24;
 const MAX_TOOL_ARGUMENT_DISPLAY_DEPTH: usize = 4;
 pub const MAX_MODEL_TOOL_RESULT_BYTES: usize = 16 * 1024;
+const DEFAULT_MODEL_TOOL_RESULT_BYTES: usize = 8 * 1024;
+const MIN_MODEL_TOOL_RESULT_BYTES: usize = 1024;
 const MAX_MODEL_TOOL_RESULT_SUMMARY_CHARS: usize = 2 * 1024;
-const MAX_MODEL_TOOL_RESULT_EXCERPT_CHARS: usize = 4 * 1024;
+const MAX_MODEL_TOOL_RESULT_EXCERPT_BYTES: usize = 16 * 1024;
 const MAX_MODEL_TOOL_RESULT_COMPACT_EXCERPT_CHARS: usize = 512;
 const MAX_MODEL_TOOL_RESULT_FACT_STRING_CHARS: usize = 4 * 1024;
 const MAX_MODEL_TOOL_RESULT_ITEMS: usize = 32;
 const MAX_MODEL_TOOL_RESULT_DEPTH: usize = 5;
+const MAX_MODEL_CHANGE_PREVIEW_BYTES: usize = 3 * 1024;
+const MAX_MODEL_CHANGE_PREVIEW_LINES: usize = 24;
+const MAX_MODEL_CHANGE_PREVIEW_FILES: usize = 8;
+const MAX_MODEL_CHANGE_PREVIEW_LINE_BYTES: usize = 512;
 const MAX_MODEL_TOOL_OUTPUT_CHARS: usize = 2 * 1024;
 const MAX_MODEL_TOOL_REASON_CHARS: usize = 512;
 const MAX_MODEL_TOOL_SEARCH_QUERY_CHARS: usize = 512;
@@ -62,6 +77,11 @@ const MAX_MODEL_TOOL_SEARCH_RESULTS: usize = 8;
 const MAX_MODEL_TOOL_SEARCH_TITLE_CHARS: usize = 160;
 const MAX_MODEL_TOOL_SEARCH_URL_CHARS: usize = 512;
 const MAX_MODEL_TOOL_SEARCH_SNIPPET_CHARS: usize = 320;
+// 缺失文件提示只服务于下一次模型调用，必须有界，不能把错误恢复变成一次
+// 无界的工作区扫描或把宿主目录结构泄漏到 provider。
+const MAX_READ_FILE_HINT_DEPTH: usize = 6;
+const MAX_READ_FILE_HINT_ENTRIES: usize = 2_048;
+const MAX_READ_FILE_HINT_CANDIDATES: usize = 8;
 const EXTERNAL_TOOL_TIMEOUT_MS: u64 = if cfg!(test) { 100 } else { 30_000 };
 const MAX_VERIFIER_TIMEOUT_MS: u64 = 30 * 60 * 1_000;
 const MAX_VERIFIER_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
@@ -76,6 +96,7 @@ pub const CONTRACT_FILE_CONTENT_VERIFIER_TOOL: &str = "contract_file_content_ver
 pub const CONTRACT_PATH_VERIFIER_TOOL: &str = "contract_path_verifier";
 
 mod builtin;
+mod model_patch;
 mod process;
 mod process_supervisor;
 mod project_verifier;
@@ -171,6 +192,15 @@ pub struct SideEffectPreparation {
     pub before_images: Vec<FileBeforeImage>,
     pub complete: bool,
     workspace_snapshot: Option<workspace_scan::WorkspaceSnapshot>,
+}
+
+impl SideEffectPreparation {
+    /// 只有存在 workspace snapshot 时，调用方才需要为 opaque 工具持久化
+    /// before-image；严格只读 shell 明确没有副作用证据需要保存。
+    #[must_use]
+    pub fn tracks_workspace_changes(&self) -> bool {
+        self.workspace_snapshot.is_some()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -303,6 +333,8 @@ pub trait ToolReplayBackend: std::fmt::Debug + Send + Sync {
 pub struct ToolRegistry {
     contracts: HashMap<String, ToolContract>,
     capabilities: HashMap<String, ToolCapabilities>,
+    /// evaluate/prepare/invoke 共享已编译 schema，避免同一工具轮次重复编译。
+    compiled_validators: Arc<RwLock<HashMap<String, Arc<jsonschema::Validator>>>>,
 }
 
 impl ToolRegistry {
@@ -321,6 +353,7 @@ impl ToolRegistry {
         Self {
             contracts,
             capabilities,
+            compiled_validators: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -351,6 +384,64 @@ impl ToolRegistry {
     #[must_use]
     pub fn capabilities(&self, tool_name: &str) -> Option<&ToolCapabilities> {
         self.capabilities.get(tool_name)
+    }
+
+    fn validate_tool_arguments(
+        &self,
+        contract: &ToolContract,
+        arguments: &Value,
+    ) -> Result<(), ToolError> {
+        let validator = if let Some(validator) = self
+            .compiled_validators
+            .read()
+            .expect("tool validator cache lock poisoned")
+            .get(&contract.tool_name)
+            .cloned()
+        {
+            validator
+        } else {
+            let compiled = Arc::new(jsonschema::validator_for(&contract.input_schema).map_err(
+                |error| {
+                    ToolError::InvalidArguments(format!(
+                        "tool `{}` has an invalid input schema: {error}",
+                        contract.tool_name
+                    ))
+                },
+            )?);
+            let mut cache = self
+                .compiled_validators
+                .write()
+                .expect("tool validator cache lock poisoned");
+            cache
+                .entry(contract.tool_name.clone())
+                .or_insert(compiled)
+                .clone()
+        };
+        let errors = validator
+            .iter_errors(arguments)
+            .map(|error| {
+                bounded_text(
+                    &error.masked_with("<redacted-value>").to_string(),
+                    MAX_TOOL_ERROR_CHARS,
+                )
+            })
+            .collect::<Vec<_>>();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(ToolError::InvalidArguments(format!(
+                "tool `{}` arguments do not match its contract: {}",
+                contract.tool_name,
+                errors.join("; ")
+            )))
+        }
+    }
+
+    fn invalidate_validator(&self, tool_name: &str) {
+        self.compiled_validators
+            .write()
+            .expect("tool validator cache lock poisoned")
+            .remove(tool_name);
     }
 
     fn register_external(
@@ -401,6 +492,7 @@ impl ToolRegistry {
             }
             self.capabilities
                 .insert(contract.tool_name.clone(), capabilities);
+            self.invalidate_validator(&contract.tool_name);
             self.contracts.insert(contract.tool_name.clone(), contract);
         }
         Ok(())
@@ -713,6 +805,7 @@ impl ToolRuntime {
     ) -> Result<Self, ToolError> {
         let tool = BuiltinTool::Subagent;
         if self.registry.contract(tool.name()).is_none() {
+            self.registry.invalidate_validator(tool.name());
             self.registry
                 .contracts
                 .insert(tool.name().to_owned(), tool.contract());
@@ -728,6 +821,7 @@ impl ToolRuntime {
     /// This keeps capability reduction explicit for restricted runtimes and child tasks.
     #[must_use]
     pub fn without_tool(mut self, tool_name: &str) -> Self {
+        self.registry.invalidate_validator(tool_name);
         self.registry.contracts.remove(tool_name);
         self.registry.capabilities.remove(tool_name);
         if matches!(
@@ -1027,7 +1121,8 @@ impl ToolRuntime {
             .registry
             .contract(&request.tool_name)
             .ok_or_else(|| ToolError::UnknownTool(request.tool_name.clone()))?;
-        validate_tool_arguments(contract, &request.arguments)?;
+        self.registry
+            .validate_tool_arguments(contract, &request.arguments)?;
 
         let builtin = BuiltinTool::from_name(&request.tool_name);
         let mut policy = match builtin {
@@ -1064,9 +1159,8 @@ impl ToolRuntime {
                 self.policy.evaluate_path(&request.tool_name, ".", true)
             }
             Some(BuiltinTool::Shell) => {
-                let shell_policy = self
-                    .policy
-                    .evaluate_shell(&string_arg(&request.arguments, "command")?);
+                let shell_command = shell_command_for_request(&request.arguments)?;
+                let shell_policy = self.policy.evaluate_shell(&shell_command);
                 optional_string_arg(&request.arguments, "workdir")
                     .map(|workdir| {
                         self.policy
@@ -1136,7 +1230,8 @@ impl ToolRuntime {
             .registry
             .contract(&request.tool_name)
             .ok_or_else(|| ToolError::UnknownTool(request.tool_name.clone()))?;
-        validate_tool_arguments(contract, &request.arguments)?;
+        self.registry
+            .validate_tool_arguments(contract, &request.arguments)?;
 
         match BuiltinTool::from_name(&request.tool_name) {
             Some(BuiltinTool::WriteFile) => {
@@ -1186,6 +1281,13 @@ impl ToolRuntime {
                 })
             }
             Some(BuiltinTool::Shell) => {
+                if shell_request_is_strictly_read_only(&request.arguments) {
+                    return Ok(SideEffectPreparation {
+                        before_images: Vec::new(),
+                        complete: true,
+                        workspace_snapshot: None,
+                    });
+                }
                 let snapshot = workspace_scan::capture(self.policy.workspace_root()).await;
                 Ok(SideEffectPreparation {
                     before_images: snapshot.before_images(),
@@ -1213,6 +1315,45 @@ impl ToolRuntime {
                 complete: true,
                 workspace_snapshot: None,
             }),
+        }
+    }
+
+    /// Resolve the workspace identities used by the runtime keyed-write
+    /// scheduler. The returned paths use the same policy resolution as the
+    /// actual mutation implementation, so lexical aliases and existing
+    /// symlink boundaries cannot be scheduled as unrelated writes. An empty
+    /// vector means the request is not a keyed mutation and must be treated as
+    /// an exclusive operation by the caller.
+    pub async fn resolve_keyed_write_paths(
+        &self,
+        request: &ToolRequest,
+    ) -> Result<Vec<PathBuf>, ToolError> {
+        if !matches!(
+            request.tool_name.as_str(),
+            "write_file" | "edit_file" | "apply_patch"
+        ) {
+            return Ok(Vec::new());
+        }
+        let contract = self
+            .registry
+            .contract(&request.tool_name)
+            .ok_or_else(|| ToolError::UnknownTool(request.tool_name.clone()))?;
+        self.registry
+            .validate_tool_arguments(contract, &request.arguments)?;
+        match request.tool_name.as_str() {
+            "write_file" => {
+                let path = string_arg(&request.arguments, "path")?;
+                Ok(vec![self.resolve_tool_path("write_file", path, false)?])
+            }
+            "edit_file" => {
+                let path = string_arg(&request.arguments, "path")?;
+                Ok(vec![self.resolve_tool_path("edit_file", path, true)?])
+            }
+            "apply_patch" => {
+                let patch = string_arg(&request.arguments, "patch")?;
+                self.resolved_patch_paths(&patch).await
+            }
+            _ => Ok(Vec::new()),
         }
     }
 
@@ -1358,7 +1499,8 @@ impl ToolRuntime {
                     .registry
                     .contract(&request.tool_name)
                     .ok_or_else(|| ToolError::UnknownTool(request.tool_name.clone()))?;
-                validate_tool_arguments(contract, &request.arguments)?;
+                self.registry
+                    .validate_tool_arguments(contract, &request.arguments)?;
                 if execution_cancellation.is_cancelled() {
                     return Ok(cancelled_report_with_policy(
                         request,
@@ -1377,7 +1519,7 @@ impl ToolRuntime {
                         ));
                     }
                     PolicyDecision::Deny | PolicyDecision::Block => {
-                        return Ok(blocked_report(request, policy));
+                        return Ok(self.blocked_report_with_hints(request, policy).await);
                     }
                 }
 
@@ -1432,7 +1574,15 @@ impl ToolRuntime {
                         self.web_search(request, policy, execution_cancellation.clone())
                             .await
                     }
-                    Some(BuiltinTool::ShellSession) => self.shell_session(request, policy).await,
+                    Some(BuiltinTool::ShellSession) => {
+                        self.shell_session(
+                            request,
+                            policy,
+                            cancellation.clone(),
+                            execution_cancellation.clone(),
+                        )
+                        .await
+                    }
                     Some(BuiltinTool::Subagent | BuiltinTool::DelegateTask) => {
                         self.delegate_task(
                             request,
@@ -1568,13 +1718,196 @@ impl ToolRuntime {
         error: impl Into<String>,
     ) -> ToolExecutionReport {
         let reason = bounded_text(&error.into(), MAX_TOOL_ERROR_CHARS);
+        let structured_facts = execution_error_facts(&request, &reason);
         error_report(
             request,
             "tool execution failed",
-            json!({"error": reason}),
+            structured_facts,
             reason,
             policy,
         )
+    }
+
+    /// 在真实执行错误上补充有限的 workspace-relative 候选路径。
+    /// 该辅助信息只改变模型可见事实，不改变原始错误、状态或 artifact。
+    pub async fn execution_error_report_with_hints(
+        &self,
+        request: ToolRequest,
+        policy: PolicyEvaluation,
+        error: impl Into<String>,
+    ) -> ToolExecutionReport {
+        let reason = bounded_text(&error.into(), MAX_TOOL_ERROR_CHARS);
+        let structured_facts = self
+            .execution_error_facts_with_hints(&request, &reason)
+            .await;
+        error_report(
+            request,
+            "tool execution failed",
+            structured_facts,
+            reason,
+            policy,
+        )
+    }
+
+    async fn blocked_report_with_hints(
+        &self,
+        request: ToolRequest,
+        policy: PolicyEvaluation,
+    ) -> ToolExecutionReport {
+        let mut report = blocked_report(request.clone(), policy.clone());
+        if request.tool_name != "read_file"
+            || !read_file_hint_reason(&policy.reason)
+            || !self.read_file_hint_request_is_safe(&request)
+        {
+            return report;
+        }
+        let model_reason = "path resolution failed for the requested workspace path".to_owned();
+        report.envelope.summary = model_reason.clone();
+        let Value::Object(facts) = &mut report.envelope.structured_facts else {
+            return report;
+        };
+        facts.insert("reason".to_owned(), Value::String(model_reason));
+        if let Some(path) = request.arguments.get("path").and_then(Value::as_str) {
+            facts.insert(
+                "path".to_owned(),
+                Value::String(bounded_text(
+                    &redact_sensitive_text(path).0,
+                    MAX_PATH_ARGUMENT_CHARS,
+                )),
+            );
+        }
+        facts.insert(
+            "path_resolution".to_owned(),
+            Value::String(read_file_path_resolution(&policy.reason).to_owned()),
+        );
+        if let Some(candidates) = self
+            .read_file_path_candidates(&request, &policy.reason)
+            .await
+        {
+            facts.insert("candidates".to_owned(), json!(candidates));
+            facts.insert(
+                "next_action".to_owned(),
+                Value::String("retry read_file with one of the candidate paths".to_owned()),
+            );
+        } else {
+            facts.insert(
+                "next_action".to_owned(),
+                Value::String(
+                    "run one bounded read-only shell discovery such as rg --files, then read the exact file path"
+                        .to_owned(),
+                ),
+            );
+        }
+        report
+    }
+
+    async fn execution_error_facts_with_hints(&self, request: &ToolRequest, reason: &str) -> Value {
+        let mut facts = execution_error_facts(request, reason);
+        let Some(candidates) = self.read_file_path_candidates(request, reason).await else {
+            return facts;
+        };
+        if let Value::Object(object) = &mut facts {
+            object.insert("candidates".to_owned(), json!(candidates));
+            object.insert(
+                "next_action".to_owned(),
+                Value::String("retry read_file with one of the candidate paths".to_owned()),
+            );
+        }
+        facts
+    }
+
+    async fn read_file_path_candidates(
+        &self,
+        request: &ToolRequest,
+        reason: &str,
+    ) -> Option<Vec<String>> {
+        if request.tool_name != "read_file" || !read_file_hint_reason(reason) {
+            return None;
+        }
+        let requested_path = request.arguments.get("path").and_then(Value::as_str)?;
+        if !self.read_file_hint_request_is_safe(request) {
+            return None;
+        }
+        let basename = Path::new(requested_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty() && *name != "." && *name != "..")?;
+        let workspace_root = self.policy.workspace_root().to_path_buf();
+        let mut pending = vec![(workspace_root.clone(), 0_usize)];
+        let mut visited_entries = 0_usize;
+        let mut candidates = BTreeSet::new();
+
+        while let Some((directory, depth)) = pending.pop() {
+            if visited_entries >= MAX_READ_FILE_HINT_ENTRIES {
+                break;
+            }
+            let mut reader = match tokio::fs::read_dir(&directory).await {
+                Ok(reader) => reader,
+                Err(_) => continue,
+            };
+            let mut entries = Vec::new();
+            while visited_entries < MAX_READ_FILE_HINT_ENTRIES {
+                match reader.next_entry().await {
+                    Ok(Some(entry)) => {
+                        visited_entries = visited_entries.saturating_add(1);
+                        entries.push(entry);
+                    }
+                    Ok(None) | Err(_) => break,
+                }
+            }
+            entries.sort_by_key(|entry| entry.file_name().to_string_lossy().into_owned());
+
+            for entry in entries {
+                let file_name = entry.file_name();
+                let file_name = file_name.to_string_lossy();
+                let file_type = match entry.file_type().await {
+                    Ok(file_type) => file_type,
+                    Err(_) => continue,
+                };
+                if file_type.is_dir() {
+                    if depth < MAX_READ_FILE_HINT_DEPTH
+                        && !read_file_hint_ignored_directory(&file_name)
+                    {
+                        pending.push((entry.path(), depth.saturating_add(1)));
+                    }
+                    continue;
+                }
+                // 不跟随符号链接，避免候选提示跨越 workspace 边界或暴露宿主路径。
+                if !file_type.is_file() || file_type.is_symlink() || file_name != basename {
+                    continue;
+                }
+                let path = entry.path();
+                let Some(relative) = path.strip_prefix(&workspace_root).ok() else {
+                    continue;
+                };
+                let candidate_policy = self.policy.evaluate_path("read_file", relative, true);
+                if candidate_policy.decision != PolicyDecision::Allow {
+                    continue;
+                }
+                let relative = relative.to_string_lossy().replace('\\', "/");
+                if !relative.is_empty() {
+                    candidates.insert(bounded_text(&relative, MAX_PATH_ARGUMENT_CHARS));
+                }
+            }
+        }
+
+        (!candidates.is_empty()).then(|| {
+            candidates
+                .into_iter()
+                .take(MAX_READ_FILE_HINT_CANDIDATES)
+                .collect()
+        })
+    }
+
+    fn read_file_hint_request_is_safe(&self, request: &ToolRequest) -> bool {
+        let Some(requested_path) = request.arguments.get("path").and_then(Value::as_str) else {
+            return false;
+        };
+        let resolved_request = self
+            .policy
+            .evaluate_path("read_file", requested_path, false);
+        resolved_request.decision == PolicyDecision::Allow
+            && Path::new(&resolved_request.resource).starts_with(self.policy.workspace_root())
     }
 
     /// Build the terminal report used when an enclosing runtime deadline wins.
@@ -1644,13 +1977,41 @@ impl ToolRuntime {
             .ok_or_else(|| ToolError::Execution("read target does not exist".to_owned()))?;
         let content =
             String::from_utf8(content).map_err(|error| ToolError::Execution(error.to_string()))?;
-        let lines = output_line_count(&content);
+        let total_bytes = content.len();
+        let total_lines = output_line_count(&content);
+        let content_digest = checksum(content.as_bytes());
+        let offset = read_offset(&request.arguments);
+        let limit = read_limit(&request.arguments);
+        let window = select_read_window(&content, offset, limit, total_lines);
+        let mut structured_facts = json!({
+            // Provider 可见事实使用调用方给出的 workspace 相对路径。解析后的
+            // 绝对路径仍保留为持久执行事实，但每轮重复会浪费 token，并暴露
+            // 对模型决策没有价值的宿主路径前缀。
+            "path": path,
+            "resolved_path": resolved_path,
+            "content_digest": content_digest,
+            "bytes": window.content.len(),
+            "lines": window.lines,
+            "offset": offset,
+            "limit": limit,
+            "total_bytes": total_bytes,
+            "total_lines": total_lines,
+            "has_more": window.has_more,
+            "truncated": window.has_more,
+            "eof": !window.has_more,
+        });
+        if window.has_more {
+            structured_facts["continuation"] = json!({
+                "next_cursor": window.next_offset,
+                "next_offset": window.next_offset,
+            });
+        }
         Ok(with_item_count(
             success_report(
                 request,
                 "file read",
-                json!({"path": resolved_path, "bytes": content.len(), "lines": lines}),
-                content,
+                structured_facts,
+                window.content,
                 Vec::new(),
                 policy,
             ),
@@ -1681,9 +2042,63 @@ impl ToolRuntime {
                 policy,
             ));
         }
-        tokio::fs::write(&resolved_path, content.as_bytes())
-            .await
-            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        let existing_content = before_images
+            .iter()
+            .find(|image| image.path == resolved_path)
+            .and_then(|image| image.content.as_deref());
+        if existing_content == Some(content.as_bytes()) {
+            let digest = checksum(content.as_bytes());
+            let mut report = success_report(
+                request,
+                "file already contains requested content",
+                json!({
+                    "path": resolved_path,
+                    "bytes": content.len(),
+                    "content_digest": digest,
+                    "changed": false,
+                    "idempotent": true,
+                    "workspace_changes_known": true,
+                }),
+                String::new(),
+                Vec::new(),
+                policy,
+            );
+            report.before_images = before_images.clone();
+            report.after_images = before_images;
+            report.metrics.item_count = Some(1);
+            return Ok(report);
+        }
+        if let Err(error) = tokio::fs::write(&resolved_path, content.as_bytes()).await {
+            let parent = resolved_path.parent().map(PathBuf::from);
+            let parent_missing = match parent.as_deref() {
+                Some(parent) => match tokio::fs::metadata(parent).await {
+                    Ok(metadata) => !metadata.is_dir(),
+                    Err(_) => true,
+                },
+                None => false,
+            };
+            let reason = error.to_string();
+            return Ok(error_report(
+                request,
+                "file write failed",
+                json!({
+                    "path": resolved_path,
+                    "parent": parent,
+                    "parent_missing": parent_missing,
+                    "error_kind": io_error_kind_name(error.kind()),
+                    "errno": error.raw_os_error(),
+                    "error": reason,
+                    "action_required": if parent_missing {
+                        "create_parent_directory_explicitly"
+                    } else {
+                        "inspect_write_error"
+                    },
+                    "workspace_changes_known": true,
+                }),
+                reason,
+                policy,
+            ));
+        }
         let mut report = success_report(
             request,
             "file written",
@@ -1691,6 +2106,8 @@ impl ToolRuntime {
                 "path": resolved_path,
                 "bytes": content.len(),
                 "content_digest": checksum(content.as_bytes()),
+                "changed": true,
+                "workspace_changes_known": true,
             }),
             content.clone(),
             vec![resolved_path.clone()],
@@ -1713,6 +2130,7 @@ impl ToolRuntime {
                 true,
             )),
         }];
+        attach_model_visible_change_preview(&mut report, self.policy.workspace_root());
         report.metrics.item_count = Some(1);
         Ok(report)
     }
@@ -1724,8 +2142,7 @@ impl ToolRuntime {
         before_images: Vec<FileBeforeImage>,
     ) -> Result<ToolExecutionReport, ToolError> {
         let path = string_arg(&request.arguments, "path")?;
-        let search = string_arg(&request.arguments, "search")?;
-        let replace = string_arg(&request.arguments, "replace")?;
+        let edits = parse_file_edits(&request.arguments)?;
         let resolved_path = self.resolve_tool_path("edit_file", &path, true)?;
         if !before_image_still_current(&resolved_path, &before_images).await? {
             return Ok(error_report(
@@ -1751,36 +2168,79 @@ impl ToolRuntime {
         };
         let original = String::from_utf8(original_bytes)
             .map_err(|error| ToolError::Execution(error.to_string()))?;
-        if !original.contains(&search) {
-            return Ok(error_report(
-                request,
-                "edit target not found",
-                json!({"path": resolved_path, "search_found": false}),
-                original,
-                policy,
-            ));
-        }
-        let edited = original.replacen(&search, &replace, 1);
+        let (edited, replacement_count) = match apply_file_edits(&original, &edits) {
+            Ok(result) => result,
+            Err(failure) => {
+                return Ok(error_report(
+                    request,
+                    &failure.summary,
+                    json!({
+                        "path": resolved_path,
+                        "edit_index": failure.edit_index,
+                        "search_found": failure.search_found,
+                        "overlap": failure.overlap,
+                        "replacements": 0,
+                    }),
+                    original,
+                    policy,
+                ));
+            }
+        };
         if edited.len() as u64 > MAX_FILE_CONTENT_BYTES {
             return Ok(error_report(
                 request,
                 "edited content exceeds file size limit",
-                json!({"path": resolved_path, "max_bytes": MAX_FILE_CONTENT_BYTES}),
+                json!({
+                    "path": resolved_path,
+                    "max_bytes": MAX_FILE_CONTENT_BYTES,
+                    "replacements": replacement_count,
+                }),
                 String::new(),
                 policy,
             ));
         }
-        tokio::fs::write(&resolved_path, edited.as_bytes())
-            .await
-            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        if let Err(error) = tokio::fs::write(&resolved_path, edited.as_bytes()).await {
+            let parent = resolved_path.parent().map(PathBuf::from);
+            let parent_missing = match parent.as_deref() {
+                Some(parent) => match tokio::fs::metadata(parent).await {
+                    Ok(metadata) => !metadata.is_dir(),
+                    Err(_) => true,
+                },
+                None => false,
+            };
+            let reason = error.to_string();
+            return Ok(error_report(
+                request,
+                "file edit write failed",
+                json!({
+                    "path": resolved_path,
+                    "parent": parent,
+                    "parent_missing": parent_missing,
+                    "error_kind": io_error_kind_name(error.kind()),
+                    "errno": error.raw_os_error(),
+                    "error": reason,
+                    "action_required": if parent_missing {
+                        "create_parent_directory_explicitly"
+                    } else {
+                        "inspect_write_error"
+                    },
+                    "workspace_changes_known": true,
+                }),
+                reason,
+                policy,
+            ));
+        }
         let mut report = success_report(
             request,
             "file edited",
             json!({
                 "path": resolved_path,
-                "replacements": 1,
+                "replacements": replacement_count,
+                "edit_count": edits.len(),
                 "bytes": edited.len(),
                 "content_digest": checksum(edited.as_bytes()),
+                "changed": true,
+                "workspace_changes_known": true,
             }),
             edited.clone(),
             vec![resolved_path.clone()],
@@ -1803,12 +2263,28 @@ impl ToolRuntime {
                 true,
             )),
         }];
+        attach_model_visible_change_preview(&mut report, self.policy.workspace_root());
         report.metrics.item_count = Some(1);
         Ok(report)
     }
 
     async fn patch_paths(&self, patch: &str) -> Result<Vec<PathBuf>, ToolError> {
         validate_patch_input(patch)?;
+        if model_patch::looks_like_model_patch(patch) {
+            return model_patch::parse(patch)
+                .map(|parsed| {
+                    parsed
+                        .files
+                        .into_iter()
+                        .flat_map(|file| {
+                            std::iter::once(file.path)
+                                .chain(file.move_path)
+                                .collect::<Vec<_>>()
+                        })
+                        .collect()
+                })
+                .map_err(ToolError::InvalidArguments);
+        }
         let mut args = vec!["apply".to_owned()];
         if self.policy.mode() == golutra_policy::WorkspacePolicyMode::Unrestricted {
             args.push("--unsafe-paths".to_owned());
@@ -1892,6 +2368,7 @@ impl ToolRuntime {
                 ));
             }
         }
+        let patch = self.normalize_model_patch(&patch).await?;
         let mut args = vec!["apply".to_owned()];
         if self.policy.mode() == golutra_policy::WorkspacePolicyMode::Unrestricted {
             args.push("--unsafe-paths".to_owned());
@@ -1963,9 +2440,63 @@ impl ToolRuntime {
         );
         report.before_images = before_images;
         report.after_images = after_images;
+        attach_model_visible_change_preview(&mut report, self.policy.workspace_root());
         report.metrics = process_metrics(&output);
         report.metrics.item_count = Some(u64::try_from(changed_count).unwrap_or(u64::MAX));
         Ok(report)
+    }
+
+    async fn normalize_model_patch(&self, patch: &str) -> Result<String, ToolError> {
+        if !model_patch::looks_like_model_patch(patch) {
+            return Ok(patch.to_owned());
+        }
+        let parsed = model_patch::parse(patch).map_err(ToolError::InvalidArguments)?;
+        let mut originals = BTreeMap::new();
+        for file in &parsed.files {
+            let source_requires_existing = matches!(
+                file.kind,
+                model_patch::ModelPatchFileKind::Update(_)
+                    | model_patch::ModelPatchFileKind::Delete
+            );
+            let source_path =
+                self.resolve_tool_path("apply_patch", &file.path, source_requires_existing)?;
+            match tokio::fs::symlink_metadata(&source_path).await {
+                Ok(_) if source_requires_existing => {
+                    let content = tokio::fs::read(&source_path)
+                        .await
+                        .map_err(|error| ToolError::Execution(error.to_string()))?;
+                    originals.insert(file.path.clone(), content);
+                }
+                Ok(_) => {
+                    originals.insert(file.path.clone(), Vec::new());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if source_requires_existing {
+                        return Err(ToolError::InvalidArguments(format!(
+                            "patch target does not exist: {}",
+                            file.path.display()
+                        )));
+                    }
+                }
+                Err(error) => return Err(ToolError::Execution(error.to_string())),
+            }
+            if let Some(move_path) = &file.move_path {
+                let destination_path = self.resolve_tool_path("apply_patch", move_path, false)?;
+                match tokio::fs::symlink_metadata(&destination_path).await {
+                    Ok(_) => {
+                        originals.insert(move_path.clone(), Vec::new());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(ToolError::Execution(format!(
+                            "could not inspect patch move destination `{}`: {error}",
+                            move_path.display()
+                        )));
+                    }
+                }
+            }
+        }
+        model_patch::render(&parsed, &originals).map_err(ToolError::InvalidArguments)
     }
 
     async fn run_patch_command(
@@ -2293,7 +2824,8 @@ impl ToolRuntime {
         started_at: Instant,
         progress: &mut Option<&mut (dyn FnMut(ToolProgress) + Send)>,
     ) -> Result<ToolExecutionReport, ToolError> {
-        let command = string_arg(&request.arguments, "command")?;
+        let command = shell_command_for_request(&request.arguments)?;
+        let strictly_read_only = shell_request_is_strictly_read_only(&request.arguments);
         let background = request
             .arguments
             .get("background")
@@ -2309,7 +2841,10 @@ impl ToolRuntime {
                 DEFAULT_TIMEOUT_MS
             });
         let effective_timeout_ms = effective_shell_timeout(timeout_ms);
-        let command_line = CommandLine::parse(&command)?;
+        let command_line = CommandLine::parse_for_execution(
+            &command,
+            self.policy.mode() == golutra_policy::WorkspacePolicyMode::Unrestricted,
+        )?;
         let cwd = match optional_string_arg(&request.arguments, "workdir") {
             Some(workdir) => self.resolve_tool_path("shell", workdir, true)?,
             None => self.policy.workspace_root().to_path_buf(),
@@ -2325,9 +2860,13 @@ impl ToolRuntime {
                 "quoted Python heredocs are supported only for foreground commands".to_owned(),
             ));
         }
-        let workspace_before = match workspace_before {
-            Some(snapshot) => snapshot,
-            None => workspace_scan::capture(self.policy.workspace_root()).await,
+        let workspace_before = if strictly_read_only {
+            None
+        } else {
+            Some(match workspace_before {
+                Some(snapshot) => snapshot,
+                None => workspace_scan::capture(self.policy.workspace_root()).await,
+            })
         };
         if background {
             let wait_ms = request
@@ -2353,7 +2892,8 @@ impl ToolRuntime {
                     sandbox: &self.sandbox,
                     workspace_access: WorkspaceAccess::ReadWrite,
                     allow_network: self.allow_network,
-                    workspace_before,
+                    workspace_before: workspace_before
+                        .expect("background shell calls have a workspace baseline"),
                 })
                 .await?;
             return Ok(supervised_process_report(request, policy, snapshot));
@@ -2373,7 +2913,11 @@ impl ToolRuntime {
                     timeout_ms: effective_timeout_ms,
                     cancellation,
                     sandbox: &self.sandbox,
-                    workspace_access: WorkspaceAccess::ReadWrite,
+                    workspace_access: if strictly_read_only {
+                        WorkspaceAccess::ReadOnly
+                    } else {
+                        WorkspaceAccess::ReadWrite
+                    },
                     allow_network: self.allow_network,
                     stdin: command_line.stdin.as_deref(),
                     isolated_home: false,
@@ -2382,8 +2926,18 @@ impl ToolRuntime {
             )
             .await?
         };
-        let workspace_changes =
-            workspace_scan::compare(self.policy.workspace_root(), workspace_before).await;
+        let workspace_changes = if strictly_read_only {
+            workspace_scan::WorkspaceMutationScan {
+                complete: true,
+                ..workspace_scan::WorkspaceMutationScan::default()
+            }
+        } else {
+            workspace_scan::compare(
+                self.policy.workspace_root(),
+                workspace_before.expect("mutable shell calls have a workspace baseline"),
+            )
+            .await
+        };
         let status = if shell_output.cancelled {
             ToolResultStatus::Cancelled
         } else if shell_output.timed_out {
@@ -2528,6 +3082,8 @@ impl ToolRuntime {
         policy: PolicyEvaluation,
     ) -> Result<ToolExecutionReport, ToolError> {
         let process_id = string_arg(&request.arguments, "process_id")?;
+        self.validate_authoritative_pid(&request, &process_id)
+            .await?;
         let cursor = process_cursor(&request.arguments);
         let wait_ms = process_wait_ms(&request.arguments, default_poll_wait_ms());
         let snapshot = self
@@ -2543,6 +3099,8 @@ impl ToolRuntime {
         policy: PolicyEvaluation,
     ) -> Result<ToolExecutionReport, ToolError> {
         let process_id = string_arg(&request.arguments, "process_id")?;
+        self.validate_authoritative_pid(&request, &process_id)
+            .await?;
         let cursor = process_cursor(&request.arguments);
         let snapshot = self
             .process_supervisor
@@ -2557,6 +3115,8 @@ impl ToolRuntime {
         policy: PolicyEvaluation,
     ) -> Result<ToolExecutionReport, ToolError> {
         let process_id = string_arg(&request.arguments, "process_id")?;
+        self.validate_authoritative_pid(&request, &process_id)
+            .await?;
         let input = string_arg(&request.arguments, "input")?;
         let cursor = process_cursor(&request.arguments);
         let wait_ms = process_wait_ms(&request.arguments, 250);
@@ -2573,6 +3133,8 @@ impl ToolRuntime {
         policy: PolicyEvaluation,
     ) -> Result<ToolExecutionReport, ToolError> {
         let process_id = string_arg(&request.arguments, "process_id")?;
+        self.validate_authoritative_pid(&request, &process_id)
+            .await?;
         let cursor = process_cursor(&request.arguments);
         let snapshot = self
             .process_supervisor
@@ -2585,16 +3147,60 @@ impl ToolRuntime {
         &self,
         request: ToolRequest,
         policy: PolicyEvaluation,
+        cancellation: CancellationToken,
+        execution_cancellation: CancellationToken,
     ) -> Result<ToolExecutionReport, ToolError> {
         let action = string_arg(&request.arguments, "action")?;
         let process_id = string_arg(&request.arguments, "process_id")?;
+        let authoritative_pid =
+            process_authoritative_pid(&request.arguments)?.ok_or_else(|| {
+                ToolError::InvalidArguments(
+                    "shell_session requires authoritative_pid from the start response".to_owned(),
+                )
+            })?;
+        self.process_supervisor
+            .validate_authoritative_pid(request.session_id, &process_id, authoritative_pid)
+            .await?;
         let cursor = process_cursor(&request.arguments);
         let snapshot = match action.as_str() {
             "wait" => {
                 let wait_ms = process_wait_ms(&request.arguments, default_poll_wait_ms());
-                self.process_supervisor
-                    .poll(request.session_id, &process_id, cursor, wait_ms)
-                    .await?
+                let wait_for_terminal = request
+                    .arguments
+                    .get("wait_for_terminal")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if wait_for_terminal {
+                    let result = self
+                        .process_supervisor
+                        .wait_until_terminal(
+                            request.session_id,
+                            &process_id,
+                            cursor,
+                            wait_ms,
+                            &execution_cancellation,
+                        )
+                        .await?;
+                    if result.cancelled {
+                        if cancellation.is_cancelled() {
+                            return Ok(cancelled_report_with_policy(
+                                request,
+                                policy,
+                                "background terminal wait was cancelled",
+                            ));
+                        }
+                        return Ok(self.deadline_exceeded_report(
+                            request,
+                            policy,
+                            "background terminal wait",
+                        ));
+                    }
+                    result.snapshot
+                } else {
+                    self.process_supervisor
+                        .poll(request.session_id, &process_id, cursor, wait_ms)
+                        .await?
+                }
             }
             "write" => {
                 let input = string_arg(&request.arguments, "input")?;
@@ -2615,6 +3221,19 @@ impl ToolRuntime {
             }
         };
         Ok(supervised_process_report(request, policy, snapshot))
+    }
+
+    async fn validate_authoritative_pid(
+        &self,
+        request: &ToolRequest,
+        process_id: &str,
+    ) -> Result<(), ToolError> {
+        let Some(authoritative_pid) = process_authoritative_pid(&request.arguments)? else {
+            return Ok(());
+        };
+        self.process_supervisor
+            .validate_authoritative_pid(request.session_id, process_id, authoritative_pid)
+            .await
     }
 
     async fn web_search(
@@ -2919,31 +3538,173 @@ fn bounded_query_limit(arguments: &Value) -> usize {
         .clamp(1, 100)
 }
 
-fn validate_tool_arguments(contract: &ToolContract, arguments: &Value) -> Result<(), ToolError> {
-    let validator = jsonschema::validator_for(&contract.input_schema).map_err(|error| {
-        ToolError::InvalidArguments(format!(
-            "tool `{}` has an invalid input schema: {error}",
-            contract.tool_name
-        ))
-    })?;
-    let errors = validator
-        .iter_errors(arguments)
-        .map(|error| {
-            bounded_text(
-                &error.masked_with("<redacted-value>").to_string(),
-                MAX_TOOL_ERROR_CHARS,
-            )
-        })
-        .collect::<Vec<_>>();
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(ToolError::InvalidArguments(format!(
-            "tool `{}` arguments do not match its contract: {}",
-            contract.tool_name,
-            errors.join("; ")
-        )))
+#[derive(Debug)]
+struct ReadWindow {
+    content: String,
+    lines: u64,
+    next_offset: usize,
+    has_more: bool,
+}
+
+fn read_offset(arguments: &Value) -> usize {
+    arguments
+        .get("offset")
+        .and_then(Value::as_u64)
+        .and_then(|offset| usize::try_from(offset).ok())
+        .filter(|offset| *offset > 0)
+        .unwrap_or(1)
+}
+
+fn read_limit(arguments: &Value) -> usize {
+    arguments
+        .get("limit")
+        .and_then(Value::as_u64)
+        .and_then(|limit| usize::try_from(limit).ok())
+        .unwrap_or(DEFAULT_READ_MAX_LINES)
+        .clamp(1, MAX_READ_LINES)
+}
+
+/// 选择稳定且可按行定位的窗口。默认值有意设置为有界，模型只需文件头部时，
+/// 不必为整个生成文件或 vendor 文件付出输入 token。
+fn select_read_window(content: &str, offset: usize, limit: usize, total_lines: u64) -> ReadWindow {
+    if content.is_empty() {
+        return ReadWindow {
+            content: String::new(),
+            lines: 0,
+            next_offset: offset,
+            has_more: false,
+        };
     }
+
+    let start = offset.saturating_sub(1);
+    let total_lines_usize = usize::try_from(total_lines).unwrap_or(usize::MAX);
+    let end = start.saturating_add(limit).min(total_lines_usize);
+    let mut selected = String::new();
+    let mut selected_lines = 0_usize;
+    for (index, line) in content.split_inclusive('\n').enumerate() {
+        if index < start {
+            continue;
+        }
+        if index >= end {
+            break;
+        }
+        selected.push_str(line);
+        selected_lines = selected_lines.saturating_add(1);
+    }
+    ReadWindow {
+        lines: u64::try_from(selected_lines).unwrap_or(u64::MAX),
+        content: selected,
+        next_offset: end.saturating_add(1),
+        has_more: end < total_lines_usize,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FileEdit {
+    old_text: String,
+    new_text: String,
+}
+
+#[derive(Debug)]
+struct EditFailure {
+    summary: String,
+    edit_index: usize,
+    search_found: bool,
+    overlap: bool,
+}
+
+fn parse_file_edits(arguments: &Value) -> Result<Vec<FileEdit>, ToolError> {
+    let edits = arguments
+        .get("edits")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ToolError::InvalidArguments("edits must be a non-empty array".to_owned()))?;
+    if edits.is_empty() || edits.len() > MAX_FILE_EDITS {
+        return Err(ToolError::InvalidArguments(format!(
+            "edits must contain between 1 and {MAX_FILE_EDITS} replacements"
+        )));
+    }
+    edits
+        .iter()
+        .enumerate()
+        .map(|(index, edit)| {
+            let old_text = edit
+                .get("old_text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ToolError::InvalidArguments(format!(
+                        "edits[{index}].old_text must be a non-empty string"
+                    ))
+                })?;
+            if old_text.is_empty() {
+                return Err(ToolError::InvalidArguments(format!(
+                    "edits[{index}].old_text must be a non-empty string"
+                )));
+            }
+            let new_text = edit
+                .get("new_text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ToolError::InvalidArguments(format!("edits[{index}].new_text must be a string"))
+                })?;
+            if old_text.len() as u64 > MAX_FILE_CONTENT_BYTES
+                || new_text.len() as u64 > MAX_FILE_CONTENT_BYTES
+            {
+                return Err(ToolError::InvalidArguments(format!(
+                    "edits[{index}] exceeds the file content limit"
+                )));
+            }
+            Ok(FileEdit {
+                old_text: old_text.to_owned(),
+                new_text: new_text.to_owned(),
+            })
+        })
+        .collect()
+}
+
+fn apply_file_edits(original: &str, edits: &[FileEdit]) -> Result<(String, usize), EditFailure> {
+    let mut matches = Vec::with_capacity(edits.len());
+    for (index, edit) in edits.iter().enumerate() {
+        let mut occurrences = original.match_indices(&edit.old_text);
+        let Some((start, matched)) = occurrences.next() else {
+            return Err(EditFailure {
+                summary: format!("edit target not found at edits[{index}]"),
+                edit_index: index,
+                search_found: false,
+                overlap: false,
+            });
+        };
+        if occurrences.next().is_some() {
+            return Err(EditFailure {
+                summary: format!("edit target is not unique at edits[{index}]"),
+                edit_index: index,
+                search_found: true,
+                overlap: false,
+            });
+        }
+        matches.push((start, start + matched.len(), index));
+    }
+
+    matches.sort_by_key(|(start, _, _)| *start);
+    for pair in matches.windows(2) {
+        if pair[0].1 > pair[1].0 {
+            return Err(EditFailure {
+                summary: "file edits overlap; merge the affected text into one edit".to_owned(),
+                edit_index: pair[1].2,
+                search_found: true,
+                overlap: true,
+            });
+        }
+    }
+
+    let mut output = String::with_capacity(original.len());
+    let mut cursor = 0;
+    for (start, end, index) in matches {
+        output.push_str(&original[cursor..start]);
+        output.push_str(&edits[index].new_text);
+        cursor = end;
+    }
+    output.push_str(&original[cursor..]);
+    Ok((output, edits.len()))
 }
 
 fn success_report(
@@ -2981,6 +3742,137 @@ fn error_report(
         Vec::new(),
         policy_evaluation,
     )
+}
+
+/// 解析失败时只向模型补充下一步可执行的事实，不自动改写请求路径。
+/// 原始错误仍完整进入 artifact，避免为了减少回合而隐藏权限或路径边界。
+fn execution_error_facts(request: &ToolRequest, reason: &str) -> Value {
+    let mut facts = serde_json::Map::new();
+    facts.insert("error".to_owned(), Value::String(reason.to_owned()));
+    if mutation_tool_name(&request.tool_name) && reason.contains("checkpoint") {
+        add_checkpoint_error_facts(request, reason, &mut facts);
+    }
+    if request.tool_name == "read_file"
+        && let Some(path) = request.arguments.get("path").and_then(Value::as_str)
+    {
+        facts.insert(
+            "path".to_owned(),
+            Value::String(bounded_text(path, MAX_PATH_ARGUMENT_CHARS)),
+        );
+        facts.insert(
+            "path_resolution".to_owned(),
+            Value::String(read_file_path_resolution(reason).to_owned()),
+        );
+        facts.insert(
+            "next_action".to_owned(),
+            Value::String(
+                "run one bounded read-only shell discovery such as rg --files, then read the exact file path"
+                    .to_owned(),
+            ),
+        );
+    }
+    Value::Object(facts)
+}
+
+/// 将 checkpoint 失败转换为有限、可执行的模型事实。这里只描述下一步所需的
+/// 路径关系，不尝试修复目录或重放请求；完整 provider 错误仍保存在 artifact。
+fn add_checkpoint_error_facts(
+    request: &ToolRequest,
+    reason: &str,
+    facts: &mut serde_json::Map<String, Value>,
+) {
+    let Some(path) = request.arguments.get("path").and_then(Value::as_str) else {
+        facts.insert(
+            "error_kind".to_owned(),
+            Value::String("checkpoint_io".to_owned()),
+        );
+        facts.insert(
+            "action_required".to_owned(),
+            Value::String("inspect_checkpoint_error".to_owned()),
+        );
+        return;
+    };
+
+    let (path, _) = redact_sensitive_text(path);
+    facts.insert(
+        "path".to_owned(),
+        Value::String(bounded_text(&path, MAX_PATH_ARGUMENT_CHARS)),
+    );
+    if let Some(parent) = Path::new(&path).parent()
+        && !parent.as_os_str().is_empty()
+        && parent != Path::new(".")
+    {
+        facts.insert(
+            "parent".to_owned(),
+            Value::String(bounded_text(
+                &parent.to_string_lossy(),
+                MAX_PATH_ARGUMENT_CHARS,
+            )),
+        );
+    }
+
+    let parent_missing = checkpoint_error_mentions_missing_path(reason);
+    facts.insert("parent_missing".to_owned(), Value::Bool(parent_missing));
+    facts.insert(
+        "error_kind".to_owned(),
+        Value::String(
+            if parent_missing {
+                "checkpoint_parent_missing"
+            } else {
+                "checkpoint_io"
+            }
+            .to_owned(),
+        ),
+    );
+    facts.insert(
+        "action_required".to_owned(),
+        Value::String(
+            if parent_missing {
+                "create_parent_directory_explicitly"
+            } else {
+                "inspect_checkpoint_error"
+            }
+            .to_owned(),
+        ),
+    );
+}
+
+fn checkpoint_error_mentions_missing_path(reason: &str) -> bool {
+    let lower = reason.to_ascii_lowercase();
+    lower.contains("no such file or directory")
+        || lower.contains("not found")
+        || lower.contains("cannot find the path")
+}
+
+fn read_file_hint_reason(reason: &str) -> bool {
+    reason.contains("read target does not exist")
+        || reason.contains("path canonicalization failed")
+        || reason.contains("not a regular file")
+}
+
+fn read_file_path_resolution(reason: &str) -> &'static str {
+    if reason.contains("not a regular file") {
+        "directory_or_non_regular_file"
+    } else if reason.contains("canonicalization failed") {
+        "missing_or_unresolvable"
+    } else {
+        "validation_failed"
+    }
+}
+
+fn read_file_hint_ignored_directory(name: &str) -> bool {
+    name.starts_with('.')
+        || matches!(
+            name,
+            "target"
+                | "node_modules"
+                | "dist"
+                | "build"
+                | ".next"
+                | "__pycache__"
+                | ".venv"
+                | "venv"
+        )
 }
 
 fn blocked_report(
@@ -3287,6 +4179,19 @@ fn report(
 ) -> ToolExecutionReport {
     let (redacted_output, redaction_status) = redact_sensitive_text(&raw_output);
     let redacted_summary = redact_sensitive_text(summary).0;
+    let mut structured_facts = structured_facts;
+    if request.tool_name == "read_file"
+        && redacted_output.len() > DEFAULT_READ_EXCERPT_BYTES
+        && let Value::Object(facts) = &mut structured_facts
+    {
+        // 请求的行窗口可能完整，但 provider 可见摘录仍受字节上限约束；显式
+        // 保留这个区别，避免模型把被截断的行误判为 EOF。
+        facts.insert("model_visible_truncated".to_owned(), Value::Bool(true));
+        facts.insert(
+            "model_visible_bytes".to_owned(),
+            Value::Number((DEFAULT_READ_EXCERPT_BYTES as u64).into()),
+        );
+    }
     let structured_facts = redact_sensitive_value(structured_facts);
     let artifact = artifact_for(&request, &redacted_output, redaction_status);
     let evidence = EvidenceRecord {
@@ -3309,6 +4214,11 @@ fn report(
         // 文件副作用的完整内容已经保存在 artifact 中；再次回显会让每个
         // 后续 turn 重复支付相同 token，模型只需状态摘要和结构化 digest。
         Some(redacted_summary.clone())
+    } else if request.tool_name == "read_file" {
+        Some(bounded_text_bytes(
+            &redacted_output,
+            DEFAULT_READ_EXCERPT_BYTES,
+        ))
     } else {
         Some(excerpt(&redacted_output, DEFAULT_EXCERPT_LIMIT))
     };
@@ -3353,6 +4263,157 @@ fn mutation_tool_name(tool_name: &str) -> bool {
         BuiltinTool::from_name(tool_name),
         Some(BuiltinTool::WriteFile | BuiltinTool::EditFile | BuiltinTool::ApplyPatch)
     )
+}
+
+/// 为成功文件变更补充精简的 provider 可见说明。
+///
+/// 完整 diff 仍保存在持久变更 artifact 中。这里利用工具报告尚未释放的前后镜像
+/// 生成有界预览，让下一轮无需重复读取即可决策。缺失文件按空内容处理；不可用
+/// 或二进制镜像不生成预览，避免猜测内容。
+fn attach_model_visible_change_preview(report: &mut ToolExecutionReport, workspace_root: &Path) {
+    if report.envelope.status != ToolResultStatus::Ok
+        || !mutation_tool_name(&report.envelope.tool_name)
+        || report.changed_files.is_empty()
+    {
+        return;
+    }
+
+    let mut previews = Vec::new();
+    let mut retained_bytes = 0_usize;
+    for path in report
+        .changed_files
+        .iter()
+        .take(MAX_MODEL_CHANGE_PREVIEW_FILES)
+    {
+        let before = report
+            .before_images
+            .iter()
+            .find(|image| image.path == *path);
+        let after = report.after_images.iter().find(|image| image.path == *path);
+        let after_image = after;
+        let (Some(before), Some(after_text)) = (preview_text(before), preview_text(after_image))
+        else {
+            continue;
+        };
+
+        let mut added_lines = Vec::new();
+        let mut removed_lines = Vec::new();
+        let mut line_count = 0_usize;
+        let mut truncated = false;
+        for change in TextDiff::from_lines(before.as_str(), after_text.as_str()).iter_all_changes()
+        {
+            let (target, prefix) = match change.tag() {
+                ChangeTag::Insert => (&mut added_lines, '+'),
+                ChangeTag::Delete => (&mut removed_lines, '-'),
+                ChangeTag::Equal => continue,
+            };
+            if line_count >= MAX_MODEL_CHANGE_PREVIEW_LINES {
+                truncated = true;
+                break;
+            }
+            let value = change.value().trim_end_matches(['\r', '\n']);
+            let redacted = redact_sensitive_text(&format!("{prefix}{value}")).0;
+            let line = bounded_text_bytes(&redacted, MAX_MODEL_CHANGE_PREVIEW_LINE_BYTES);
+            let line_bytes = line.len().saturating_add(1);
+            if retained_bytes
+                .saturating_add(line_bytes)
+                .saturating_add(path.to_string_lossy().len())
+                > MAX_MODEL_CHANGE_PREVIEW_BYTES
+            {
+                truncated = true;
+                break;
+            }
+            retained_bytes = retained_bytes.saturating_add(line_bytes);
+            line_count = line_count.saturating_add(1);
+            target.push(line);
+        }
+        if added_lines.is_empty() && removed_lines.is_empty() && !truncated {
+            continue;
+        }
+
+        let mut item = serde_json::Map::new();
+        let model_path = path
+            .strip_prefix(workspace_root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned();
+        item.insert("path".to_owned(), Value::String(model_path));
+        item.insert(
+            "added_lines".to_owned(),
+            Value::Array(added_lines.into_iter().map(Value::String).collect()),
+        );
+        item.insert(
+            "removed_lines".to_owned(),
+            Value::Array(removed_lines.into_iter().map(Value::String).collect()),
+        );
+        item.insert("truncated".to_owned(), Value::Bool(truncated));
+        if let Some(checksum) = after_image
+            .and_then(|image| image.metadata.as_ref())
+            .and_then(|metadata| metadata.checksum.clone())
+        {
+            item.insert("content_digest".to_owned(), Value::String(checksum));
+        }
+        previews.push(redact_sensitive_value(Value::Object(item)));
+        if truncated || retained_bytes >= MAX_MODEL_CHANGE_PREVIEW_BYTES {
+            break;
+        }
+    }
+
+    if let Value::Object(facts) = &mut report.envelope.structured_facts {
+        if let Some(Value::String(path)) = facts.get_mut("path") {
+            let relative = Path::new(path.as_str())
+                .strip_prefix(workspace_root)
+                .unwrap_or_else(|_| Path::new(path.as_str()))
+                .to_string_lossy()
+                .into_owned();
+            *path = relative;
+        }
+        let changed_paths = report
+            .changed_files
+            .iter()
+            .map(|path| {
+                Value::String(
+                    path.strip_prefix(workspace_root)
+                        .unwrap_or(path)
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if !changed_paths.is_empty() {
+            facts.insert("changed_paths".to_owned(), Value::Array(changed_paths));
+        }
+        if !previews.is_empty() {
+            facts.insert("change_preview".to_owned(), Value::Array(previews));
+        }
+    }
+}
+
+fn preview_text(image: Option<&FileBeforeImage>) -> Option<String> {
+    let Some(image) = image else {
+        return Some(String::new());
+    };
+    match (image.content.as_deref(), image.metadata.as_ref()) {
+        (Some(bytes), _) => std::str::from_utf8(bytes).ok().map(ToOwned::to_owned),
+        // 缺失路径没有内容和元数据；存在元数据但内容不可用时，镜像应保持不透明。
+        (None, None) => Some(String::new()),
+        (None, Some(_)) => None,
+    }
+}
+
+fn io_error_kind_name(kind: std::io::ErrorKind) -> &'static str {
+    match kind {
+        std::io::ErrorKind::NotFound => "not_found",
+        std::io::ErrorKind::PermissionDenied => "permission_denied",
+        std::io::ErrorKind::AlreadyExists => "already_exists",
+        std::io::ErrorKind::InvalidInput => "invalid_input",
+        std::io::ErrorKind::InvalidData => "invalid_data",
+        std::io::ErrorKind::TimedOut => "timed_out",
+        std::io::ErrorKind::WouldBlock => "would_block",
+        std::io::ErrorKind::Interrupted => "interrupted",
+        std::io::ErrorKind::WriteZero => "write_zero",
+        _ => "other",
+    }
 }
 
 fn with_metrics(
@@ -3441,6 +4502,28 @@ fn process_cursor(arguments: &Value) -> u64 {
     arguments.get("cursor").and_then(Value::as_u64).unwrap_or(0)
 }
 
+fn process_authoritative_pid(arguments: &Value) -> Result<Option<u32>, ToolError> {
+    let Some(value) = arguments.get("authoritative_pid") else {
+        return Ok(None);
+    };
+    let Some(raw_pid) = value.as_u64() else {
+        return Err(ToolError::InvalidArguments(
+            "authoritative_pid must be a positive integer".to_owned(),
+        ));
+    };
+    let pid = u32::try_from(raw_pid).map_err(|_| {
+        ToolError::InvalidArguments(
+            "authoritative_pid is outside the supported OS PID range".to_owned(),
+        )
+    })?;
+    if pid == 0 {
+        return Err(ToolError::InvalidArguments(
+            "authoritative_pid must be a positive integer".to_owned(),
+        ));
+    }
+    Ok(Some(pid))
+}
+
 fn process_wait_ms(arguments: &Value, default: u64) -> u64 {
     arguments
         .get("wait_ms")
@@ -3450,8 +4533,16 @@ fn process_wait_ms(arguments: &Value, default: u64) -> u64 {
 }
 
 fn process_summary_value(summary: ProcessSummary) -> Value {
+    let next_action = process_next_action(
+        summary.state,
+        &summary.process_id,
+        summary.authoritative_pid,
+        summary.output_cursor,
+        summary.terminal_event_id,
+    );
     json!({
         "process_id": summary.process_id,
+        "authoritative_pid": summary.authoritative_pid,
         "command": bounded_text(
             &summary.command_display,
             MAX_TOOL_ARGUMENT_DISPLAY_STRING_BYTES,
@@ -3462,8 +4553,9 @@ fn process_summary_value(summary: ProcessSummary) -> Value {
         "output_bytes": summary.output_bytes,
         "output_lines": summary.output_lines,
         "output_truncated": summary.output_truncated,
+        "terminal_event_id": summary.terminal_event_id,
         "terminal": summary.state.is_terminal(),
-        "next_action": process_next_action(summary.state, &summary.process_id, summary.output_cursor),
+        "next_action": next_action,
     })
 }
 
@@ -3485,8 +4577,13 @@ fn supervised_process_report(
     };
     let workspace_changes_known = snapshot.workspace_changes_known;
     let terminal = snapshot.state.is_terminal();
-    let next_action =
-        process_next_action(snapshot.state, &snapshot.process_id, snapshot.output_cursor);
+    let next_action = process_next_action(
+        snapshot.state,
+        &snapshot.process_id,
+        snapshot.authoritative_pid,
+        snapshot.output_cursor,
+        snapshot.terminal_event_id,
+    );
     let mut result = report(
         request,
         status,
@@ -3502,6 +4599,7 @@ fn supervised_process_report(
         },
         json!({
             "process_id": snapshot.process_id,
+            "authoritative_pid": snapshot.authoritative_pid,
             "process_state": state,
             "exit_code": snapshot.exit_code,
             "output_cursor": snapshot.output_cursor,
@@ -3509,6 +4607,7 @@ fn supervised_process_report(
             "output_lines": snapshot.output_lines,
             "output_truncated": snapshot.output_truncated,
             "output_lost": snapshot.output_lost,
+            "terminal_event_id": snapshot.terminal_event_id,
             "workspace_changes_known": workspace_changes_known,
             "process_lifetime_scope": "runtime",
             "survives_runtime_exit": false,
@@ -3560,7 +4659,13 @@ fn process_state_name(state: ProcessState) -> &'static str {
     }
 }
 
-fn process_next_action(state: ProcessState, process_id: &str, cursor: u64) -> Value {
+fn process_next_action(
+    state: ProcessState,
+    process_id: &str,
+    authoritative_pid: u32,
+    cursor: u64,
+    terminal_event_id: Option<u64>,
+) -> Value {
     if state == ProcessState::Running {
         // 把下一步所需的最小参数直接交给模型，避免它重复读取或重置 cursor。
         json!({
@@ -3568,11 +4673,18 @@ fn process_next_action(state: ProcessState, process_id: &str, cursor: u64) -> Va
             "tool": "shell_session",
             "action": "wait",
             "process_id": process_id,
+            "authoritative_pid": authoritative_pid,
             "cursor": cursor,
             "wait_ms": default_poll_wait_ms(),
+            "wait_for_terminal": true,
         })
     } else {
-        json!({"kind": "terminal", "process_state": process_state_name(state)})
+        json!({
+            "kind": "terminal",
+            "process_state": process_state_name(state),
+            "authoritative_pid": authoritative_pid,
+            "terminal_event_id": terminal_event_id,
+        })
     }
 }
 
@@ -3673,75 +4785,122 @@ pub fn redact_tool_arguments(arguments: &Value) -> Value {
 /// intentionally excluded from model context.
 #[must_use]
 pub fn model_visible_tool_result(envelope: &ToolResultEnvelope) -> String {
+    model_visible_tool_result_with_limit(envelope, DEFAULT_MODEL_TOOL_RESULT_BYTES)
+}
+
+/// 在明确的 token 预算下生成 provider 可见结果。
+///
+/// 内部按字节限制投影，调用方沿用上下文规划中的“字符数除以四”估算。
+/// 将换算集中在这里可明确边界，避免误把 token 数直接当作字节上限。
+#[must_use]
+pub fn model_visible_tool_result_with_token_budget(
+    envelope: &ToolResultEnvelope,
+    max_tokens: u64,
+) -> String {
+    let max_bytes = max_tokens.saturating_mul(4).min(usize::MAX as u64) as usize;
+    model_visible_tool_result_with_limit(envelope, max_bytes)
+}
+
+/// 生成有界的 provider 可见结果。普通投影使用保守的 8 KiB 封套；调用方可按
+/// 确定性的上下文预算请求更小上限，硬上限始终固定，避免单个工具占满提示词。
+/// 压缩说明文字前先保留状态以及工具专属的续读/错误事实。
+#[must_use]
+pub fn model_visible_tool_result_with_limit(
+    envelope: &ToolResultEnvelope,
+    max_bytes: usize,
+) -> String {
+    let max_bytes = max_bytes.clamp(MIN_MODEL_TOOL_RESULT_BYTES, MAX_MODEL_TOOL_RESULT_BYTES);
     let summary = bounded_text(
         &redact_sensitive_text(&envelope.summary).0,
         MAX_MODEL_TOOL_RESULT_SUMMARY_CHARS,
     );
     let facts = redact_sensitive_value(envelope.structured_facts.clone());
     let excerpt = envelope.model_visible_excerpt.as_deref().map(|value| {
-        bounded_text(
+        bounded_text_bytes(
             &redact_sensitive_text(value).0,
-            MAX_MODEL_TOOL_RESULT_EXCERPT_CHARS,
+            MAX_MODEL_TOOL_RESULT_EXCERPT_BYTES,
         )
     });
     let known = is_pi_plus_tool(&envelope.tool_name);
-    let (facts, summary, excerpt, keep_summary, keep_excerpt) = match envelope.tool_name.as_str() {
-        "read_file" => {
-            let content = excerpt.or_else(|| {
-                facts
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .map(|value| bounded_text(value, MAX_MODEL_TOOL_RESULT_EXCERPT_CHARS))
-            });
-            (
-                selected_model_facts(&facts, READ_FILE_MODEL_FACTS),
+    let (mut facts, summary, mut excerpt, keep_summary, keep_excerpt) =
+        match envelope.tool_name.as_str() {
+            "read_file" => {
+                let content = excerpt.or_else(|| {
+                    facts
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .map(|value| bounded_text_bytes(value, MAX_MODEL_TOOL_RESULT_EXCERPT_BYTES))
+                });
+                (
+                    selected_model_facts(&facts, READ_FILE_MODEL_FACTS),
+                    summary,
+                    content,
+                    envelope.status != ToolResultStatus::Ok,
+                    true,
+                )
+            }
+            "write_file" | "edit_file" | "apply_patch" => (
+                selected_model_facts(&facts, MUTATION_MODEL_FACTS),
                 summary,
-                content,
-                envelope.status != ToolResultStatus::Ok,
+                None,
+                // mutation 的结构化事实只说明路径和计数，短摘要仍是模型判断
+                // 写入是否成功所需的语义；完整内容和 patch 输出继续留在 durable artifact。
                 true,
-            )
-        }
-        "write_file" | "edit_file" | "apply_patch" => (
-            selected_model_facts(&facts, MUTATION_MODEL_FACTS),
-            summary,
-            None,
-            // mutation 的结构化事实只说明路径和计数，短摘要仍是模型判断
-            // 写入是否成功所需的语义；完整内容和 patch 输出继续留在 durable artifact。
-            true,
-            false,
-        ),
-        "shell" | "shell_session" => (
-            selected_model_facts(&facts, PROCESS_MODEL_FACTS),
-            summary,
-            excerpt.map(|value| bounded_text(&value, MAX_MODEL_TOOL_OUTPUT_CHARS)),
-            envelope.status != ToolResultStatus::Ok,
-            true,
-        ),
-        "web_search" => (
-            project_search_model_facts(&facts),
-            summary,
-            None,
-            envelope.status != ToolResultStatus::Ok,
-            false,
-        ),
-        "subagent" => {
-            let keep_excerpt = excerpt.as_deref().is_some_and(|value| value != summary);
-            (
-                project_subagent_model_facts(&facts),
+                false,
+            ),
+            "shell" | "shell_session" => (
+                selected_model_facts(&facts, PROCESS_MODEL_FACTS),
                 summary,
                 excerpt.map(|value| bounded_text(&value, MAX_MODEL_TOOL_OUTPUT_CHARS)),
+                envelope.status != ToolResultStatus::Ok,
                 true,
-                keep_excerpt,
-            )
-        }
-        _ => (
-            project_model_tool_value(&facts, 0),
-            summary,
-            excerpt,
-            !known,
-            !known,
-        ),
-    };
+            ),
+            "web_search" => (
+                project_search_model_facts(&facts),
+                summary,
+                None,
+                envelope.status != ToolResultStatus::Ok,
+                false,
+            ),
+            "subagent" => {
+                let keep_excerpt = excerpt.as_deref().is_some_and(|value| value != summary);
+                (
+                    project_subagent_model_facts(&facts),
+                    summary,
+                    excerpt.map(|value| bounded_text(&value, MAX_MODEL_TOOL_OUTPUT_CHARS)),
+                    true,
+                    keep_excerpt,
+                )
+            }
+            _ => (
+                project_model_tool_value(&facts, 0),
+                summary,
+                excerpt,
+                !known,
+                !known,
+            ),
+        };
+    // mutation 调用方原本将路径列表命名为 `changed_files`；这里提供稳定的
+    // provider 可见 `changed_paths`，但不复制完整持久封套。
+    if matches!(
+        envelope.tool_name.as_str(),
+        "write_file" | "edit_file" | "apply_patch"
+    ) && let Value::Object(object) = &mut facts
+        && !object.contains_key("changed_paths")
+        && let Some(paths) = object.get("changed_files").cloned()
+    {
+        object.insert("changed_paths".to_owned(), paths);
+    }
+    prune_redundant_success_facts(&envelope.tool_name, envelope.status, &mut facts);
+    // 成功文件或进程输出使用纯文本更易消费；先保留精简 JSON 事实头，再原样
+    // 追加摘录，避免把转义换行再次嵌入 JSON 字符串。
+    let inline_excerpt = (keep_excerpt
+        && matches!(
+            envelope.tool_name.as_str(),
+            "read_file" | "shell" | "shell_session"
+        ))
+    .then(|| excerpt.take())
+    .flatten();
     let mut projection = model_tool_result_base(&envelope.tool_name, envelope.status);
     if let Value::Object(object) = &mut projection {
         object.insert("structured_facts".to_owned(), facts);
@@ -3762,18 +4921,33 @@ pub fn model_visible_tool_result(envelope: &ToolResultEnvelope) -> String {
             object.insert("model_visible_excerpt".to_owned(), Value::String(excerpt));
         }
     }
-    serialize_model_tool_projection(projection, &envelope.tool_name, envelope.status, &summary)
+    let header = serialize_model_tool_projection(
+        projection,
+        &envelope.tool_name,
+        envelope.status,
+        &summary,
+        max_bytes,
+    );
+    append_model_visible_excerpt(header, inline_excerpt.as_deref(), max_bytes)
 }
 
 const READ_FILE_MODEL_FACTS: &[&str] = &[
     "path",
+    "requested_path",
+    "path_normalized",
+    "content_digest",
+    "path_resolution",
+    "candidates",
+    "next_action",
     "bytes",
     "lines",
     "truncated",
     "continuation",
     "next_cursor",
+    "next_offset",
     "cursor",
     "offset",
+    "limit",
     "total_bytes",
     "total_lines",
     "has_more",
@@ -3783,17 +4957,26 @@ const READ_FILE_MODEL_FACTS: &[&str] = &[
     "timed_out",
     "cancelled",
     "blocked",
+    "model_visible_truncated",
+    "model_visible_bytes",
 ];
 
 const MUTATION_MODEL_FACTS: &[&str] = &[
     "path",
+    "changed_paths",
+    "changed",
+    "idempotent",
+    "content_digest",
     "changed_files",
     "changed_file_count",
     "workspace_change_count",
     "workspace_changes_known",
     "workspace_mutation_detected",
+    "change_preview",
     "bytes",
     "replacements",
+    "edit_count",
+    "error_kind",
     "conflict",
     "search_found",
     "max_bytes",
@@ -3802,6 +4985,9 @@ const MUTATION_MODEL_FACTS: &[&str] = &[
     "cancelled",
     "error",
     "reason",
+    "parent",
+    "parent_missing",
+    "action_required",
     "checkpointed_paths",
     "resolved_paths",
     "output_truncated",
@@ -3810,6 +4996,7 @@ const MUTATION_MODEL_FACTS: &[&str] = &[
 
 const PROCESS_MODEL_FACTS: &[&str] = &[
     "process_id",
+    "authoritative_pid",
     "process_state",
     "exit_code",
     "timed_out",
@@ -3825,6 +5012,7 @@ const PROCESS_MODEL_FACTS: &[&str] = &[
     "survives_runtime_exit",
     "terminal",
     "wait_strategy",
+    "wait_for_terminal",
     "next_action",
     "error",
     "reason",
@@ -3849,6 +5037,88 @@ fn selected_model_facts(value: &Value, keys: &[&str]) -> Value {
         }
     }
     Value::Object(projected)
+}
+
+/// 删除已由状态、配对工具参数或保留内容表达的成功态记账字段。失败态保持不变，
+/// 确保恢复流程始终能看到完整且有界的诊断。
+fn prune_redundant_success_facts(tool_name: &str, status: ToolResultStatus, facts: &mut Value) {
+    if status != ToolResultStatus::Ok {
+        return;
+    }
+    let Some(object) = facts.as_object_mut() else {
+        return;
+    };
+    object.retain(|_, value| !value.is_null());
+    match tool_name {
+        "read_file" => {
+            for key in [
+                "bytes",
+                "lines",
+                "offset",
+                "limit",
+                "total_bytes",
+                "total_lines",
+                "model_visible_bytes",
+            ] {
+                object.remove(key);
+            }
+            remove_false_fact(object, "has_more");
+            remove_false_fact(object, "truncated");
+            remove_false_fact(object, "model_visible_truncated");
+            // `has_more` 与 `eof` 互补；只保留正向事实，避免每次完整读取重复付费。
+            if object.get("eof") == Some(&Value::Bool(false)) {
+                object.remove("eof");
+            }
+        }
+        "write_file" | "edit_file" | "apply_patch" => {
+            if object.contains_key("changed_paths") {
+                object.remove("changed_files");
+            }
+            remove_true_fact(object, "changed");
+            remove_true_fact(object, "workspace_changes_known");
+            remove_true_fact(object, "workspace_mutation_detected");
+            if object.get("workspace_change_count") == object.get("changed_file_count") {
+                object.remove("workspace_change_count");
+            }
+        }
+        "shell" | "shell_session" => {
+            object.remove("output_bytes");
+            object.remove("output_lines");
+            remove_false_fact(object, "timed_out");
+            remove_false_fact(object, "cancelled");
+            remove_false_fact(object, "output_truncated");
+            remove_true_fact(object, "workspace_changes_known");
+            if object.get("workspace_change_count") == Some(&Value::from(0_u64)) {
+                object.remove("workspace_change_count");
+            }
+        }
+        _ => {}
+    }
+}
+
+fn remove_false_fact(object: &mut serde_json::Map<String, Value>, key: &str) {
+    if object.get(key) == Some(&Value::Bool(false)) {
+        object.remove(key);
+    }
+}
+
+fn remove_true_fact(object: &mut serde_json::Map<String, Value>, key: &str) {
+    if object.get(key) == Some(&Value::Bool(true)) {
+        object.remove(key);
+    }
+}
+
+fn append_model_visible_excerpt(header: String, excerpt: Option<&str>, max_bytes: usize) -> String {
+    const SEPARATOR: &str = "\n--- output ---\n";
+    let Some(excerpt) = excerpt.filter(|value| !value.is_empty()) else {
+        return header;
+    };
+    let available = max_bytes.saturating_sub(header.len().saturating_add(SEPARATOR.len()));
+    if available == 0 {
+        return header;
+    }
+    let excerpt = bounded_text_bytes(excerpt, available);
+    format!("{header}{SEPARATOR}{excerpt}")
 }
 
 fn project_search_model_facts(value: &Value) -> Value {
@@ -3935,32 +5205,402 @@ fn serialize_model_tool_projection(
     tool_name: &str,
     status: ToolResultStatus,
     summary: &str,
+    max_bytes: usize,
 ) -> String {
-    if serialized_value_len(&projection) > MAX_MODEL_TOOL_RESULT_BYTES
+    let original_facts = projection
+        .get("structured_facts")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let keep_summary = model_tool_summary_is_required(tool_name, status);
+
+    if serialized_value_len(&projection) > max_bytes
         && let Value::Object(object) = &mut projection
     {
         if let Some(facts) = object.get_mut("structured_facts") {
-            *facts = compact_model_tool_value(facts);
+            *facts = compact_model_tool_facts(tool_name, facts);
         }
         if let Some(value) = object.get_mut("model_visible_excerpt")
             && let Some(text) = value.as_str()
         {
-            *value = Value::String(bounded_text(
+            *value = Value::String(bounded_text_bytes(
                 text,
-                MAX_MODEL_TOOL_RESULT_COMPACT_EXCERPT_CHARS,
+                MAX_MODEL_TOOL_RESULT_COMPACT_EXCERPT_CHARS
+                    .saturating_mul(4)
+                    .min(max_bytes / 2),
             ));
         }
     }
-    if serialized_value_len(&projection) <= MAX_MODEL_TOOL_RESULT_BYTES {
+    if serialized_value_len(&projection) > max_bytes
+        && let Value::Object(object) = &mut projection
+    {
+        // 先保留结构化事实和状态。成功输出可以通过 continuation/cursor 再取，
+        // 但错误摘要必须保留，模型才能知道如何恢复。
+        object.remove("model_visible_excerpt");
+        if keep_summary {
+            if let Some(value) = object.get_mut("summary")
+                && let Some(text) = value.as_str()
+            {
+                *value = Value::String(bounded_text_bytes(
+                    text,
+                    MAX_MODEL_TOOL_RESULT_SUMMARY_CHARS.min(max_bytes.saturating_sub(256)),
+                ));
+            }
+        } else {
+            object.remove("summary");
+        }
+    }
+    if serialized_value_len(&projection) <= max_bytes {
         return serde_json::to_string(&projection)
             .unwrap_or_else(|_| "{\"status\":\"error\"}".to_owned());
     }
-    let mut fallback = model_tool_result_base(tool_name, status);
-    if status != ToolResultStatus::Ok {
-        fallback["summary"] = Value::String(bounded_text(summary, MAX_MODEL_TOOL_REASON_CHARS));
+    if let Value::Object(object) = &mut projection {
+        object.insert(
+            "structured_facts".to_owned(),
+            minimal_model_tool_facts(tool_name, &original_facts),
+        );
+        if !keep_summary {
+            object.remove("summary");
+        }
     }
-    fallback["structured_facts"] = json!({"_golutra_truncated": true});
-    serde_json::to_string(&fallback).unwrap_or_else(|_| "{\"status\":\"error\"}".to_owned())
+    if serialized_value_len(&projection) <= max_bytes {
+        return serde_json::to_string(&projection)
+            .unwrap_or_else(|_| "{\"status\":\"error\"}".to_owned());
+    }
+
+    let mut fallback = model_tool_result_base(tool_name, status);
+    fallback["structured_facts"] = minimal_model_tool_facts(tool_name, &original_facts);
+    if keep_summary {
+        fallback["summary"] = Value::String(bounded_text_bytes(
+            summary,
+            MAX_MODEL_TOOL_RESULT_SUMMARY_CHARS.min(max_bytes.saturating_sub(256)),
+        ));
+    }
+    let serialized =
+        serde_json::to_string(&fallback).unwrap_or_else(|_| "{\"status\":\"error\"}".to_owned());
+    if serialized.len() <= max_bytes {
+        serialized
+    } else {
+        // 预算异常紧时仍返回可解析的核心状态；正常调用的最小预算足以容纳
+        // tool_name、status 以及上面的专属事实和摘要。
+        let mut minimal = model_tool_result_base(tool_name, status);
+        if keep_summary {
+            minimal["summary"] = Value::String(bounded_text_bytes(
+                summary,
+                max_bytes.saturating_sub(192).min(256),
+            ));
+        }
+        let serialized =
+            serde_json::to_string(&minimal).unwrap_or_else(|_| "{\"status\":\"error\"}".to_owned());
+        if serialized.len() <= max_bytes {
+            serialized
+        } else {
+            serde_json::to_string(&model_tool_result_base(tool_name, status))
+                .unwrap_or_else(|_| "{\"status\":\"error\"}".to_owned())
+        }
+    }
+}
+
+fn model_tool_summary_is_required(tool_name: &str, status: ToolResultStatus) -> bool {
+    status != ToolResultStatus::Ok
+        || !is_pi_plus_tool(tool_name)
+        || matches!(
+            tool_name,
+            "write_file" | "edit_file" | "apply_patch" | "subagent"
+        )
+}
+
+fn model_fact_priority(tool_name: &str) -> &'static [&'static str] {
+    match tool_name {
+        "read_file" => READ_FILE_MODEL_FACTS,
+        "write_file" | "edit_file" | "apply_patch" => MUTATION_MODEL_FACTS,
+        "shell" | "shell_session" => PROCESS_MODEL_FACTS,
+        "web_search" => &["error", "reason", "query", "result_count", "cached"],
+        "subagent" => &[
+            "child_status",
+            "completed",
+            "success",
+            "status",
+            "error",
+            "reason",
+            "cancelled",
+            "timed_out",
+            "blocked",
+            "partial",
+            "truncated",
+            "continuation",
+        ],
+        _ => &[
+            "status",
+            "error",
+            "reason",
+            "continuation",
+            "next_offset",
+            "next_cursor",
+        ],
+    }
+}
+
+fn model_fact_mandatory(tool_name: &str) -> &'static [&'static str] {
+    match tool_name {
+        "read_file" => &[
+            "path",
+            "content_digest",
+            "continuation",
+            "next_offset",
+            "next_cursor",
+            "has_more",
+            "eof",
+            "truncated",
+            "error",
+            "reason",
+            "timed_out",
+            "cancelled",
+            "blocked",
+        ],
+        "write_file" | "edit_file" | "apply_patch" => &[
+            "path",
+            "parent",
+            "parent_missing",
+            "action_required",
+            "error_kind",
+            "changed_file_count",
+            "workspace_change_count",
+            "workspace_changes_known",
+            "workspace_mutation_detected",
+            "conflict",
+            "error",
+            "reason",
+            "blocked",
+        ],
+        "shell" | "shell_session" => &[
+            "process_id",
+            "authoritative_pid",
+            "process_state",
+            "exit_code",
+            "output_cursor",
+            "timed_out",
+            "cancelled",
+            "terminal",
+            "next_action",
+            "error",
+            "reason",
+            "blocked",
+        ],
+        "web_search" => &["error", "reason", "query", "result_count", "cached"],
+        "subagent" => &[
+            "child_status",
+            "completed",
+            "success",
+            "error",
+            "reason",
+            "cancelled",
+            "timed_out",
+            "blocked",
+            "partial",
+            "truncated",
+            "continuation",
+        ],
+        _ => &[
+            "status",
+            "error",
+            "reason",
+            "continuation",
+            "next_offset",
+            "next_cursor",
+        ],
+    }
+}
+
+fn compact_model_tool_facts(tool_name: &str, value: &Value) -> Value {
+    let Some(object) = value.as_object() else {
+        return compact_model_tool_value(value, 0);
+    };
+    let priority = model_fact_priority(tool_name);
+    let mandatory = model_fact_mandatory(tool_name);
+    let mut projected = serde_json::Map::new();
+    for key in mandatory {
+        if let Some(value) = object.get(*key) {
+            projected.insert((*key).to_owned(), compact_model_fact_value(key, value));
+        }
+    }
+    for key in priority {
+        if projected.len() >= 16 || projected.contains_key(*key) {
+            continue;
+        }
+        if let Some(value) = object.get(*key) {
+            projected.insert((*key).to_owned(), compact_model_fact_value(key, value));
+        }
+    }
+    let mut remaining = object
+        .keys()
+        .filter(|key| !projected.contains_key(*key))
+        .collect::<Vec<_>>();
+    remaining.sort();
+    for key in remaining
+        .into_iter()
+        .take(8usize.saturating_sub(projected.len()))
+    {
+        if let Some(value) = object.get(key) {
+            projected.insert(key.clone(), compact_model_fact_value(key, value));
+        }
+    }
+    if projected.len() < object.len() {
+        projected.insert("_golutra_truncated".to_owned(), Value::Bool(true));
+    }
+    Value::Object(projected)
+}
+
+fn minimal_model_tool_facts(tool_name: &str, value: &Value) -> Value {
+    let Some(object) = value.as_object() else {
+        return compact_model_tool_value(value, 0);
+    };
+    let mut projected = serde_json::Map::new();
+    for key in model_fact_mandatory(tool_name) {
+        if let Some(value) = object.get(*key) {
+            projected.insert((*key).to_owned(), compact_model_fact_value(key, value));
+        }
+    }
+    if projected.is_empty() && !object.is_empty() {
+        projected.insert("_golutra_truncated".to_owned(), Value::Bool(true));
+    }
+    Value::Object(projected)
+}
+
+fn compact_model_fact_value(key: &str, value: &Value) -> Value {
+    match key {
+        "continuation" => match value {
+            Value::Object(object) => compact_priority_model_object(
+                object,
+                &[
+                    "next_offset",
+                    "next_cursor",
+                    "has_more",
+                    "eof",
+                    "cursor",
+                    "offset",
+                ],
+                8,
+            ),
+            _ => compact_model_tool_value(value, 0),
+        },
+        "next_action" => match value {
+            Value::Object(object) => compact_priority_model_object(
+                object,
+                &[
+                    "action",
+                    "process_id",
+                    "authoritative_pid",
+                    "cursor",
+                    "wait_ms",
+                    "wait_for_terminal",
+                ],
+                8,
+            ),
+            _ => compact_model_tool_value(value, 0),
+        },
+        "error" => match value {
+            Value::Object(object) => {
+                compact_priority_model_object(object, &["code", "message", "reason"], 6)
+            }
+            _ => compact_model_tool_value(value, 0),
+        },
+        "change_preview" => compact_change_preview(value),
+        // 文件变更列表可非常大；保留少量路径样本和截断标记，把预算留给
+        // changed_file_count、conflict 等能决定下一步动作的标量事实。
+        "changed_files" | "checkpointed_paths" | "resolved_paths" => match value {
+            Value::Array(values) => {
+                let mut projected = values
+                    .iter()
+                    .take(4)
+                    .map(|value| match value {
+                        Value::String(text) => Value::String(bounded_text_bytes(text, 96)),
+                        _ => compact_model_tool_value(value, 1),
+                    })
+                    .collect::<Vec<_>>();
+                if values.len() > 4 {
+                    projected.push(Value::String(format!(
+                        "<omitted {} additional items>",
+                        values.len() - 4
+                    )));
+                }
+                Value::Array(projected)
+            }
+            _ => compact_model_tool_value(value, 0),
+        },
+        _ => compact_model_tool_value(value, 0),
+    }
+}
+
+fn compact_change_preview(value: &Value) -> Value {
+    let Some(items) = value.as_array() else {
+        return compact_model_tool_value(value, 0);
+    };
+    Value::Array(
+        items
+            .iter()
+            .take(MAX_MODEL_CHANGE_PREVIEW_FILES)
+            .filter_map(|item| {
+                let object = item.as_object()?;
+                let mut compact = serde_json::Map::new();
+                for key in ["path", "content_digest", "truncated"] {
+                    if let Some(value) = object.get(key) {
+                        compact.insert(key.to_owned(), compact_model_tool_value(value, 0));
+                    }
+                }
+                for key in ["added_lines", "removed_lines"] {
+                    if let Some(Value::Array(lines)) = object.get(key) {
+                        compact.insert(
+                            key.to_owned(),
+                            Value::Array(
+                                lines
+                                    .iter()
+                                    .take(12)
+                                    .map(|line| match line {
+                                        Value::String(line) => Value::String(bounded_text_bytes(
+                                            line,
+                                            MAX_MODEL_CHANGE_PREVIEW_LINE_BYTES,
+                                        )),
+                                        other => compact_model_tool_value(other, 0),
+                                    })
+                                    .collect(),
+                            ),
+                        );
+                    }
+                }
+                Some(Value::Object(compact))
+            })
+            .collect(),
+    )
+}
+
+fn compact_priority_model_object(
+    object: &serde_json::Map<String, Value>,
+    priority: &[&str],
+    max_fields: usize,
+) -> Value {
+    let mut projected = serde_json::Map::new();
+    for key in priority {
+        if let Some(value) = object.get(*key) {
+            projected.insert((*key).to_owned(), compact_model_tool_value(value, 1));
+        }
+    }
+    let mut remaining = object
+        .keys()
+        .filter(|key| !projected.contains_key(*key))
+        .collect::<Vec<_>>();
+    remaining.sort();
+    for key in remaining
+        .into_iter()
+        .take(max_fields.saturating_sub(projected.len()))
+    {
+        if let Some(value) = object.get(key) {
+            projected.insert(key.clone(), compact_model_tool_value(value, 1));
+        }
+    }
+    if projected.len() < object.len() {
+        projected.insert("_golutra_truncated".to_owned(), Value::Bool(true));
+    }
+    Value::Object(projected)
 }
 
 fn project_model_tool_value(value: &Value, depth: usize) -> Value {
@@ -4002,12 +5642,31 @@ fn project_model_tool_value(value: &Value, depth: usize) -> Value {
     }
 }
 
-fn compact_model_tool_value(value: &Value) -> Value {
+fn compact_model_tool_value(value: &Value, depth: usize) -> Value {
+    if depth >= 2 {
+        return match value {
+            Value::String(text) => Value::String(bounded_text_bytes(text, 256)),
+            Value::Null | Value::Bool(_) | Value::Number(_) => value.clone(),
+            Value::Object(object) => {
+                Value::String(format!("<omitted object with {} fields>", object.len()))
+            }
+            Value::Array(values) => {
+                Value::String(format!("<omitted array with {} items>", values.len()))
+            }
+        };
+    }
     match value {
         Value::Object(object) => {
             let mut projected = serde_json::Map::new();
-            for (key, value) in object.iter().take(8) {
-                projected.insert(bounded_text(key, 64), compact_model_tool_value(value));
+            let mut keys = object.keys().collect::<Vec<_>>();
+            keys.sort();
+            for key in keys.into_iter().take(8) {
+                if let Some(value) = object.get(key) {
+                    projected.insert(
+                        bounded_text(key, 64),
+                        compact_model_tool_value(value, depth + 1),
+                    );
+                }
             }
             if object.len() > 8 {
                 projected.insert("_golutra_truncated".to_owned(), Value::Bool(true));
@@ -4018,7 +5677,7 @@ fn compact_model_tool_value(value: &Value) -> Value {
             let mut projected = values
                 .iter()
                 .take(8)
-                .map(compact_model_tool_value)
+                .map(|value| compact_model_tool_value(value, depth + 1))
                 .collect::<Vec<_>>();
             if values.len() > 8 {
                 projected.push(Value::String(format!(
@@ -4028,7 +5687,7 @@ fn compact_model_tool_value(value: &Value) -> Value {
             }
             Value::Array(projected)
         }
-        Value::String(text) => Value::String(bounded_text(text, 256)),
+        Value::String(text) => Value::String(bounded_text_bytes(text, 256)),
         Value::Null | Value::Bool(_) | Value::Number(_) => value.clone(),
     }
 }
@@ -4045,6 +5704,8 @@ fn omitted_model_tool_value(value: &Value) -> Value {
 
 const PREFERRED_TOOL_ARGUMENT_KEYS: &[&str] = &[
     "path",
+    "offset",
+    "limit",
     "command",
     "workdir",
     "pattern",
@@ -4059,6 +5720,7 @@ const PREFERRED_TOOL_ARGUMENT_KEYS: &[&str] = &[
     "method",
     "search",
     "replace",
+    "edits",
     "content",
 ];
 
@@ -4447,6 +6109,128 @@ fn string_arg(arguments: &Value, key: &str) -> Result<String, ToolError> {
         .ok_or_else(|| ToolError::InvalidArguments(format!("missing string argument `{key}`")))
 }
 
+fn shell_command_for_request(arguments: &Value) -> Result<String, ToolError> {
+    let command = optional_string_arg(arguments, "command");
+    let argv = arguments
+        .get("argv")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| {
+                    item.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                        ToolError::InvalidArguments("shell argv entries must be strings".to_owned())
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+        });
+    let argv = match argv {
+        Some(result) => Some(result?),
+        None if arguments.get("argv").is_some() => {
+            return Err(ToolError::InvalidArguments(
+                "shell argv must be an array".to_owned(),
+            ));
+        }
+        None => None,
+    };
+
+    let Some(argv) = argv else {
+        let command = command.ok_or_else(|| {
+            ToolError::InvalidArguments("shell requires command or argv".to_owned())
+        })?;
+        if command.trim().is_empty() {
+            return Err(ToolError::InvalidArguments(
+                "shell command cannot be empty".to_owned(),
+            ));
+        }
+        return Ok(command);
+    };
+    if argv.is_empty() || argv.len() > MAX_SHELL_ARGV_ITEMS {
+        return Err(ToolError::InvalidArguments(format!(
+            "shell argv must contain between 1 and {MAX_SHELL_ARGV_ITEMS} entries"
+        )));
+    }
+    if argv
+        .iter()
+        .any(|argument| argument.is_empty() || argument.contains('\0'))
+    {
+        return Err(ToolError::InvalidArguments(
+            "shell argv entries must be non-empty and cannot contain NUL bytes".to_owned(),
+        ));
+    }
+    let canonical = argv
+        .iter()
+        .map(|argument| shell_quote_argv_item(argument))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if canonical.len() > MAX_SHELL_COMMAND_CHARS {
+        return Err(ToolError::InvalidArguments(format!(
+            "shell argv exceeds {MAX_SHELL_COMMAND_CHARS} encoded bytes"
+        )));
+    }
+
+    if let Some(command) = command {
+        if command.trim().is_empty() {
+            return Err(ToolError::InvalidArguments(
+                "shell command cannot be empty when argv is present".to_owned(),
+            ));
+        }
+        let compatible = match golutra_policy::parse_shell_command_with_input(&command) {
+            Some(parsed) if parsed.stdin.is_none() => argv.starts_with(&parsed.parts),
+            // 格式错误的重复命令只有在它恰好等于 argv 提供的可执行文件名时才无害；
+            // 其他冲突都必须显式报错，不能静默改变请求的任务。
+            None => command.trim() == argv[0],
+            Some(_) => false,
+        };
+        if !compatible {
+            return Err(ToolError::InvalidArguments(
+                "shell command and argv describe different commands".to_owned(),
+            ));
+        }
+    }
+    Ok(canonical)
+}
+
+/// Return whether a shell request can skip opaque workspace mutation tracking.
+///
+/// The request-level check keeps command/argv normalization in one place and
+/// adds the execution flags that are not part of the parsed argv contract.
+/// A false result intentionally falls back to the slower, fully observable
+/// process path.
+#[must_use]
+pub fn shell_request_is_strictly_read_only(arguments: &Value) -> bool {
+    if arguments
+        .get("background")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let Ok(command) = shell_command_for_request(arguments) else {
+        return false;
+    };
+    let Some(parsed) = parse_shell_command_with_input(&command) else {
+        return false;
+    };
+    parsed.stdin.is_none()
+        && explicit_shell_script(&parsed.parts).is_none()
+        && !contains_shell_metacharacter(&command)
+        && shell_command_is_strictly_read_only(&parsed.parts)
+}
+
+fn shell_quote_argv_item(argument: &str) -> String {
+    if argument.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'_' | b'+' | b'-' | b'=' | b'.' | b'/' | b'@' | b'%' | b':'
+            )
+    }) {
+        return argument.to_owned();
+    }
+    format!("'{}'", argument.replace('\'', "'\"'\"'"))
+}
+
 fn optional_string_arg(arguments: &Value, key: &str) -> Option<String> {
     arguments
         .get(key)
@@ -4512,6 +6296,20 @@ pub fn redact_sensitive_text(raw_output: &str) -> (String, RedactionStatus) {
 
 fn bounded_text(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
+}
+
+/// 在 UTF-8 字节边界上截断 provider 可见文本。这里不追加省略后缀，
+/// 因为调用方通常还要按序列化后的 JSON 总大小继续收缩；后缀会让预算
+/// 计算产生漂移，也可能把本应保留的状态事实挤出去。
+fn bounded_text_bytes(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let mut boundary = max_bytes.min(value.len());
+    while boundary > 0 && !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value[..boundary].to_owned()
 }
 
 fn excerpt(raw_output: &str, limit: usize) -> String {

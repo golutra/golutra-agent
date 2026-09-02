@@ -9,6 +9,7 @@ endpoint cannot make the report look more precise than the wire response.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import signal
@@ -101,6 +102,16 @@ TASKS: tuple[Task, ...] = (
     ),
 )
 
+CACHE_SCENARIO_IDS = (
+    "first_turn_cold",
+    "same_session_tool_round",
+    "same_thread_next_turn",
+)
+CACHE_PREFIX = "\n".join(
+    f"cache-line-{index:04d}: alpha beta gamma delta epsilon zeta eta theta remains immutable."
+    for index in range(640)
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -112,6 +123,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--provider", default="my-api")
     parser.add_argument("--model", default="gpt-5.5")
     parser.add_argument("--task", action="append", dest="task_ids", help="task id (repeatable; default: all)")
+    parser.add_argument(
+        "--cache-scenario",
+        action="append",
+        dest="cache_scenario_ids",
+        choices=CACHE_SCENARIO_IDS,
+        help="cache scenario (repeatable; default: all)",
+    )
+    parser.add_argument(
+        "--skip-cache-scenarios",
+        action="store_true",
+        help="run only the functional task suite",
+    )
+    parser.add_argument(
+        "--cache-only",
+        action="store_true",
+        help="run cache scenarios without the functional task suite",
+    )
     parser.add_argument("--timeout", type=float, default=180.0)
     parser.add_argument("--max-elapsed-ms", type=int, default=120_000)
     parser.add_argument("--work-root", type=Path, help="retain per-run work and observations here")
@@ -237,6 +265,8 @@ def nested_runtime_events_timed(
 def empty_metrics() -> dict[str, Any]:
     return {
         "completed": False,
+        # 原生 runtime 的终态与包装进程返回码分开记录，避免验证失败被伪装成生命周期失败。
+        "runtime_terminal_success": False,
         "return_code": None,
         "elapsed_ms": None,
         "process_first_event_ms": None,
@@ -782,10 +812,10 @@ class ProviderRequestTracker:
         else:
             key = self._resolve_without_explicit(
                 timestamp,
-                prefer_oldest=event_type == "provider_completed",
+                prefer_oldest=event_type in {"provider_completed", "provider_failed"},
             )
 
-        if event_type == "provider_completed":
+        if event_type in {"provider_completed", "provider_failed"}:
             self._active = [candidate for candidate in self._active if candidate != key]
             synthetic = self._synthetic.get(key)
             if synthetic is not None and not synthetic.closed:
@@ -863,12 +893,203 @@ def elapsed_between(end: float | None, start: float | None) -> float | None:
     return round(max(0.0, end - start), 1)
 
 
+def provider_request_metrics(
+    request_id: str,
+    request_index: int,
+    observation: dict[str, Any],
+    usage: dict[str, Any] | None,
+    cache_context: dict[str, Any] | None = None,
+    previous_cache_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """把一个 provider round 投影成独立、可比较的计量记录。"""
+    metrics = empty_metrics()
+    metrics["request_count"] = 1
+    apply_usage_records(metrics, [usage] if usage is not None else [], 1)
+    uncached = metrics.get("uncached_input_tokens")
+    cache_read = metrics.get("cache_read_tokens")
+    denominator = (
+        uncached + cache_read
+        if isinstance(uncached, int) and isinstance(cache_read, int)
+        else None
+    )
+    cache_hit_ratio = (
+        round(cache_read / denominator, 6)
+        if denominator is not None and denominator > 0
+        else None
+    )
+    projection = {
+        "request_id": request_id,
+        "request_index": request_index,
+        "request_count": 1,
+        "ttft_ms": elapsed_between(
+            observation.get("first_token_ms"), observation.get("started_ms")
+        ),
+        "terminal_latency_ms": elapsed_between(
+            observation.get("completed_ms"), observation.get("started_ms")
+        ),
+        "tool_call_count": as_number(observation.get("tool_call_count")) or 0,
+        "error_count": as_number(observation.get("error_count")) or 0,
+        "cache_hit_ratio": cache_hit_ratio,
+        "usage_source": metrics["usage_source"],
+        "usage_complete": metrics["usage_complete"],
+        "usage_coverage": metrics["usage_coverage"],
+    }
+    for field in USAGE_FIELDS:
+        projection[field] = metrics.get(field)
+        partial = metrics.get(f"{field}_partial")
+        if partial is not None:
+            projection[f"{field}_partial"] = partial
+    projection.update(
+        provider_cache_round_diagnostics(
+            cache_context,
+            previous_cache_context,
+            projection.get("prompt_tokens"),
+            projection.get("cache_read_tokens"),
+        )
+    )
+    return projection
+
+
+def _diagnostic_identity(value: Any) -> str | None:
+    """只保留路由标识的哈希，避免把原值复制到基准报告。"""
+    if not isinstance(value, str) or not value:
+        return None
+    return f"sha256:{hashlib.sha256(value.encode('utf-8')).hexdigest()}"
+
+
+def provider_cache_context(payload: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    """从上下文快照事件读取不含正文的缓存事实。"""
+    snapshot = payload.get("snapshot")
+    diagnostics = payload.get("cache_diagnostics")
+    if not isinstance(snapshot, dict) or not isinstance(diagnostics, dict):
+        return None
+    request_id = snapshot.get("provider_request_id")
+    if not isinstance(request_id, str) or not request_id:
+        return None
+    message_manifest = snapshot.get("message_manifest")
+    message_manifest = message_manifest if isinstance(message_manifest, list) else []
+    wire_digests = []
+    for message in message_manifest:
+        if not isinstance(message, dict):
+            continue
+        digest = message.get("wire_digest") or message.get("content_digest")
+        if isinstance(digest, str) and digest:
+            wire_digests.append(digest)
+    route = diagnostics.get("route")
+    route = route if isinstance(route, dict) else {}
+    return request_id, {
+        "scope_digest": _diagnostic_identity(diagnostics.get("scope_key")),
+        "route_digest": route.get("digest"),
+        "cache_policy": diagnostics.get("cache_policy"),
+        "message_count": diagnostics.get("message_count"),
+        "message_prefix_token_estimate": diagnostics.get(
+            "message_prefix_token_estimate"
+        ),
+        "message_prefix_digest": diagnostics.get("message_prefix_digest"),
+        "tool_digest": diagnostics.get("tool_digest"),
+        "canonical_request_digest": diagnostics.get("canonical_request_digest"),
+        "_message_wire_digests": wire_digests,
+    }
+
+
+def provider_cache_round_diagnostics(
+    current: dict[str, Any] | None,
+    previous: dict[str, Any] | None,
+    prompt_tokens: Any,
+    cache_read_tokens: Any,
+) -> dict[str, Any]:
+    if current is None:
+        return {
+            "cache_prefix_relation": "unknown",
+            "cache_outcome_reason": "diagnostics_unavailable",
+        }
+
+    if previous is None:
+        relation = "cold_start"
+    elif current.get("scope_digest") != previous.get("scope_digest"):
+        relation = "scope_changed"
+    elif current.get("route_digest") != previous.get("route_digest"):
+        relation = "route_changed"
+    elif current.get("cache_policy") != previous.get("cache_policy"):
+        relation = "cache_policy_changed"
+    elif current.get("tool_digest") != previous.get("tool_digest"):
+        relation = "tool_schema_changed"
+    else:
+        prior_messages = previous.get("_message_wire_digests")
+        current_messages = current.get("_message_wire_digests")
+        if not isinstance(prior_messages, list) or not isinstance(current_messages, list):
+            relation = "unknown"
+        elif current_messages[: len(prior_messages)] == prior_messages:
+            relation = "append_only"
+        else:
+            relation = "message_prefix_rewritten"
+
+    if not isinstance(cache_read_tokens, int):
+        outcome = "usage_unknown"
+    elif cache_read_tokens > 0:
+        outcome = "cache_hit"
+    elif relation == "cold_start":
+        outcome = "cold_start"
+    elif isinstance(prompt_tokens, int) and prompt_tokens < 1_024:
+        outcome = "below_provider_cache_threshold"
+    elif relation == "append_only":
+        outcome = "provider_miss_on_stable_prefix"
+    elif relation == "unknown":
+        outcome = "prefix_relation_unknown"
+    else:
+        outcome = relation
+
+    public_context = {
+        key: value
+        for key, value in current.items()
+        if not key.startswith("_") and value is not None
+    }
+    return {
+        "cache_prefix_relation": relation,
+        "cache_outcome_reason": outcome,
+        "cache_diagnostics": public_context,
+    }
+
+
+def project_provider_requests(
+    request_order: Iterable[str],
+    observations: dict[str, dict[str, Any]],
+    usage_records: dict[str, dict[str, Any]],
+    cache_contexts: dict[str, dict[str, Any]] | None = None,
+    previous_cache_context: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    order = list(dict.fromkeys(request_order))
+    for request_id in usage_records:
+        if request_id not in order:
+            order.append(request_id)
+    contexts = cache_contexts or {}
+    projected = []
+    previous_context = previous_cache_context
+    for index, request_id in enumerate(order):
+        current_context = contexts.get(request_id)
+        projected.append(
+            provider_request_metrics(
+                request_id,
+                index,
+                observations.get(request_id, {}),
+                usage_records.get(request_id),
+                current_context,
+                previous_context,
+            )
+        )
+        if current_context is not None:
+            previous_context = current_context
+    return projected
+
+
 def parse_golutra(
     stdout: str,
     elapsed_ms: float,
     return_code: int,
     run_dir: Path,
     line_times_ms: Iterable[float] | None = None,
+    previous_cache_context: dict[str, Any] | None = None,
+    track_cache_context: bool = False,
 ) -> dict[str, Any]:
     metrics = empty_metrics()
     metrics["return_code"] = return_code
@@ -908,18 +1129,24 @@ def parse_golutra(
     first_token = None
     terminal = None
     seen_requests: set[str] = set()
+    request_order: list[str] = []
+    request_observations: dict[str, dict[str, Any]] = {}
+    request_cache_contexts: dict[str, dict[str, Any]] = {}
+    latest_cache_context = previous_cache_context
     request_tracker = ProviderRequestTracker()
     usage_records: dict[str, dict[str, Any]] = {}
     fallback_usage_records: dict[str, dict[str, Any]] = {}
     tool_names: set[str] = set()
     observed_tool_calls = 0
+    terminal_success: bool | None = None
     for event, arrival in timed_events:
         event_type = event.get("type")
         if event_type == "turn.completed":
-            metrics["completed"] = event.get("status") == "completed"
+            terminal_success = event.get("status") == "completed"
             metrics["final_message"] = str(event.get("final_message") or "")[:512]
             terminal = observed_time(event, arrival)
         elif event_type == "turn.failed":
+            terminal_success = False
             metrics["final_message"] = str(event.get("error") or event.get("final_message") or "")[:512]
             terminal = observed_time(event, arrival)
     for event, arrival in nested_timed:
@@ -928,25 +1155,47 @@ def parse_golutra(
         event_time = observed_time(event, arrival)
         if event_type == "context_built" and metrics["planned_input_tokens"] is None:
             metrics["planned_input_tokens"] = as_number(payload.get("planned_input_tokens"))
+        if event_type == "context_snapshot_created":
+            context = provider_cache_context(payload)
+            if context is not None:
+                context_request_id, cache_context = context
+                request_cache_contexts[context_request_id] = cache_context
+                latest_cache_context = cache_context
         if event_type in {"turn_completed", "turn.completed"} and terminal is None:
-            metrics["completed"] = str(payload.get("status") or "completed").lower() == "completed"
+            terminal_success = str(payload.get("status") or "completed").lower() == "completed"
             terminal = event_time
         elif event_type in {"turn_failed", "turn.failed"} and terminal is None:
-            metrics["completed"] = False
+            terminal_success = False
             terminal = event_time
         if event_type == "provider_started":
             request_id = request_tracker.resolve(event, payload, event_type)
             seen_requests.add(request_id)
-        if event_type == "provider_streamed" and first_token is None:
+            if request_id not in request_order:
+                request_order.append(request_id)
+            request_observations.setdefault(request_id, {})["started_ms"] = event_time
+        if event_type == "provider_streamed":
             delta = payload.get("delta") if isinstance(payload.get("delta"), dict) else {}
             if has_provider_delta(delta):
-                first_token = event_time
+                request_id = request_tracker.resolve(event, payload, event_type)
+                seen_requests.add(request_id)
+                if request_id not in request_order:
+                    request_order.append(request_id)
+                request_observations.setdefault(request_id, {}).setdefault(
+                    "first_token_ms", event_time
+                )
+                if first_token is None:
+                    first_token = event_time
         if event_type == "token_usage_recorded":
             record = payload.get("record") if isinstance(payload.get("record"), dict) else {}
             request_id = request_tracker.resolve(event, payload, event_type)
             if request_id:
                 usage_records[request_id] = normalize_golutra_usage(record)
                 seen_requests.add(request_id)
+                if request_id not in request_order:
+                    request_order.append(request_id)
+                request_observations.setdefault(request_id, {}).setdefault(
+                    "completed_ms", event_time
+                )
             if metrics["planned_input_tokens"] is None:
                 metrics["planned_input_tokens"] = as_number(record.get("planned_input_tokens"))
             if record.get("estimated_cost") is not None:
@@ -969,6 +1218,10 @@ def parse_golutra(
         if event_type == "provider_completed":
             request_id = request_tracker.resolve(event, payload, event_type)
             seen_requests.add(request_id)
+            if request_id not in request_order:
+                request_order.append(request_id)
+            observation = request_observations.setdefault(request_id, {})
+            observation["completed_ms"] = event_time
             if request_id and isinstance(payload.get("usage"), dict):
                 fallback_record = normalize_golutra_usage(
                     usage_record_from_provider_completed(event, payload)
@@ -977,17 +1230,37 @@ def parse_golutra(
                 fallback_usage_records[request_id] = fallback_record
             count = as_number(payload.get("tool_call_count"))
             if count is not None:
+                observation["tool_call_count"] = count
                 metrics["tool_call_count"] = max(metrics["tool_call_count"], count)
             for call in payload.get("provider_tool_calls", []):
                 if isinstance(call, dict):
                     name = call.get("name") or call.get("tool_name")
                     if isinstance(name, str) and name:
                         tool_names.add(name)
+        if event_type == "provider_failed":
+            request_id = request_tracker.resolve(event, payload, event_type)
+            seen_requests.add(request_id)
+            if request_id not in request_order:
+                request_order.append(request_id)
+            observation = request_observations.setdefault(request_id, {})
+            observation["completed_ms"] = event_time
+            observation["error_count"] = (as_number(observation.get("error_count")) or 0) + 1
     metrics["tool_call_count"] = max(metrics["tool_call_count"], observed_tool_calls)
     normalized_usage = dict(fallback_usage_records)
     normalized_usage.update(usage_records)
     metrics["request_count"] = len(seen_requests | set(normalized_usage))
     apply_usage_records(metrics, normalized_usage.values(), metrics["request_count"])
+    metrics["provider_requests"] = project_provider_requests(
+        request_order,
+        request_observations,
+        normalized_usage,
+        request_cache_contexts,
+        previous_cache_context,
+    )
+    if track_cache_context:
+        if latest_cache_context is not None:
+            # 仅供 long benchmark 在进程内延续诊断状态；不进入公开报告。
+            metrics["_last_cache_context"] = latest_cache_context
     metrics["tool_names"] = sorted(tool_names)
     metrics["first_token_ms"] = elapsed_between(first_token, process_origin)
     metrics["turn_first_token_ms"] = elapsed_between(first_token, turn_start)
@@ -1001,7 +1274,8 @@ def parse_golutra(
             metrics["provider"] = data.get("terminal_outcome", {}).get("result", {}).get("status")
         except (OSError, json.JSONDecodeError):
             pass
-    metrics["completed"] = bool(metrics["completed"]) and return_code == 0
+    metrics["runtime_terminal_success"] = terminal_success is True
+    metrics["completed"] = metrics["runtime_terminal_success"] and return_code == 0
     return metrics
 
 
@@ -1036,10 +1310,15 @@ def parse_pi(
     process_origin = 0.0 if uses_arrival_clock else process_first_event
     metrics["process_first_event_ms"] = elapsed_between(process_first_event, process_origin)
     usage_records: dict[str, dict[str, Any]] = {}
+    request_order: list[str] = []
+    request_observations: dict[str, dict[str, Any]] = {}
     session_start = None
     turn_start = None
     first_token = None
+    current_request_start = None
+    current_request_first_token = None
     terminal = None
+    terminal_success: bool | None = None
     last_message_time = None
     tool_names: set[str] = set()
     tool_calls_seen: set[str] = set()
@@ -1049,12 +1328,20 @@ def parse_pi(
         event_type = event.get("type")
         if session_start is None and event_type == "session":
             session_start = observed_time(event, arrival)
-        if turn_start is None and event_type == "turn_start":
-            turn_start = observed_time(event, arrival)
+        if event_type == "turn_start":
+            current_turn_start = observed_time(event, arrival)
+            if turn_start is None:
+                turn_start = current_turn_start
+            current_request_start = current_turn_start or current_request_start
+            current_request_first_token = None
         if event_type == "message_update":
             update = event.get("assistantMessageEvent")
-            if isinstance(update, dict) and has_pi_delta(update) and first_token is None:
-                first_token = observed_time(event, arrival)
+            if isinstance(update, dict) and has_pi_delta(update):
+                delta_time = observed_time(event, arrival)
+                if first_token is None:
+                    first_token = delta_time
+                if current_request_first_token is None:
+                    current_request_first_token = delta_time
         if event_type == "message_end":
             message = event.get("message")
             if not isinstance(message, dict):
@@ -1075,6 +1362,20 @@ def parse_pi(
             if response_id in usage_records:
                 continue
             usage_records[response_id] = normalize_pi_usage(usage)
+            request_order.append(response_id)
+            request_tool_calls = sum(
+                1
+                for block in message.get("content", [])
+                if isinstance(block, dict) and block.get("type") == "toolCall"
+            )
+            request_observations[response_id] = {
+                "started_ms": current_request_start or turn_start or session_start,
+                "first_token_ms": current_request_first_token,
+                "completed_ms": message_time,
+                "tool_call_count": request_tool_calls,
+            }
+            current_request_start = message_time
+            current_request_first_token = None
             metrics["final_message"] = extract_text(message.get("content"))[:512]
             cost = usage.get("cost")
             if isinstance(cost, dict):
@@ -1101,6 +1402,8 @@ def parse_pi(
             result = event.get("result") or event.get("toolResult") or {}
             content = result.get("content") if isinstance(result, dict) else ""
             estimated_results[result_id] = max(0, len(extract_text(content)) + 3) // 4
+            current_request_start = observed_time(event, arrival) or current_request_start
+            current_request_first_token = None
         elif event_type == "tool_execution_start":
             call_id = str(event.get("toolCallId") or event.get("timestamp") or "")
             if call_id not in tool_calls_seen:
@@ -1110,11 +1413,19 @@ def parse_pi(
                 tool_names.add(event["toolName"])
         elif event_type == "agent_end":
             terminal = observed_time(event, arrival)
-            metrics["completed"] = return_code == 0
+            terminal_success = True
     if terminal is None:
         terminal = last_message_time
     metrics["request_count"] = len(usage_records)
     apply_usage_records(metrics, usage_records.values(), metrics["request_count"])
+    if return_code != 0 and request_order:
+        last_observation = request_observations.setdefault(request_order[-1], {})
+        last_observation["error_count"] = (
+            as_number(last_observation.get("error_count")) or 0
+        ) + 1
+    metrics["provider_requests"] = project_provider_requests(
+        request_order, request_observations, usage_records
+    )
     metrics["tool_names"] = sorted(tool_names)
     # No tool-result event is different from a measured zero-token result.  A
     # missing estimate must remain unknown so aggregate reports do not turn it
@@ -1138,6 +1449,8 @@ def parse_pi(
         turn_anchor = process_first_event
     metrics["turn_first_token_ms"] = elapsed_between(first_token, turn_anchor)
     metrics["terminal_ms"] = elapsed_between(terminal, process_origin)
+    metrics["runtime_terminal_success"] = terminal_success is True
+    metrics["completed"] = metrics["runtime_terminal_success"] and return_code == 0
     return metrics
 
 
@@ -1429,6 +1742,334 @@ def prepare_workspace(source: Path, destination: Path, seeds: dict[str, str]) ->
         path.write_text(content, encoding="utf-8")
 
 
+def golutra_scenario_command(
+    args: argparse.Namespace,
+    workspace: Path,
+    prompt: str,
+    run_dir: Path,
+    thread_id: str | None = None,
+) -> list[str]:
+    command = [str(Path(args.golutra).resolve()), "--cwd", str(workspace)]
+    if thread_id is not None:
+        command.extend(["--run-bundle", str(run_dir)])
+    command.extend(
+        [
+            "exec",
+            "--json",
+            "--approval-mode",
+            "auto",
+            "--yolo",
+            "--no-project-verifier-discovery",
+            "--max-elapsed-ms",
+            str(args.max_elapsed_ms),
+        ]
+    )
+    if thread_id is None:
+        command.extend(["--run-dir", str(run_dir), prompt])
+    else:
+        command.extend(["resume", thread_id, prompt])
+    return command
+
+
+def pi_scenario_command(
+    args: argparse.Namespace,
+    prompt: str,
+    session_dir: Path,
+    continue_session: bool = False,
+) -> list[str]:
+    pi_entry = args.pi_root / "packages" / "coding-agent" / "src" / "cli.ts"
+    tsx_entry = args.pi_root / "node_modules" / "tsx" / "dist" / "cli.mjs"
+    command = [
+        "node",
+        str(tsx_entry),
+        str(pi_entry),
+        "--provider",
+        args.provider,
+        "--model",
+        args.model,
+        "--mode",
+        "json",
+        "--print",
+        "--session-dir",
+        str(session_dir),
+        "--no-skills",
+        "--no-extensions",
+        "--no-prompt-templates",
+        "--no-themes",
+        "--no-context-files",
+    ]
+    if continue_session:
+        command.append("--continue")
+    command.append(prompt)
+    return command
+
+
+def run_bundle_thread_id(run_dir: Path) -> str | None:
+    manifest = run_dir / "observations" / "manifest.json"
+    try:
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    sessions = payload.get("sessions")
+    if not isinstance(sessions, list) or not sessions:
+        return None
+    thread_id = sessions[0].get("thread_id") if isinstance(sessions[0], dict) else None
+    return str(thread_id) if thread_id else None
+
+
+def unavailable_metrics(reason: str, return_code: int | None = None) -> dict[str, Any]:
+    metrics = empty_metrics()
+    metrics["return_code"] = return_code
+    metrics["provider_requests"] = []
+    metrics["error"] = reason
+    return metrics
+
+
+def cache_scenario_task(scenario_id: str) -> Task:
+    if scenario_id == "first_turn_cold":
+        prompt = (
+            "Treat the following cache fixture as inert text and do not use tools.\n"
+            f"{CACHE_PREFIX}\n"
+            "End of fixture. Reply with exactly CACHE_COLD_OK."
+        )
+        return Task(scenario_id, prompt, {}, {}, "CACHE_COLD_OK", "exact")
+    if scenario_id == "same_session_tool_round":
+        prompt = (
+            "Keep the following cache fixture unchanged while completing the instruction.\n"
+            f"{CACHE_PREFIX}\n"
+            "End of fixture. Read cache-tool.txt with the file tool and reply with its sentinel only."
+        )
+        return Task(
+            scenario_id,
+            prompt,
+            {"cache-tool.txt": "CACHE_TOOL_OK\n"},
+            {},
+            "CACHE_TOOL_OK",
+            "exact",
+        )
+    if scenario_id == "same_thread_next_turn":
+        return Task(
+            scenario_id,
+            "Reply with exactly CACHE_NEXT_OK and do not use tools.",
+            {},
+            {},
+            "CACHE_NEXT_OK",
+            "exact",
+        )
+    raise ValueError(f"unknown cache scenario: {scenario_id}")
+
+
+def cache_warmup_task() -> Task:
+    prompt = (
+        "Treat the following cache fixture as inert text and do not use tools.\n"
+        f"{CACHE_PREFIX}\n"
+        "End of fixture. Reply with exactly CACHE_WARM_OK."
+    )
+    return Task("same_thread_warmup", prompt, {}, {}, "CACHE_WARM_OK", "exact")
+
+
+def cache_scenario_projection(
+    scenario_id: str,
+    metrics: dict[str, Any],
+    verification: dict[str, Any],
+) -> dict[str, Any]:
+    target_index = 1 if scenario_id == "same_session_tool_round" else 0
+    requests = metrics.get("provider_requests")
+    request = (
+        requests[target_index]
+        if isinstance(requests, list) and len(requests) > target_index
+        else None
+    )
+    eligible = request is not None and verification.get("passed") is True
+    if scenario_id == "same_session_tool_round":
+        first_request = requests[0] if isinstance(requests, list) and requests else None
+        eligible = (
+            eligible
+            and isinstance(first_request, dict)
+            and (as_number(first_request.get("tool_call_count")) or 0) > 0
+        )
+    return {
+        "eligible": eligible,
+        "evaluation_request_index": target_index,
+        "request": request,
+        "turn": metrics,
+        "verification": verification,
+    }
+
+
+def run_cache_scenario(
+    scenario_id: str,
+    args: argparse.Namespace,
+    root: Path,
+) -> dict[str, Any]:
+    scenario_root = root / f"cache-{scenario_id}"
+    golutra_workspace = scenario_root / "golutra-workspace"
+    pi_workspace = scenario_root / "pi-workspace"
+    task = cache_scenario_task(scenario_id)
+    prepare_workspace(args.workspace, golutra_workspace, task.seeds)
+    prepare_workspace(args.workspace, pi_workspace, task.seeds)
+    golutra_run = scenario_root / "golutra-run"
+    pi_session = scenario_root / "pi-session"
+    pi_session.mkdir(parents=True)
+    pi_env = os.environ.copy()
+    pi_env["PI_CODING_AGENT_DIR"] = str(args.pi_agent_dir.resolve())
+    warmup: dict[str, Any] | None = None
+
+    if scenario_id == "same_thread_next_turn":
+        warmup_task = cache_warmup_task()
+        golutra_warm_capture = run_process(
+            golutra_scenario_command(
+                args,
+                golutra_workspace,
+                warmup_task.prompt,
+                golutra_run,
+            ),
+            args.workspace,
+            os.environ.copy(),
+            args.timeout,
+            scenario_root / "golutra-warmup.stdout.jsonl",
+            scenario_root / "golutra-warmup.stderr.log",
+        )
+        golutra_warm_metrics = parse_golutra(
+            golutra_warm_capture.stdout,
+            golutra_warm_capture.elapsed_ms,
+            golutra_warm_capture.return_code,
+            golutra_run,
+            golutra_warm_capture.stdout_line_times_ms,
+        )
+        thread_id = run_bundle_thread_id(golutra_run)
+        if thread_id is None or golutra_warm_capture.return_code != 0:
+            golutra_metrics = unavailable_metrics(
+                "Golutra warmup did not produce a resumable thread",
+                golutra_warm_capture.return_code,
+            )
+        else:
+            golutra_capture = run_process(
+                golutra_scenario_command(
+                    args,
+                    golutra_workspace,
+                    task.prompt,
+                    golutra_run,
+                    thread_id,
+                ),
+                args.workspace,
+                os.environ.copy(),
+                args.timeout,
+                scenario_root / "golutra.stdout.jsonl",
+                scenario_root / "golutra.stderr.log",
+            )
+            golutra_metrics = parse_golutra(
+                golutra_capture.stdout,
+                golutra_capture.elapsed_ms,
+                golutra_capture.return_code,
+                golutra_run,
+                golutra_capture.stdout_line_times_ms,
+            )
+
+        pi_warm_capture = run_process(
+            pi_scenario_command(args, warmup_task.prompt, pi_session),
+            pi_workspace,
+            pi_env,
+            args.timeout,
+            scenario_root / "pi-warmup.stdout.jsonl",
+            scenario_root / "pi-warmup.stderr.log",
+        )
+        pi_warm_metrics = parse_pi(
+            pi_warm_capture.stdout,
+            pi_warm_capture.elapsed_ms,
+            pi_warm_capture.return_code,
+            pi_warm_capture.stdout_line_times_ms,
+        )
+        if pi_warm_capture.return_code != 0:
+            pi_metrics = unavailable_metrics(
+                "Pi warmup did not produce a resumable session",
+                pi_warm_capture.return_code,
+            )
+        else:
+            pi_capture = run_process(
+                pi_scenario_command(args, task.prompt, pi_session, True),
+                pi_workspace,
+                pi_env,
+                args.timeout,
+                scenario_root / "pi.stdout.jsonl",
+                scenario_root / "pi.stderr.log",
+            )
+            pi_metrics = parse_pi(
+                pi_capture.stdout,
+                pi_capture.elapsed_ms,
+                pi_capture.return_code,
+                pi_capture.stdout_line_times_ms,
+            )
+        warmup = {
+            "golutra": {
+                **golutra_warm_metrics,
+                "verification": task_verification(
+                    warmup_task, golutra_warm_metrics, golutra_workspace
+                ),
+            },
+            "pi": {
+                **pi_warm_metrics,
+                "verification": task_verification(
+                    warmup_task, pi_warm_metrics, pi_workspace
+                ),
+            },
+        }
+    else:
+        golutra_capture = run_process(
+            golutra_scenario_command(args, golutra_workspace, task.prompt, golutra_run),
+            args.workspace,
+            os.environ.copy(),
+            args.timeout,
+            scenario_root / "golutra.stdout.jsonl",
+            scenario_root / "golutra.stderr.log",
+        )
+        golutra_metrics = parse_golutra(
+            golutra_capture.stdout,
+            golutra_capture.elapsed_ms,
+            golutra_capture.return_code,
+            golutra_run,
+            golutra_capture.stdout_line_times_ms,
+        )
+        pi_capture = run_process(
+            pi_scenario_command(args, task.prompt, pi_session),
+            pi_workspace,
+            pi_env,
+            args.timeout,
+            scenario_root / "pi.stdout.jsonl",
+            scenario_root / "pi.stderr.log",
+        )
+        pi_metrics = parse_pi(
+            pi_capture.stdout,
+            pi_capture.elapsed_ms,
+            pi_capture.return_code,
+            pi_capture.stdout_line_times_ms,
+        )
+
+    golutra_verification = task_verification(task, golutra_metrics, golutra_workspace)
+    pi_verification = task_verification(task, pi_metrics, pi_workspace)
+    result = {
+        "scenario_id": scenario_id,
+        "normal_cache_kpi": scenario_id != "first_turn_cold",
+        "golutra": cache_scenario_projection(
+            scenario_id, golutra_metrics, golutra_verification
+        ),
+        "pi": cache_scenario_projection(scenario_id, pi_metrics, pi_verification),
+        "artifacts": {
+            "root": str(scenario_root),
+            "golutra_run": str(golutra_run),
+            "pi_session": str(pi_session),
+        },
+    }
+    if warmup is not None:
+        result["warmup"] = warmup
+        for engine in ("golutra", "pi"):
+            result[engine]["eligible"] = (
+                result[engine]["eligible"]
+                and warmup[engine]["verification"].get("passed") is True
+            )
+    return result
+
+
 def run_task(task: Task, args: argparse.Namespace, root: Path) -> dict[str, Any]:
     task_root = root / task.task_id
     golutra_workspace = task_root / "golutra-workspace"
@@ -1565,6 +2206,30 @@ def markdown_report(report: dict[str, Any]) -> str:
         lines.append(
             f"| {engine} | {summary['passed_tasks']}/{summary['task_count']} | {display_field(summary, 'total_tokens')} | {display_field(summary, 'prompt_tokens')} | {display_field(summary, 'uncached_input_tokens')} | {display_field(summary, 'output_tokens')} | {display_field(summary, 'reasoning_tokens')} | {display_field(summary, 'cache_read_tokens')} / {display_field(summary, 'cache_write_tokens')} | {display_field(summary, 'tool_schema_tokens_estimated')} | {display_field(summary, 'tool_result_tokens_estimated')} | {display_metric(summary.get('avg_model_prep_ms'))} / {display_metric(summary.get('avg_provider_first_token_ms'))} / {display_metric(summary.get('avg_first_token_ms'))} | {display_metric(summary.get('avg_elapsed_ms'))} |"
         )
+    lines.extend(
+        [
+            "",
+            "## Cache scenarios",
+            "",
+            "Cold reports the first request as a reference and is excluded from normal cache KPIs. Tool round evaluates only the second provider request after a tool result. Next turn evaluates only the first request of the resumed thread. No cross-session result is used.",
+            "",
+            "| Scenario | Engine | Prompt | Uncached | Cache R/W | Hit ratio | TTFT ms | Request terminal ms | Turn req/tools | Errors | Coverage R/W | Pass |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
+        ]
+    )
+    for row in report.get("cache_scenarios", []):
+        for engine in ("golutra", "pi"):
+            result = row[engine]
+            request = result.get("request") or {}
+            ratio = request.get("cache_hit_ratio")
+            ratio_text = "-" if ratio is None else f"{ratio * 100:.1f}%"
+            coverage = request.get("usage_coverage") or {}
+            read_coverage = coverage.get("cache_read_tokens", {}).get("status", "unknown")
+            write_coverage = coverage.get("cache_write_tokens", {}).get("status", "unknown")
+            turn = result.get("turn") or {}
+            lines.append(
+                f"| {row['scenario_id']} | {engine} | {display_field(request, 'prompt_tokens')} | {display_field(request, 'uncached_input_tokens')} | {display_field(request, 'cache_read_tokens')} / {display_field(request, 'cache_write_tokens')} | {ratio_text} | {display_metric(request.get('ttft_ms'))} | {display_metric(request.get('terminal_latency_ms'))} | {display_metric(turn.get('request_count'))} / {display_metric(turn.get('tool_call_count'))} | {display_metric(request.get('error_count'))} | {read_coverage} / {write_coverage} | {'yes' if result.get('eligible') else 'no'} |"
+            )
     return "\n".join(lines) + "\n"
 
 
@@ -1717,19 +2382,30 @@ def main() -> int:
     args = parse_args()
     args.workspace = args.workspace.resolve(strict=True)
     args.pi_root = args.pi_root.resolve(strict=True)
-    selected = [task for task in TASKS if not args.task_ids or task.task_id in args.task_ids]
+    selected = (
+        []
+        if args.cache_only
+        else [task for task in TASKS if not args.task_ids or task.task_id in args.task_ids]
+    )
     unknown = sorted(set(args.task_ids or ()) - {task.task_id for task in TASKS})
     if unknown:
         raise SystemExit(f"unknown task id(s): {', '.join(unknown)}")
-    if not selected:
-        raise SystemExit("no tasks selected")
+    if args.skip_cache_scenarios and args.cache_scenario_ids:
+        raise SystemExit("--skip-cache-scenarios conflicts with --cache-scenario")
+    selected_cache_scenarios = (
+        []
+        if args.skip_cache_scenarios
+        else list(args.cache_scenario_ids or CACHE_SCENARIO_IDS)
+    )
+    if not selected and not selected_cache_scenarios:
+        raise SystemExit("no tasks or cache scenarios selected")
     if args.work_root:
         work_root = args.work_root.resolve()
         work_root.mkdir(parents=True, exist_ok=True)
     else:
         work_root = Path(tempfile.mkdtemp(prefix="golutra-pi-benchmark-"))
     report = {
-        "schema_version": 3,
+        "schema_version": 4,
         "generated_at": now_iso(),
         "conditions": {
             "golutra": str(Path(args.golutra).resolve()),
@@ -1737,6 +2413,8 @@ def main() -> int:
             "provider": args.provider,
             "model": args.model,
             "task_count": len(selected),
+            "cache_scenarios": selected_cache_scenarios,
+            "cache_kpi_scope": "same_session_tool_round_and_same_thread_next_turn_only",
             "cost_source": "unknown",
             "golutra_approval_mode": "yolo",
             "project_verifier_discovery": False,
@@ -1750,11 +2428,17 @@ def main() -> int:
             "missing_usage_semantics": "coverage_status_partial_or_unknown",
         },
         "tasks": [],
+        "cache_scenarios": [],
         "work_root": str(work_root),
     }
     for task in selected:
         print(f"running {task.task_id}", file=sys.stderr, flush=True)
         report["tasks"].append(run_task(task, args, work_root))
+    for scenario_id in selected_cache_scenarios:
+        print(f"running cache scenario {scenario_id}", file=sys.stderr, flush=True)
+        report["cache_scenarios"].append(
+            run_cache_scenario(scenario_id, args, work_root)
+        )
     report["summary"] = {
         "golutra": aggregate_metrics(report["tasks"], "golutra"),
         "pi": aggregate_metrics(report["tasks"], "pi"),

@@ -10,7 +10,7 @@ use genai::{
     resolver::{AuthData, Endpoint},
 };
 use golutra_auth::{CredentialProvider, FixedCredentialProvider};
-use golutra_core::ProviderContract;
+use golutra_core::{PromptCachePolicy, ProviderContract};
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
 use secrecy::ExposeSecret;
 use serde_json::{Value, json};
@@ -21,14 +21,15 @@ use super::genai_adapter::{
     restore_wire_tool_name,
 };
 use super::{
-    GOLUTRA_PROVIDER_AUTH_PROVIDER, LlmProvider, MAX_PROVIDER_MESSAGE_BYTES,
-    MAX_PROVIDER_RESPONSE_BYTES, MAX_PROVIDER_TOOL_ARGUMENT_BYTES, MAX_PROVIDER_TOOL_CALL_ID_BYTES,
-    MAX_PROVIDER_TOOL_NAME_BYTES, ProviderError, ProviderErrorMetadata, ProviderFinishReason,
-    ProviderGenerationConfig, ProviderHttpHeaders, ProviderMessage, ProviderMessageMetadata,
-    ProviderProbeResult, ProviderProtocol, ProviderRequest, ProviderResponse, ProviderRole,
-    ProviderStreamEvent, SESSION_AFFINITY_HEADER, configured_or_first_env,
-    custom_headers_from_reader, env_mapping, first_env, generation_config_from_reader,
-    missing_env_error, protocol_capabilities, provider_credential_error, provider_http_client,
+    GOLUTRA_PROVIDER_AUTH_PROVIDER, GOLUTRA_PROVIDER_ROUTE_ID, LlmProvider,
+    MAX_PROVIDER_MESSAGE_BYTES, MAX_PROVIDER_RESPONSE_BYTES, MAX_PROVIDER_TOOL_ARGUMENT_BYTES,
+    MAX_PROVIDER_TOOL_CALL_ID_BYTES, MAX_PROVIDER_TOOL_NAME_BYTES, ProviderCacheProfile,
+    ProviderError, ProviderErrorMetadata, ProviderFinishReason, ProviderGenerationConfig,
+    ProviderHttpHeaders, ProviderMessage, ProviderMessageMetadata, ProviderProbeResult,
+    ProviderProtocol, ProviderRequest, ProviderResponse, ProviderRole, ProviderStreamEvent,
+    ProviderUsage, RESERVED_AFFINITY_HEADERS, configured_or_first_env, custom_headers_from_reader,
+    env_mapping, first_env, generation_config_from_reader, missing_env_error,
+    protocol_capabilities, provider_credential_error, provider_http_client,
     provider_http_error_with_headers, provider_transport_error, response_json_or_error,
     sanitize_provider_error, validate_native_base_url,
 };
@@ -57,6 +58,7 @@ pub struct OpenAiResponsesProviderConfig {
 pub struct OpenAiResponsesProvider {
     credential: Arc<dyn CredentialProvider>,
     config: OpenAiResponsesProviderConfig,
+    cache_profile: ProviderCacheProfile,
     client: Client,
     probe_client: reqwest::Client,
 }
@@ -108,9 +110,14 @@ impl OpenAiResponsesProvider {
         let web_config = WebConfig::default()
             .with_connect_timeout(std::time::Duration::from_secs(10))
             .with_timeout(std::time::Duration::from_secs(3_600));
+        let cache_profile = ProviderCacheProfile::for_provider(
+            ProviderProtocol::OpenAiResponses,
+            &config.provider_id,
+        );
         Self {
             credential,
             config,
+            cache_profile,
             client: Client::builder().with_web_config(web_config).build(),
             probe_client: provider_http_client(),
         }
@@ -144,6 +151,7 @@ impl OpenAiResponsesProvider {
         }
         let provider_id = reader(GOLUTRA_PROVIDER_AUTH_PROVIDER)
             .filter(|value| !value.trim().is_empty())
+            .or_else(|| reader(GOLUTRA_PROVIDER_ROUTE_ID).filter(|value| !value.trim().is_empty()))
             .unwrap_or_else(|| DEFAULT_PROVIDER_ID.to_owned());
         Ok(OpenAiResponsesProviderConfig {
             api_key,
@@ -236,6 +244,11 @@ impl OpenAiResponsesProvider {
             headers.insert(CHATGPT_ACCOUNT_ID_HEADER, value);
         }
         headers.extend(self.config.custom_headers.to_header_map());
+        // affinity 是 provider 能力，不允许自定义 header 绕过 profile gate。
+        // 探测请求也必须遵守同一边界，避免把会话路由状态带到能力发现端点。
+        for header in RESERVED_AFFINITY_HEADERS {
+            headers.remove(*header);
+        }
         builder.bearer_auth(access_token).headers(headers)
     }
 
@@ -279,17 +292,27 @@ impl OpenAiResponsesProvider {
     ) -> Result<ChatOptions, ProviderError> {
         let mut options = genai_chat_options(
             &self.config.generation_config,
+            request.max_output_tokens,
             true,
             self.cache_identity_for_request(request).as_ref(),
             request.cache_policy,
+            self.cache_profile,
         )?
         .with_extra_headers(self.request_headers(request, account_id));
-        if !request.tools.is_empty() {
-            options = options
-                .with_tool_choice(ToolChoice::Auto)
-                .with_extra_body(json!({"parallel_tool_calls": true}));
+        let mut reasoning = json!({"summary": "auto"});
+        if let Some(effort) = options
+            .reasoning_effort
+            .as_ref()
+            .and_then(|effort| effort.as_keyword())
+        {
+            reasoning["effort"] = Value::String(effort.to_owned());
         }
-        Ok(options)
+        let mut extra_body = json!({"reasoning": reasoning});
+        if !request.tools.is_empty() {
+            options = options.with_tool_choice(ToolChoice::Auto);
+            extra_body["parallel_tool_calls"] = Value::Bool(true);
+        }
+        Ok(options.with_extra_body(extra_body))
     }
 
     fn request_headers(&self, request: &ProviderRequest, account_id: Option<&str>) -> Headers {
@@ -302,8 +325,16 @@ impl OpenAiResponsesProvider {
         );
         headers.insert("originator", HeaderValue::from_static("golutra"));
         headers.extend(self.config.custom_headers.to_header_map());
+        // affinity 是 provider 能力，不允许自定义 header 绕过 profile gate。
+        for header in RESERVED_AFFINITY_HEADERS {
+            headers.remove(*header);
+        }
         if let Ok(value) = HeaderValue::from_str(&request.affinity_id()) {
-            headers.insert(SESSION_AFFINITY_HEADER, value);
+            for header in self.cache_profile.affinity_headers(request.cache_policy) {
+                if let Ok(name) = reqwest::header::HeaderName::from_bytes(header.as_bytes()) {
+                    headers.insert(name, value.clone());
+                }
+            }
         }
         if let Some(account_id) = account_id
             && let Ok(value) = HeaderValue::from_str(account_id)
@@ -476,6 +507,10 @@ impl super::LlmProvider for OpenAiResponsesProvider {
         super::route_cache_namespace("openai_responses_sse", &self.config.base_url)
     }
 
+    fn preferred_cache_policy(&self) -> PromptCachePolicy {
+        self.cache_profile.preferred_cache_policy()
+    }
+
     fn contract(&self) -> ProviderContract {
         ProviderContract {
             provider_id: self.config.provider_id.clone(),
@@ -591,6 +626,7 @@ fn responses_provider_response(
         .collect::<Result<Vec<_>, ProviderError>>()?;
     let stop_reason = end.captured_stop_reason.as_ref().map(ToString::to_string);
     let mut response = provider_response_from_genai_stream(end, model_id)?;
+    apply_responses_cache_semantics(&mut response.usage);
     if !replay_items.is_empty() {
         let message = response.message.get_or_insert_with(|| ProviderMessage {
             role: ProviderRole::Assistant,
@@ -616,6 +652,36 @@ fn responses_provider_response(
     Ok(response)
 }
 
+fn apply_responses_cache_semantics(usage: &mut ProviderUsage) {
+    if usage.usage_source != golutra_core::UsageSource::Provider || usage.input_tokens.is_none() {
+        return;
+    }
+    // Responses 在 input token details 中定义缓存读取，但没有独立的缓存写入计费项。
+    // rust-genai 会把 wire 零值折叠为 None，因此必须在协议边界恢复真实零值。
+    if usage.cached_input_tokens.is_none() {
+        usage.cached_input_tokens = Some(0);
+    }
+    if !usage.raw.is_object() {
+        usage.raw = json!({});
+    }
+    let object = usage.raw.as_object_mut().expect("usage raw is an object");
+    let details = object
+        .entry("input_tokens_details".to_owned())
+        .or_insert_with(|| json!({}));
+    if !details.is_object() {
+        *details = json!({});
+    }
+    let details = details
+        .as_object_mut()
+        .expect("usage details are an object");
+    details
+        .entry("cached_tokens".to_owned())
+        .or_insert_with(|| Value::from(usage.cached_input_tokens.unwrap_or_default()));
+    details
+        .entry("cache_write_tokens".to_owned())
+        .or_insert_with(|| Value::from(0_u64));
+}
+
 fn map_responses_genai_error(error: genai::Error) -> ProviderError {
     let message = sanitize_provider_error(&error.to_string());
     let status = genai_error_http_status(&error);
@@ -624,6 +690,9 @@ fn map_responses_genai_error(error: genai::Error) -> ProviderError {
         Some(429) => ProviderError::RateLimited { message },
         Some(status) if (500..600).contains(&status) => ProviderError::Unavailable { message },
         Some(_) => ProviderError::Failed { message },
+        // Responses maps `response.failed` to StreamParse. Treat all such
+        // parser/business failures as hard errors; transport truncation is
+        // represented separately as WebStream and remains retryable.
         None if matches!(error, genai::Error::StreamParse { .. }) => {
             ProviderError::Failed { message }
         }
@@ -669,6 +738,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn response_failed_stream_event_is_not_replayed() {
+        let parser_error =
+            serde_json::from_str::<Value>("response.failed").expect_err("invalid JSON");
+        let error = genai::Error::StreamParse {
+            model_iden: ModelIden::new(AdapterKind::OpenAIResp, "gpt-test"),
+            serde_error: parser_error,
+        };
+
+        assert!(matches!(
+            map_responses_genai_error(error),
+            ProviderError::Failed { .. }
+        ));
+    }
+
+    #[test]
     fn config_debug_never_contains_the_api_key() {
         let provider = OpenAiResponsesProvider::from_config(OpenAiResponsesProviderConfig {
             api_key: "secret-responses-key".to_owned(),
@@ -693,5 +777,102 @@ mod tests {
         let token = format!("{header}.{payload}.signature");
 
         assert_eq!(chatgpt_account_id(&token).as_deref(), Some("acct-test"));
+    }
+
+    #[test]
+    fn responses_usage_restores_cold_cache_zeroes() {
+        let mut usage = ProviderUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(5),
+            reasoning_tokens: None,
+            cached_input_tokens: None,
+            total_tokens: Some(105),
+            usage_source: golutra_core::UsageSource::Provider,
+            raw: json!({"input_tokens": 100, "output_tokens": 5}),
+        };
+
+        apply_responses_cache_semantics(&mut usage);
+        let normalized = usage.normalize();
+
+        assert_eq!(normalized.cache_read_tokens, Some(0));
+        assert_eq!(normalized.cache_write_tokens, Some(0));
+        assert_eq!(normalized.input_tokens_non_cached, Some(100));
+    }
+
+    #[test]
+    fn responses_usage_preserves_a_real_cache_hit() {
+        let mut usage = ProviderUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(5),
+            reasoning_tokens: None,
+            cached_input_tokens: Some(64),
+            total_tokens: Some(105),
+            usage_source: golutra_core::UsageSource::Provider,
+            raw: json!({"input_tokens": 100, "output_tokens": 5}),
+        };
+
+        apply_responses_cache_semantics(&mut usage);
+        let normalized = usage.normalize();
+
+        assert_eq!(normalized.cache_read_tokens, Some(64));
+        assert_eq!(normalized.cache_write_tokens, Some(0));
+        assert_eq!(normalized.input_tokens_non_cached, Some(36));
+    }
+
+    #[test]
+    fn responses_probe_strips_all_reserved_affinity_headers() {
+        let custom_headers = ProviderHttpHeaders::from_resolved(
+            [
+                ("session-id".to_owned(), "custom-session".to_owned()),
+                (
+                    "session_id".to_owned(),
+                    "custom-session-underscore".to_owned(),
+                ),
+                (
+                    "x-client-request-id".to_owned(),
+                    "custom-request".to_owned(),
+                ),
+                (
+                    "x-session-affinity".to_owned(),
+                    "custom-affinity".to_owned(),
+                ),
+                ("x-safe-header".to_owned(), "preserved".to_owned()),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .expect("valid probe headers");
+        let provider = OpenAiResponsesProvider::from_config(OpenAiResponsesProviderConfig {
+            api_key: "probe-key".to_owned(),
+            api_key_env: "PROBE_KEY".to_owned(),
+            provider_id: "openai-chatgpt".to_owned(),
+            base_url: "https://api.openai.com/v1".to_owned(),
+            model_id: "gpt-test".to_owned(),
+            generation_config: ProviderGenerationConfig::default(),
+            custom_headers,
+        });
+
+        let request = provider
+            .authenticated_probe_request(
+                provider.probe_client.get("https://example.test/models"),
+                "access-token",
+                None,
+            )
+            .build()
+            .expect("probe request builds");
+
+        for header in RESERVED_AFFINITY_HEADERS {
+            assert!(
+                !request.headers().contains_key(*header),
+                "probe carried reserved affinity header {header}"
+            );
+        }
+        assert_eq!(
+            request
+                .headers()
+                .get("x-safe-header")
+                .and_then(|value| value.to_str().ok()),
+            Some("preserved")
+        );
     }
 }

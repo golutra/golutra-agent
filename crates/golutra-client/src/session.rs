@@ -1,6 +1,8 @@
 //! Thread、session、fork、resume、rebind 与 rollout export 用例。
 
 use super::*;
+use golutra_llm::PromptCacheScope;
+use std::collections::HashSet;
 
 const MAX_SESSION_WINDOW_COUNT: u32 = 500;
 
@@ -19,6 +21,89 @@ fn session_summary(thread: ThreadRecord) -> SessionSummary {
 }
 
 impl RuntimeHost {
+    pub(super) async fn prompt_cache_scope(
+        &self,
+        session_id: SessionId,
+        delegated_task: bool,
+    ) -> Result<PromptCacheScope, ClientError> {
+        let Some(thread) = self
+            .storage
+            .repositories
+            .threads
+            .by_session(session_id)
+            .await?
+        else {
+            return Ok(PromptCacheScope::session(session_id, None));
+        };
+        self.ensure_thread_in_workspace(&thread)?;
+        self.ensure_thread_not_removed(&thread)?;
+        let Some(parent_thread_id) = thread.parent_thread_id else {
+            return Ok(PromptCacheScope::session(
+                session_id,
+                Some(thread.thread_id),
+            ));
+        };
+        if parent_thread_id == thread.thread_id {
+            return Err(ClientError::InvalidSession(
+                "a prompt cache scope cannot inherit from its own thread".to_owned(),
+            ));
+        }
+        let mut parent = self
+            .storage
+            .repositories
+            .threads
+            .by_id(parent_thread_id)
+            .await?
+            .ok_or_else(|| {
+                ClientError::InvalidSession(format!(
+                    "parent thread `{parent_thread_id}` for prompt cache scope was not found"
+                ))
+            })?;
+        let mut visited = HashSet::from([thread.thread_id]);
+        loop {
+            if !visited.insert(parent.thread_id) {
+                return Err(ClientError::InvalidSession(
+                    "prompt cache scope contains a parent thread cycle".to_owned(),
+                ));
+            }
+            self.ensure_thread_in_workspace(&parent)?;
+            self.ensure_thread_not_removed(&parent)?;
+            let Some(next_parent_thread_id) = parent.parent_thread_id else {
+                break;
+            };
+            parent = self
+                .storage
+                .repositories
+                .threads
+                .by_id(next_parent_thread_id)
+                .await?
+                .ok_or_else(|| {
+                    ClientError::InvalidSession(format!(
+                        "parent thread `{next_parent_thread_id}` for prompt cache scope was not found"
+                    ))
+                })?;
+        }
+        let parent_cache_session_id = parent.session_id;
+        if delegated_task {
+            return Ok(PromptCacheScope::subagent(
+                session_id,
+                thread.thread_id,
+                parent_cache_session_id,
+            ));
+        }
+        if thread.forked_from_sequence_no.is_some() {
+            return Ok(PromptCacheScope::fork(
+                session_id,
+                thread.thread_id,
+                parent_cache_session_id,
+            ));
+        }
+        Ok(PromptCacheScope::session(
+            session_id,
+            Some(thread.thread_id),
+        ))
+    }
+
     pub(super) async fn session_is_delegated_child(
         &self,
         session_id: SessionId,

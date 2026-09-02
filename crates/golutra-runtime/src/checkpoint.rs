@@ -331,21 +331,7 @@ impl WorkspaceCheckpointManager {
             .workspace_root
             .canonicalize()
             .map_err(|error| CheckpointError::Io(error.to_string()))?;
-        let canonical_path = if path.exists() {
-            path.canonicalize()
-                .map_err(|error| CheckpointError::Io(error.to_string()))?
-        } else {
-            let parent = path.parent().ok_or_else(|| {
-                CheckpointError::Io(format!("changed file has no parent: {}", path.display()))
-            })?;
-            let canonical_parent = parent
-                .canonicalize()
-                .map_err(|error| CheckpointError::Io(error.to_string()))?;
-            let file_name = path.file_name().ok_or_else(|| {
-                CheckpointError::Io(format!("changed file has no name: {}", path.display()))
-            })?;
-            canonical_parent.join(file_name)
-        };
+        let canonical_path = canonicalize_with_missing_suffix(&path)?;
         let relative = canonical_path
             .strip_prefix(&canonical_workspace)
             .map_err(|_| CheckpointError::OutsideWorkspace(path.display().to_string()))?;
@@ -375,6 +361,63 @@ impl WorkspaceCheckpointManager {
         Ok(matcher
             .matched_path_or_any_parents(relative_path, false)
             .is_ignore())
+    }
+}
+
+/// Canonicalize the existing portion of a path and append only the components
+/// that do not exist yet.  `Path::canonicalize` requires every component to be
+/// present, but a write checkpoint must also represent a new file below one or
+/// more missing parent directories.  We intentionally do not create anything
+/// here; the actual tool remains responsible for reporting a missing parent.
+///
+/// Looking at symlink metadata while walking upward is important: treating a
+/// broken symlink as a new file could make a later write follow it outside the
+/// workspace.  Existing symlinks are canonicalized before the missing suffix is
+/// appended, so the caller's workspace-boundary check remains authoritative.
+fn canonicalize_with_missing_suffix(path: &Path) -> Result<PathBuf, CheckpointError> {
+    let mut existing = path.to_path_buf();
+    let mut missing = Vec::new();
+
+    loop {
+        match fs::symlink_metadata(&existing) {
+            Ok(_metadata) => {
+                let mut canonical = existing
+                    .canonicalize()
+                    .map_err(|error| CheckpointError::Io(error.to_string()))?;
+                for component in missing.iter().rev() {
+                    if !matches!(
+                        Path::new(component).components().next(),
+                        Some(Component::Normal(_))
+                    ) {
+                        return Err(CheckpointError::Io(format!(
+                            "changed file contains an invalid missing path component: {}",
+                            path.display()
+                        )));
+                    }
+                    canonical.push(component);
+                }
+                return Ok(canonical);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let file_name = existing.file_name().ok_or_else(|| {
+                    CheckpointError::Io(format!(
+                        "changed file has no existing ancestor: {}",
+                        path.display()
+                    ))
+                })?;
+                missing.push(file_name.to_os_string());
+                existing = existing
+                    .parent()
+                    .ok_or_else(|| {
+                        CheckpointError::Io(format!(
+                            "changed file has no existing ancestor: {}",
+                            path.display()
+                        ))
+                    })?
+                    .to_path_buf();
+            }
+            Err(error) => return Err(CheckpointError::Io(error.to_string())),
+        }
     }
 }
 

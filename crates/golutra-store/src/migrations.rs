@@ -16,7 +16,7 @@ use tokio::time::sleep;
 
 use crate::artifact_expiration;
 
-const CURRENT_VERSION: i64 = 4;
+const CURRENT_VERSION: i64 = 5;
 const MIGRATION_LOCK_RETRIES: usize = 40;
 const MIGRATION_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
 
@@ -214,6 +214,7 @@ const MIGRATION_1_NAME: &str = "base_schema";
 const MIGRATION_2_NAME: &str = "legacy_columns_and_indexes";
 const MIGRATION_3_NAME: &str = "model_history_index";
 const MIGRATION_4_NAME: &str = "model_history_facts_index";
+const MIGRATION_5_NAME: &str = "context_snapshot_session_index";
 const LEGACY_MIGRATION_1_CHECKSUM: &str = "sha256:golutra-v1-base-20260808";
 const LEGACY_MIGRATION_2_CHECKSUM: &str = "sha256:golutra-v2-legacy-columns-20260808";
 const MIGRATION_2_COLUMNS: &[(&str, &str, &str)] = &[
@@ -341,6 +342,12 @@ const MIGRATION_4: &[&str] = &[
     "#,
 ];
 
+// 为已经完成基础迁移的数据库补齐 session 最近快照索引，避免 resume 在长会话上退化为全表扫描。
+const MIGRATION_5: &[&str] = &[r#"
+    CREATE INDEX IF NOT EXISTS idx_context_snapshots_session_created
+    ON context_snapshots (session_id, created_at DESC)
+    "#];
+
 // This checksum was produced by the first versioned migration runner before its procedural
 // signature was derived directly from the SQL and column definitions above.
 const PREVIOUS_MIGRATION_2_SIGNATURE: &[&str] = &[
@@ -398,6 +405,13 @@ fn migration_checksum(version: i64) -> String {
         4 => {
             digest.update(MIGRATION_4_NAME.as_bytes());
             for statement in MIGRATION_4 {
+                digest.update([0_u8]);
+                digest.update(statement.as_bytes());
+            }
+        }
+        5 => {
+            digest.update(MIGRATION_5_NAME.as_bytes());
+            for statement in MIGRATION_5 {
                 digest.update([0_u8]);
                 digest.update(statement.as_bytes());
             }
@@ -552,6 +566,15 @@ async fn apply_pending(connection: &mut SqliteConnection) -> Result<(), String> 
         }
         record_migration(connection, 4, MIGRATION_4_NAME, &migration_checksum(4)).await?;
     }
+    if current < 5 {
+        for statement in MIGRATION_5 {
+            sqlx::query(statement)
+                .execute(&mut *connection)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        record_migration(connection, 5, MIGRATION_5_NAME, &migration_checksum(5)).await?;
+    }
     Ok(())
 }
 
@@ -586,6 +609,7 @@ fn validate_applied(applied: &[(i64, String, String)]) -> Result<(), String> {
             2 => MIGRATION_2_NAME,
             3 => MIGRATION_3_NAME,
             4 => MIGRATION_4_NAME,
+            5 => MIGRATION_5_NAME,
             _ => return Err(format!("schema migration version {version} is unsupported")),
         };
         if name != expected_name || !migration_checksum_matches(*version, checksum) {
@@ -792,6 +816,14 @@ mod tests {
             rows[2].try_get::<String, _>("checksum").expect("checksum"),
             migration_checksum(3)
         );
+        assert_eq!(
+            rows[3].try_get::<String, _>("checksum").expect("checksum"),
+            migration_checksum(4)
+        );
+        assert_eq!(
+            rows[4].try_get::<String, _>("checksum").expect("checksum"),
+            migration_checksum(5)
+        );
     }
 
     #[tokio::test]
@@ -869,6 +901,38 @@ mod tests {
         .await
         .expect("index query");
         assert!(sql.is_some_and(|sql| sql.contains("event_type IN")));
+    }
+
+    #[tokio::test]
+    async fn context_snapshot_index_is_added_when_upgrading_from_version_four() {
+        let directory = tempdir().expect("directory");
+        let path = directory.path().join("context-index-upgrade.sqlite");
+        let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+            .expect("options")
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("pool");
+        run(&pool).await.expect("initial migrations");
+        sqlx::query("DROP INDEX idx_context_snapshots_session_created")
+            .execute(&pool)
+            .await
+            .expect("drop index");
+        sqlx::query("DELETE FROM schema_migrations WHERE version = 5")
+            .execute(&pool)
+            .await
+            .expect("rewind migration ledger");
+
+        run(&pool).await.expect("version four upgrade");
+        let sql: Option<String> = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_context_snapshots_session_created'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .expect("index query");
+        assert!(sql.is_some_and(|sql| sql.contains("context_snapshots")));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

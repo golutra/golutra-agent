@@ -17,11 +17,13 @@ async fn mock_provider_can_emit_a_deterministic_failure() {
             task_id: TaskId::new(),
             turn_id: TurnId::new(),
             session_id: None,
+            cache_scope: None,
             provider_id: "mock".to_owned(),
             model_id: "mock".to_owned(),
             messages: Vec::new(),
             tools: Vec::new(),
             cache_policy: Default::default(),
+            max_output_tokens: None,
         })
         .await
         .expect_err("mock failure");
@@ -161,6 +163,74 @@ async fn mock_provider_returns_tool_call() {
     assert_eq!(response.tool_calls[0].tool_name, "read_file");
 }
 
+#[tokio::test]
+async fn mock_provider_does_not_finish_a_new_task_for_replayed_tool_history() {
+    let provider = MockProvider::tool_call("read_file", json!({"path": "README.md"}));
+    let previous = provider
+        .complete(request())
+        .await
+        .expect("previous task response");
+    assert_eq!(previous.finish_reason, ProviderFinishReason::ToolCalls);
+    let mut request = request();
+    request.messages = vec![
+        ProviderMessage {
+            role: ProviderRole::Assistant,
+            content: String::new(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: vec![ProviderToolCall {
+                tool_call_id: "old-call".to_owned(),
+                tool_name: "read_file".to_owned(),
+                arguments: json!({"path": "old.txt"}),
+            }],
+            metadata: Default::default(),
+        },
+        ProviderMessage {
+            role: ProviderRole::Tool,
+            content: json!({"summary": "old result"}).to_string(),
+            tool_call_id: Some("old-call".to_owned()),
+            tool_name: Some("read_file".to_owned()),
+            tool_calls: Vec::new(),
+            metadata: Default::default(),
+        },
+        ProviderMessage {
+            role: ProviderRole::User,
+            content: "new task".to_owned(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+            metadata: Default::default(),
+        },
+    ];
+
+    let response = provider.complete(request).await.expect("response");
+
+    assert_eq!(response.finish_reason, ProviderFinishReason::ToolCalls);
+    assert_eq!(response.tool_calls[0].tool_name, "read_file");
+}
+
+#[tokio::test]
+async fn mock_provider_finishes_after_the_current_task_tool_result() {
+    let provider = MockProvider::tool_call("read_file", json!({"path": "README.md"}));
+    let mut request = request();
+    request.messages.push(ProviderMessage {
+        role: ProviderRole::Tool,
+        content: json!({"summary": "current result"}).to_string(),
+        tool_call_id: Some("mock-tool-call".to_owned()),
+        tool_name: Some("read_file".to_owned()),
+        tool_calls: Vec::new(),
+        metadata: Default::default(),
+    });
+
+    let response = provider.complete(request).await.expect("response");
+
+    assert_eq!(response.finish_reason, ProviderFinishReason::Stop);
+    assert_eq!(
+        response.message.expect("completion").content,
+        "Completed: current result"
+    );
+}
+
 #[test]
 fn openai_tool_parameters_come_from_the_runtime_tool_contract() {
     let input_schema = json!({
@@ -221,20 +291,36 @@ fn openai_tool_parameters_come_from_the_runtime_tool_contract() {
 fn shell_provider_description_distinguishes_lifetime_from_initial_wait() {
     let description = provider_tool_description("shell");
 
-    assert!(description.contains("as argv"));
-    assert!(description.contains("Python heredoc"));
-    assert!(description.contains("timeout_ms is the absolute process lifetime"));
-    assert!(description.contains("yield_time_ms only the initial wait"));
-    assert!(description.contains("runtime owns the process"));
-    assert!(description.contains("must outlive the runtime"));
-    assert!(description.len() < 400);
+    assert!(description.contains("argv"));
+    assert!(description.contains("command"));
+    assert!(description.contains("bash -lc"));
+    assert!(description.contains("heredoc"));
+    assert!(description.contains("timeout_ms"));
+    assert!(description.contains("background"));
+    assert!(description.contains("omit timeout_ms"));
+    assert!(description.contains("hard lifetime"));
+    assert!(description.contains("initial return"));
+    assert!(description.len() < 260);
 }
 
 #[test]
 fn provider_tool_descriptions_own_file_and_question_usage_details() {
     let write_file = provider_tool_description("write_file");
-    assert!(write_file.contains("complete UTF-8 content"));
-    assert!(write_file.contains("workspace-relative file"));
+    assert!(write_file.contains("Create a new UTF-8 file"));
+    assert!(write_file.contains("completely rewrite"));
+
+    let read_file = provider_tool_description("read_file");
+    assert!(read_file.contains("offset/limit"));
+    assert!(read_file.contains("next_offset"));
+    let edit_file = provider_tool_description("edit_file");
+    assert!(edit_file.contains("non-overlapping"));
+    assert!(edit_file.contains("edits[]"));
+
+    let apply_patch = provider_tool_description("apply_patch");
+    assert!(apply_patch.contains("Atomically"));
+    assert!(apply_patch.contains("unified"));
+    assert!(apply_patch.contains("Begin/Update/Add/Delete"));
+    assert!(apply_patch.contains("related multi-file"));
 
     let ask_user = provider_tool_description("ask_user");
     assert!(ask_user.contains("consequential decision"));
@@ -248,7 +334,8 @@ fn provider_tool_descriptions_own_file_and_question_usage_details() {
     assert!(subagent.contains("isolated child task"));
     assert!(subagent.contains("cannot create another child"));
     assert!(provider_tool_description("web_search").contains("network"));
-    assert!(provider_tool_description("shell_session").contains("background"));
+    assert!(provider_tool_description("shell_session").contains("authoritative_pid"));
+    assert!(provider_tool_description("shell_session").contains("cursor"));
     assert_ne!(
         provider_tool_description("process_list"),
         "Golutra workspace tool."
@@ -268,6 +355,112 @@ fn provider_tool_descriptions_own_file_and_question_usage_details() {
     assert_ne!(
         provider_tool_description("process_reconnect"),
         "Golutra workspace tool."
+    );
+}
+
+#[test]
+fn provider_surface_descriptions_are_bounded_without_dropping_capability_terms() {
+    let required_terms = [
+        ("read_file", &["offset/limit", "next_offset"][..]),
+        ("write_file", &["new UTF-8 file", "completely rewrite"][..]),
+        ("edit_file", &["edits[]", "non-overlapping"][..]),
+        (
+            "apply_patch",
+            &[
+                "Atomically",
+                "unified",
+                "Begin/Update/Add/Delete",
+                "multi-file",
+            ][..],
+        ),
+        ("shell", &["argv", "command", "heredoc", "background"][..]),
+        ("web_search", &["network"][..]),
+        ("shell_session", &["authoritative_pid", "cursor"][..]),
+        (
+            "subagent",
+            &["isolated child", "cannot create another child"][..],
+        ),
+    ];
+    for (tool_name, terms) in required_terms {
+        let description = provider_tool_description(tool_name);
+        assert!(!description.is_empty());
+        assert!(
+            description.len() < 256,
+            "{tool_name} description grew unexpectedly"
+        );
+        for term in terms {
+            assert!(
+                description.contains(term),
+                "{tool_name} description lost `{term}`"
+            );
+        }
+    }
+}
+
+#[test]
+fn multi_edit_schema_keeps_all_replacements_required_for_strict_requests() {
+    let contract = golutra_core::ToolContract {
+        tool_name: "edit_file".to_owned(),
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "path": {"type": "string"},
+                "edits": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "old_text": {"type": "string"},
+                            "new_text": {"type": "string"}
+                        },
+                        "required": ["old_text", "new_text"]
+                    }
+                }
+            },
+            "required": ["path", "edits"]
+        }),
+        output_schema: json!({}),
+        error_schema: json!({}),
+        side_effect_type: golutra_core::SideEffectType::File,
+        idempotency_key_policy: "required_for_retry".to_owned(),
+        timeout_policy: "bounded".to_owned(),
+        cancellation_policy: "supported".to_owned(),
+        retry_policy: "no_implicit_retry_for_side_effects".to_owned(),
+        artifact_policy: "none".to_owned(),
+        permission_policy_ref: None,
+    };
+    let request = ProviderRequest {
+        request_id: ProviderRequestId::new(),
+        task_id: TaskId::new(),
+        turn_id: TurnId::new(),
+        session_id: None,
+        cache_scope: None,
+        provider_id: "openai-responses".to_owned(),
+        model_id: "gpt-test".to_owned(),
+        messages: vec![ProviderMessage {
+            role: ProviderRole::User,
+            content: "edit two locations".to_owned(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+            metadata: Default::default(),
+        }],
+        tools: vec![contract],
+        cache_policy: PromptCachePolicy::None,
+        max_output_tokens: None,
+    };
+
+    let chat_request =
+        crate::genai_adapter::genai_chat_request(&request, ProviderProtocol::OpenAiResponses)
+            .expect("genai request");
+    let tool = &chat_request.tools.expect("tool list")[0];
+    assert_eq!(tool.strict, Some(true));
+    let schema = tool.schema.as_ref().expect("schema");
+    assert_eq!(
+        schema["properties"]["edits"]["items"]["required"],
+        json!(["old_text", "new_text"])
     );
 }
 
@@ -887,6 +1080,7 @@ fn request() -> ProviderRequest {
         task_id: TaskId::new(),
         turn_id: TurnId::new(),
         session_id: None,
+        cache_scope: None,
         provider_id: "mock".to_owned(),
         model_id: "mock-model".to_owned(),
         messages: vec![ProviderMessage {
@@ -899,16 +1093,22 @@ fn request() -> ProviderRequest {
         }],
         tools: Vec::new(),
         cache_policy: Default::default(),
+        max_output_tokens: None,
     }
 }
 
 #[test]
 fn prompt_cache_identity_is_stable_and_session_scoped() {
     let mut first = request();
-    first.session_id = Some(golutra_core::SessionId::new());
+    let session_id = golutra_core::SessionId::new();
+    first.session_id = Some(session_id);
     first.cache_policy = golutra_core::PromptCachePolicy::Auto;
     let second = first.clone();
     assert_eq!(first.cache_identity(), second.cache_identity());
+    assert_eq!(
+        first.cache_identity().expect("cache identity").key,
+        session_id.to_string()
+    );
 
     let mut changed = first.clone();
     changed.messages[0].content.push('!');
@@ -931,6 +1131,46 @@ fn provider_affinity_prefers_session_and_falls_back_to_task() {
     let session_id = golutra_core::SessionId::new();
     request.session_id = Some(session_id);
     assert_eq!(request.affinity_id(), session_id.to_string());
+
+    let thread_id = golutra_core::ThreadId::new();
+    let parent_session_id = golutra_core::SessionId::new();
+    request.cache_scope = Some(PromptCacheScope::subagent(
+        session_id,
+        thread_id,
+        parent_session_id,
+    ));
+    assert_eq!(request.affinity_id(), parent_session_id.to_string());
+}
+
+#[test]
+fn trusted_parent_cache_scopes_use_readable_wire_keys() {
+    let session_id = golutra_core::SessionId::new();
+    let thread_id = golutra_core::ThreadId::new();
+    let parent_session_id = golutra_core::SessionId::new();
+    let cases = [
+        (
+            PromptCacheScope::fork(session_id, thread_id, parent_session_id),
+            PromptCacheScopeKind::Fork,
+            parent_session_id.to_string(),
+        ),
+        (
+            PromptCacheScope::subagent(session_id, thread_id, parent_session_id),
+            PromptCacheScopeKind::Subagent,
+            parent_session_id.to_string(),
+        ),
+    ];
+
+    for (scope, kind, key) in cases {
+        assert_eq!(scope.kind(), kind);
+        assert_eq!(scope.key(), key);
+        assert_eq!(scope.thread_id(), Some(thread_id));
+    }
+    assert_eq!(
+        PromptCacheScope::session(session_id, Some(thread_id))
+            .compaction()
+            .key(),
+        session_id.to_string()
+    );
 }
 
 #[test]
@@ -941,11 +1181,17 @@ fn provider_cache_identity_isolated_by_protocol_endpoint() {
     let first = OpenAiCompatibleProvider::new("test-key", "https://gateway-a.example/v1", "model");
     let second = OpenAiCompatibleProvider::new("test-key", "https://gateway-b.example/v1", "model");
 
+    let first_identity = first
+        .cache_identity_for_request(&request)
+        .expect("first identity");
+    let second_identity = second
+        .cache_identity_for_request(&request)
+        .expect("second identity");
     assert_ne!(
-        first.cache_identity_for_request(&request),
-        second.cache_identity_for_request(&request),
+        first_identity, second_identity,
         "identical session/provider/model names must not share endpoint caches"
     );
+    assert_eq!(first_identity.key, second_identity.key);
     assert_eq!(
         first.cache_identity_for_request(&request),
         first.cache_identity_for_request(&request)
@@ -1088,7 +1334,8 @@ fn provider_tool_projection_uses_the_same_wire_alias_as_transports() {
 #[test]
 fn openai_cache_fields_are_sent_only_for_supported_endpoint() {
     let mut request = request();
-    request.session_id = Some(golutra_core::SessionId::new());
+    let session_id = golutra_core::SessionId::new();
+    request.session_id = Some(session_id);
     request.cache_policy = golutra_core::PromptCachePolicy::Long;
 
     let supported = openai_completion_body(
@@ -1098,10 +1345,7 @@ fn openai_cache_fields_are_sent_only_for_supported_endpoint() {
         false,
         true,
     );
-    assert_eq!(
-        supported["prompt_cache_key"].as_str().map(str::len),
-        Some(64)
-    );
+    assert_eq!(supported["prompt_cache_key"], session_id.to_string());
     assert_eq!(supported["prompt_cache_retention"], "24h");
 
     let custom = openai_completion_body(
@@ -1113,6 +1357,24 @@ fn openai_cache_fields_are_sent_only_for_supported_endpoint() {
     );
     assert!(custom.get("prompt_cache_key").is_none());
     assert!(custom.get("prompt_cache_retention").is_none());
+}
+
+#[test]
+fn openai_request_output_limit_overrides_the_profile_default() {
+    let mut request = request();
+    request.max_output_tokens = Some(256);
+    let body = openai_completion_body(
+        &request,
+        "gpt-test",
+        &ProviderGenerationConfig {
+            max_tokens: Some(4_096),
+            ..ProviderGenerationConfig::default()
+        },
+        false,
+        false,
+    );
+
+    assert_eq!(body["max_tokens"], 256);
 }
 
 #[test]
@@ -1145,12 +1407,110 @@ fn openai_tools_request_parallel_tool_calls_explicitly() {
 }
 
 #[test]
-fn prompt_cache_support_includes_golutra_gateway_only() {
-    assert!(openai_prompt_cache_supported("https://api.golutra.cn/v1"));
-    assert!(openai_prompt_cache_supported("https://api.openai.com/v1"));
-    assert!(!openai_prompt_cache_supported(
-        "https://compatible.example/v1"
-    ));
+fn provider_cache_profile_gates_compatible_gateway_fields() {
+    let golutra = ProviderCacheProfile::for_provider(ProviderProtocol::OpenAiCompatible, "golutra");
+    assert!(golutra.prompt_cache_key(golutra_core::PromptCachePolicy::Auto));
+    assert_eq!(
+        golutra.affinity_headers(golutra_core::PromptCachePolicy::Auto),
+        COMPATIBLE_AFFINITY_HEADERS
+    );
+    assert!(golutra.supports_long_retention(golutra_core::PromptCachePolicy::Long));
+    assert_eq!(
+        golutra.preferred_cache_policy(),
+        golutra_core::PromptCachePolicy::Auto
+    );
+
+    let codex =
+        ProviderCacheProfile::for_provider(ProviderProtocol::OpenAiResponses, "openai-chatgpt");
+    assert_eq!(
+        codex.affinity_headers(golutra_core::PromptCachePolicy::Auto),
+        CODEX_AFFINITY_HEADERS
+    );
+
+    let anthropic = ProviderCacheProfile::for_provider(ProviderProtocol::Anthropic, "anthropic");
+    assert!(
+        anthropic
+            .affinity_headers(golutra_core::PromptCachePolicy::Auto)
+            .is_empty()
+    );
+
+    let unknown =
+        ProviderCacheProfile::for_provider(ProviderProtocol::OpenAiCompatible, "unknown-gateway");
+    assert!(!unknown.prompt_cache_key(golutra_core::PromptCachePolicy::Long));
+    assert!(
+        unknown
+            .affinity_headers(golutra_core::PromptCachePolicy::Long)
+            .is_empty()
+    );
+    assert_eq!(
+        unknown.preferred_cache_policy(),
+        golutra_core::PromptCachePolicy::Auto
+    );
+
+    let responses_custom =
+        ProviderCacheProfile::for_provider(ProviderProtocol::OpenAiResponses, "custom-responses");
+    assert!(responses_custom.prompt_cache_key(golutra_core::PromptCachePolicy::Long));
+    assert!(
+        responses_custom
+            .affinity_headers(golutra_core::PromptCachePolicy::None)
+            .is_empty()
+    );
+    assert_eq!(
+        responses_custom.preferred_cache_policy(),
+        golutra_core::PromptCachePolicy::Auto
+    );
+}
+
+#[test]
+fn provider_adapters_expose_capability_gated_cache_policy() {
+    let responses = OpenAiResponsesProvider::from_config(OpenAiResponsesProviderConfig {
+        api_key: "test-key".to_owned(),
+        api_key_env: "TEST_KEY".to_owned(),
+        provider_id: "custom-responses".to_owned(),
+        base_url: "https://gateway.example/v1".to_owned(),
+        model_id: "model".to_owned(),
+        generation_config: ProviderGenerationConfig::default(),
+        custom_headers: ProviderHttpHeaders::default(),
+    });
+    assert_eq!(
+        responses.preferred_cache_policy(),
+        golutra_core::PromptCachePolicy::Auto
+    );
+
+    let unknown = OpenAiCompatibleProvider::from_config(OpenAiCompatibleProviderConfig {
+        api_key: "test-key".to_owned(),
+        api_key_env: "TEST_KEY".to_owned(),
+        provider_id: "unknown-gateway".to_owned(),
+        base_url: "https://gateway.example/v1".to_owned(),
+        model_id: "model".to_owned(),
+        protocol: ProviderProtocol::OpenAiCompatible,
+        generation_config: ProviderGenerationConfig::default(),
+        custom_headers: ProviderHttpHeaders::default(),
+    });
+    assert_eq!(
+        unknown.preferred_cache_policy(),
+        golutra_core::PromptCachePolicy::Auto
+    );
+}
+
+#[test]
+fn provider_route_identity_is_read_without_using_endpoint_host() {
+    let config = OpenAiResponsesProvider::config_from_env_reader(|key| match key {
+        "GOLUTRA_PROVIDER_API_KEY" => Some("test-key".to_owned()),
+        "GOLUTRA_PROVIDER_MODEL" => Some("gpt-test".to_owned()),
+        "GOLUTRA_PROVIDER_BASE_URL" => Some("https://arbitrary-gateway.example/v1".to_owned()),
+        GOLUTRA_PROVIDER_ROUTE_ID => Some("golutra".to_owned()),
+        _ => None,
+    })
+    .expect("Responses config");
+    assert_eq!(config.provider_id, "golutra");
+
+    let profile =
+        ProviderCacheProfile::for_provider(ProviderProtocol::OpenAiResponses, &config.provider_id);
+    assert_eq!(
+        profile.affinity_headers(golutra_core::PromptCachePolicy::Auto),
+        RESPONSES_AFFINITY_HEADERS
+    );
 }
 
 #[test]

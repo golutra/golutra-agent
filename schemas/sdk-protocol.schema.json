@@ -2161,6 +2161,11 @@
           "items": {
             "type": "string"
           }
+        },
+        "wire_digest": {
+          "description": "完整 provider message wire 的摘要，包含工具调用参数和协议元数据。",
+          "type": "string",
+          "default": ""
         }
       },
       "required": [
@@ -2222,6 +2227,14 @@
       "properties": {
         "budget_snapshot": {
           "$ref": "#/$defs/TokenBudgetSnapshot"
+        },
+        "cache_scope_key": {
+          "description": "provider adapter 使用的稳定且不含敏感信息的缓存作用域。键只能是\nsession UUID 或可信的父线程作用域，绝不包含请求正文或凭据。",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
         },
         "canonical_request_digest": {
           "type": "string"

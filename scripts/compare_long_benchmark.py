@@ -1,0 +1,2467 @@
+#!/usr/bin/env python3
+"""Run a four-turn Golutra/Pi/Codex long-task comparison.
+
+The harness uses one fixture and one Responses provider/model/reasoning setting
+for all three products. Credentials are copied into owner-only temporary homes,
+never serialized into the report, and removed when the run exits.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import hashlib
+import json
+import math
+import os
+import platform
+import shutil
+import signal
+import statistics
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable
+
+import compare_pi_benchmark as paired
+
+
+ENGINE_NAMES = ("golutra", "pi", "codex")
+SCENARIO_NAMES = (
+    "first_turn_cold",
+    "same_session_tool_round",
+    "same_thread_next_turn",
+    "long_task_resume",
+)
+IMMUTABLE_PATHS = ("tests/test_stage1.py", "tools/background_probe.py")
+SENTINEL = "LEDGER-LONG-73X"
+VERIFIER_CACHEABLE_STAGES = frozenset({1, 2, 3})
+VERIFIER_ARTIFACT_LIMIT = 64 * 1024
+MAX_TOOL_CALL_LEDGER_ENTRIES = 256
+
+
+@dataclass
+class EngineState:
+    name: str
+    workspace: Path
+    artifact_root: Path
+    env: dict[str, str]
+    thread_id: str | None = None
+    codex_cumulative_usage: dict[str, int] | None = None
+    golutra_cache_context: dict[str, Any] | None = None
+    turns: list[dict[str, Any]] = field(default_factory=list)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--reclassify-from",
+        type=Path,
+        help="rebuild status fields from an existing report and retained stdout artifacts",
+    )
+    parser.add_argument("--golutra", type=Path, default=Path("target/debug/golutra-cli"))
+    parser.add_argument(
+        "--pi-root",
+        type=Path,
+        default=Path("../project/pi"),
+    )
+    parser.add_argument("--codex", default="codex")
+    parser.add_argument("--provider", default="my-api")
+    parser.add_argument("--model", default="gpt-5.5")
+    parser.add_argument("--reasoning-effort", default="medium")
+    parser.add_argument("--base-url", default="https://api.golutra.cn")
+    parser.add_argument("--timeout", type=float, default=420.0)
+    parser.add_argument("--max-elapsed-ms", type=int, default=360_000)
+    parser.add_argument(
+        "--stop-on-strict-failure",
+        action="store_true",
+        help="stop later stages after a strict failure (disabled by default so recovery is observable)",
+    )
+    parser.add_argument("--work-root", type=Path)
+    parser.add_argument("--keep-work-root", action="store_true")
+    parser.add_argument("--golutra-home-source", type=Path, default=Path.home() / ".golutra")
+    parser.add_argument("--pi-agent-source", type=Path, default=Path.home() / ".pi" / "agent")
+    parser.add_argument("--codex-home-source", type=Path, default=Path.home() / ".codex")
+    return parser.parse_args()
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def file_digest(path: Path) -> str:
+    return sha256_bytes(path.read_bytes())
+
+
+def tree_digest(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(candidate for candidate in root.rglob("*") if candidate.is_file()):
+        relative = path.relative_to(root).as_posix()
+        if relative.startswith((".git/", ".long-bench/")) or "__pycache__" in path.parts:
+            continue
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def private_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    path.chmod(0o700)
+
+
+def write_private_text(path: Path, value: str) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    descriptor = os.open(path, flags, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        stream.write(value)
+
+
+def copy_private(source: Path, destination: Path) -> None:
+    if not source.is_file():
+        raise FileNotFoundError(source)
+    shutil.copyfile(source, destination)
+    destination.chmod(0o600)
+
+
+def prepare_golutra_home(args: argparse.Namespace, destination: Path) -> None:
+    private_directory(destination)
+    source = args.golutra_home_source.resolve(strict=True)
+    payload = json.loads((source / "provider.json").read_text(encoding="utf-8"))
+    active = payload.get("active_profile")
+    found = False
+    for profile in payload.get("profiles", []):
+        if profile.get("name") != active:
+            continue
+        if profile.get("model_id") != args.model:
+            profile["model_id"] = args.model
+        profile["protocol"] = "openai-responses"
+        profile["base_url"] = args.base_url.rstrip("/") + "/v1"
+        profile["generation_config"] = {"reasoning_effort": args.reasoning_effort}
+        found = True
+    if not found:
+        raise ValueError(f"active Golutra provider profile not found: {active!r}")
+    write_private_text(
+        destination / "provider.json",
+        json.dumps(payload, indent=2, ensure_ascii=True) + "\n",
+    )
+    copy_private(source / "credentials.json", destination / "credentials.json")
+
+
+def prepare_pi_home(args: argparse.Namespace, destination: Path) -> None:
+    private_directory(destination)
+    source_path = args.pi_agent_source.resolve(strict=True) / "models.json"
+    source = json.loads(source_path.read_text(encoding="utf-8"))
+    provider = copy.deepcopy(source.get("providers", {}).get(args.provider))
+    if not isinstance(provider, dict):
+        raise ValueError(f"Pi provider not found: {args.provider!r}")
+    models = provider.get("models")
+    if not isinstance(models, list):
+        raise ValueError("Pi provider models must be a list")
+    selected = next(
+        (copy.deepcopy(model) for model in models if model.get("id") == args.model),
+        {"id": args.model},
+    )
+    selected.update(
+        {
+            "id": args.model,
+            "reasoning": True,
+            "input": ["text"],
+            "contextWindow": 200_000,
+            "maxTokens": 32_000,
+            "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+            },
+        }
+    )
+    provider["api"] = "openai-responses"
+    provider["baseUrl"] = args.base_url.rstrip("/") + "/v1"
+    provider["compat"] = {
+        "sendSessionIdHeader": True,
+        "supportsLongCacheRetention": True,
+    }
+    provider["models"] = [selected]
+    write_private_text(
+        destination / "models.json",
+        json.dumps({"providers": {args.provider: provider}}, indent=2, ensure_ascii=True) + "\n",
+    )
+    write_private_text(destination / "settings.json", "{}\n")
+
+
+def prepare_codex_home(args: argparse.Namespace, destination: Path) -> None:
+    private_directory(destination)
+    source = args.codex_home_source.resolve(strict=True)
+    copy_private(source / "auth.json", destination / "auth.json")
+    config = "\n".join(
+        (
+            'model_provider = "custom"',
+            f'model = {json.dumps(args.model)}',
+            f'model_reasoning_effort = {json.dumps(args.reasoning_effort)}',
+            "disable_response_storage = true",
+            "notify = []",
+            "",
+            "[model_providers.custom]",
+            'name = "benchmark-custom"',
+            f'base_url = {json.dumps(args.base_url.rstrip("/"))}',
+            'wire_api = "responses"',
+            "requires_openai_auth = true",
+            "",
+        )
+    )
+    write_private_text(destination / "config.toml", config)
+
+
+def long_prefix() -> str:
+    return "\n".join(
+        f"compat-{index:04d}: immutable ordering, idempotence, recovery, and checksums remain required."
+        for index in range(640)
+    )
+
+
+def turn_prompts() -> tuple[str, ...]:
+    stage_one = """Complete stage 1 of this long-running task in the current workspace.
+
+Implement the existing jobledger package across model.py, codec.py, ledger.py, and cli.py. Keep the public signatures already present.
+
+Requirements:
+- JobEvent.from_mapping accepts exactly event_id, job_id, state, sequence, and optional metadata. IDs must be non-empty strings; state is one of queued/running/succeeded/failed; sequence is a non-negative integer but not bool; metadata must be an object.
+- to_mapping returns those five fields. Callers must not be able to mutate an event through the source mapping or returned mapping.
+- encode_event/decode_event use one canonical compact JSON object with sorted keys.
+- JobLedger keeps events ordered by (sequence, event_id). Identical event_id duplicates are idempotent and append returns false; conflicting duplicates raise ValueError. latest, filtered events, and state_counts must be deterministic.
+- save writes newline-terminated NDJSON. load is strict.
+- The CLI supports `append PATH EVENT_JSON` and `summary PATH`; summary prints a JSON object.
+
+Do not modify tests or tools/background_probe.py. Run `python3 -m unittest discover -s tests -v`. Finish only when it passes."""
+    stage_two = """Continue the same task and harden recovery without replacing the stage 1 design.
+
+Implement these additional requirements:
+- JobEvent owns a deep copy of metadata at construction and to_mapping returns a fresh deep copy.
+- JobLedger.load_recovering may ignore exactly one malformed non-empty final record only when the file does not end in a newline. It must reject malformed middle records and malformed newline-terminated final records. JobLedger.load remains strict.
+- merge(other) is transactional: preflight every event, leave self unchanged on any conflict, otherwise add all new events and return the number added. Identical duplicates add zero.
+- save must use a same-directory temporary file and atomic replace so a failed write cannot expose a partial destination.
+
+Do not modify tests or the probe tool. Run the visible tests and inspect the affected code before finishing."""
+    stage_three = f"""The following compatibility ledger is inert reference text. Keep it in this conversation unchanged.
+{long_prefix()}
+End compatibility ledger.
+
+Continue the same repository task. Add checkpoint support in jobledger/checkpoint.py with this exact API:
+- frozen Checkpoint(version, through_sequence, state_counts, sentinel, checksum)
+- create_checkpoint(ledger, sentinel), encode_checkpoint(checkpoint), decode_checkpoint(text)
+- version is 1; through_sequence is the largest sequence or -1; state_counts comes from the ledger.
+- checksum is lowercase SHA-256 over canonical compact sorted-key JSON of version, through_sequence, state_counts, and sentinel, excluding checksum itself. decode_checkpoint validates version, types, and checksum and rejects tampering.
+
+Use sentinel {SENTINEL}. Create .long-bench/checkpoint.json by checkpointing a ledger containing queued sequence 1 and running sequence 4. Do not modify tests or the probe tool. Run the visible tests before finishing."""
+    stage_four = """Finish the same long task using the sentinel and checkpoint agreement from the previous turn.
+
+First start `python3 tools/background_probe.py` with the product's native background command/session mechanism. While it is still running, modify jobledger/checkpoint.py to add:
+
+`restore_counts(checkpoint, events) -> dict[str, int]`
+
+It returns checkpoint state_counts plus each supplied event state. Every supplied event sequence must be strictly greater than checkpoint.through_sequence; reject the entire call with ValueError otherwise, without mutating checkpoint data.
+
+Only after the implementation is complete, create .long-bench/probe.release, then use one shell_session wait with wait_for_terminal=true and a bounded wait_ms to observe the terminal state. Run the visible tests after that. Do not modify tests or tools/background_probe.py. Leave no background process running."""
+    return stage_one, stage_two, stage_three, stage_four
+
+
+def prompt_metadata(prompt: str) -> dict[str, Any]:
+    encoded = prompt.encode("utf-8")
+    return {
+        "sha256": sha256_bytes(encoded),
+        "bytes": len(encoded),
+        "characters": len(prompt),
+        "tokens_estimated": math.ceil(len(encoded) / 4),
+    }
+
+
+def golutra_command(
+    args: argparse.Namespace,
+    state: EngineState,
+    prompt: str,
+    stage: int,
+    *,
+    resume: bool = False,
+) -> list[str]:
+    command = [str(args.golutra), "--cwd", str(state.workspace)]
+    if stage > 1 and state.thread_id:
+        command.extend(("--run-bundle", str(state.artifact_root / "run")))
+    command.extend(
+        (
+            "exec",
+            "--json",
+            "--approval-mode",
+            "auto",
+            "--yolo",
+            "--no-project-verifier-discovery",
+            "--max-elapsed-ms",
+            str(args.max_elapsed_ms),
+        )
+    )
+    if not resume and (stage == 1 or not state.thread_id):
+        command.extend(("--run-dir", str(state.artifact_root / "run"), prompt))
+    else:
+        command.extend(("resume", state.thread_id, prompt))
+    return command
+
+
+def pi_command(
+    args: argparse.Namespace,
+    state: EngineState,
+    prompt: str,
+    stage: int,
+    *,
+    resume: bool = False,
+) -> list[str]:
+    pi_entry = args.pi_root / "packages" / "coding-agent" / "src" / "cli.ts"
+    tsx_entry = args.pi_root / "node_modules" / "tsx" / "dist" / "cli.mjs"
+    command = [
+        "node",
+        str(tsx_entry),
+        str(pi_entry),
+        "--provider",
+        args.provider,
+        "--model",
+        args.model,
+        "--thinking",
+        args.reasoning_effort,
+        "--mode",
+        "json",
+        "--print",
+        "--session-dir",
+        str(state.artifact_root / "session"),
+        "--no-skills",
+        "--no-extensions",
+        "--no-prompt-templates",
+        "--no-themes",
+        "--no-context-files",
+    ]
+    if stage > 1 or resume:
+        command.append("--continue")
+    command.append(prompt)
+    return command
+
+
+def codex_command(
+    args: argparse.Namespace,
+    state: EngineState,
+    prompt: str,
+    stage: int,
+    *,
+    resume: bool = False,
+) -> list[str]:
+    command = [
+        args.codex,
+        "exec",
+        "--json",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--skip-git-repo-check",
+        "--ignore-rules",
+        "--model",
+        args.model,
+        "-c",
+        f'model_provider="custom"',
+        "-c",
+        f'model_reasoning_effort="{args.reasoning_effort}"',
+        "-c",
+        "notify=[]",
+        "-C",
+        str(state.workspace),
+    ]
+    if not resume and (stage == 1 or not state.thread_id):
+        command.append(prompt)
+    else:
+        command.extend(("resume", state.thread_id, prompt))
+    return command
+
+
+def json_lines_with_times(
+    text: str,
+    line_times_ms: Iterable[float],
+) -> Iterable[tuple[dict[str, Any], float]]:
+    lines = text.splitlines()
+    times = list(line_times_ms)
+    if len(lines) != len(times):
+        raise ValueError("Codex stdout timing alignment mismatch")
+    for line, observed_ms in zip(lines, times, strict=True):
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            yield value, observed_ms
+
+
+def subtract_cumulative_usage(
+    current: dict[str, int],
+    previous: dict[str, int] | None,
+) -> tuple[dict[str, int], str]:
+    if previous is None:
+        return current, "reported_turn_total"
+    if all(current.get(key, 0) >= previous.get(key, 0) for key in current):
+        return (
+            {key: current.get(key, 0) - previous.get(key, 0) for key in current},
+            "derived_from_cumulative_turn_totals",
+        )
+    return current, "reported_total_reset"
+
+
+def parse_codex(
+    capture: paired.ProcessCapture,
+    previous_usage: dict[str, int] | None,
+) -> tuple[dict[str, Any], dict[str, int] | None, str | None]:
+    metrics = paired.empty_metrics()
+    metrics["elapsed_ms"] = round(capture.elapsed_ms, 1)
+    metrics["return_code"] = capture.return_code
+    metrics["request_count"] = None
+    metrics["provider_requests"] = []
+    metrics["provider_first_token_ms"] = None
+    metrics["model_prep_ms"] = None
+    events = list(json_lines_with_times(capture.stdout, capture.stdout_line_times_ms))
+    thread_id = None
+    completed = False
+    terminal_ms = None
+    first_observable_ms = None
+    final_message = ""
+    cumulative: dict[str, int] | None = None
+    tools: dict[str, str] = {}
+    for event, observed_ms in events:
+        event_type = event.get("type")
+        if event_type == "thread.started":
+            candidate = event.get("thread_id")
+            thread_id = str(candidate) if candidate else thread_id
+        if event_type in {"item.started", "item.updated", "item.completed"}:
+            item = event.get("item")
+            if isinstance(item, dict):
+                item_type = str(item.get("type") or "")
+                if first_observable_ms is None and item_type not in {"todo_list"}:
+                    first_observable_ms = observed_ms
+                if event_type == "item.completed" and item_type == "agent_message":
+                    final_message = str(item.get("text") or final_message)
+                if event_type == "item.completed" and item_type in {
+                    "command_execution",
+                    "file_change",
+                    "mcp_tool_call",
+                    "collab_tool_call",
+                    "web_search",
+                }:
+                    tools[str(item.get("id") or f"{item_type}:{len(tools)}")] = item_type
+        if event_type == "turn.completed":
+            usage = event.get("usage")
+            if isinstance(usage, dict):
+                cumulative = {
+                    "input_tokens": int(usage.get("input_tokens") or 0),
+                    "cached_input_tokens": int(usage.get("cached_input_tokens") or 0),
+                    "cache_write_input_tokens": int(usage.get("cache_write_input_tokens") or 0),
+                    "output_tokens": int(usage.get("output_tokens") or 0),
+                    "reasoning_output_tokens": int(usage.get("reasoning_output_tokens") or 0),
+                }
+            completed = True
+            terminal_ms = observed_ms
+    metrics["runtime_terminal_success"] = completed
+    metrics["completed"] = completed and capture.return_code == 0
+    metrics["terminal_ms"] = round(terminal_ms, 1) if terminal_ms is not None else None
+    metrics["first_token_ms"] = (
+        round(first_observable_ms, 1) if first_observable_ms is not None else None
+    )
+    metrics["turn_first_token_ms"] = metrics["first_token_ms"]
+    metrics["first_observable_source"] = "codex_first_non_todo_item"
+    metrics["final_message"] = final_message
+    metrics["tool_call_count"] = len(tools)
+    metrics["tool_result_count"] = len(tools)
+    metrics["tool_names"] = sorted(tools.values())
+    if cumulative is None:
+        return metrics, previous_usage, thread_id
+    usage, usage_source = subtract_cumulative_usage(cumulative, previous_usage)
+    prompt = usage["input_tokens"]
+    cache_read = usage["cached_input_tokens"]
+    output = usage["output_tokens"]
+    metrics.update(
+        {
+            "raw_input_tokens": prompt,
+            "prompt_tokens": prompt,
+            "uncached_input_tokens": max(0, prompt - cache_read),
+            "output_tokens": output,
+            "reasoning_tokens": usage["reasoning_output_tokens"],
+            "cache_read_tokens": cache_read,
+            "cache_write_tokens": usage["cache_write_input_tokens"],
+            "provider_total_tokens": prompt + output,
+            "total_tokens": prompt + output,
+            "usage_source": usage_source,
+            "usage_complete": True,
+            "usage_record_count": 1,
+            "provider_total_source": "derived_input_plus_output",
+        }
+    )
+    coverage: dict[str, dict[str, Any]] = {}
+    for field_name in paired.USAGE_FIELDS:
+        applicable = field_name not in {
+            "tool_schema_tokens_estimated",
+            "tool_result_tokens_estimated",
+        }
+        coverage[field_name] = {
+            "reported_requests": 1 if applicable else 0,
+            "expected_requests": 1 if applicable else 0,
+            "complete": applicable,
+            "status": "complete" if applicable else "not_applicable",
+            "source": "reported"
+            if field_name not in {"uncached_input_tokens", "provider_total_tokens", "total_tokens"}
+            else "derived",
+        }
+    metrics["usage_coverage"] = coverage
+    return metrics, cumulative, thread_id
+
+
+def verifier_dependency_fingerprint(workspace: Path) -> dict[str, str | None]:
+    dependencies = (
+        "jobledger",
+        "tests",
+        "tools/background_probe.py",
+    )
+    fingerprint: dict[str, str | None] = {}
+    for relative in dependencies:
+        path = workspace / relative
+        if path.is_file():
+            fingerprint[relative] = file_digest(path)
+        elif path.is_dir():
+            fingerprint[relative] = tree_digest(path)
+        else:
+            fingerprint[relative] = None
+    return fingerprint
+
+
+def verifier_cache_identity(workspace: Path, stage: int) -> tuple[str, dict[str, Any]]:
+    stage_inputs: dict[str, str | None] = {}
+    if stage == 3:
+        checkpoint = workspace / ".long-bench" / "checkpoint.json"
+        stage_inputs[".long-bench/checkpoint.json"] = (
+            file_digest(checkpoint) if checkpoint.is_file() else None
+        )
+    identity: dict[str, Any] = {
+        "schema_version": 1,
+        "stage": stage,
+        "workspace_digest": tree_digest(workspace),
+        "verifier_digest": file_digest(Path(__file__).with_name("verify_long_benchmark.py")),
+        "environment": {
+            "python": platform.python_version(),
+            "implementation": platform.python_implementation(),
+            "executable": sys.executable,
+            "platform": platform.platform(),
+        },
+        "dependency_paths": verifier_dependency_fingerprint(workspace),
+        "stage_inputs": stage_inputs,
+    }
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return sha256_bytes(encoded.encode("utf-8")), identity
+
+
+def _write_verifier_artifacts(
+    artifact_root: Path | None,
+    stage: int,
+    raw_output: str,
+    payload: dict[str, Any],
+) -> None:
+    if artifact_root is None:
+        return
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    raw_path = artifact_root / "verifier.stdout.log"
+    raw_path.write_bytes(raw_output.encode("utf-8", errors="replace")[:VERIFIER_ARTIFACT_LIMIT])
+    payload_path = artifact_root / "verifier.json"
+    payload_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+
+
+def run_verifier(
+    workspace: Path,
+    stage: int,
+    artifact_root: Path | None = None,
+) -> dict[str, Any]:
+    cacheable = stage in VERIFIER_CACHEABLE_STAGES
+    cache_key, identity = verifier_cache_identity(workspace, stage)
+    cache_root = artifact_root.parent / "verifier-cache" if artifact_root is not None else None
+    cache_path = cache_root / f"{cache_key}.json" if cache_root is not None else None
+    if cacheable and cache_path is not None and cache_path.is_file():
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            payload = cached.get("payload")
+            cached_identity = cached.get("identity")
+            if (
+                isinstance(payload, dict)
+                and payload.get("passed") is True
+                and cached_identity == identity
+            ):
+                raw_output = str(cached.get("raw_output") or "")
+                result = dict(payload)
+                result.update(
+                    {
+                        "cached": True,
+                        "cacheable": True,
+                        "cache_key": cache_key,
+                        "cache_source": "content_addressed",
+                        "cache_identity": identity,
+                        "elapsed_ms": 0.0,
+                    }
+                )
+                _write_verifier_artifacts(artifact_root, stage, raw_output, result)
+                return result
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            # 损坏的缓存只会退回真实验证；不能把它当作通过或失败证据。
+            pass
+
+    started = time.monotonic()
+    artifact_path = artifact_root / "verifier.raw.log" if artifact_root is not None else None
+    command = [
+        sys.executable,
+        str(Path(__file__).with_name("verify_long_benchmark.py")),
+        "--workspace",
+        str(workspace),
+        "--stage",
+        str(stage),
+    ]
+    if artifact_path is not None:
+        command.extend(("--artifact", str(artifact_path)))
+    try:
+        result = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=90,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        elapsed_ms = round((time.monotonic() - started) * 1000, 1)
+        output = error.output if isinstance(error.output, str) else ""
+        payload = {
+            "schema_version": 1,
+            "passed": False,
+            "diagnostic": {
+                "check": f"stage_{stage}",
+                "kind": "verifier_timeout",
+                "message": "workspace verifier exceeded its 90 second deadline",
+            },
+            "error": "workspace verifier timed out",
+            "return_code": None,
+            "elapsed_ms": elapsed_ms,
+            "cached": False,
+            "cacheable": False,
+            "cache_key": cache_key,
+            "cache_source": "live",
+            "cache_identity": identity,
+        }
+        _write_verifier_artifacts(artifact_root, stage, output, payload)
+        return payload
+    except OSError as error:
+        elapsed_ms = round((time.monotonic() - started) * 1000, 1)
+        payload = {
+            "schema_version": 1,
+            "passed": False,
+            "diagnostic": {
+                "check": f"stage_{stage}",
+                "kind": "verifier_launch_error",
+                "message": bounded_text(error),
+            },
+            "error": bounded_text(error),
+            "return_code": None,
+            "elapsed_ms": elapsed_ms,
+            "cached": False,
+            "cacheable": False,
+            "cache_key": cache_key,
+            "cache_source": "live",
+            "cache_identity": identity,
+        }
+        _write_verifier_artifacts(artifact_root, stage, "", payload)
+        return payload
+    elapsed_ms = round((time.monotonic() - started) * 1000, 1)
+    try:
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError):
+        payload = {
+            "schema_version": 1,
+            "passed": False,
+            "error": bounded_text(result.stdout[-4000:]),
+        }
+    payload["return_code"] = result.returncode
+    payload["elapsed_ms"] = elapsed_ms
+    payload["cached"] = False
+    payload["cacheable"] = cacheable
+    payload["cache_key"] = cache_key
+    payload["cache_source"] = "live"
+    payload["cache_identity"] = identity
+    _write_verifier_artifacts(artifact_root, stage, result.stdout, payload)
+    if cacheable and payload.get("passed") is True and cache_path is not None:
+        cache_root.mkdir(parents=True, exist_ok=True)
+        cache_payload = {
+            "schema_version": 1,
+            "identity": identity,
+            "payload": {
+                key: value
+                for key, value in payload.items()
+                if key not in {"elapsed_ms", "cached", "cache_source", "cache_identity"}
+            },
+            "raw_output": result.stdout[-VERIFIER_ARTIFACT_LIMIT:],
+        }
+        temporary = cache_path.with_suffix(".tmp")
+        temporary.write_text(
+            json.dumps(cache_payload, indent=2, ensure_ascii=True) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(cache_path)
+    return payload
+
+
+def immutable_digests(workspace: Path) -> dict[str, str | None]:
+    return {
+        relative: file_digest(workspace / relative)
+        if (workspace / relative).is_file()
+        else None
+        for relative in IMMUTABLE_PATHS
+    }
+
+
+def classify_turn(
+    metrics: dict[str, Any],
+    verifier: dict[str, Any],
+    immutable_ok: bool,
+) -> dict[str, Any]:
+    """Keep task evidence, runtime lifecycle, and wrapper status separate."""
+    return_code = metrics.get("return_code")
+    if not isinstance(return_code, int) or isinstance(return_code, bool):
+        return_code = None
+    workspace_verifier_pass = verifier.get("passed") is True
+    runtime_terminal_success = metrics.get("runtime_terminal_success") is True
+    strict_passed = (
+        workspace_verifier_pass
+        and runtime_terminal_success
+        and return_code == 0
+        and immutable_ok
+    )
+    return {
+        "workspace_verifier_pass": workspace_verifier_pass,
+        "runtime_terminal_success": runtime_terminal_success,
+        "process_return_code": return_code,
+        "strict_passed": strict_passed,
+    }
+
+
+def terminal_event_success(engine: str, stdout: str) -> bool:
+    """Read the native terminal event without conflating process exit status."""
+    events = list(paired.iter_json_lines(stdout))
+    candidates: list[dict[str, Any]] = list(events)
+    if engine == "golutra":
+        candidates.extend(paired.nested_runtime_events(events))
+    result: bool | None = None
+    for event in candidates:
+        event_type = str(event.get("type") or event.get("event_type") or "")
+        if engine == "golutra":
+            if event_type in {"turn.completed", "turn_completed"}:
+                status = str(event.get("status") or "completed").lower()
+                result = status == "completed"
+            elif event_type in {"turn.failed", "turn_failed"}:
+                result = False
+        elif engine == "pi":
+            if event_type == "agent_end":
+                result = True
+        elif event_type == "turn.completed":
+            status = str(event.get("status") or "completed").lower()
+            result = status == "completed"
+    return result is True
+
+
+def aggregate_turns(turns: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate a list of already classified turns."""
+    summary: dict[str, Any] = {
+        "workspace_verifier_passed": sum(
+            turn.get("workspace_verifier_pass") is True for turn in turns
+        ),
+        "runtime_terminal_successes": sum(
+            turn.get("runtime_terminal_success") is True for turn in turns
+        ),
+        "strict_passed": sum(turn.get("strict_passed") is True for turn in turns),
+        "stages_total": len(turns),
+    }
+    return_codes: dict[str, int] = {}
+    for turn in turns:
+        value = turn.get("process_return_code")
+        key = str(value) if isinstance(value, int) and not isinstance(value, bool) else "unknown"
+        return_codes[key] = return_codes.get(key, 0) + 1
+    summary["process_return_codes"] = return_codes
+    for field_name in (
+        "prompt_tokens",
+        "uncached_input_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "provider_total_tokens",
+        "tool_schema_tokens_estimated",
+        "tool_result_tokens_estimated",
+        "tool_call_count",
+        "model_tool_call_count",
+        "necessary_tool_call_count",
+        "repeated_tool_call_count",
+        "avoidable_repeat_tool_call_count",
+        "state_changed_revalidation_count",
+        "background_wait_count",
+        "verifier_read_count",
+        "unclassified_tool_call_count",
+        "request_count",
+    ):
+        complete, partial = sum_complete(turns, field_name)
+        summary[field_name] = complete
+        if partial is not None:
+            summary[f"{field_name}_partial"] = partial
+    prompt = summary.get("prompt_tokens")
+    cache_read = summary.get("cache_read_tokens")
+    summary["cache_hit_ratio"] = (
+        round(cache_read / prompt, 4)
+        if isinstance(prompt, int) and prompt > 0 and isinstance(cache_read, int)
+        else None
+    )
+    elapsed = [
+        float(turn["metrics"]["elapsed_ms"])
+        for turn in turns
+        if turn["metrics"].get("elapsed_ms") is not None
+    ]
+    summary["elapsed_total_ms"] = round(sum(elapsed), 1)
+    summary["elapsed_p50_ms"] = round(statistics.median(elapsed), 1) if elapsed else None
+    summary["elapsed_max_ms"] = max(elapsed, default=None)
+    first = [
+        float(turn["metrics"]["first_token_ms"])
+        for turn in turns
+        if turn["metrics"].get("first_token_ms") is not None
+    ]
+    provider_first = [
+        float(turn["metrics"]["provider_first_token_ms"])
+        for turn in turns
+        if turn["metrics"].get("provider_first_token_ms") is not None
+    ]
+    summary["first_observable_p50_ms"] = quantile(first, 0.5)
+    summary["provider_ttft_p50_ms"] = quantile(provider_first, 0.5)
+    summary["usage_complete_stages"] = sum(
+        turn["metrics"].get("usage_complete") is True for turn in turns
+    )
+    summary["repair_attempts"] = sum(
+        int(turn.get("repair_attempts") or 0)
+        for turn in turns
+        if isinstance(turn.get("repair_attempts", 0), int)
+    )
+    summary["verifier_runs"] = sum(
+        len(turn.get("verification_attempts", []))
+        for turn in turns
+        if isinstance(turn.get("verification_attempts", []), list)
+    )
+    summary["verifier_cache_hits"] = sum(
+        sum(
+            attempt.get("cached") is True
+            for attempt in turn.get("verification_attempts", [])
+            if isinstance(attempt, dict)
+        )
+        for turn in turns
+        if isinstance(turn.get("verification_attempts", []), list)
+    )
+    provider_requests = [
+        request
+        for turn in turns
+        for request in turn.get("metrics", {}).get("provider_requests", [])
+        if isinstance(request, dict)
+    ]
+    diagnosed_requests = [
+        request
+        for request in provider_requests
+        if isinstance(request.get("cache_diagnostics"), dict)
+    ]
+    if diagnosed_requests:
+        prefix_relations: dict[str, int] = {}
+        outcome_reasons: dict[str, int] = {}
+        stable_miss_uncached = 0
+        stable_miss_uncached_complete = True
+        for request in diagnosed_requests:
+            relation = str(request.get("cache_prefix_relation") or "unknown")
+            outcome = str(request.get("cache_outcome_reason") or "unknown")
+            prefix_relations[relation] = prefix_relations.get(relation, 0) + 1
+            outcome_reasons[outcome] = outcome_reasons.get(outcome, 0) + 1
+            if outcome == "provider_miss_on_stable_prefix":
+                uncached = request.get("uncached_input_tokens")
+                if isinstance(uncached, int) and not isinstance(uncached, bool):
+                    stable_miss_uncached += uncached
+                else:
+                    stable_miss_uncached_complete = False
+        stable_misses = outcome_reasons.get("provider_miss_on_stable_prefix", 0)
+        summary["cache_diagnostic_requests"] = len(diagnosed_requests)
+        summary["cache_prefix_relations"] = prefix_relations
+        summary["cache_outcome_reasons"] = outcome_reasons
+        summary["stable_prefix_miss_requests"] = stable_misses
+        summary["stable_prefix_miss_uncached_tokens"] = (
+            stable_miss_uncached if stable_miss_uncached_complete else None
+        )
+        if not stable_miss_uncached_complete:
+            summary["stable_prefix_miss_uncached_tokens_partial"] = stable_miss_uncached
+    else:
+        summary["cache_diagnostic_requests"] = None
+        summary["cache_prefix_relations"] = None
+        summary["cache_outcome_reasons"] = None
+        summary["stable_prefix_miss_requests"] = None
+        summary["stable_prefix_miss_uncached_tokens"] = None
+    summary["skipped_stages"] = sum(turn.get("skipped") is True for turn in turns)
+    return summary
+
+
+def command_for(
+    args: argparse.Namespace,
+    state: EngineState,
+    prompt: str,
+    stage: int,
+    *,
+    resume: bool = False,
+) -> list[str]:
+    if state.name == "golutra":
+        return golutra_command(args, state, prompt, stage, resume=resume)
+    if state.name == "pi":
+        return pi_command(args, state, prompt, stage, resume=resume)
+    return codex_command(args, state, prompt, stage, resume=resume)
+
+
+def _stable_value_digest(value: Any) -> str | None:
+    """Return a non-content-bearing identity for one observed tool input."""
+    if value is None:
+        return None
+    try:
+        encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    except (TypeError, ValueError):
+        encoded = repr(value)
+    # Hash only a bounded canonical representation. The report never stores the
+    # command or arguments themselves, so secrets cannot leak through the ledger.
+    encoded = encoded[:16_384]
+    return sha256_bytes(encoded.encode("utf-8"))
+
+
+def _tool_name_from_event(event: dict[str, Any], payload: dict[str, Any]) -> str | None:
+    envelope = payload.get("envelope")
+    envelope = envelope if isinstance(envelope, dict) else {}
+    for value in (
+        payload.get("tool_name"),
+        payload.get("toolName"),
+        payload.get("name"),
+        event.get("tool_name"),
+        event.get("toolName"),
+        envelope.get("tool_name"),
+    ):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _tool_arguments_from_event(
+    event: dict[str, Any],
+    payload: dict[str, Any],
+    item: dict[str, Any] | None = None,
+) -> Any:
+    containers = [payload, event]
+    if item is not None:
+        containers.insert(0, item)
+    envelope = payload.get("envelope")
+    if isinstance(envelope, dict):
+        containers.append(envelope)
+    for container in containers:
+        for key in ("arguments", "argument", "params", "parameters", "input"):
+            if key in container and container[key] is not None:
+                return container[key]
+        if "argv" in container and container["argv"] is not None:
+            return {"argv": container["argv"]}
+        if "command" in container and container["command"] is not None:
+            return {"command": container["command"]}
+        if "display_arguments" in container and container["display_arguments"] is not None:
+            return container["display_arguments"]
+    return None
+
+
+def _tool_event_id(event: dict[str, Any], payload: dict[str, Any], item: dict[str, Any] | None) -> str | None:
+    containers = [event, payload]
+    if item is not None:
+        containers.insert(0, item)
+    # 持久化工具事件与 provider_completed 备用摘要共享上游 ID；优先使用它，
+    # 才能把两种投影收敛为同一次操作，而不是按内部 ID 重复计数。
+    for key in (
+        "provider_tool_call_id",
+        "providerToolCallId",
+        "tool_call_id",
+        "toolCallId",
+        "call_id",
+        "callId",
+    ):
+        for container in containers:
+            value = container.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    # An item/block id identifies the individual operation. Do not fall back to
+    # the enclosing event id when an item is present: one provider_completed or
+    # message_end event can contain several id-less calls.
+    if item is not None:
+        value = item.get("id")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        return None
+    for container in containers:
+        value = container.get("id")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _is_tool_call_event(event_type: str) -> bool:
+    return event_type in {
+        "tool_started",
+        "tool_requested",
+        "tool_call_started",
+        "tool_execution_start",
+        "tool_call",
+    } or event_type.endswith(("tool_started", "tool_requested", "tool_execution_start"))
+
+
+def _append_tool_call_record(
+    records: list[dict[str, Any]],
+    seen_ids: set[str],
+    seen_events: set[str],
+    event: dict[str, Any],
+    payload: dict[str, Any],
+    *,
+    source: str,
+    item: dict[str, Any] | None = None,
+    tool_name: str | None = None,
+    ordinal: int | None = None,
+    event_order: int | None = None,
+) -> None:
+    name = tool_name or _tool_name_from_event(event, payload)
+    if not name or name == "external_verifier":
+        return
+    call_id = _tool_event_id(event, payload, item)
+    if call_id is not None:
+        if call_id in seen_ids:
+            return
+        seen_ids.add(call_id)
+    arguments = _tool_arguments_from_event(event, payload, item)
+    argument_digest = _stable_value_digest(arguments)
+    # 上游没有调用 ID 时，用事件时间/回合身份去重投影，同时保留真正的重复调用。
+    event_identity = f"call:{call_id}" if call_id is not None else None
+    if event_identity is None and item is not None and ordinal is not None:
+        event_id = event.get("id")
+        event_identity = (
+            f"event:{event_id}:item:{ordinal}"
+            if isinstance(event_id, str) and event_id
+            else None
+        )
+    if event_identity is None:
+        event_identity = event.get("id")
+    if not isinstance(event_identity, str) or not event_identity:
+        # 时间戳/回合身份让参数相同的两个无 ID 调用保持独立；同一事件的投影仍
+        # 共享一个键。若连时间戳也没有，序号只负责区分同一投影里的多个调用。
+        event_identity = _stable_value_digest(
+            {
+                "event_type": event.get("event_type"),
+                "name": name,
+                "arguments": arguments,
+                "timestamp": event.get("timestamp"),
+                "provider_round_id": event.get("provider_round_id"),
+                "ordinal": ordinal,
+            }
+        )
+    if event_identity and event_identity in seen_events:
+        return
+    if event_identity:
+        seen_events.add(event_identity)
+    records.append(
+        {
+            "tool_name": name,
+            "argument_digest": argument_digest,
+            "source": source,
+            "_event_order": event_order if event_order is not None else len(records),
+            "_call_id": call_id,
+            "background_wait": (
+                name in {"process_poll", "process_reconnect"}
+                or (
+                    name == "shell_session"
+                    and isinstance(arguments, dict)
+                    and arguments.get("action") == "wait"
+                )
+            ),
+        }
+    )
+
+
+def _event_completion_status(event: dict[str, Any], payload: dict[str, Any]) -> str | None:
+    """Return a normalized terminal status when an event carries one."""
+    envelope = payload.get("envelope")
+    envelope = envelope if isinstance(envelope, dict) else {}
+    for container in (payload, envelope, event):
+        value = container.get("status")
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+    return None
+
+
+def _event_is_tool_completion(event_type: str) -> bool:
+    return event_type in {
+        "tool_completed",
+        "tool_result",
+        "tool_execution_end",
+        "tool_call_completed",
+        "tool_execution_completed",
+        "item.completed",
+    } or event_type.endswith(("tool_completed", "tool_execution_end"))
+
+
+def _completion_facts(payload: dict[str, Any]) -> dict[str, Any]:
+    envelope = payload.get("envelope")
+    if isinstance(envelope, dict):
+        facts = envelope.get("structured_facts")
+        if isinstance(facts, dict):
+            return facts
+    for key in ("structured_facts", "facts", "result"):
+        facts = payload.get(key)
+        if isinstance(facts, dict):
+            return facts
+    return {}
+
+
+def _completion_is_success(status: str | None, payload: dict[str, Any]) -> bool:
+    """Treat an unmarked completion as usable, but never a marked error."""
+    if status in {"error", "failed", "blocked", "cancelled", "timeout", "timed_out"}:
+        return False
+    envelope = payload.get("envelope")
+    envelope = envelope if isinstance(envelope, dict) else {}
+    for container in (payload, envelope):
+        if container.get("is_error") is True or container.get("isError") is True:
+            return False
+        if isinstance(container.get("error"), (str, dict, list)):
+            return False
+    return True
+
+
+def _completion_changed_workspace(
+    tool_name: str | None,
+    status: str | None,
+    payload: dict[str, Any],
+) -> bool:
+    """Conservatively identify a completed mutation that changes state.
+
+    Unknown successful mutation facts are treated as changed. That prevents a
+    report from incorrectly calling a later verification read avoidable when a
+    provider omitted its detailed change count.
+    """
+    if tool_name not in {"write_file", "edit_file", "apply_patch"}:
+        return False
+    if status in {"error", "failed", "blocked", "cancelled", "timeout", "timed_out"}:
+        return False
+    facts = _completion_facts(payload)
+    if facts.get("idempotent") is True and facts.get("changed") is False:
+        return False
+    if facts.get("changed") is False and facts.get("workspace_mutation_detected") is False:
+        count = facts.get("workspace_change_count", facts.get("changed_file_count"))
+        if isinstance(count, (int, float)) and not isinstance(count, bool) and count <= 0:
+            return False
+    return True
+
+
+def _annotate_tool_call_records(
+    records: list[dict[str, Any]],
+    events: list[tuple[dict[str, Any], float | None]],
+) -> None:
+    """Attach non-sensitive execution state used by the accounting report."""
+    completions: list[
+        tuple[int, str | None, str | None, str | None, dict[str, Any]]
+    ] = []
+    for event_order, (event, _arrival) in enumerate(events):
+        event_type = str(event.get("event_type") or event.get("type") or "")
+        if not _event_is_tool_completion(event_type):
+            continue
+        payload = paired.event_payload(event)
+        name = _tool_name_from_event(event, payload)
+        call_id = _tool_event_id(event, payload, None)
+        status = _event_completion_status(event, payload)
+        completions.append((event_order, name, call_id, status, payload))
+
+    # A few providers use a result id distinct from the start id. Pair those
+    # records by tool name and occurrence while preferring an exact id match.
+    records_by_name: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        record["workspace_epoch"] = 0
+        record["fact_complete"] = False
+        record["result_success"] = False
+        records_by_name.setdefault(str(record["tool_name"]), []).append(record)
+
+    # Mark terminal facts. Exact IDs are authoritative; name pairing is only a
+    # fallback for legacy/provider streams that do not share IDs.
+    for _order, name, call_id, status, payload in completions:
+        matched = False
+        if isinstance(call_id, str) and call_id:
+            for record in records:
+                if record.get("_call_id") == call_id:
+                    record["fact_complete"] = True
+                    record["result_success"] = (
+                        record.get("result_success") is True
+                        or _completion_is_success(status, payload)
+                    )
+                    matched = True
+                    break
+        if not matched and name:
+            candidates = records_by_name.get(name, [])
+            for record in candidates:
+                if not record.get("fact_complete"):
+                    record["fact_complete"] = True
+                    record["result_success"] = _completion_is_success(status, payload)
+                    break
+
+    state_change_orders = [
+        order
+        for order, name, _call_id, status, payload in completions
+        if _completion_changed_workspace(
+            name,
+            status,
+            payload,
+        )
+    ]
+    state_change_orders.sort()
+    for record in records:
+        order = int(record.get("_event_order", 0))
+        record["workspace_epoch"] = sum(change < order for change in state_change_orders)
+        record["verifier_read"] = str(record["tool_name"]).startswith("contract_") or str(
+            record["tool_name"]
+        ) in {"workspace_verifier", "external_verifier"}
+    # Internal fields are intentionally retained only until accounting has
+    # classified the record; they never enter the durable report ledger.
+
+
+def _normalized_long_benchmark_events(
+    engine: str,
+    stdout: str,
+    line_times_ms: Iterable[float] | None,
+) -> list[tuple[dict[str, Any], float | None]]:
+    timed = list(paired.iter_timed_json_lines(stdout, line_times_ms))
+    if engine == "golutra":
+        nested = list(paired.nested_runtime_events_timed(timed))
+        # A few runtimes expose a durable event directly rather than through
+        # runtime.event/item.data. Keep it when the normalized stream lacks it.
+        known = {
+            (str(event.get("id") or ""), str(event.get("event_type") or ""))
+            for event, _ in nested
+        }
+        known_fingerprints = {
+            paired.runtime_event_fingerprint(event)
+            for event, _ in nested
+        }
+        for event, arrival in timed:
+            candidates: list[dict[str, Any]] = []
+            if isinstance(event.get("event_type"), str):
+                candidates.append(event)
+            if event.get("type") == "runtime.event" and isinstance(event.get("event"), dict):
+                candidate = event["event"]
+                if isinstance(candidate.get("event_type"), str):
+                    candidates.append(candidate)
+            for candidate in candidates:
+                key = (str(candidate.get("id") or ""), str(candidate.get("event_type") or ""))
+                if key in known:
+                    continue
+                event_type = str(candidate.get("event_type") or "")
+                # 持久化工具事件的事件 ID 是操作身份；即使参数相同，只要 ID 不同
+                # 也必须保留，否则账本会吞掉模型真实的重复决策。
+                if event_type.startswith("tool_") or event_type == "provider_completed":
+                    nested.append((candidate, arrival))
+                    known.add(key)
+                    continue
+                fingerprint = paired.runtime_event_fingerprint(candidate)
+                if fingerprint not in known_fingerprints:
+                    nested.append((candidate, arrival))
+                    known.add(key)
+                    known_fingerprints.add(fingerprint)
+        return nested
+    return timed
+
+
+def collect_tool_call_records(
+    engine: str,
+    stdout: str,
+    line_times_ms: Iterable[float] | None,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    seen_events: set[str] = set()
+    completed_fallback: list[
+        tuple[dict[str, Any], dict[str, Any], dict[str, Any], int, int]
+    ] = []
+    events = _normalized_long_benchmark_events(engine, stdout, line_times_ms)
+    for event_order, (event, _arrival) in enumerate(events):
+        event_type = str(event.get("event_type") or event.get("type") or "")
+        payload = paired.event_payload(event)
+        if engine == "golutra":
+            if _is_tool_call_event(event_type):
+                _append_tool_call_record(
+                    records,
+                    seen_ids,
+                    seen_events,
+                    event,
+                    payload,
+                    source="runtime",
+                    event_order=event_order,
+                )
+            elif event_type == "provider_completed":
+                calls = payload.get("provider_tool_calls")
+                if isinstance(calls, list):
+                    for ordinal, call in enumerate(calls):
+                        if isinstance(call, dict):
+                            completed_fallback.append((event, call, call, ordinal, event_order))
+        elif engine == "pi":
+            if event_type == "tool_execution_start":
+                _append_tool_call_record(
+                    records,
+                    seen_ids,
+                    seen_events,
+                    event,
+                    payload,
+                    source="execution",
+                    event_order=event_order,
+                )
+            elif event_type == "message_end":
+                message = event.get("message")
+                if isinstance(message, dict):
+                    for ordinal, block in enumerate(message.get("content", [])):
+                        if isinstance(block, dict) and block.get("type") == "toolCall":
+                            block_payload = dict(block)
+                            _append_tool_call_record(
+                                records,
+                                seen_ids,
+                                seen_events,
+                                event,
+                                block_payload,
+                                source="assistant",
+                                item=block,
+                                tool_name=str(block.get("name") or "") or None,
+                                ordinal=ordinal,
+                                event_order=event_order,
+                            )
+        else:
+            item = event.get("item")
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or "")
+            is_candidate = (
+                "command" in item_type
+                or "file_change" in item_type
+                or "tool" in item_type
+                or "web_search" in item_type
+                or "collab" in item_type
+            )
+            if not is_candidate:
+                continue
+            if event_type == "item.started":
+                _append_tool_call_record(
+                    records,
+                    seen_ids,
+                    seen_events,
+                    event,
+                    item,
+                    source="item",
+                    item=item,
+                    tool_name=item_type,
+                )
+            elif event_type == "item.completed":
+                completed_fallback.append((event, item, item, 0, event_order))
+    direct_record_count = len(records)
+    # 某些 Codex/provider 版本只发 completed 项；仅在找不到对应 started 操作时
+    # 补入，并按单个调用处理，保证一次操作只计一次。
+    for event, item, payload, ordinal, event_order in completed_fallback:
+        candidate_id = _tool_event_id(event, payload, item)
+        if candidate_id and candidate_id in seen_ids:
+            continue
+        if engine == "golutra" and direct_record_count > 0 and candidate_id is None:
+            # 已有直接生命周期事件但双方都没有操作 ID 时，直接事件是唯一可靠
+            # 来源；不要把无法关联的 provider 摘要再次计入。带 ID 的备用调用
+            # 仍可逐项补齐缺失记录。
+            continue
+        fallback_name = (
+            _tool_name_from_event(event, payload)
+            or (str(item.get("name") or "") if isinstance(item, dict) else "")
+            or (str(item.get("tool_name") or "") if isinstance(item, dict) else "")
+            or (str(item.get("type") or "") if isinstance(item, dict) else "")
+            or None
+        )
+        _append_tool_call_record(
+            records,
+            seen_ids,
+            seen_events,
+            event,
+            payload,
+            source="completed",
+            item=item,
+            tool_name=fallback_name,
+            ordinal=ordinal,
+            event_order=event_order,
+        )
+    _annotate_tool_call_records(records, events)
+    return records
+
+
+def apply_tool_call_accounting(
+    metrics: dict[str, Any],
+    engine: str,
+    stdout: str,
+    line_times_ms: Iterable[float] | None,
+) -> None:
+    records = collect_tool_call_records(engine, stdout, line_times_ms)
+    parser_count = as_int(metrics.get("tool_call_count")) or 0
+    observed_count = max(parser_count, len(records))
+    signatures: dict[tuple[str, str], int] = {}
+    previous_records: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    repeated = 0
+    avoidable_repeats = 0
+    state_changed_revalidations = 0
+    waits = 0
+    verifier_reads = 0
+    unclassified = max(0, observed_count - len(records))
+    ledger: list[dict[str, Any]] = []
+    for index, record in enumerate(records):
+        name = str(record["tool_name"])
+        digest = record.get("argument_digest")
+        signature = (name, digest) if isinstance(digest, str) else None
+        occurrence = 0
+        if signature is not None:
+            occurrence = signatures.get(signature, 0) + 1
+            signatures[signature] = occurrence
+            if occurrence > 1:
+                repeated += 1
+                prior = previous_records[signature][-1]
+                if int(record.get("workspace_epoch", 0)) > int(
+                    prior.get("workspace_epoch", 0)
+                ):
+                    state_changed_revalidations += 1
+                elif (
+                    record.get("fact_complete") is True
+                    and record.get("result_success") is True
+                    and prior.get("fact_complete") is True
+                    and prior.get("result_success") is True
+                ):
+                    avoidable_repeats += 1
+            previous_records.setdefault(signature, []).append(record)
+        else:
+            unclassified += 1
+        is_wait = record.get("background_wait") is True
+        waits += int(is_wait)
+        verifier_read = record.get("verifier_read") is True
+        verifier_reads += int(verifier_read)
+        if len(ledger) < MAX_TOOL_CALL_LEDGER_ENTRIES:
+            ledger.append(
+                {
+                    "index": index,
+                    "tool_name": name,
+                    "argument_digest": digest,
+                    "source": record.get("source"),
+                    "background_wait": is_wait,
+                    "repeated": occurrence > 1,
+                    "avoidable_repeat": (
+                        occurrence > 1
+                        and record.get("workspace_epoch", 0)
+                        == previous_records[signature][-2].get("workspace_epoch", 0)
+                        and record.get("fact_complete") is True
+                        and record.get("result_success") is True
+                        and previous_records[signature][-2].get("fact_complete") is True
+                        and previous_records[signature][-2].get("result_success") is True
+                    )
+                    if signature is not None and occurrence > 1
+                    else False,
+                    "state_changed_revalidation": (
+                        occurrence > 1
+                        and record.get("workspace_epoch", 0)
+                        > previous_records[signature][-2].get("workspace_epoch", 0)
+                    )
+                    if signature is not None and occurrence > 1
+                    else False,
+                    "verifier_read": verifier_read,
+                }
+            )
+    metrics["model_tool_call_count"] = observed_count
+    metrics["necessary_tool_call_count"] = max(0, observed_count - avoidable_repeats)
+    metrics["repeated_tool_call_count"] = repeated
+    metrics["avoidable_repeat_tool_call_count"] = avoidable_repeats
+    metrics["state_changed_revalidation_count"] = state_changed_revalidations
+    metrics["background_wait_count"] = waits
+    metrics["verifier_read_count"] = verifier_reads
+    metrics["unclassified_tool_call_count"] = unclassified
+    metrics["tool_call_ledger"] = ledger
+    metrics["tool_call_ledger_truncated"] = len(records) > MAX_TOOL_CALL_LEDGER_ENTRIES
+    metrics["tool_call_accounting"] = {
+        "model_calls": observed_count,
+        "necessary_calls_lower_bound": max(0, observed_count - avoidable_repeats),
+        "repeated_calls_observed": repeated,
+        "avoidable_repeats": avoidable_repeats,
+        "state_changed_revalidations": state_changed_revalidations,
+        "background_wait_calls": waits,
+        "verifier_read_calls": verifier_reads,
+        "unclassified_calls": unclassified,
+        "result_events": as_int(metrics.get("tool_result_count")),
+        "source": engine,
+    }
+
+
+def parse_metrics(
+    state: EngineState,
+    capture: paired.ProcessCapture,
+) -> dict[str, Any]:
+    if state.name == "golutra":
+        metrics = paired.parse_golutra(
+            capture.stdout,
+            capture.elapsed_ms,
+            capture.return_code,
+            state.artifact_root / "run",
+            capture.stdout_line_times_ms,
+            previous_cache_context=state.golutra_cache_context,
+            track_cache_context=True,
+        )
+        state.golutra_cache_context = metrics.pop(
+            "_last_cache_context", state.golutra_cache_context
+        )
+    elif state.name == "pi":
+        metrics = paired.parse_pi(
+            capture.stdout,
+            capture.elapsed_ms,
+            capture.return_code,
+            capture.stdout_line_times_ms,
+        )
+    else:
+        metrics, cumulative, thread_id = parse_codex(capture, state.codex_cumulative_usage)
+        state.codex_cumulative_usage = cumulative
+        state.thread_id = state.thread_id or thread_id
+    apply_tool_call_accounting(metrics, state.name, capture.stdout, capture.stdout_line_times_ms)
+    return metrics
+
+
+def sanitize_local_paths(value: Any, state: EngineState) -> Any:
+    """Replace temporary benchmark paths before model text enters a report."""
+    if not isinstance(value, str):
+        return value
+    return value.replace(str(state.workspace), "<isolated-workspace>").replace(
+        str(state.artifact_root), "<isolated-artifacts>"
+    )
+
+
+def verification_feedback(verifier: dict[str, Any]) -> str:
+    diagnostic = verifier.get("diagnostic")
+    if not isinstance(diagnostic, dict):
+        diagnostic = {"message": verifier.get("error", "strict verifier failed")}
+    # 只把结构化事实送回模型；原始 traceback 保留在 artifact，避免把
+    # 无界实现细节再次塞进 provider 上下文。
+    bounded = {
+        key: value
+        for key, value in diagnostic.items()
+        if key
+        in {
+            "check",
+            "kind",
+            "message",
+            "expected_type",
+            "actual_type",
+            "expected_keys",
+            "actual_keys",
+            "missing_keys",
+            "unexpected_keys",
+            "field_differences",
+            "checksum",
+            "parse_error",
+        }
+    }
+    encoded = json.dumps(bounded, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return (
+        "The strict workspace verifier failed. Inspect the actual workspace and repair the "
+        "implementation yourself. Do not weaken, bypass, or auto-fill the contract. "
+        "You have one explicit repair turn; run the relevant tests and leave the workspace "
+        "in a valid state. Verifier diagnostics:\n"
+        f"{encoded}"
+    )
+
+
+def merge_repair_metrics(
+    primary: dict[str, Any],
+    repair: dict[str, Any],
+) -> dict[str, Any]:
+    """Combine two provider executions while preserving unknown coverage."""
+    merged = dict(primary)
+    for field_name in (
+        "prompt_tokens",
+        "uncached_input_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "output_tokens",
+        "reasoning_tokens",
+        "provider_total_tokens",
+        "total_tokens",
+        "tool_schema_tokens_estimated",
+        "tool_result_tokens_estimated",
+        "tool_call_count",
+        "tool_result_count",
+        "model_tool_call_count",
+        "necessary_tool_call_count",
+        "repeated_tool_call_count",
+        "avoidable_repeat_tool_call_count",
+        "state_changed_revalidation_count",
+        "background_wait_count",
+        "verifier_read_count",
+        "unclassified_tool_call_count",
+        "request_count",
+        "elapsed_ms",
+    ):
+        left = primary.get(field_name)
+        right = repair.get(field_name)
+        if isinstance(left, (int, float)) and not isinstance(left, bool) and isinstance(
+            right, (int, float)
+        ) and not isinstance(right, bool):
+            merged[field_name] = left + right
+        else:
+            merged[field_name] = None
+            known = [
+                value
+                for value in (left, right)
+                if isinstance(value, (int, float)) and not isinstance(value, bool)
+            ]
+            if known:
+                merged[f"{field_name}_partial"] = sum(known)
+    for field_name in ("first_token_ms", "turn_first_token_ms", "provider_first_token_ms"):
+        merged[field_name] = primary.get(field_name)
+        if merged[field_name] is None:
+            merged[field_name] = repair.get(field_name)
+    merged["terminal_ms"] = repair.get("terminal_ms") or primary.get("terminal_ms")
+    merged["completed"] = repair.get("completed") is True
+    merged["runtime_terminal_success"] = repair.get("runtime_terminal_success") is True
+    merged["return_code"] = repair.get("return_code")
+    merged["final_message"] = repair.get("final_message") or primary.get("final_message", "")
+    merged["usage_source"] = ",".join(
+        sorted(
+            {
+                str(value)
+                for value in (primary.get("usage_source"), repair.get("usage_source"))
+                if value and value != "unknown"
+            }
+        )
+    ) or "unknown"
+    merged["usage_complete"] = (
+        primary.get("usage_complete") is True and repair.get("usage_complete") is True
+    )
+    merged["repair_attempts"] = 1
+    primary_ledger = primary.get("tool_call_ledger")
+    repair_ledger = repair.get("tool_call_ledger")
+    if isinstance(primary_ledger, list) and isinstance(repair_ledger, list):
+        merged["tool_call_ledger"] = (
+            primary_ledger[:MAX_TOOL_CALL_LEDGER_ENTRIES]
+            + repair_ledger[: max(0, MAX_TOOL_CALL_LEDGER_ENTRIES - len(primary_ledger))]
+        )
+    merged["tool_call_ledger_truncated"] = bool(
+        primary.get("tool_call_ledger_truncated")
+        or repair.get("tool_call_ledger_truncated")
+        or len(primary_ledger or []) + len(repair_ledger or []) > MAX_TOOL_CALL_LEDGER_ENTRIES
+    )
+    merged["tool_call_accounting"] = {
+        "model_calls": merged.get("model_tool_call_count"),
+        "necessary_calls_lower_bound": merged.get("necessary_tool_call_count"),
+        "repeated_calls_observed": merged.get("repeated_tool_call_count"),
+        "avoidable_repeats": merged.get("avoidable_repeat_tool_call_count"),
+        "state_changed_revalidations": merged.get("state_changed_revalidation_count"),
+        "background_wait_calls": merged.get("background_wait_count"),
+        "verifier_read_calls": merged.get("verifier_read_count"),
+        "unclassified_calls": merged.get("unclassified_tool_call_count"),
+        "result_events": merged.get("tool_result_count"),
+        "source": "primary_plus_repair",
+    }
+    return merged
+
+
+def skipped_turn(state: EngineState, stage: int, reason: str) -> dict[str, Any]:
+    metrics = paired.empty_metrics()
+    metrics["return_code"] = None
+    verification = {
+        "schema_version": 1,
+        "passed": False,
+        "skipped": True,
+        "reason": reason,
+        "cacheable": False,
+    }
+    turn = {
+        "stage": stage,
+        "workspace_verifier_pass": False,
+        "runtime_terminal_success": False,
+        "process_return_code": None,
+        "strict_passed": False,
+        "resumed": False,
+        "metrics": metrics,
+        "verification": verification,
+        "verification_attempts": [],
+        "repair_attempts": 0,
+        "repair": None,
+        "immutable_inputs_preserved": True,
+        "workspace_digest": tree_digest(state.workspace),
+        "skipped": True,
+    }
+    state.turns.append(turn)
+    return turn
+
+
+def run_turn(
+    args: argparse.Namespace,
+    state: EngineState,
+    prompt: str,
+    stage: int,
+    baseline_immutable: dict[str, str | None],
+) -> dict[str, Any]:
+    output_root = state.artifact_root / f"stage-{stage}"
+    output_root.mkdir(parents=True, exist_ok=True)
+    capture = paired.run_process(
+        command_for(args, state, prompt, stage),
+        state.workspace,
+        state.env,
+        args.timeout,
+        output_root / "stdout.jsonl",
+        output_root / "stderr.log",
+    )
+    metrics = parse_metrics(state, capture)
+    metrics["final_message"] = sanitize_local_paths(metrics.get("final_message"), state)
+    if state.name == "golutra" and state.thread_id is None:
+        state.thread_id = paired.run_bundle_thread_id(state.artifact_root / "run")
+    immutable_after = immutable_digests(state.workspace)
+    immutable_ok = immutable_after == baseline_immutable
+    verifier = run_verifier(state.workspace, stage, output_root)
+    verification_attempts = [verifier]
+    repair_turn: dict[str, Any] | None = None
+    can_resume = state.name != "golutra" or state.thread_id is not None
+    if (
+        verifier.get("passed") is not True
+        and metrics.get("runtime_terminal_success") is True
+        and metrics.get("return_code") == 0
+        and immutable_ok
+        and can_resume
+    ):
+        repair_prompt = verification_feedback(verifier)
+        repair_root = output_root / "repair"
+        repair_root.mkdir(parents=True, exist_ok=True)
+        repair_capture = paired.run_process(
+            command_for(args, state, repair_prompt, stage, resume=True),
+            state.workspace,
+            state.env,
+            args.timeout,
+            repair_root / "stdout.jsonl",
+            repair_root / "stderr.log",
+        )
+        repair_metrics = parse_metrics(state, repair_capture)
+        repair_metrics["final_message"] = sanitize_local_paths(
+            repair_metrics.get("final_message"), state
+        )
+        repair_verifier = run_verifier(state.workspace, stage, repair_root)
+        verification_attempts.append(repair_verifier)
+        repair_turn = {
+            "metrics": repair_metrics,
+            "verification": repair_verifier,
+            "prompt": prompt_metadata(repair_prompt),
+            "return_code": repair_capture.return_code,
+        }
+        metrics = merge_repair_metrics(metrics, repair_metrics)
+        verifier = repair_verifier
+        immutable_after = immutable_digests(state.workspace)
+        immutable_ok = immutable_after == baseline_immutable
+    classification = classify_turn(metrics, verifier, immutable_ok)
+    turn = {
+        "stage": stage,
+        **classification,
+        "resumed": stage > 1 and state.thread_id is not None,
+        "metrics": metrics,
+        "verification": verifier,
+        "verification_attempts": verification_attempts,
+        "repair_attempts": 1 if repair_turn is not None else 0,
+        "repair": repair_turn,
+        "immutable_inputs_preserved": immutable_ok,
+        "workspace_digest": tree_digest(state.workspace),
+    }
+    state.turns.append(turn)
+    return turn
+
+
+def as_int(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def sum_complete(turns: list[dict[str, Any]], field_name: str) -> tuple[int | None, int | None]:
+    values: list[int] = []
+    for turn in turns:
+        value = as_int(turn["metrics"].get(field_name))
+        if value is None:
+            partial = [
+                as_int(candidate["metrics"].get(field_name))
+                for candidate in turns
+                if as_int(candidate["metrics"].get(field_name)) is not None
+            ]
+            return None, sum(value for value in partial if value is not None) if partial else None
+        values.append(value)
+    return sum(values), None
+
+
+def quantile(values: list[float], proportion: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, math.ceil(proportion * len(ordered)) - 1)
+    return round(ordered[index], 1)
+
+
+def aggregate(state: EngineState) -> dict[str, Any]:
+    return aggregate_turns(state.turns)
+
+
+def display(value: Any, *, milliseconds: bool = False) -> str:
+    if value is None:
+        return "unknown"
+    if isinstance(value, float):
+        return f"{value:,.1f}" + (" ms" if milliseconds else "")
+    if isinstance(value, int):
+        return f"{value:,}" + (" ms" if milliseconds else "")
+    return str(value)
+
+
+def markdown_report(report: dict[str, Any]) -> str:
+    lines = [
+        "# Golutra / Pi / Codex Long-Task Benchmark",
+        "",
+        f"Generated: `{report['generated_at']}`",
+        "",
+        "## Conditions",
+        "",
+        f"- Model/protocol/reasoning: `{report['conditions']['model']}` / Responses / `{report['conditions']['reasoning_effort']}`",
+        f"- Fixture digest: `{report['conditions']['fixture_digest']}`",
+        "- Four turns: multi-file implementation, recovery repair, long-context checkpoint, background process plus resume.",
+        f"- Later stages continue after a strict failure: `{not report['conditions'].get('stop_on_strict_failure', False)}`; skipped stages are never counted as successful work.",
+        "- Each product used its native tool surface. Project instructions, skills, extensions, and prompt templates were disabled for the fixture.",
+        "- Credentials lived only in owner-only temporary homes and are absent from this report.",
+        "",
+        "## Aggregate",
+        "",
+        "| Metric | Golutra | Pi | Codex |",
+        "| --- | ---: | ---: | ---: |",
+    ]
+    measurement_mode = report["conditions"].get("measurement_mode")
+    if measurement_mode:
+        status_note = str(report["conditions"].get("status_note") or "").rstrip(".")
+        detail = f"; {status_note}" if status_note else ""
+        lines.insert(
+            10,
+            f"- Measurement mode: `{measurement_mode}`{detail}.",
+        )
+        current_fixture = Path(__file__).with_name("fixtures") / "long_benchmark"
+        if measurement_mode == "reclassified_from_retained_artifacts" and current_fixture.is_dir():
+            current_digest = tree_digest(current_fixture)
+            source_digest = report["conditions"].get("fixture_digest")
+            if current_digest != source_digest:
+                lines.insert(
+                    11,
+                    f"- Current fixture digest: `{current_digest}`; the retained sample predates fixture-only changes and was not rerun.",
+                )
+    summaries = report["summary"]
+    rows = (
+        ("Workspace verifier", "workspace_verifier_passed"),
+        ("Runtime terminal success", "runtime_terminal_successes"),
+        ("Strict pass", "strict_passed"),
+        ("Process return codes", "process_return_codes"),
+        ("Provider total", "provider_total_tokens"),
+        ("Prompt input", "prompt_tokens"),
+        ("Uncached input", "uncached_input_tokens"),
+        ("Cache read", "cache_read_tokens"),
+        ("Cache write", "cache_write_tokens"),
+        ("Output", "output_tokens"),
+        ("Reasoning output", "reasoning_tokens"),
+        ("Tool schema (estimated)", "tool_schema_tokens_estimated"),
+        ("Tool result (estimated)", "tool_result_tokens_estimated"),
+        ("Cache hit ratio", "cache_hit_ratio"),
+        ("Cache diagnostics coverage", "cache_diagnostic_requests"),
+        ("Stable-prefix cache misses", "stable_prefix_miss_requests"),
+        ("Stable-prefix miss uncached", "stable_prefix_miss_uncached_tokens"),
+        ("Provider requests", "request_count"),
+        ("Tool calls", "tool_call_count"),
+        ("Necessary calls (lower bound)", "necessary_tool_call_count"),
+        ("Repeated calls observed", "repeated_tool_call_count"),
+        ("Avoidable repeated calls", "avoidable_repeat_tool_call_count"),
+        ("State-changed revalidations", "state_changed_revalidation_count"),
+        ("Background waits", "background_wait_count"),
+        ("Verifier reads", "verifier_read_count"),
+        ("Unclassified calls", "unclassified_tool_call_count"),
+        ("Verifier runs", "verifier_runs"),
+        ("Verifier cache hits", "verifier_cache_hits"),
+        ("Repair turns", "repair_attempts"),
+        ("Skipped stages", "skipped_stages"),
+        ("End-to-end total", "elapsed_total_ms"),
+        ("End-to-end P50", "elapsed_p50_ms"),
+        ("First observable P50", "first_observable_p50_ms"),
+        ("Provider TTFT P50", "provider_ttft_p50_ms"),
+    )
+    for label, key in rows:
+        values = []
+        for engine in ENGINE_NAMES:
+            value = summaries[engine].get(key)
+            if key in {
+                "workspace_verifier_passed",
+                "runtime_terminal_successes",
+                "strict_passed",
+            }:
+                rendered = f"{value}/{summaries[engine]['stages_total']}"
+            elif key == "process_return_codes":
+                rendered = ", ".join(
+                    f"{code}:{count}" for code, count in sorted(value.items())
+                ) if value else "unknown"
+            elif key == "cache_hit_ratio" and value is not None:
+                rendered = f"{value * 100:.1f}%"
+            elif value is None and summaries[engine].get(f"{key}_partial") is not None:
+                rendered = (
+                    f"unknown (partial {display(summaries[engine][f'{key}_partial'])})"
+                )
+            else:
+                rendered = display(value, milliseconds=key.endswith("_ms"))
+            values.append(rendered)
+        lines.append(f"| {label} | {values[0]} | {values[1]} | {values[2]} |")
+    lines.extend(
+        (
+            "",
+            "## Per Turn",
+            "",
+            "| Stage | Scenario | Engine | Workspace verifier | Runtime terminal | Return code | Strict | E2E | Prompt | Uncached | Cache read | Hit | Output | Requests | Tools | Necessary | Repeated | Avoidable | Revalidation | BG waits | Verifier runs | Verifier reads | Repairs | Provider TTFT |",
+            "| ---: | --- | --- | --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        )
+    )
+    for stage in report["stages"]:
+        for engine in ENGINE_NAMES:
+            turn = stage[engine]
+            metric = turn["metrics"]
+            prompt = metric.get("prompt_tokens")
+            cache_read = metric.get("cache_read_tokens")
+            hit = (
+                f"{cache_read / prompt * 100:.1f}%"
+                if isinstance(prompt, int) and prompt > 0 and isinstance(cache_read, int)
+                else "unknown"
+            )
+            lines.append(
+                "| {stage} | {scenario} | {engine} | {workspace} | {runtime} | {return_code} | {strict} | {elapsed} | {prompt} | {uncached} | {read} | {hit} | {output} | {requests} | {tools} | {necessary} | {repeated} | {avoidable} | {revalidation} | {waits} | {verifier_runs} | {verifier_reads} | {repairs} | {ttft} |".format(
+                    stage=stage["stage"],
+                    scenario=stage.get("scenario", "unknown"),
+                    engine=engine,
+                    workspace="yes" if turn.get("workspace_verifier_pass") else "no",
+                    runtime="yes" if turn.get("runtime_terminal_success") else "no",
+                    return_code=display(turn.get("process_return_code")),
+                    strict="yes" if turn.get("strict_passed") else "no",
+                    elapsed=display(metric.get("elapsed_ms"), milliseconds=True),
+                    prompt=display(prompt),
+                    uncached=display(metric.get("uncached_input_tokens")),
+                    read=display(cache_read),
+                    hit=hit,
+                    output=display(metric.get("output_tokens")),
+                    requests=display(metric.get("request_count")),
+                    tools=display(metric.get("tool_call_count")),
+                    necessary=display(metric.get("necessary_tool_call_count")),
+                    repeated=display(metric.get("repeated_tool_call_count")),
+                    avoidable=display(metric.get("avoidable_repeat_tool_call_count")),
+                    revalidation=display(metric.get("state_changed_revalidation_count")),
+                    waits=display(metric.get("background_wait_count")),
+                    verifier_runs=display(len(turn.get("verification_attempts", []))),
+                    verifier_reads=display(metric.get("verifier_read_count")),
+                    repairs=display(turn.get("repair_attempts")),
+                    ttft=display(metric.get("provider_first_token_ms"), milliseconds=True),
+                )
+            )
+    lines.extend(
+        (
+            "",
+            "## Measurement Notes",
+            "",
+            "- Golutra and Pi expose provider-round events, so provider TTFT and request counts are measured from host-observed JSONL arrival times.",
+            "- Codex `exec --json` exposes a turn aggregate but not provider-round timing/counts. Its provider TTFT and request count remain `unknown`; first observable item is reported separately.",
+            "- Codex resume usage is cumulative. Per-turn values are derived by subtracting the previous cumulative turn total; its provider total is derived as input plus output.",
+            "- Token fields are provider reported unless a row above is explicitly described as derived. Tool schema/result values are local estimates and are not included in provider totals or cross-product rankings.",
+            "- `Workspace verifier` proves the fixture behavior; `Runtime terminal` proves a native terminal event; `Return code` is the wrapper process status; `Strict pass` requires all of these plus immutable inputs.",
+            "- Verifier runs are content-addressed for deterministic stages 1-3 using workspace, verifier, environment, and dependency fingerprints; stage 4 process/time checks are never cached. Cache hits are reported separately.",
+            "- A repair turn is an explicit model request carrying bounded verifier facts. It is counted independently and is attempted at most once after a successful runtime turn; no automatic file or schema repair is performed.",
+            "- Call accounting stores only tool names and argument digests. `Necessary calls` is a conservative lower bound; an exact repeated name/digest is reported as observed repetition, not silently suppressed or declared invalid.",
+            "- Background waits count only explicit `shell_session` wait or process poll/reconnect operations. Verifier checks and repair turns are reported separately from model tool calls.",
+            "- This is one controlled sample per product, not a population-level latency claim. Network order rotates by stage to reduce, not eliminate, upstream timing bias.",
+            "",
+        )
+    )
+    lines.extend(comparison_findings(report))
+    return "\n".join(lines)
+
+
+def percentage_delta(value: Any, baseline: Any) -> str:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return "unknown"
+    if not isinstance(baseline, (int, float)) or isinstance(baseline, bool) or baseline == 0:
+        return "unknown"
+    return f"{(value / baseline - 1) * 100:+.1f}%"
+
+
+def ratio_display(value: Any) -> str:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return "unknown"
+    return f"{value * 100:.1f}%"
+
+
+def bounded_text(value: str, limit: int = 180) -> str:
+    """Keep generated diagnostic text short enough for a durable report."""
+    value = " ".join(value.split())
+    return value if len(value) <= limit else f"{value[:limit]}..."
+
+
+def failed_stage_details(report: dict[str, Any], engine: str) -> list[str]:
+    details: list[str] = []
+    for stage in report.get("stages", []):
+        turn = stage.get(engine) or {}
+        if turn.get("strict_passed") is True:
+            continue
+        reasons: list[str] = []
+        if turn.get("workspace_verifier_pass") is not True:
+            reasons.append("workspace verifier failed")
+        if turn.get("runtime_terminal_success") is not True:
+            reasons.append("runtime terminal was not successful")
+        process_code = turn.get("process_return_code")
+        if process_code not in (None, 0):
+            reasons.append(f"process return code {process_code}")
+        if turn.get("immutable_inputs_preserved") is False:
+            reasons.append("immutable fixture input changed")
+        if not reasons:
+            reasons.append("strict conditions were not all satisfied")
+        scenario = stage.get("scenario", "unknown")
+        details.append(f"stage {stage.get('stage', '?')} ({scenario}): {', '.join(reasons)}")
+    return details
+
+
+def comparison_findings(report: dict[str, Any]) -> list[str]:
+    """Add an explicit, data-backed interpretation to the machine report."""
+    summaries = report["summary"]
+    golutra = summaries["golutra"]
+    pi = summaries["pi"]
+    codex = summaries["codex"]
+    first_values = [
+        (summary.get("first_observable_p50_ms"), engine)
+        for engine, summary in summaries.items()
+        if isinstance(summary.get("first_observable_p50_ms"), (int, float))
+    ]
+    first_winner = min(first_values) if first_values else (None, "unknown")
+    cache_values = [
+        (summary.get("cache_hit_ratio"), engine)
+        for engine, summary in summaries.items()
+        if isinstance(summary.get("cache_hit_ratio"), (int, float))
+    ]
+    cache_winner = max(cache_values) if cache_values else (None, "unknown")
+    provider_values = [
+        (summary.get("provider_total_tokens"), engine)
+        for engine, summary in summaries.items()
+        if isinstance(summary.get("provider_total_tokens"), (int, float))
+    ]
+    elapsed_values = [
+        (summary.get("elapsed_total_ms"), engine)
+        for engine, summary in summaries.items()
+        if isinstance(summary.get("elapsed_total_ms"), (int, float))
+    ]
+    tool_values = [
+        (summary.get("tool_call_count"), engine)
+        for engine, summary in summaries.items()
+        if isinstance(summary.get("tool_call_count"), (int, float))
+    ]
+    provider_winner = min(provider_values) if provider_values else (None, "unknown")
+    elapsed_winner = min(elapsed_values) if elapsed_values else (None, "unknown")
+    tool_winner = min(tool_values) if tool_values else (None, "unknown")
+    failed_details = failed_stage_details(report, "golutra")
+    strict_total = golutra.get("stages_total", 0)
+    strict_passed = golutra.get("strict_passed", 0)
+    findings = [
+        "",
+        "## Capability comparison",
+        "",
+        "| Dimension | Golutra | Pi | Codex | Practical implication |",
+        "| --- | --- | --- | --- | --- |",
+        "| Tool surface | Compact seven-tool runtime plus patch/background/subagent boundaries | Compact native coding-agent tools | Broader built-in execution and collaboration surface | Golutra keeps the prompt surface small; its next gain is fewer repeated calls, not more tools. |",
+        "| Long-task state | Durable runtime events, verification, token budget, parent-thread/cache scope | Session continuation and compaction centered on session history | Thread/resume model with strong continuation semantics | Golutra has the right primitives, but terminal verification must not turn successful work into a failed turn. |",
+        "| Cache/usage observability | Provider-round usage, coverage and local estimates are separately labeled | Provider usage and session affinity are visible; round timing is less exposed here | Turn aggregate usage; request/TTFT detail is limited in this interface | Keep Golutra's detailed diagnostics while preserving a stable provider-facing prefix. |",
+        "| Background execution | Event-driven `shell_session` lifecycle with PID cleanup checks | Native background/session behavior | Native command execution and resume | Use deterministic latches and outer deadlines; never infer lifecycle from a fixed sleep. |",
+        f"| Measured result | First observable P50 {display(golutra.get('first_observable_p50_ms'), milliseconds=True)}; cache {ratio_display(golutra.get('cache_hit_ratio'))}; strict {golutra.get('strict_passed', 0)}/{golutra.get('stages_total', 0)} | Provider total {display(pi.get('provider_total_tokens'))}; E2E {display(pi.get('elapsed_total_ms'), milliseconds=True)} | Provider total {display(codex.get('provider_total_tokens'))}; E2E {display(codex.get('elapsed_total_ms'), milliseconds=True)} | Measured winners: {provider_winner[1]} by provider tokens, {elapsed_winner[1]} by E2E, {tool_winner[1]} by tool calls. |",
+        "",
+        "## Findings",
+        "",
+        "### Advantages",
+        "",
+        f"- Golutra first observable P50 is {display(golutra.get('first_observable_p50_ms'), milliseconds=True)}, versus Pi {display(pi.get('first_observable_p50_ms'), milliseconds=True)} and Codex {display(codex.get('first_observable_p50_ms'), milliseconds=True)}; the measured winner is {first_winner[1]} at {display(first_winner[0], milliseconds=True)}.",
+        f"- Golutra cache hit ratio is {ratio_display(golutra.get('cache_hit_ratio'))}, versus Pi {ratio_display(pi.get('cache_hit_ratio'))} and Codex {ratio_display(codex.get('cache_hit_ratio'))}; the measured cache-ratio winner is {cache_winner[1]} at {ratio_display(cache_winner[0])}.",
+        "- Golutra exposes provider-round timing, request counts, and detailed usage coverage that are unavailable from Codex's JSON output.",
+        "",
+        "### Gaps",
+        "",
+        f"- Golutra provider total is {display(golutra.get('provider_total_tokens'))} ({percentage_delta(golutra.get('provider_total_tokens'), pi.get('provider_total_tokens'))} vs Pi), with {display(golutra.get('output_tokens'))} output tokens; extra tool/reasoning turns drive the excess.",
+        f"- End-to-end total is {display(golutra.get('elapsed_total_ms'), milliseconds=True)} ({percentage_delta(golutra.get('elapsed_total_ms'), pi.get('elapsed_total_ms'))} vs Pi; {percentage_delta(golutra.get('elapsed_total_ms'), codex.get('elapsed_total_ms'))} vs Codex). Golutra makes {display(golutra.get('tool_call_count'))} tool calls versus Pi {display(pi.get('tool_call_count'))} and Codex {display(codex.get('tool_call_count'))}.",
+    ]
+    if failed_details:
+        findings.extend(
+            [
+                f"- Golutra strict status is {strict_passed}/{strict_total}; failed-stage details are recorded below. A successful workspace verifier does not erase a failed runtime terminal or process status.",
+                "",
+                "### Golutra failed stages",
+                "",
+            ]
+        )
+        findings.extend(f"- {detail}" for detail in failed_details)
+    else:
+        findings.append(f"- Golutra strict status is {strict_passed}/{strict_total}; all measured stages satisfied the strict gate.")
+    findings.extend(
+        [
+            "",
+            "### Improvement priorities",
+            "",
+            "1. P0: keep strict read-only shell inspection on the no-snapshot, read-only path and batch adjacent independent reads; any ambiguous command must retain the fully observed fallback.",
+            "2. P1: reduce long-input provider first-response and P95 latency by preserving the stable prefix and measuring uncached input on controlled live runs; do not change reasoning settings.",
+            "3. P1: continue auditing repeated validation/tool rounds and make result projections complete enough for the next decision without adding tools or speculative retries.",
+            "4. P2: keep real PTY/CJK, background terminal-state, cross-platform build, and installation smoke tests in the release gate.",
+            "5. P2: retain provider capability/usage coverage labels (`reported`, `derived`, `estimated`, `unknown`) and do not compare cross-session cache hit rates as a normal-session metric.",
+            "",
+        ]
+    )
+    return findings
+
+
+def version(command: list[str], cwd: Path) -> str:
+    result = subprocess.run(
+        command,
+        cwd=cwd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=10,
+        check=False,
+    )
+    return result.stdout.strip().splitlines()[0] if result.stdout.strip() else "unknown"
+
+
+def cleanup_probe(workspace: Path) -> None:
+    pid_path = workspace / ".long-bench" / "probe.pid"
+    try:
+        process_id = int(pid_path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return
+    try:
+        details = subprocess.run(
+            ["ps", "-p", str(process_id), "-o", "command="],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return
+    if "background_probe.py" not in details or str(workspace) not in details:
+        return
+    try:
+        os.kill(process_id, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+
+
+def _accounting_snapshot(
+    engine: str,
+    stdout: str,
+    reported_count: int = 0,
+) -> dict[str, Any]:
+    metrics = {"tool_call_count": reported_count, "tool_result_count": 0}
+    apply_tool_call_accounting(metrics, engine, stdout, None)
+    return metrics
+
+
+def _merge_accounting_snapshots(
+    primary: dict[str, Any],
+    repair: dict[str, Any],
+) -> dict[str, Any]:
+    fields = (
+        "model_tool_call_count",
+        "necessary_tool_call_count",
+        "repeated_tool_call_count",
+        "avoidable_repeat_tool_call_count",
+        "state_changed_revalidation_count",
+        "background_wait_count",
+        "verifier_read_count",
+        "unclassified_tool_call_count",
+    )
+    merged = {field: (as_int(primary.get(field)) or 0) + (as_int(repair.get(field)) or 0) for field in fields}
+    primary_ledger = primary.get("tool_call_ledger")
+    repair_ledger = repair.get("tool_call_ledger")
+    primary_ledger = primary_ledger if isinstance(primary_ledger, list) else []
+    repair_ledger = repair_ledger if isinstance(repair_ledger, list) else []
+    merged["tool_call_ledger"] = (
+        primary_ledger[:MAX_TOOL_CALL_LEDGER_ENTRIES]
+        + repair_ledger[: max(0, MAX_TOOL_CALL_LEDGER_ENTRIES - len(primary_ledger))]
+    )
+    merged["tool_call_ledger_truncated"] = bool(
+        primary.get("tool_call_ledger_truncated")
+        or repair.get("tool_call_ledger_truncated")
+        or len(primary_ledger) + len(repair_ledger) > MAX_TOOL_CALL_LEDGER_ENTRIES
+    )
+    merged["tool_call_accounting"] = {
+        "model_calls": merged["model_tool_call_count"],
+        "necessary_calls_lower_bound": merged["necessary_tool_call_count"],
+        "repeated_calls_observed": merged["repeated_tool_call_count"],
+        "avoidable_repeats": merged["avoidable_repeat_tool_call_count"],
+        "state_changed_revalidations": merged["state_changed_revalidation_count"],
+        "background_wait_calls": merged["background_wait_count"],
+        "verifier_read_calls": merged["verifier_read_count"],
+        "unclassified_calls": merged["unclassified_tool_call_count"],
+        "result_events": None,
+        "source": "retained_artifacts",
+    }
+    return merged
+
+
+def reclassify_call_accounting(
+    engine: str,
+    turn: dict[str, Any],
+    work_root: Path,
+    stage_number: int,
+) -> None:
+    stage_root = work_root / engine / "artifacts" / f"stage-{stage_number}"
+    primary_path = stage_root / "stdout.jsonl"
+    repair_path = stage_root / "repair" / "stdout.jsonl"
+    existing_metrics = turn.get("metrics")
+    existing_metrics = existing_metrics if isinstance(existing_metrics, dict) else {}
+    if primary_path.is_file() and repair_path.is_file():
+        primary = _accounting_snapshot(engine, primary_path.read_text(encoding="utf-8", errors="replace"))
+        repair = _accounting_snapshot(engine, repair_path.read_text(encoding="utf-8", errors="replace"))
+        existing_metrics.update(_merge_accounting_snapshots(primary, repair))
+        return
+    if primary_path.is_file():
+        snapshot = _accounting_snapshot(
+            engine,
+            primary_path.read_text(encoding="utf-8", errors="replace"),
+            as_int(existing_metrics.get("tool_call_count")) or 0,
+        )
+        for key in (
+            "model_tool_call_count",
+            "necessary_tool_call_count",
+            "repeated_tool_call_count",
+            "avoidable_repeat_tool_call_count",
+            "state_changed_revalidation_count",
+            "background_wait_count",
+            "verifier_read_count",
+            "unclassified_tool_call_count",
+            "tool_call_ledger",
+            "tool_call_ledger_truncated",
+            "tool_call_accounting",
+        ):
+            existing_metrics[key] = snapshot.get(key)
+
+
+def reclassify_report(report_path: Path, work_root: Path) -> dict[str, Any]:
+    """Rebuild status fields from retained artifacts without provider calls."""
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["schema_version"] = 2
+    report["source_report_generated_at"] = report.get(
+        "source_report_generated_at", report.get("generated_at")
+    )
+    report["generated_at"] = utc_now()
+    for stage in report.get("stages", []):
+        stage_number = int(stage["stage"])
+        if 1 <= stage_number <= len(SCENARIO_NAMES):
+            stage["scenario"] = SCENARIO_NAMES[stage_number - 1]
+        for engine in ENGINE_NAMES:
+            turn = stage[engine]
+            metrics = turn.setdefault("metrics", {})
+            artifact = work_root / engine / "artifacts" / f"stage-{stage_number}" / "stdout.jsonl"
+            if artifact.is_file():
+                runtime_success = terminal_event_success(
+                    engine, artifact.read_text(encoding="utf-8", errors="replace")
+                )
+            else:
+                runtime_success = metrics.get("runtime_terminal_success") is True
+            metrics["runtime_terminal_success"] = runtime_success
+            reclassify_call_accounting(engine, turn, work_root, stage_number)
+            verifier = turn.get("verification")
+            verifier = verifier if isinstance(verifier, dict) else {}
+            immutable_ok = turn.get("immutable_inputs_preserved") is True
+            turn.pop("passed", None)
+            turn.update(classify_turn(metrics, verifier, immutable_ok))
+    report["summary"] = {
+        engine: aggregate_turns(
+            [stage[engine] for stage in report.get("stages", [])]
+        )
+        for engine in ENGINE_NAMES
+    }
+    report.setdefault("conditions", {})["measurement_mode"] = (
+        "reclassified_from_retained_artifacts"
+    )
+    current_fixture = Path(__file__).with_name("fixtures") / "long_benchmark"
+    if current_fixture.is_dir():
+        report["conditions"]["current_fixture_digest"] = tree_digest(current_fixture)
+    report["conditions"]["status_note"] = (
+        "status fields were rebuilt from the original run; no provider calls were made"
+    )
+    return report
+
+
+def write_report(output: Path, report: dict[str, Any]) -> Path:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(report, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+    markdown = output.with_suffix(".md")
+    markdown.write_text(markdown_report(report), encoding="utf-8")
+    return markdown
+
+
+def main() -> int:
+    args = parse_args()
+    if args.reclassify_from is not None:
+        if args.work_root is None:
+            raise SystemExit("--reclassify-from requires --work-root")
+        source = args.reclassify_from.resolve(strict=True)
+        retained = args.work_root.resolve(strict=True)
+        report = reclassify_report(source, retained)
+        markdown = write_report(args.output, report)
+        print(
+            json.dumps(
+                {
+                    "output": str(args.output),
+                    "markdown": str(markdown),
+                    "work_root": str(retained),
+                }
+            ),
+            file=sys.stderr,
+        )
+        return 0
+    repository_root = Path(__file__).resolve().parents[1]
+    args.golutra = (repository_root / args.golutra).resolve() if not args.golutra.is_absolute() else args.golutra.resolve()
+    args.pi_root = (repository_root / args.pi_root).resolve(strict=True) if not args.pi_root.is_absolute() else args.pi_root.resolve(strict=True)
+    fixture = Path(__file__).with_name("fixtures") / "long_benchmark"
+    fixture = fixture.resolve(strict=True)
+    baseline_immutable = immutable_digests(fixture)
+    fixture_digest = tree_digest(fixture)
+    prompts = turn_prompts()
+
+    external_work_root = args.work_root.resolve() if args.work_root else None
+    work_context = None if external_work_root else tempfile.TemporaryDirectory(prefix="golutra-long-threeway-")
+    work_root = external_work_root or Path(work_context.name)
+    private_directory(work_root)
+    sensitive_context = tempfile.TemporaryDirectory(prefix="golutra-long-credentials-")
+    sensitive_root = Path(sensitive_context.name)
+    try:
+        golutra_home = sensitive_root / "golutra"
+        pi_home = sensitive_root / "pi"
+        codex_home = sensitive_root / "codex"
+        prepare_golutra_home(args, golutra_home)
+        prepare_pi_home(args, pi_home)
+        prepare_codex_home(args, codex_home)
+
+        homes = {
+            "golutra": ("GOLUTRA_HOME", golutra_home),
+            "pi": ("PI_CODING_AGENT_DIR", pi_home),
+            "codex": ("CODEX_HOME", codex_home),
+        }
+        states: dict[str, EngineState] = {}
+        for engine in ENGINE_NAMES:
+            workspace = work_root / engine / "workspace"
+            artifact_root = work_root / engine / "artifacts"
+            shutil.copytree(fixture, workspace)
+            artifact_root.mkdir(parents=True)
+            env = os.environ.copy()
+            variable, home = homes[engine]
+            env[variable] = str(home)
+            if engine == "pi":
+                env["PI_OFFLINE"] = "1"
+            states[engine] = EngineState(engine, workspace, artifact_root, env)
+
+        stages: list[dict[str, Any]] = []
+        for stage, prompt in enumerate(prompts, start=1):
+            stage_result: dict[str, Any] = {
+                "stage": stage,
+                "scenario": SCENARIO_NAMES[stage - 1],
+                "prompt": prompt_metadata(prompt),
+                "execution_order": [],
+            }
+            offset = (stage - 1) % len(ENGINE_NAMES)
+            order = ENGINE_NAMES[offset:] + ENGINE_NAMES[:offset]
+            for engine in order:
+                print(f"running stage {stage}: {engine}", file=sys.stderr, flush=True)
+                stage_result["execution_order"].append(engine)
+                state = states[engine]
+                previous = state.turns[-1] if state.turns else None
+                if (
+                    args.stop_on_strict_failure
+                    and stage > 1
+                    and previous is not None
+                    and previous.get("strict_passed") is not True
+                ):
+                    stage_result[engine] = skipped_turn(
+                        state,
+                        stage,
+                        f"previous stage {stage - 1} did not satisfy the strict gate",
+                    )
+                else:
+                    stage_result[engine] = run_turn(
+                        args,
+                        state,
+                        prompt,
+                        stage,
+                        baseline_immutable,
+                    )
+            stages.append(stage_result)
+
+        report = {
+                "schema_version": 2,
+            "generated_at": utc_now(),
+            "conditions": {
+                "provider_endpoint": args.base_url,
+                "protocol": "openai-responses",
+                "model": args.model,
+                "reasoning_effort": args.reasoning_effort,
+                "fixture_digest": fixture_digest,
+                "fixture_inputs_immutable": baseline_immutable,
+                "turn_count": len(prompts),
+                "credentials": "owner_only_temporary_homes_not_serialized",
+                "work_root_retained": bool(args.keep_work_root or external_work_root),
+                "timing_source": "host_monotonic_jsonl_arrival",
+                "measurement_mode": "live_provider",
+                "status_note": "provider calls executed under isolated temporary homes",
+                "stop_on_strict_failure": args.stop_on_strict_failure,
+                "golutra_version": version([str(args.golutra), "--version"], repository_root),
+                "pi_version": version(
+                    ["node", "packages/coding-agent/dist/cli.js", "--version"],
+                    args.pi_root,
+                ),
+                "codex_version": version([args.codex, "--version"], repository_root),
+            },
+            "stages": stages,
+            "summary": {engine: aggregate(states[engine]) for engine in ENGINE_NAMES},
+        }
+        markdown = write_report(args.output, report)
+        print(
+            json.dumps(
+                {
+                    "output": str(args.output),
+                    "markdown": str(markdown),
+                    "work_root": str(work_root) if args.keep_work_root or external_work_root else None,
+                }
+            ),
+            file=sys.stderr,
+        )
+        return 0 if all(summary["strict_passed"] == len(prompts) for summary in report["summary"].values()) else 1
+    finally:
+        for engine_root in (work_root / engine / "workspace" for engine in ENGINE_NAMES):
+            cleanup_probe(engine_root)
+        sensitive_context.cleanup()
+        if work_context is not None and not args.keep_work_root:
+            work_context.cleanup()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

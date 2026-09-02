@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     fmt,
     sync::{
-        Arc, OnceLock, RwLock,
+        Arc, Mutex, OnceLock, RwLock,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -14,7 +14,7 @@ use futures_util::StreamExt;
 use golutra_auth::{CredentialProvider, FixedCredentialProvider};
 use golutra_core::{
     CacheIdentity, NormalizedUsage, PromptCachePolicy, ProviderContract, ProviderRequestId,
-    ProviderResponseId, SessionId, TaskId, ToolContract, TurnId,
+    ProviderResponseId, SessionId, TaskId, ThreadId, ToolContract, TurnId,
 };
 pub use golutra_core::{ProviderUsage, UsageSource};
 use reqwest::header::HeaderMap;
@@ -49,6 +49,8 @@ const GOLUTRA_PROVIDER_MODEL: &str = "GOLUTRA_PROVIDER_MODEL";
 const GOLUTRA_PROVIDER_BASE_URL: &str = "GOLUTRA_PROVIDER_BASE_URL";
 const GOLUTRA_PROVIDER_GENERATION_CONFIG: &str = "GOLUTRA_PROVIDER_GENERATION_CONFIG";
 pub const GOLUTRA_PROVIDER_CUSTOM_HEADERS: &str = "GOLUTRA_PROVIDER_CUSTOM_HEADERS";
+/// 非敏感的 provider route identity；只用于声明能力选择，不包含凭据或用户内容。
+pub const GOLUTRA_PROVIDER_ROUTE_ID: &str = "GOLUTRA_PROVIDER_ROUTE_ID";
 const GOLUTRA_PROVIDER_AUTH_PROVIDER: &str = "GOLUTRA_PROVIDER_AUTH_PROVIDER";
 const OPENAI_API_KEY: &str = "OPENAI_API_KEY";
 const OPENAI_MODEL: &str = "OPENAI_MODEL";
@@ -76,6 +78,123 @@ const MAX_PROVIDER_TOOL_NAME_BYTES: usize = 128;
 const MAX_PROVIDER_CUSTOM_HEADERS: usize = 32;
 const MAX_PROVIDER_HEADER_VALUE_BYTES: usize = 8 * 1024;
 const SESSION_AFFINITY_HEADER: &str = "session-id";
+const SESSION_ID_HEADER: &str = "session_id";
+const CLIENT_REQUEST_ID_HEADER: &str = "x-client-request-id";
+const SESSION_AFFINITY_ALIAS_HEADER: &str = "x-session-affinity";
+const EMPTY_AFFINITY_HEADERS: &[&str] = &[];
+const CODEX_AFFINITY_HEADERS: &[&str] = &[SESSION_AFFINITY_HEADER, CLIENT_REQUEST_ID_HEADER];
+const RESPONSES_AFFINITY_HEADERS: &[&str] = &[SESSION_ID_HEADER, CLIENT_REQUEST_ID_HEADER];
+const COMPATIBLE_AFFINITY_HEADERS: &[&str] = &[
+    SESSION_ID_HEADER,
+    CLIENT_REQUEST_ID_HEADER,
+    SESSION_AFFINITY_ALIAS_HEADER,
+];
+const ANTHROPIC_AFFINITY_HEADERS: &[&str] = &[SESSION_AFFINITY_ALIAS_HEADER];
+const RESERVED_AFFINITY_HEADERS: &[&str] = &[
+    SESSION_AFFINITY_HEADER,
+    SESSION_ID_HEADER,
+    CLIENT_REQUEST_ID_HEADER,
+    SESSION_AFFINITY_ALIAS_HEADER,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderCacheMode {
+    Disabled,
+    Responses,
+    Anthropic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProviderCacheProfile {
+    pub(crate) mode: ProviderCacheMode,
+    affinity_headers: &'static [&'static str],
+    supports_long_retention: bool,
+}
+
+impl ProviderCacheProfile {
+    /// 按声明的 provider identity 解析缓存能力。
+    ///
+    /// 这里不读取 URL/hostname：路由迁移到其他网关时不会静默改变 wire
+    /// 合约。显式 Responses/Anthropic 协议声明缓存支持；兼容协议必须使用
+    /// 已知 identity，未知网关保持保守关闭。
+    fn for_provider(protocol: ProviderProtocol, provider_id: &str) -> Self {
+        let provider_id = canonical_provider_identity(provider_id);
+        let (mode, affinity_headers, supports_long_retention) = match protocol {
+            ProviderProtocol::Anthropic => (
+                ProviderCacheMode::Anthropic,
+                match provider_id.as_str() {
+                    "fireworks"
+                    | "fireworks-ai"
+                    | "cloudflare"
+                    | "cloudflare-workers-ai"
+                    | "groq" => ANTHROPIC_AFFINITY_HEADERS,
+                    _ => EMPTY_AFFINITY_HEADERS,
+                },
+                true,
+            ),
+            ProviderProtocol::OpenAiResponses => (
+                ProviderCacheMode::Responses,
+                match provider_id.as_str() {
+                    "openai-chatgpt" | "chatgpt" | "chatgpt-codex" | "codex" => {
+                        CODEX_AFFINITY_HEADERS
+                    }
+                    // 显式 Responses 路由即使使用自定义显示名也具备缓存能力，
+                    // 统一使用通用 header 对。
+                    _ => RESPONSES_AFFINITY_HEADERS,
+                },
+                true,
+            ),
+            ProviderProtocol::OpenAiCompatible => match provider_id.as_str() {
+                "openai" | "golutra" | "golutra-agent" => (
+                    ProviderCacheMode::Responses,
+                    if provider_id == "golutra" || provider_id == "golutra-agent" {
+                        COMPATIBLE_AFFINITY_HEADERS
+                    } else {
+                        RESPONSES_AFFINITY_HEADERS
+                    },
+                    true,
+                ),
+                _ => (ProviderCacheMode::Disabled, EMPTY_AFFINITY_HEADERS, false),
+            },
+            _ => (ProviderCacheMode::Disabled, EMPTY_AFFINITY_HEADERS, false),
+        };
+        Self {
+            mode,
+            affinity_headers,
+            supports_long_retention,
+        }
+    }
+
+    fn prompt_cache_key(self, policy: PromptCachePolicy) -> bool {
+        policy != PromptCachePolicy::None && self.mode == ProviderCacheMode::Responses
+    }
+
+    fn affinity_headers(self, policy: PromptCachePolicy) -> &'static [&'static str] {
+        if policy == PromptCachePolicy::None {
+            EMPTY_AFFINITY_HEADERS
+        } else {
+            self.affinity_headers
+        }
+    }
+
+    fn supports_long_retention(self, policy: PromptCachePolicy) -> bool {
+        policy == PromptCachePolicy::Long && self.supports_long_retention
+    }
+
+    /// 主会话遵循 provider 的默认 retention。长期保留仍由调用方通过
+    /// `PromptCachePolicy::Long` 显式请求，并在 `supports_long_retention`
+    /// 中做能力门控，避免把长期策略隐式写入每一轮请求。
+    fn preferred_cache_policy(self) -> PromptCachePolicy {
+        PromptCachePolicy::Auto
+    }
+}
+
+fn canonical_provider_identity(provider_id: &str) -> String {
+    provider_id
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['_', ' '], "-")
+}
 
 /// 脱敏后的 provider 诊断元数据，只用于重试决策和可行动的观测。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -161,6 +280,108 @@ impl ProviderError {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptCacheScopeKind {
+    Session,
+    Fork,
+    Subagent,
+    Compaction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptCacheScope {
+    session_id: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thread_id: Option<ThreadId>,
+    kind: PromptCacheScopeKind,
+    key: String,
+}
+
+impl PromptCacheScope {
+    #[must_use]
+    pub fn session(session_id: SessionId, thread_id: Option<ThreadId>) -> Self {
+        Self {
+            session_id,
+            thread_id,
+            kind: PromptCacheScopeKind::Session,
+            key: session_id.to_string(),
+        }
+    }
+
+    #[must_use]
+    pub fn fork(
+        session_id: SessionId,
+        thread_id: ThreadId,
+        parent_cache_session_id: SessionId,
+    ) -> Self {
+        Self::parent_scoped(
+            session_id,
+            thread_id,
+            parent_cache_session_id,
+            PromptCacheScopeKind::Fork,
+        )
+    }
+
+    #[must_use]
+    pub fn subagent(
+        session_id: SessionId,
+        thread_id: ThreadId,
+        parent_cache_session_id: SessionId,
+    ) -> Self {
+        Self::parent_scoped(
+            session_id,
+            thread_id,
+            parent_cache_session_id,
+            PromptCacheScopeKind::Subagent,
+        )
+    }
+
+    #[must_use]
+    pub fn compaction(&self) -> Self {
+        Self {
+            session_id: self.session_id,
+            thread_id: self.thread_id,
+            kind: PromptCacheScopeKind::Compaction,
+            key: self.key.clone(),
+        }
+    }
+
+    fn parent_scoped(
+        session_id: SessionId,
+        thread_id: ThreadId,
+        parent_cache_session_id: SessionId,
+        kind: PromptCacheScopeKind,
+    ) -> Self {
+        Self {
+            session_id,
+            thread_id: Some(thread_id),
+            kind,
+            key: parent_cache_session_id.to_string(),
+        }
+    }
+
+    #[must_use]
+    pub fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+
+    #[must_use]
+    pub fn thread_id(&self) -> Option<ThreadId> {
+        self.thread_id
+    }
+
+    #[must_use]
+    pub fn kind(&self) -> PromptCacheScopeKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderRequest {
     pub request_id: ProviderRequestId,
@@ -168,19 +389,28 @@ pub struct ProviderRequest {
     pub turn_id: TurnId,
     #[serde(default)]
     pub session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_scope: Option<PromptCacheScope>,
     pub provider_id: String,
     pub model_id: String,
     pub messages: Vec<ProviderMessage>,
     pub tools: Vec<ToolContract>,
     #[serde(default)]
     pub cache_policy: PromptCachePolicy,
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
 }
 
 impl ProviderRequest {
     fn affinity_id(&self) -> String {
-        self.session_id.map_or_else(
-            || self.task_id.to_string(),
-            |session_id| session_id.to_string(),
+        self.cache_scope.as_ref().map_or_else(
+            || {
+                self.session_id.map_or_else(
+                    || self.task_id.to_string(),
+                    |session_id| session_id.to_string(),
+                )
+            },
+            |scope| scope.key().to_owned(),
         )
     }
 
@@ -189,9 +419,9 @@ impl ProviderRequest {
         self.cache_identity_with_namespace("default")
     }
 
-    /// Build a cache identity that is isolated by the actual provider route.
-    /// The namespace is a stable protocol/endpoint fingerprint supplied by the
-    /// adapter; request bodies and volatile task ids deliberately stay out of it.
+    /// 为稳定的 wire 作用域构造 provider 本地观测身份。
+    /// provider、模型和路由只保留为本地元数据；上游 key 仅使用可读的 session
+    /// 或可信父线程作用域。
     #[must_use]
     pub fn cache_identity_with_namespace(&self, namespace: &str) -> Option<CacheIdentity> {
         let session_id = self.session_id?;
@@ -200,23 +430,17 @@ impl ProviderRequest {
         }
         let canonical_provider = self.provider_id.trim().to_ascii_lowercase();
         let canonical_model = self.model_id.trim().to_ascii_lowercase();
-        let prefix = format!(
-            "golutra-prompt-cache-v2\0{}\0{}\0{}\0{}",
-            session_id,
-            canonical_provider,
-            canonical_model,
-            namespace.trim(),
+        let (thread_id, key) = self.cache_scope.as_ref().map_or_else(
+            || (None, session_id.to_string()),
+            |scope| (scope.thread_id(), scope.key().to_owned()),
         );
-        use sha2::{Digest, Sha256};
-        // OpenAI-compatible 网关通常把 prompt cache key 限制为 64 字符；
-        // 截断十六进制摘要仍保留足够的 session affinity 碰撞安全余量。
-        let digest = format!("{:x}", Sha256::digest(prefix.as_bytes()));
         Some(CacheIdentity {
             session_id,
-            thread_id: None,
+            thread_id,
             provider_id: canonical_provider,
             model_id: canonical_model,
-            key: format!("sha256:{}", &digest[..57]),
+            route_namespace: namespace.trim().to_owned(),
+            key,
         })
     }
 
@@ -552,6 +776,12 @@ pub trait LlmProvider: Send + Sync {
         request.cache_identity_with_namespace(&self.cache_namespace())
     }
 
+    /// 返回主会话请求使用的缓存保留策略。辅助请求（例如 compaction）由
+    /// 调用方显式指定策略，不会被该偏好覆盖。
+    fn preferred_cache_policy(&self) -> PromptCachePolicy {
+        PromptCachePolicy::Auto
+    }
+
     async fn complete_stream(
         &self,
         request: ProviderRequest,
@@ -582,6 +812,7 @@ pub trait LlmProvider: Send + Sync {
 pub struct MockProvider {
     contract: ProviderContract,
     outcome: MockProviderOutcome,
+    state: Arc<Mutex<MockProviderState>>,
 }
 
 #[derive(Debug, Clone)]
@@ -590,7 +821,54 @@ enum MockProviderOutcome {
     Error(ProviderError),
 }
 
+#[derive(Debug, Default)]
+struct MockProviderState {
+    task_id: Option<TaskId>,
+    tool_call_emitted: bool,
+    request_id: Option<ProviderRequestId>,
+    request_phase: Option<MockResponsePhase>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MockResponsePhase {
+    ToolCall,
+    Completion,
+}
+
 impl MockProvider {
+    /// 只保留当前任务和最近请求，避免长时间复用模拟 provider 时状态无界增长。
+    fn response_phase(&self, request: &ProviderRequest) -> MockResponsePhase {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.task_id != Some(request.task_id) {
+            state.task_id = Some(request.task_id);
+            state.tool_call_emitted = false;
+            state.request_id = None;
+            state.request_phase = None;
+        }
+        if state.request_id == Some(request.request_id)
+            && let Some(phase) = state.request_phase
+        {
+            return phase;
+        }
+        let phase = if request
+            .messages
+            .last()
+            .is_some_and(|message| message.role == ProviderRole::Tool)
+            || state.tool_call_emitted
+        {
+            MockResponsePhase::Completion
+        } else {
+            state.tool_call_emitted = true;
+            MockResponsePhase::ToolCall
+        };
+        state.request_id = Some(request.request_id);
+        state.request_phase = Some(phase);
+        phase
+    }
+
     #[must_use]
     pub fn text_response(content: impl Into<String>) -> Self {
         Self {
@@ -610,6 +888,7 @@ impl MockProvider {
                 finish_reason: ProviderFinishReason::Stop,
                 raw_metadata: serde_json::json!({"provider": "mock"}),
             })),
+            state: Arc::new(Mutex::new(MockProviderState::default())),
         }
     }
 
@@ -630,6 +909,7 @@ impl MockProvider {
                 finish_reason: ProviderFinishReason::ToolCalls,
                 raw_metadata: serde_json::json!({"provider": "mock"}),
             })),
+            state: Arc::new(Mutex::new(MockProviderState::default())),
         }
     }
 
@@ -641,6 +921,7 @@ impl MockProvider {
             outcome: MockProviderOutcome::Error(ProviderError::Failed {
                 message: message.into(),
             }),
+            state: Arc::new(Mutex::new(MockProviderState::default())),
         }
     }
 }
@@ -652,12 +933,11 @@ impl LlmProvider for MockProvider {
             MockProviderOutcome::Response(response) => response.as_ref(),
             MockProviderOutcome::Error(error) => return Err(error.clone()),
         };
-        if !response.tool_calls.is_empty()
-            && request
-                .messages
-                .iter()
-                .any(|message| message.role == ProviderRole::Tool)
-        {
+        if !response.tool_calls.is_empty() {
+            let phase = self.response_phase(&request);
+            if !matches!(phase, MockResponsePhase::Completion) {
+                return Ok(response.clone());
+            }
             let summary = request
                 .messages
                 .iter()
@@ -704,6 +984,7 @@ pub struct OpenAiCompatibleProvider {
     model_id: String,
     generation_config: ProviderGenerationConfig,
     custom_headers: ProviderHttpHeaders,
+    cache_profile: ProviderCacheProfile,
     client: reqwest::Client,
 }
 
@@ -801,7 +1082,7 @@ impl OpenAiCompatibleProvider {
         builder: reqwest::RequestBuilder,
         token: &str,
         initiator: &str,
-        affinity_id: Option<&str>,
+        affinity_headers: &HeaderMap,
     ) -> reqwest::RequestBuilder {
         let builder = builder.bearer_auth(token);
         let builder = if self.provider_id == "github-copilot" {
@@ -816,12 +1097,27 @@ impl OpenAiCompatibleProvider {
         } else {
             builder
         };
-        let builder = builder.headers(self.custom_headers.to_header_map());
-        if let Some(affinity_id) = affinity_id {
-            builder.header(SESSION_AFFINITY_HEADER, affinity_id)
-        } else {
-            builder
+        let mut custom_headers = self.custom_headers.to_header_map();
+        // affinity 是 provider 能力，不允许自定义 header 绕过 profile gate。
+        for header in RESERVED_AFFINITY_HEADERS {
+            custom_headers.remove(*header);
         }
+        builder
+            .headers(custom_headers)
+            .headers(affinity_headers.clone())
+    }
+
+    fn affinity_headers(&self, request: &ProviderRequest) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        let affinity_id = request.affinity_id();
+        if let Ok(value) = reqwest::header::HeaderValue::from_str(&affinity_id) {
+            for header in self.cache_profile.affinity_headers(request.cache_policy) {
+                if let Ok(name) = reqwest::header::HeaderName::from_bytes(header.as_bytes()) {
+                    headers.insert(name, value.clone());
+                }
+            }
+        }
+        headers
     }
 
     #[must_use]
@@ -831,6 +1127,7 @@ impl OpenAiCompatibleProvider {
         model_id: impl Into<String>,
     ) -> Self {
         let api_key = api_key.into();
+        let base_url = normalize_openai_base_url(&base_url.into());
         Self {
             credential: Arc::new(FixedCredentialProvider::new(
                 api_key,
@@ -838,7 +1135,11 @@ impl OpenAiCompatibleProvider {
             )),
             api_key_env: GOLUTRA_PROVIDER_API_KEY.to_owned(),
             provider_id: "openai-compatible".to_owned(),
-            base_url: normalize_openai_base_url(&base_url.into()),
+            cache_profile: ProviderCacheProfile::for_provider(
+                ProviderProtocol::OpenAiCompatible,
+                "openai-compatible",
+            ),
+            base_url,
             model_id: model_id.into(),
             generation_config: ProviderGenerationConfig::default(),
             custom_headers: ProviderHttpHeaders::default(),
@@ -860,11 +1161,15 @@ impl OpenAiCompatibleProvider {
         config: OpenAiCompatibleProviderConfig,
         credential: Arc<dyn CredentialProvider>,
     ) -> Self {
+        let base_url = normalize_openai_base_url(&config.base_url);
+        let cache_profile =
+            ProviderCacheProfile::for_provider(config.protocol, &config.provider_id);
         Self {
             credential,
             api_key_env: config.api_key_env,
             provider_id: config.provider_id,
-            base_url: normalize_openai_base_url(&config.base_url),
+            cache_profile,
+            base_url,
             model_id: config.model_id,
             generation_config: config.generation_config,
             custom_headers: config.custom_headers,
@@ -914,6 +1219,9 @@ impl OpenAiCompatibleProvider {
             api_key_env,
             provider_id: reader(GOLUTRA_PROVIDER_AUTH_PROVIDER)
                 .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    reader(GOLUTRA_PROVIDER_ROUTE_ID).filter(|value| !value.trim().is_empty())
+                })
                 .unwrap_or_else(|| "openai-compatible".to_owned()),
             base_url,
             model_id,
@@ -949,7 +1257,12 @@ impl OpenAiCompatibleProvider {
             .await
             .map_err(provider_credential_error)?;
         let response = self
-            .authenticated_request(self.client.get(url), token.expose_secret(), "user", None)
+            .authenticated_request(
+                self.client.get(url),
+                token.expose_secret(),
+                "user",
+                &HeaderMap::new(),
+            )
             .send()
             .await
             .map_err(provider_transport_error)?;
@@ -961,17 +1274,22 @@ impl OpenAiCompatibleProvider {
             .credential(true)
             .await
             .map_err(provider_credential_error)?;
-        self.authenticated_request(self.client.get(url), token.expose_secret(), "user", None)
-            .send()
-            .await
-            .map_err(provider_transport_error)
+        self.authenticated_request(
+            self.client.get(url),
+            token.expose_secret(),
+            "user",
+            &HeaderMap::new(),
+        )
+        .send()
+        .await
+        .map_err(provider_transport_error)
     }
 
     async fn post_with_auth_retry(
         &self,
         url: &str,
         body: &Value,
-        affinity_id: &str,
+        affinity_headers: &HeaderMap,
     ) -> Result<reqwest::Response, ProviderError> {
         let token = self
             .credential
@@ -984,7 +1302,7 @@ impl OpenAiCompatibleProvider {
                 self.client.post(url).json(body),
                 token.expose_secret(),
                 initiator,
-                Some(affinity_id),
+                affinity_headers,
             )
             .send()
             .await
@@ -1001,7 +1319,7 @@ impl OpenAiCompatibleProvider {
             self.client.post(url).json(body),
             token.expose_secret(),
             initiator,
-            Some(affinity_id),
+            affinity_headers,
         )
         .send()
         .await
@@ -1063,12 +1381,13 @@ impl LlmProvider for OpenAiCompatibleProvider {
             &self.model_id,
             &self.generation_config,
             false,
-            openai_prompt_cache_supported(&self.base_url),
+            self.cache_profile,
             cache_identity.as_ref(),
         );
-        let affinity_id = request.affinity_id();
-
-        let response = self.post_with_auth_retry(&url, &body, &affinity_id).await?;
+        let affinity_headers = self.affinity_headers(&request);
+        let response = self
+            .post_with_auth_retry(&url, &body, &affinity_headers)
+            .await?;
         let status = response.status();
         let headers = response.headers().clone();
         let value = response_json_or_error(response).await?;
@@ -1098,11 +1417,13 @@ impl LlmProvider for OpenAiCompatibleProvider {
             &self.model_id,
             &self.generation_config,
             true,
-            openai_prompt_cache_supported(&self.base_url),
+            self.cache_profile,
             cache_identity.as_ref(),
         );
-        let affinity_id = request.affinity_id();
-        let response = self.post_with_auth_retry(&url, &body, &affinity_id).await?;
+        let affinity_headers = self.affinity_headers(&request);
+        let response = self
+            .post_with_auth_retry(&url, &body, &affinity_headers)
+            .await?;
         let status = response.status();
         if status.as_u16() == 429 {
             let headers = response.headers().clone();
@@ -1149,6 +1470,10 @@ impl LlmProvider for OpenAiCompatibleProvider {
 
     fn cache_namespace(&self) -> String {
         route_cache_namespace("openai_chat_completions", &self.base_url)
+    }
+
+    fn preferred_cache_policy(&self) -> PromptCachePolicy {
+        self.cache_profile.preferred_cache_policy()
     }
 }
 
@@ -1370,6 +1695,18 @@ impl LlmProvider for ConfiguredProvider {
             | Self::Gemini(provider)
             | Self::VertexAi(provider)
             | Self::Genai(provider) => provider.cache_namespace(),
+        }
+    }
+
+    fn preferred_cache_policy(&self) -> PromptCachePolicy {
+        match self {
+            Self::Mock(provider) => provider.preferred_cache_policy(),
+            Self::OpenAiCompatible(provider) => provider.preferred_cache_policy(),
+            Self::OpenAiResponses(provider) => provider.preferred_cache_policy(),
+            Self::Anthropic(provider)
+            | Self::Gemini(provider)
+            | Self::VertexAi(provider)
+            | Self::Genai(provider) => provider.preferred_cache_policy(),
         }
     }
 
@@ -1759,18 +2096,22 @@ fn is_sensitive_header(name: &str) -> bool {
 
 pub fn provider_tool_description(tool_name: &str) -> &'static str {
     match tool_name {
-        "read_file" => "Read a UTF-8 text file in the workspace.",
-        "write_file" => "Write complete UTF-8 content to a workspace-relative file.",
-        "edit_file" => "Replace the first exact match in a workspace-relative UTF-8 file.",
-        "apply_patch" => "Apply a unified diff atomically to workspace-relative files.",
-        "web_search" => {
-            "Search the web when network access is enabled; return concise source-backed results."
+        "read_file" => "Read workspace lines; use offset/limit and continuation.next_offset.",
+        "write_file" => {
+            "Create a new UTF-8 file or completely rewrite one; returns status and digest."
         }
+        "edit_file" => {
+            "Change one UTF-8 file with exact, non-overlapping edits[]; batch disjoint edits; returns status, digest, preview."
+        }
+        "apply_patch" => {
+            "Atomically apply a unified or Begin/Update/Add/Delete patch for related multi-file changes; returns status, digest, preview."
+        }
+        "web_search" => "Search the network when enabled; return source-backed results.",
         "shell_session" => {
-            "Manage a runtime-owned background shell process: wait, write, or terminate; use its cursor for new output."
+            "Control a background shell; authoritative_pid must match. Reuse cursor; one bounded wait_for_terminal=true, or write/terminate."
         }
         "subagent" => {
-            "Run one isolated child task and return a bounded summary and artifact references; it cannot create another child."
+            "Run one isolated child task; it cannot create another child; return a bounded result."
         }
         "list_dir" => "List entries in a workspace-relative directory.",
         "rg_search" => "Search workspace files with ripgrep.",
@@ -1783,7 +2124,7 @@ pub fn provider_tool_description(tool_name: &str) -> &'static str {
             "Delegate one complete, self-contained task to an isolated child agent and wait for its result. The child does not receive this conversation. Omit model and reasoning_effort to inherit the current agent settings; specify either field only when the task benefits from an explicit override."
         }
         "shell" => {
-            "Run a workspace command as argv. Use workdir for a workspace subdirectory; pass a quoted Python heredoc on stdin, or invoke an available shell for pipes, redirects, and compound scripts. With background=true, timeout_ms is the absolute process lifetime, yield_time_ms only the initial wait, and the runtime owns the process until it ends; do not use it for processes that must outlive the runtime."
+            "Run via argv or command; use bash -lc for pipes, redirects, heredoc, or compound commands. background=true returns after initial return; shell_session waits. timeout_ms is a hard lifetime; omit timeout_ms normally."
         }
         "process_list" => {
             "List managed background processes owned by the current session, including redacted commands, states, exit codes, and output statistics. This does not consume process output or advance a cursor."
@@ -2200,12 +2541,20 @@ fn openai_completion_body(
     prompt_cache_supported: bool,
 ) -> Value {
     let cache_identity = request.cache_identity();
+    let cache_profile = ProviderCacheProfile::for_provider(
+        ProviderProtocol::OpenAiCompatible,
+        if prompt_cache_supported {
+            "golutra"
+        } else {
+            "custom"
+        },
+    );
     openai_completion_body_with_identity(
         request,
         model_id,
         generation_config,
         streaming,
-        prompt_cache_supported,
+        cache_profile,
         cache_identity.as_ref(),
     )
 }
@@ -2215,7 +2564,7 @@ fn openai_completion_body_with_identity(
     model_id: &str,
     generation_config: &ProviderGenerationConfig,
     streaming: bool,
-    prompt_cache_supported: bool,
+    cache_profile: ProviderCacheProfile,
     cache_identity: Option<&CacheIdentity>,
 ) -> Value {
     let mut body = json!({
@@ -2233,35 +2582,19 @@ fn openai_completion_body_with_identity(
         body["stream"] = Value::Bool(true);
         body["stream_options"] = json!({"include_usage": true});
     }
-    if prompt_cache_supported && let Some(identity) = cache_identity {
+    if cache_profile.prompt_cache_key(request.cache_policy)
+        && let Some(identity) = cache_identity
+    {
         body["prompt_cache_key"] = Value::String(identity.key.clone());
-        match request.cache_policy {
-            golutra_core::PromptCachePolicy::Short => {
-                body["prompt_cache_retention"] = Value::String("5m".to_owned());
-            }
-            golutra_core::PromptCachePolicy::Long => {
-                body["prompt_cache_retention"] = Value::String("24h".to_owned());
-            }
-            golutra_core::PromptCachePolicy::Auto | golutra_core::PromptCachePolicy::None => {}
+        if cache_profile.supports_long_retention(request.cache_policy) {
+            body["prompt_cache_retention"] = Value::String("24h".to_owned());
         }
     }
     apply_generation_config_to_openai_body(&mut body, generation_config);
+    if let Some(max_output_tokens) = request.max_output_tokens {
+        body["max_tokens"] = Value::Number(max_output_tokens.into());
+    }
     body
-}
-
-fn openai_prompt_cache_supported(base_url: &str) -> bool {
-    reqwest::Url::parse(base_url)
-        .ok()
-        .and_then(|url| {
-            url.host_str().map(|host| {
-                // 仅这两个端点实现了请求投影依赖的 OpenAI prompt-cache 扩展；
-                // 保持白名单收窄，避免向任意兼容网关意外发送 provider 专属字段。
-                ["api.openai.com", "api.golutra.cn"]
-                    .iter()
-                    .any(|supported| host.eq_ignore_ascii_case(supported))
-            })
-        })
-        .unwrap_or(false)
 }
 
 #[derive(Debug, Default)]

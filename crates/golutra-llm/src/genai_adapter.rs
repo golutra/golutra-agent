@@ -20,7 +20,8 @@ use secrecy::ExposeSecret;
 use serde_json::{Value, json};
 
 use super::{
-    LlmProvider, ProviderError, ProviderErrorMetadata, ProviderFinishReason,
+    GOLUTRA_PROVIDER_AUTH_PROVIDER, GOLUTRA_PROVIDER_ROUTE_ID, LlmProvider, ProviderCacheMode,
+    ProviderCacheProfile, ProviderError, ProviderErrorMetadata, ProviderFinishReason,
     ProviderGenerationConfig, ProviderHttpHeaders, ProviderMessage, ProviderProbeResult,
     ProviderProtocol, ProviderRequest, ProviderResponse, ProviderRole, ProviderStreamEvent,
     ProviderToolCall, ProviderUsage, UsageSource, configured_or_first_env,
@@ -34,6 +35,7 @@ use super::{
 pub struct GenaiProviderConfig {
     pub api_key: String,
     pub api_key_env: String,
+    pub provider_id: String,
     pub base_url: String,
     pub model_id: String,
     pub protocol: ProviderProtocol,
@@ -45,6 +47,7 @@ pub struct GenaiProviderConfig {
 pub struct GenaiProviderAdapter {
     config: GenaiProviderConfig,
     credential: Arc<dyn CredentialProvider>,
+    cache_profile: ProviderCacheProfile,
     client: Client,
 }
 
@@ -53,6 +56,7 @@ impl fmt::Debug for GenaiProviderConfig {
         formatter
             .debug_struct("GenaiProviderConfig")
             .field("api_key_env", &self.api_key_env)
+            .field("provider_id", &self.provider_id)
             .field("base_url", &self.base_url)
             .field("model_id", &self.model_id)
             .field("protocol", &self.protocol)
@@ -99,9 +103,12 @@ impl GenaiProviderAdapter {
             // way of an active long-running stream.
             .with_timeout(std::time::Duration::from_secs(3_600))
             .with_default_headers(config.custom_headers.to_header_map());
+        let cache_profile =
+            ProviderCacheProfile::for_provider(config.protocol, &config.provider_id);
         Self {
             config,
             credential,
+            cache_profile,
             client: Client::builder().with_web_config(web_config).build(),
         }
     }
@@ -147,9 +154,14 @@ impl GenaiProviderAdapter {
                 message: "provider max_tokens exceeds the supported u32 range".to_owned(),
             });
         }
+        let provider_id = reader(GOLUTRA_PROVIDER_AUTH_PROVIDER)
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| reader(GOLUTRA_PROVIDER_ROUTE_ID).filter(|value| !value.trim().is_empty()))
+            .unwrap_or_else(|| protocol.id().to_owned());
         Ok(GenaiProviderConfig {
             api_key,
             api_key_env,
+            provider_id,
             base_url,
             model_id,
             protocol,
@@ -166,7 +178,8 @@ impl GenaiProviderAdapter {
                 task_id: TaskId::new(),
                 turn_id: TurnId::new(),
                 session_id: None,
-                provider_id: self.config.protocol.id().to_owned(),
+                cache_scope: None,
+                provider_id: self.config.provider_id.clone(),
                 model_id: self.config.model_id.clone(),
                 messages: vec![ProviderMessage {
                     role: ProviderRole::User,
@@ -178,11 +191,12 @@ impl GenaiProviderAdapter {
                 }],
                 tools: Vec::new(),
                 cache_policy: Default::default(),
+                max_output_tokens: None,
             },
         )
         .await?;
         Ok(ProviderProbeResult {
-            provider_id: self.config.protocol.id().to_owned(),
+            provider_id: self.config.provider_id.clone(),
             protocol: native_protocol(self.config.protocol).to_owned(),
             base_url: self.config.base_url.clone(),
             model_id: self.config.model_id.clone(),
@@ -232,9 +246,11 @@ impl GenaiProviderAdapter {
         let chat_request = genai_chat_request(request, self.config.protocol)?;
         let options = genai_chat_options(
             &self.config.generation_config,
+            request.max_output_tokens,
             false,
             self.cache_identity_for_request(request).as_ref(),
             request.cache_policy,
+            self.cache_profile,
         )?;
         let api_key = self
             .credential
@@ -281,9 +297,11 @@ impl GenaiProviderAdapter {
         let chat_request = genai_chat_request(request, self.config.protocol)?;
         let options = genai_chat_options(
             &self.config.generation_config,
+            request.max_output_tokens,
             true,
             self.cache_identity_for_request(request).as_ref(),
             request.cache_policy,
+            self.cache_profile,
         )?;
         let mut force_refresh = false;
         let response = loop {
@@ -368,7 +386,7 @@ impl super::LlmProvider for GenaiProviderAdapter {
 
     fn contract(&self) -> ProviderContract {
         ProviderContract {
-            provider_id: self.config.protocol.id().to_owned(),
+            provider_id: self.config.provider_id.clone(),
             model_id: self.config.model_id.clone(),
             native_protocol: native_protocol(self.config.protocol).to_owned(),
             stream_event_mapping: "genai_normalized_stream".to_owned(),
@@ -386,6 +404,10 @@ impl super::LlmProvider for GenaiProviderAdapter {
 
     fn cache_namespace(&self) -> String {
         super::route_cache_namespace(native_protocol(self.config.protocol), &self.config.base_url)
+    }
+
+    fn preferred_cache_policy(&self) -> PromptCachePolicy {
+        self.cache_profile.preferred_cache_policy()
     }
 }
 
@@ -551,19 +573,39 @@ fn openai_responses_thought_signature(item: &Value) -> Result<String, ProviderEr
 
 pub(crate) fn genai_chat_options(
     config: &ProviderGenerationConfig,
+    request_max_output_tokens: Option<u64>,
     streaming: bool,
     cache_identity: Option<&golutra_core::CacheIdentity>,
     cache_policy: PromptCachePolicy,
+    cache_profile: ProviderCacheProfile,
 ) -> Result<ChatOptions, ProviderError> {
     let mut options = ChatOptions::default().with_capture_raw_body(true);
-    if let Some(identity) = cache_identity {
+    if cache_profile.prompt_cache_key(cache_policy)
+        && let Some(identity) = cache_identity
+    {
         options = options.with_prompt_cache_key(identity.key.clone());
-        options = match cache_policy {
-            PromptCachePolicy::Short => options.with_cache_control(CacheControl::Ephemeral5m),
-            PromptCachePolicy::Long => options.with_cache_control(CacheControl::Ephemeral24h),
-            PromptCachePolicy::Auto | PromptCachePolicy::None => options,
-        };
     }
+    options = match (cache_profile.mode, cache_policy) {
+        (_, PromptCachePolicy::None) | (ProviderCacheMode::Disabled, _) => options,
+        (ProviderCacheMode::Responses, PromptCachePolicy::Long)
+            if cache_profile.supports_long_retention(cache_policy) =>
+        {
+            options.with_cache_control(CacheControl::Ephemeral24h)
+        }
+        (ProviderCacheMode::Responses, PromptCachePolicy::Auto | PromptCachePolicy::Short) => {
+            options
+        }
+        (ProviderCacheMode::Responses, PromptCachePolicy::Long) => options,
+        (ProviderCacheMode::Anthropic, PromptCachePolicy::Long)
+            if cache_profile.supports_long_retention(cache_policy) =>
+        {
+            options.with_cache_control(CacheControl::Ephemeral1h)
+        }
+        (ProviderCacheMode::Anthropic, PromptCachePolicy::Auto | PromptCachePolicy::Short) => {
+            options.with_cache_control(CacheControl::Ephemeral5m)
+        }
+        (ProviderCacheMode::Anthropic, PromptCachePolicy::Long) => options,
+    };
     if streaming {
         options = options
             .with_capture_usage(true)
@@ -571,10 +613,10 @@ pub(crate) fn genai_chat_options(
             .with_capture_reasoning_content(true)
             .with_capture_tool_calls(true);
     }
-    if let Some(max_tokens) = config.max_tokens {
+    if let Some(max_tokens) = request_max_output_tokens.or(config.max_tokens) {
         options = options.with_max_tokens(u32::try_from(max_tokens).map_err(|_| {
             ProviderError::NotConfigured {
-                message: "provider max_tokens exceeds the supported u32 range".to_owned(),
+                message: "provider max output tokens exceeds the supported u32 range".to_owned(),
             }
         })?);
     }
@@ -750,7 +792,7 @@ fn provider_usage_from_genai_with_raw(
     // normal network responses.  Do not eagerly serialize the typed genai
     // usage before `unwrap_or`: that allocation used to happen even when the
     // raw value was available and was paid on every streamed turn.
-    let mut usage_raw = match raw_usage {
+    let usage_raw = match raw_usage {
         Some(raw_usage) => raw_usage.clone(),
         None => serde_json::to_value(usage).map_err(|error| ProviderError::Malformed {
             message: format!("genai usage could not be serialized: {error}"),
@@ -778,42 +820,6 @@ fn provider_usage_from_genai_with_raw(
                 ],
             )
         });
-    let cache_write_tokens = usage
-        .prompt_tokens_details
-        .as_ref()
-        .and_then(|details| non_negative_u64(details.cache_creation_tokens))
-        .or_else(|| {
-            super::first_usage_u64(
-                &usage_raw,
-                &[
-                    "/cache_creation_tokens",
-                    "/cache_write_tokens",
-                    "/cacheCreationTokens",
-                    "/cacheWriteTokens",
-                    "/prompt_tokens_details/cache_creation_tokens",
-                    "/prompt_tokens_details/cache_write_tokens",
-                    "/prompt_tokens_details/cacheCreationTokens",
-                    "/prompt_tokens_details/cacheWriteTokens",
-                    "/input_tokens_details/cache_creation_tokens",
-                    "/input_tokens_details/cache_write_tokens",
-                    "/input_tokens_details/cacheCreationTokens",
-                    "/input_tokens_details/cacheWriteTokens",
-                ],
-            )
-        });
-    // genai 会把零计数映射为 None；出现正的 cache read 即证明本轮命中，
-    // 省略的写入计数应按 provider 语义保留为 0，并写回 canonical normalizer 使用的原始对象。
-    if cache_read_tokens.is_some_and(|tokens| tokens > 0) && cache_write_tokens.is_none() {
-        let details = usage_raw
-            .as_object_mut()
-            .and_then(|object| object.get_mut("prompt_tokens_details"))
-            .and_then(Value::as_object_mut);
-        if let Some(details) = details {
-            details
-                .entry("cache_write_tokens".to_owned())
-                .or_insert_with(|| Value::from(0_u64));
-        }
-    }
     Ok(ProviderUsage {
         input_tokens: non_negative_u64(usage.prompt_tokens).or_else(|| {
             super::first_usage_u64(
@@ -854,10 +860,7 @@ fn provider_usage_from_genai_with_raw(
                     ],
                 )
             }),
-        cached_input_tokens: usage
-            .prompt_tokens_details
-            .as_ref()
-            .and_then(|details| non_negative_u64(details.cached_tokens)),
+        cached_input_tokens: cache_read_tokens,
         total_tokens: non_negative_u64(usage.total_tokens).or_else(|| {
             super::first_usage_u64(
                 &usage_raw,
@@ -952,7 +955,12 @@ pub(crate) fn map_genai_error(error: genai::Error) -> ProviderError {
             | genai::Error::NoAuthData { .. } => ProviderError::NotConfigured { message },
             genai::Error::InvalidJsonResponseElement { .. }
             | genai::Error::ChatResponseGeneration { .. }
-            | genai::Error::SerdeJson(_) => ProviderError::Malformed { message },
+            // rust-genai uses StreamParse for both malformed SSE payloads and
+            // explicit provider `response.failed` events. Neither is safe to
+            // replay: the request would produce the same semantic failure.
+            | genai::Error::StreamParse { .. }
+            | genai::Error::ChatResponse { .. }
+            | genai::Error::SerdeJson(_) => ProviderError::Failed { message },
             _ if message.to_ascii_lowercase().contains("timed out") => {
                 ProviderError::Timeout { message }
             }
@@ -1089,10 +1097,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stream_parser_and_provider_error_events_are_hard_failures() {
+        let parser_error = serde_json::from_str::<Value>("not-json").expect_err("invalid JSON");
+        let parser_error = genai::Error::StreamParse {
+            model_iden: ModelIden::new(AdapterKind::OpenAIResp, "gpt-test"),
+            serde_error: parser_error,
+        };
+        assert!(matches!(
+            map_genai_error(parser_error),
+            ProviderError::Failed { .. }
+        ));
+
+        let response_error = genai::Error::ChatResponse {
+            model_iden: ModelIden::new(AdapterKind::OpenAIResp, "gpt-test"),
+            body: json!({"error": {"message": "stream unavailable"}}),
+        };
+        assert!(matches!(
+            map_genai_error(response_error),
+            ProviderError::Failed { .. }
+        ));
+    }
+
+    #[test]
     fn config_debug_never_contains_the_api_key() {
         let provider = GenaiProviderAdapter::from_config(GenaiProviderConfig {
             api_key: "secret-provider-key".to_owned(),
             api_key_env: crate::GOLUTRA_PROVIDER_API_KEY.to_owned(),
+            provider_id: "anthropic".to_owned(),
             base_url: "https://api.anthropic.com/v1".to_owned(),
             model_id: "claude-test".to_owned(),
             protocol: ProviderProtocol::Anthropic,
@@ -1107,7 +1138,7 @@ mod tests {
     }
 
     #[test]
-    fn generation_config_maps_reasoning_effort_and_output_limit() {
+    fn request_output_limit_overrides_generation_config() {
         let options = genai_chat_options(
             &ProviderGenerationConfig {
                 enable_thinking: true,
@@ -1115,13 +1146,15 @@ mod tests {
                 context_window_size: Some(128_000),
                 max_tokens: Some(4_096),
             },
+            Some(1_024),
             false,
             None,
             PromptCachePolicy::Auto,
+            ProviderCacheProfile::for_provider(ProviderProtocol::Genai, "genai"),
         )
         .expect("generation options");
 
-        assert_eq!(options.max_tokens, Some(4_096));
+        assert_eq!(options.max_tokens, Some(1_024));
         assert!(matches!(
             options.reasoning_effort,
             Some(ReasoningEffort::XHigh)
@@ -1129,42 +1162,88 @@ mod tests {
     }
 
     #[test]
-    fn cache_policy_maps_to_stable_key_and_explicit_retention() {
+    fn cache_profile_maps_each_protocol_without_leaking_fields() {
         let identity = golutra_core::CacheIdentity {
             session_id: golutra_core::SessionId::new(),
             thread_id: None,
             provider_id: "provider".to_owned(),
             model_id: "model".to_owned(),
+            route_namespace: "test".to_owned(),
             key: "sha256:test-key".to_owned(),
         };
         let short = genai_chat_options(
             &ProviderGenerationConfig::default(),
+            None,
             false,
             Some(&identity),
             PromptCachePolicy::Short,
+            ProviderCacheProfile::for_provider(ProviderProtocol::OpenAiResponses, "golutra"),
         )
         .expect("short cache options");
         assert_eq!(short.prompt_cache_key.as_deref(), Some("sha256:test-key"));
-        assert_eq!(short.cache_control, Some(CacheControl::Ephemeral5m));
+        assert!(short.cache_control.is_none());
 
         let long = genai_chat_options(
             &ProviderGenerationConfig::default(),
+            None,
             false,
             Some(&identity),
             PromptCachePolicy::Long,
+            ProviderCacheProfile::for_provider(ProviderProtocol::OpenAiResponses, "golutra"),
         )
         .expect("long cache options");
         assert_eq!(long.cache_control, Some(CacheControl::Ephemeral24h));
 
         let none = genai_chat_options(
             &ProviderGenerationConfig::default(),
+            None,
             false,
             None,
             PromptCachePolicy::None,
+            ProviderCacheProfile::for_provider(ProviderProtocol::OpenAiResponses, "golutra"),
         )
         .expect("none cache options");
         assert!(none.prompt_cache_key.is_none());
         assert!(none.cache_control.is_none());
+
+        let anthropic = genai_chat_options(
+            &ProviderGenerationConfig::default(),
+            None,
+            false,
+            Some(&identity),
+            PromptCachePolicy::Auto,
+            ProviderCacheProfile::for_provider(ProviderProtocol::Anthropic, "anthropic"),
+        )
+        .expect("Anthropic cache options");
+        assert!(anthropic.prompt_cache_key.is_none());
+        assert_eq!(anthropic.cache_control, Some(CacheControl::Ephemeral5m));
+
+        let anthropic_long = genai_chat_options(
+            &ProviderGenerationConfig::default(),
+            None,
+            false,
+            Some(&identity),
+            PromptCachePolicy::Long,
+            ProviderCacheProfile::for_provider(ProviderProtocol::Anthropic, "anthropic"),
+        )
+        .expect("Anthropic long cache options");
+        assert!(anthropic_long.prompt_cache_key.is_none());
+        assert_eq!(
+            anthropic_long.cache_control,
+            Some(CacheControl::Ephemeral1h)
+        );
+
+        let unknown = genai_chat_options(
+            &ProviderGenerationConfig::default(),
+            None,
+            false,
+            Some(&identity),
+            PromptCachePolicy::Long,
+            ProviderCacheProfile::for_provider(ProviderProtocol::Genai, "custom"),
+        )
+        .expect("unknown gateway options");
+        assert!(unknown.prompt_cache_key.is_none());
+        assert!(unknown.cache_control.is_none());
     }
 
     #[test]
@@ -1214,7 +1293,7 @@ mod tests {
     }
 
     #[test]
-    fn genai_usage_projects_cache_write_zero_on_a_cache_hit() {
+    fn genai_usage_keeps_omitted_cache_write_unknown() {
         let usage = genai::chat::Usage {
             prompt_tokens: Some(100),
             prompt_tokens_details: Some(genai::chat::PromptTokensDetails {
@@ -1232,19 +1311,14 @@ mod tests {
         let normalized = projected.normalize();
         assert_eq!(normalized.input_tokens_non_cached, Some(36));
         assert_eq!(normalized.cache_read_tokens, Some(64));
-        assert_eq!(normalized.cache_write_tokens, Some(0));
+        assert_eq!(normalized.cache_write_tokens, None);
     }
 
     #[test]
     fn genai_usage_prefers_raw_response_breakdown() {
         let usage = genai::chat::Usage {
             prompt_tokens: Some(100),
-            prompt_tokens_details: Some(genai::chat::PromptTokensDetails {
-                cache_creation_tokens: None,
-                cache_creation_details: None,
-                cached_tokens: Some(64),
-                audio_tokens: None,
-            }),
+            prompt_tokens_details: None,
             completion_tokens: Some(5),
             completion_tokens_details: None,
             total_tokens: Some(105),
@@ -1258,6 +1332,7 @@ mod tests {
 
         let projected =
             provider_usage_from_genai_with_raw(&usage, Some(&raw)).expect("genai raw usage");
+        assert_eq!(projected.cached_input_tokens, Some(64));
         let normalized = projected.normalize();
         assert_eq!(normalized.cache_read_tokens, Some(64));
         assert_eq!(normalized.cache_write_tokens, Some(0));
@@ -1271,6 +1346,7 @@ mod tests {
             task_id: TaskId::new(),
             turn_id: TurnId::new(),
             session_id: None,
+            cache_scope: None,
             provider_id: "openai-responses".to_owned(),
             model_id: "gpt-test".to_owned(),
             messages: vec![ProviderMessage {
@@ -1306,6 +1382,7 @@ mod tests {
                 permission_policy_ref: None,
             }],
             cache_policy: PromptCachePolicy::None,
+            max_output_tokens: None,
         };
 
         let chat_request =
@@ -1334,6 +1411,7 @@ mod tests {
             task_id: TaskId::new(),
             turn_id: TurnId::new(),
             session_id: None,
+            cache_scope: None,
             provider_id: "openai-responses".to_owned(),
             model_id: "gpt-test".to_owned(),
             messages: vec![ProviderMessage {
@@ -1366,6 +1444,7 @@ mod tests {
                 permission_policy_ref: None,
             }],
             cache_policy: PromptCachePolicy::None,
+            max_output_tokens: None,
         };
 
         let chat_request =
@@ -1384,6 +1463,7 @@ mod tests {
             task_id: TaskId::new(),
             turn_id: TurnId::new(),
             session_id: None,
+            cache_scope: None,
             provider_id: "openai-responses".to_owned(),
             model_id: "gpt-test".to_owned(),
             messages: vec![ProviderMessage {
@@ -1413,6 +1493,7 @@ mod tests {
                 permission_policy_ref: None,
             }],
             cache_policy: PromptCachePolicy::None,
+            max_output_tokens: None,
         };
 
         let chat_request =

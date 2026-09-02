@@ -1,8 +1,11 @@
 //! Context construction, task supervision, AgentLoop, and provider auth lifecycles.
 
 use super::*;
-use golutra_context::{estimate_tokens, structured_compaction_summary};
-use golutra_llm::ProviderGenerationConfig;
+use golutra_context::{estimate_message_tokens, estimate_tokens, fit_compaction_context_content};
+use golutra_llm::{
+    LlmProvider, PromptCacheScope, ProviderGenerationConfig, ProviderMessage, ProviderRequest,
+    ProviderRole,
+};
 use tokio::{runtime::Handle, task::JoinHandle};
 
 const ABNORMAL_RECORDER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -19,7 +22,11 @@ const MAX_SKILL_CONTEXT_TOKENS: u64 = 1_024;
 const MIN_RECENT_HISTORY_TOKENS: u64 = 1_024;
 const MAX_WORKING_SUMMARY_TOKENS: u64 = 2_048;
 const ACTIVE_PATH_COMPACTION_MAX_DEPTH: u32 = 65_536;
-
+const MAX_RESUME_PROVIDER_REQUEST_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_RESUME_PROVIDER_MESSAGES: usize = 16_384;
+// 精确 replay 只有在能放进当前窗口时才有价值；超出后强行保留会把
+// 动态历史标成稳定前缀，阻止 compaction 并让每个后续请求重复支付全文。
+const RESUME_REPLAY_HEADROOM_TOKENS: u64 = 1_024;
 fn memory_candidate_limit(context_budget: u64) -> usize {
     if context_budget == 0 {
         return 0;
@@ -103,6 +110,90 @@ impl RuntimeObservationSink for ChannelObservationSink {
 }
 
 impl RuntimeHost {
+    /// 读取最近一次主 provider 请求，只有完整 wire 和当前稳定前缀均匹配时
+    /// 才用于跨进程 resume；任何损坏、过期或协议不一致都静默回退普通投影。
+    async fn resume_provider_context(
+        &self,
+        session_id: SessionId,
+        current_task_id: TaskId,
+        objective: &str,
+        provider: &ConfiguredProvider,
+        cache_scope: &PromptCacheScope,
+        context_budget: u64,
+    ) -> Result<Option<AgentReplayContext>, ClientError> {
+        if objective.trim().is_empty() {
+            return Ok(None);
+        }
+        let Some(snapshot) = self
+            .storage
+            .repositories
+            .artifacts
+            .latest_context(session_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if snapshot.budget_snapshot.budget_policy == "auxiliary_compaction_summary"
+            || snapshot.session_id != session_id
+            || snapshot.provider_request_id.0.is_nil()
+        {
+            return Ok(None);
+        }
+        let Some(artifact_id) = snapshot.restricted_request_artifact_ref else {
+            return Ok(None);
+        };
+        let Some(artifact) = self.storage.repositories.artifacts.get(artifact_id).await? else {
+            return Ok(None);
+        };
+        if artifact.session_id != session_id
+            || artifact.artifact_type != "provider_request_replay"
+            || artifact.redaction_status != RedactionStatus::Raw
+        {
+            return Ok(None);
+        }
+        let Some(bytes) = self
+            .storage
+            .store
+            .load_artifact_bytes_bounded(&artifact, MAX_RESUME_PROVIDER_REQUEST_BYTES)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Ok(previous) = serde_json::from_slice::<ProviderRequest>(&bytes) else {
+            return Ok(None);
+        };
+        let contract = provider.contract();
+        let expected_cache_policy = provider.preferred_cache_policy();
+        if previous.request_id != snapshot.provider_request_id
+            || previous.session_id != Some(session_id)
+            || previous.provider_id != contract.provider_id
+            || previous.model_id != contract.model_id
+            || previous.cache_policy != expected_cache_policy
+            || previous
+                .cache_scope
+                .as_ref()
+                .is_none_or(|scope| scope.key() != cache_scope.key())
+            || previous.messages.len() > MAX_RESUME_PROVIDER_MESSAGES
+            || !provider_transcript_is_replayable(&previous.messages)
+        {
+            return Ok(None);
+        }
+
+        let Some(messages) = resume_replay_messages_within_budget(
+            previous.messages,
+            previous.task_id,
+            current_task_id,
+            objective,
+            context_budget,
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some(AgentReplayContext::for_resume(
+            messages,
+            previous.tools,
+        )))
+    }
+
     /// Cancel every host-owned task and delegation operation, then wait until
     /// their supervisors have released the in-process ownership maps. The
     /// process supervisor is shut down by `RuntimeHost::close` after this
@@ -263,6 +354,84 @@ impl RuntimeHost {
     }
 }
 
+/// Build the exact provider transcript used for resume while it fits the real
+/// context budget. No soft history cap is applied: preserving the full prior
+/// wire keeps tool-call/result pairs intact and lets the next request reuse the
+/// previous request as its prefix. Only a true context overflow falls back to
+/// the ordinary activity-tree projection and compaction path.
+pub(crate) fn resume_replay_messages_within_budget(
+    mut messages: Vec<ProviderMessage>,
+    previous_task_id: TaskId,
+    current_task_id: TaskId,
+    objective: &str,
+    context_budget: u64,
+) -> Option<Vec<ProviderMessage>> {
+    let objective = objective.trim();
+    if objective.is_empty() {
+        return None;
+    }
+    let already_current_objective = messages
+        .last()
+        .is_some_and(|message| message.role == ProviderRole::User && message.content == objective);
+    if previous_task_id != current_task_id || !already_current_objective {
+        messages.push(ProviderMessage {
+            role: ProviderRole::User,
+            content: objective.to_owned(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+            metadata: Default::default(),
+        });
+    }
+    if messages.len() > MAX_RESUME_PROVIDER_MESSAGES {
+        return None;
+    }
+    let replay_tokens = estimate_message_tokens(&messages);
+    let replay_over_hard_limit = context_budget != u64::MAX
+        && replay_tokens > context_budget.saturating_sub(RESUME_REPLAY_HEADROOM_TOKENS);
+    (!replay_over_hard_limit).then_some(messages)
+}
+
+pub(crate) fn provider_transcript_is_replayable(messages: &[ProviderMessage]) -> bool {
+    let mut pending_tool_calls = std::collections::HashSet::<String>::new();
+    let mut seen_tool_call_ids = std::collections::HashSet::<String>::new();
+    for message in messages {
+        match message.role {
+            ProviderRole::Assistant => {
+                if !pending_tool_calls.is_empty() {
+                    return false;
+                }
+                for call in &message.tool_calls {
+                    if call.tool_call_id.trim().is_empty()
+                        || !seen_tool_call_ids.insert(call.tool_call_id.clone())
+                        || !pending_tool_calls.insert(call.tool_call_id.clone())
+                    {
+                        return false;
+                    }
+                }
+            }
+            ProviderRole::Tool => {
+                let Some(tool_call_id) = message
+                    .tool_call_id
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                else {
+                    return false;
+                };
+                if !pending_tool_calls.remove(tool_call_id) {
+                    return false;
+                }
+            }
+            ProviderRole::System | ProviderRole::User => {
+                if !pending_tool_calls.is_empty() {
+                    return false;
+                }
+            }
+        }
+    }
+    pending_tool_calls.is_empty()
+}
+
 pub(crate) struct HostedObservationRecorder {
     sender: observation_recorder::ObservationSender,
     worker: Option<tokio::task::JoinHandle<Result<(), ClientError>>>,
@@ -403,7 +572,6 @@ impl RuntimeHost {
                 source_refs: project_instructions.source_refs,
             });
         }
-
         let objective_contributor = ContextContributor {
             name: "objective".to_owned(),
             role: ProviderRole::User,
@@ -701,20 +869,17 @@ impl RuntimeHost {
             .min(MAX_WORKING_SUMMARY_TOKENS);
         let mut contributors = Vec::new();
         let mut summary_tokens = 0;
-        if let Some((sequence_no, summary)) = compaction {
-            // 当前摘要是 canonical 结构，重新按预算编码可保持 JSON 完整；
-            // 不对结构化内容做字符级截断，也不解释旧的非结构化格式。
-            let summary = structured_compaction_summary(Some(&summary), &[], summary_budget);
-            if !summary.is_empty() {
-                summary_tokens = estimate_tokens(&summary);
-                contributors.push(ContextContributor {
-                    name: "working_summary".to_owned(),
-                    role: ProviderRole::User,
-                    content: summary,
-                    token_budget_hint: 0,
-                    source_refs: vec![format!("event-sequence:{sequence_no}")],
-                });
-            }
+        if let Some((sequence_no, summary)) = compaction
+            && let Some(content) = fit_compaction_context_content(&summary, summary_budget)
+        {
+            summary_tokens = estimate_tokens(&content);
+            contributors.push(ContextContributor {
+                name: "working_summary".to_owned(),
+                role: ProviderRole::User,
+                content,
+                token_budget_hint: 0,
+                source_refs: vec![format!("event-sequence:{sequence_no}")],
+            });
         }
         let history_budget = token_budget.saturating_sub(summary_tokens);
         let history = if let Some(facts) = history_facts {
@@ -1195,6 +1360,9 @@ impl RuntimeHost {
             .get(crate::delegation::DELEGATED_TASK_MARKER)
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let prompt_cache_scope = self
+            .prompt_cache_scope(task.session_id, delegated_task)
+            .await?;
         tool_executor = tool_executor
             .with_task_delegation_backend(Arc::new(
                 crate::delegation::RuntimeTaskDelegationBackend::new(Arc::downgrade(&self)),
@@ -1221,6 +1389,16 @@ impl RuntimeHost {
             provider_session_policy,
         } = provider_plan;
         let context_budget = context_builder.budget_limit();
+        let resume_context = self
+            .resume_provider_context(
+                task.session_id,
+                task.task_id,
+                &objective,
+                &provider,
+                &prompt_cache_scope,
+                context_budget,
+            )
+            .await?;
         let legacy_task = LegacyTaskAdapter::new(&task.payload, &objective);
         if !has_explicit_task_contract && should_apply_legacy_adapter(&task.payload, execution_mode)
         {
@@ -1286,10 +1464,15 @@ impl RuntimeHost {
             },
         })
         .with_task_contract(task_contract)
+        .with_cache_scope(prompt_cache_scope)
         .with_execution_mode(execution_mode.explicit())
         .with_tool_profile(tool_profile)
         .with_deferred_external_verification(defer_external_verification)
         .with_governor_usage(governor_usage);
+        let run = match resume_context {
+            Some(replay_context) => run.with_replay_context(replay_context),
+            None => run,
+        };
         let run = match max_elapsed_ms {
             Some(max_elapsed_ms) => run.with_max_elapsed_ms(max_elapsed_ms),
             None => run,

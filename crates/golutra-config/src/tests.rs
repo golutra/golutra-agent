@@ -749,6 +749,10 @@ async fn runtime_env_uses_dynamic_secret_provider_instead_of_serializing_key() {
         runtime_env.get("GOLUTRA_PROVIDER_API_KEY"),
         Some("<resolved-credential>".to_owned())
     );
+    assert_eq!(
+        runtime_env.get(golutra_llm::GOLUTRA_PROVIDER_ROUTE_ID),
+        Some("custom".to_owned())
+    );
     assert_eq!(resolved.expose_secret(), "profile-secret");
 }
 

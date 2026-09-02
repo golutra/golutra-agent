@@ -301,10 +301,33 @@ fn task_mock_provider(payload: &Value, objective: &str) -> (MockProvider, bool, 
         );
     }
     if lower.contains("sleep") {
+        let interruptible = lower.contains("before completing");
+        let marker = interruptible
+            .then(|| std::env::var_os("GOLUTRA_TEST_INTERRUPTIBLE_SHELL_MARKER"))
+            .flatten()
+            .filter(|path| !path.is_empty())
+            .map(|path| {
+                let path_buf = PathBuf::from(path);
+                let path = path_buf.to_string_lossy();
+                let path = format!("'{}'", path.replace('\'', "'\"'\"'"));
+                let script = format!("touch {path} && sleep 60")
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('$', "\\$")
+                    .replace('`', "\\`");
+                format!("bash -lc \"{script}\"")
+            });
+        let (command, timeout_ms) = match marker {
+            Some(command) => (command, 120_000),
+            None => ("sleep 10".to_owned(), 20_000),
+        };
         return (
-            // 留出检查点落盘和外部 SIGINT 触发的窗口，同时仍低于 shell
-            // 工具的默认进程生命周期上限，避免生命周期测试依赖机器速度。
-            MockProvider::tool_call("shell", json!({"command": "sleep 5", "timeout_ms": 15_000})),
+            // 测试夹具可通过显式 marker 确认 shell 已启动；普通 mock 任务
+            // 仍使用短的有界 sleep。
+            MockProvider::tool_call(
+                "shell",
+                json!({"command": command, "timeout_ms": timeout_ms}),
+            ),
             false,
             true,
         );
@@ -369,6 +392,7 @@ const ROUTE_ENV_KEYS: &[&str] = &[
     "GOLUTRA_PROVIDER_BASE_URL",
     "GOLUTRA_PROVIDER_GENERATION_CONFIG",
     "GOLUTRA_PROVIDER_CUSTOM_HEADERS",
+    "GOLUTRA_PROVIDER_ROUTE_ID",
     "GOLUTRA_PROVIDER_AUTH_PROVIDER",
     "GOLUTRA_PROVIDER_FALLBACK_PROTOCOL",
     "GOLUTRA_PROVIDER_STREAM_MAX_RETRIES",

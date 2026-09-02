@@ -89,7 +89,20 @@ pub(crate) struct CommandLine {
 }
 
 impl CommandLine {
+    #[cfg(test)]
     pub(crate) fn parse(command: &str) -> Result<Self, ToolError> {
+        Self::parse_for_execution(command, false)
+    }
+
+    /// 按选定的工作区执行模式解析命令。
+    ///
+    /// 受保护执行保持仅 argv 的契约，避免调用方把审批变成隐式脚本。
+    /// 不受限任务已经明确退出该策略边界；将合法复合命令作为一个 `bash -lc`
+    /// 脚本接受，可以避免模型使用常见 shell 语法时产生不必要的纠正回合。
+    pub(crate) fn parse_for_execution(
+        command: &str,
+        allow_implicit_shell: bool,
+    ) -> Result<Self, ToolError> {
         let parsed = parse_shell_command_with_input(command).ok_or_else(|| {
             ToolError::InvalidArguments("shell command contains invalid quoting".to_owned())
         })?;
@@ -97,6 +110,16 @@ impl CommandLine {
             && explicit_shell_script(&parsed.parts).is_none()
             && contains_shell_metacharacter(command)
         {
+            if allow_implicit_shell {
+                #[cfg(unix)]
+                {
+                    return Ok(Self {
+                        program: "bash".to_owned(),
+                        args: vec!["-lc".to_owned(), command.trim().to_owned()],
+                        stdin: None,
+                    });
+                }
+            }
             return Err(ToolError::InvalidArguments(
                 "unquoted shell operators require an explicit bash -lc wrapper".to_owned(),
             ));

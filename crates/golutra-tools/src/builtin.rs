@@ -8,8 +8,9 @@ use serde_json::{Value, json};
 
 use super::{
     MAX_BACKGROUND_PROCESS_TIMEOUT_MS, MAX_DELEGATED_TASK_CHARS, MAX_FILE_CONTENT_BYTES,
-    MAX_PATCH_BYTES, MAX_PATH_ARGUMENT_CHARS, MAX_PATTERN_ARGUMENT_CHARS, MAX_PROCESS_INPUT_CHARS,
-    MAX_SHELL_COMMAND_CHARS, ToolCapabilities, max_poll_wait_ms,
+    MAX_FILE_EDITS, MAX_PATCH_BYTES, MAX_PATH_ARGUMENT_CHARS, MAX_PATTERN_ARGUMENT_CHARS,
+    MAX_PROCESS_INPUT_CHARS, MAX_READ_LINES, MAX_SHELL_ARGV_ITEMS, MAX_SHELL_COMMAND_CHARS,
+    ToolCapabilities, max_poll_wait_ms,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -166,7 +167,30 @@ impl BuiltinTool {
 
 pub(super) fn contract(tool_name: &str, side_effect_type: SideEffectType) -> ToolContract {
     let input_schema = match tool_name {
-        "read_file" => object_schema(&[("path", MAX_PATH_ARGUMENT_CHARS)], &["path"], &["path"]),
+        "read_file" => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_PATH_ARGUMENT_CHARS,
+                    "description": "Workspace file path."
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "1-based line; next_offset continues."
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_READ_LINES,
+                    "description": "Max lines."
+                }
+            },
+            "required": ["path"]
+        }),
         "write_file" => object_schema(
             &[
                 ("path", MAX_PATH_ARGUMENT_CHARS),
@@ -175,16 +199,56 @@ pub(super) fn contract(tool_name: &str, side_effect_type: SideEffectType) -> Too
             &["path", "content"],
             &["path"],
         ),
-        "edit_file" => object_schema(
-            &[
-                ("path", MAX_PATH_ARGUMENT_CHARS),
-                ("search", MAX_FILE_CONTENT_BYTES as usize),
-                ("replace", MAX_FILE_CONTENT_BYTES as usize),
-            ],
-            &["path", "search", "replace"],
-            &["path", "search"],
-        ),
-        "apply_patch" => object_schema(&[("patch", MAX_PATCH_BYTES)], &["patch"], &["patch"]),
+        "edit_file" => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_PATH_ARGUMENT_CHARS,
+                    "description": "Workspace file path."
+                },
+                "edits": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": MAX_FILE_EDITS,
+                    "description": "Exact non-overlapping replacements; batch disjoint edits.",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "old_text": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": MAX_FILE_CONTENT_BYTES,
+                                "description": "Exact text, including whitespace/newlines."
+                            },
+                            "new_text": {
+                                "type": "string",
+                                "maxLength": MAX_FILE_CONTENT_BYTES,
+                                "description": "Replacement text."
+                            }
+                        },
+                        "required": ["old_text", "new_text"]
+                    }
+                }
+            },
+            "required": ["path", "edits"]
+        }),
+        "apply_patch" => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "patch": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_PATCH_BYTES,
+                    "description": "Atomic unified or Begin/Update/Add/Delete patch."
+                }
+            },
+            "required": ["patch"]
+        }),
         "web_search" => json!({
             "type": "object",
             "additionalProperties": false,
@@ -256,18 +320,18 @@ pub(super) fn contract(tool_name: &str, side_effect_type: SideEffectType) -> Too
                     "type": "string",
                     "minLength": 1,
                     "maxLength": MAX_DELEGATED_TASK_CHARS,
-                    "description": "A complete, self-contained task for one child agent. Include the relevant goal, constraints, and expected result; the child does not receive the parent conversation history."
+                    "description": "Self-contained child task; child has no parent history."
                 },
                 "model": {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": 256,
-                    "description": "Optional model override. Omit it to inherit the parent agent's effective model."
+                    "description": "Optional model override; omit to inherit."
                 },
                 "reasoning_effort": {
                     "type": "string",
                     "enum": ["low", "medium", "high", "xhigh"],
-                    "description": "Optional reasoning effort override. Omit it to inherit the parent agent's effective setting."
+                    "description": "Optional reasoning override; omit to inherit."
                 }
             },
             "required": ["task"]
@@ -280,32 +344,43 @@ pub(super) fn contract(tool_name: &str, side_effect_type: SideEffectType) -> Too
                     "type": "string",
                     "minLength": 1,
                     "maxLength": MAX_SHELL_COMMAND_CHARS,
-                    "description": "An argv command. A Python heredoc such as python - <<'PY' is passed on stdin. Unquoted operators (|, >, &&, ;) are rejected; use bash -lc for pipelines, redirection, or compound scripts."
+                    "description": "Command; use bash -lc for pipes, redirects, compound commands, or heredoc."
+                },
+                "argv": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": MAX_SHELL_ARGV_ITEMS,
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_SHELL_COMMAND_CHARS
+                    },
+                    "description": "Direct argv; if combined, match command/prefix."
                 },
                 "workdir": {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": MAX_PATH_ARGUMENT_CHARS,
-                    "description": "Optional workspace-relative working directory."
+                    "description": "workspace-relative directory."
                 },
                 "timeout_ms": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": MAX_BACKGROUND_PROCESS_TIMEOUT_MS,
-                    "description": "The absolute process lifetime in milliseconds; defaults to 5000 foreground or 3600000 background."
+                    "description": "Hard process lifetime in ms; omit normally, set only to intentionally terminate."
                 },
                 "background": {
                     "type": "boolean",
-                    "description": "Start a runtime-scoped process and return process_id after yield_time_ms. It stops when the runtime ends. Use shell_session with the returned next_action to wait, write, or terminate."
+                    "description": "Start a runtime-owned process and return immediately after yield_time_ms. Normally omit timeout_ms; use shell_session while it is running."
                 },
                 "yield_time_ms": {
                     "type": "integer",
                     "minimum": 0,
                     "maximum": max_poll_wait_ms(),
-                    "description": "Initial wait for output or exit; does not extend timeout_ms."
+                    "description": "Initial output/exit wait (default 0); does not set or extend process lifetime."
                 }
             },
-            "required": ["command"]
+            "required": []
         }),
         "shell_session" => shell_session_schema(),
         "process_list" => object_schema(&[], &[], &[]),
@@ -357,13 +432,15 @@ fn shell_session_schema() -> Value {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "action": {"type": "string", "enum": ["wait", "write", "terminate"], "description": "wait for new output or exit; write stdin; or terminate the process group"},
-            "process_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "The process_id returned by shell(background=true)."},
-            "cursor": {"type": "integer", "minimum": 0, "description": "Last consumed output cursor; pass the returned cursor unchanged on the next call."},
-            "input": {"type": "string", "maxLength": MAX_PROCESS_INPUT_CHARS, "description": "Input to the managed process stdin (write action only)."},
-            "wait_ms": {"type": "integer", "minimum": 0, "maximum": max_poll_wait_ms(), "description": "Maximum event-driven wait; returns immediately when output or a terminal state is available."}
+            "action": {"type": "string", "enum": ["wait", "write", "terminate"], "description": "Wait/read, write stdin, or terminate."},
+            "process_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "ID returned by shell(background=true)."},
+            "authoritative_pid": {"type": "integer", "minimum": 1, "maximum": u32::MAX, "description": "Required OS PID; must match start."},
+            "cursor": {"type": "integer", "minimum": 0, "description": "Last output cursor; reuse."},
+            "input": {"type": "string", "maxLength": MAX_PROCESS_INPUT_CHARS, "description": "Stdin text for write."},
+            "wait_ms": {"type": "integer", "minimum": 0, "maximum": max_poll_wait_ms(), "description": "Bounded event-driven wait in ms."},
+            "wait_for_terminal": {"type": "boolean", "description": "Wait for one terminal state or deadline."}
         },
-        "required": ["action", "process_id"]
+        "required": ["action", "process_id", "authoritative_pid"]
     })
 }
 
@@ -392,6 +469,10 @@ fn process_session_schema(include_input: bool, include_wait: bool) -> Value {
         (
             "cursor".to_owned(),
             json!({"type": "integer", "minimum": 0}),
+        ),
+        (
+            "authoritative_pid".to_owned(),
+            json!({"type": "integer", "minimum": 1, "maximum": u32::MAX}),
         ),
     ]);
     let mut required = vec!["process_id"];

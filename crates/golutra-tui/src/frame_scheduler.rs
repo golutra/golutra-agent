@@ -119,6 +119,17 @@ impl FrameScheduler {
         );
     }
 
+    /// 首个有意义的 provider 事件使用立即通道，后续增量仍由帧频预算合并。
+    /// 立即通道只改变待绘制 deadline，不跳过事件顺序或终态处理。
+    pub(crate) fn request_immediate_at(&mut self, now: Instant) {
+        self.metrics.redraw_requests = self.metrics.redraw_requests.saturating_add(1);
+        if self.deadline.is_some() {
+            self.metrics.coalesced_redraws = self.metrics.coalesced_redraws.saturating_add(1);
+        }
+        self.metrics.pending_redraws = 1;
+        self.deadline = Some(self.deadline.map_or(now, |current| current.min(now)));
+    }
+
     #[must_use]
     pub(crate) fn deadline(&self) -> Option<Instant> {
         self.deadline
@@ -166,7 +177,7 @@ impl FrameScheduler {
         turn_id: TurnId,
         stream_sequence_no: Option<u64>,
         now: Instant,
-    ) {
+    ) -> bool {
         let state = self.streams.entry(turn_id).or_default();
         let first = !state.has_delta;
         // RuntimeEvent.sequence_no 是会话级序号；只有 provider 明确提供
@@ -198,6 +209,7 @@ impl FrameScheduler {
         if duplicate {
             self.metrics.duplicate_frames = self.metrics.duplicate_frames.saturating_add(1);
         }
+        first
     }
 
     pub(crate) fn record_stream_completed(&mut self, turn_id: TurnId) {
@@ -290,6 +302,20 @@ mod tests {
     }
 
     #[test]
+    fn immediate_request_bypasses_frame_interval_for_first_delta() {
+        let first = Instant::now();
+        let mut scheduler = FrameScheduler::default();
+        scheduler.request_at(first);
+        scheduler.mark_drawn_at(first);
+
+        let next = first + Duration::from_millis(1);
+        scheduler.request_immediate_at(next);
+
+        assert_eq!(scheduler.deadline(), Some(next));
+        assert_eq!(scheduler.metrics().redraw_requests, 2);
+    }
+
+    #[test]
     fn requests_are_counted_and_coalesced_deterministically() {
         let first = Instant::now();
         let mut scheduler = FrameScheduler::default();
@@ -308,8 +334,8 @@ mod tests {
         let turn = TurnId::new();
         let mut scheduler = FrameScheduler::default();
         let base = Instant::now();
-        scheduler.record_delta_at(turn, Some(10), base);
-        scheduler.record_delta_at(turn, Some(12), base + Duration::from_millis(1));
+        assert!(scheduler.record_delta_at(turn, Some(10), base));
+        assert!(!scheduler.record_delta_at(turn, Some(12), base + Duration::from_millis(1)));
         scheduler.record_stream_completed(turn);
         scheduler.record_final_message(turn);
         scheduler.mark_drawn_at(Instant::now());

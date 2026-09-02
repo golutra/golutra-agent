@@ -1549,6 +1549,29 @@ impl RuntimeStore {
             .collect()
     }
 
+    /// 读取 session 最近一次主上下文快照，供显式 resume 复用完整 provider wire。
+    /// 辅助压缩请求不能成为恢复基准，必须在查询边界排除，避免调用方误用。
+    pub async fn load_latest_context_snapshot(
+        &self,
+        session_id: SessionId,
+    ) -> StoreResult<Option<ContextSnapshot>> {
+        let row = sqlx::query(
+            "SELECT snapshot_json FROM context_snapshots
+             WHERE session_id = ?
+               AND json_extract(snapshot_json, '$.budget_snapshot.budget_policy')
+                   != 'auxiliary_compaction_summary'
+             ORDER BY created_at DESC, snapshot_id DESC LIMIT 1",
+        )
+        .bind(session_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            let snapshot_json: String = row.try_get("snapshot_json")?;
+            Ok(serde_json::from_str(&snapshot_json)?)
+        })
+        .transpose()
+    }
+
     pub async fn store_verification_plan(&self, plan: &VerificationPlan) -> StoreResult<()> {
         sqlx::query(
             "INSERT OR REPLACE INTO verification_plans

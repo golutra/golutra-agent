@@ -17,7 +17,10 @@ use golutra_core::{
     UserQuestionMode, UserQuestionOption, UserQuestionPrompt, UserQuestionRequest, VerificationId,
     VerificationRecord, VerificationResult, WorkspaceChangeRequirement, WorkspaceId,
 };
-use golutra_llm::{ConfiguredProvider, MockProvider, ProviderError, ProviderMessage, ProviderRole};
+use golutra_llm::{
+    ConfiguredProvider, MockProvider, ProviderError, ProviderMessage, ProviderRole,
+    ProviderToolCall,
+};
 use golutra_protocol::{
     ArtifactReadRequest, EventFilter, RuntimeEventSource, RuntimeEventType, RuntimeQueryKind,
     TaskTraceRequest,
@@ -33,6 +36,210 @@ use crate::event_codec::{ObservationIntegrityClass, observation_descriptor};
 use crate::governance_commands::memory_support_matches;
 
 use super::*;
+
+fn replay_assistant(calls: &[(&str, &str)]) -> ProviderMessage {
+    ProviderMessage {
+        role: ProviderRole::Assistant,
+        content: String::new(),
+        tool_call_id: None,
+        tool_name: None,
+        tool_calls: calls
+            .iter()
+            .map(|(id, name)| ProviderToolCall {
+                tool_call_id: (*id).to_owned(),
+                tool_name: (*name).to_owned(),
+                arguments: json!({}),
+            })
+            .collect(),
+        metadata: Default::default(),
+    }
+}
+
+fn replay_tool(call_id: Option<&str>) -> ProviderMessage {
+    ProviderMessage {
+        role: ProviderRole::Tool,
+        content: "result".to_owned(),
+        tool_call_id: call_id.map(str::to_owned),
+        tool_name: Some("read_file".to_owned()),
+        tool_calls: Vec::new(),
+        metadata: Default::default(),
+    }
+}
+
+fn replay_user(content: impl Into<String>) -> ProviderMessage {
+    ProviderMessage {
+        role: ProviderRole::User,
+        content: content.into(),
+        tool_call_id: None,
+        tool_name: None,
+        tool_calls: Vec::new(),
+        metadata: Default::default(),
+    }
+}
+
+#[test]
+fn resume_replay_keeps_complete_wire_and_appends_a_cross_task_objective() {
+    let previous_task_id = TaskId::new();
+    let current_task_id = TaskId::new();
+    let messages = vec![
+        replay_user("inspect"),
+        replay_assistant(&[("call-a", "read_file"), ("call-b", "read_file")]),
+        replay_tool(Some("call-a")),
+        replay_tool(Some("call-b")),
+        ProviderMessage {
+            role: ProviderRole::Assistant,
+            content: "inspection complete".to_owned(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+            metadata: Default::default(),
+        },
+    ];
+    let mut expected = messages.clone();
+    expected.push(replay_user("continue implementation"));
+    let context_budget = estimate_message_tokens(&expected).saturating_add(1_024);
+
+    let replay = crate::execution::resume_replay_messages_within_budget(
+        messages,
+        previous_task_id,
+        current_task_id,
+        " continue implementation ",
+        context_budget,
+    )
+    .expect("complete replay should fit the real context budget");
+
+    assert_eq!(replay, expected);
+    assert!(crate::execution::provider_transcript_is_replayable(
+        &replay[..replay.len() - 1]
+    ));
+}
+
+#[test]
+fn resume_replay_falls_back_only_when_the_real_context_budget_is_exceeded() {
+    let task_id = TaskId::new();
+    let messages = vec![replay_user("inspect a large workspace")];
+
+    assert!(
+        crate::execution::resume_replay_messages_within_budget(
+            messages,
+            task_id,
+            task_id,
+            "inspect a large workspace",
+            1_024,
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn resume_replay_does_not_duplicate_the_current_objective_or_split_tool_pairs() {
+    let task_id = TaskId::new();
+    let messages = vec![
+        replay_assistant(&[("call-a", "read_file")]),
+        replay_tool(Some("call-a")),
+        replay_user("continue"),
+    ];
+
+    let replay = crate::execution::resume_replay_messages_within_budget(
+        messages.clone(),
+        task_id,
+        task_id,
+        "continue",
+        u64::MAX,
+    )
+    .expect("unbounded context should preserve replay");
+
+    assert_eq!(replay, messages);
+    assert!(crate::execution::provider_transcript_is_replayable(&replay));
+}
+
+#[test]
+fn resume_replay_has_no_soft_history_cap_for_an_unbounded_context() {
+    let task_id = TaskId::new();
+    let large_objective = "x".repeat(200_000);
+    let messages = vec![replay_user(large_objective.clone())];
+
+    let replay = crate::execution::resume_replay_messages_within_budget(
+        messages.clone(),
+        task_id,
+        task_id,
+        &large_objective,
+        u64::MAX,
+    )
+    .expect("unbounded context must not use a soft replay limit");
+
+    assert_eq!(replay, messages);
+}
+
+#[test]
+fn provider_transcript_accepts_completed_parallel_tool_calls() {
+    let messages = vec![
+        ProviderMessage {
+            role: ProviderRole::User,
+            content: "inspect".to_owned(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+            metadata: Default::default(),
+        },
+        replay_assistant(&[("call-a", "read_file"), ("call-b", "read_file")]),
+        replay_tool(Some("call-a")),
+        replay_tool(Some("call-b")),
+        ProviderMessage {
+            role: ProviderRole::Assistant,
+            content: "done".to_owned(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+            metadata: Default::default(),
+        },
+    ];
+
+    assert!(crate::execution::provider_transcript_is_replayable(
+        &messages
+    ));
+}
+
+#[test]
+fn provider_transcript_rejects_dangling_tool_call() {
+    let messages = vec![
+        replay_assistant(&[("call-a", "read_file")]),
+        ProviderMessage {
+            role: ProviderRole::User,
+            content: "follow up".to_owned(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+            metadata: Default::default(),
+        },
+    ];
+
+    assert!(!crate::execution::provider_transcript_is_replayable(
+        &messages
+    ));
+}
+
+#[test]
+fn provider_transcript_rejects_reused_tool_call_id() {
+    let messages = vec![
+        replay_assistant(&[("call-a", "read_file")]),
+        replay_tool(Some("call-a")),
+        replay_assistant(&[("call-a", "read_file")]),
+    ];
+
+    assert!(!crate::execution::provider_transcript_is_replayable(
+        &messages
+    ));
+}
+
+#[test]
+fn provider_transcript_rejects_tool_result_without_id() {
+    let messages = vec![replay_tool(None)];
+
+    assert!(!crate::execution::provider_transcript_is_replayable(
+        &messages
+    ));
+}
 
 fn history_projection_event(
     sequence_no: u64,
@@ -57,6 +264,16 @@ fn history_projection_event(
         payload_ref: None,
         durable: true,
     }
+}
+
+fn test_compaction_summary(summary: &str) -> String {
+    compaction_summary_envelope(
+        summary,
+        CompactionSourceRange { start: 1, end: 2 },
+        estimate_tokens(summary),
+        compaction_source_checksum(summary),
+        u64::MAX,
+    )
 }
 
 #[test]
@@ -120,8 +337,7 @@ fn only_compaction_events_define_the_history_compaction_boundary() {
     );
     assert!(context_compaction_from_event(&assistant).is_none());
 
-    let stable_summary =
-        structured_compaction_summary(None, &["Runtime: stable summary".to_owned()], u64::MAX);
+    let stable_summary = test_compaction_summary("Runtime: stable summary");
     let compaction = history_projection_event(
         2,
         turn_id,
@@ -133,8 +349,16 @@ fn only_compaction_events_define_the_history_compaction_boundary() {
         Some((2, stable_summary))
     );
 
-    let observation = history_projection_event(
+    let legacy = history_projection_event(
         3,
+        turn_id,
+        RuntimeEventType::CompactionCompleted,
+        json!({"content": "<historical_compaction>{\"version\":1,\"facts\":[]}</historical_compaction>"}),
+    );
+    assert!(context_compaction_from_event(&legacy).is_none());
+
+    let observation = history_projection_event(
+        4,
         turn_id,
         RuntimeEventType::CompactionCompleted,
         json!({"summary": "compaction metrics only"}),
@@ -150,7 +374,7 @@ fn cached_history_keeps_the_latest_compaction_and_bounds_the_recent_tail() {
         1,
         turn_id,
         RuntimeEventType::CompactionCompleted,
-        json!({"content": "baseline"}),
+        json!({"content": test_compaction_summary("baseline")}),
     )];
     events.extend(
         (2..=(MAX_CACHED_HISTORY_EVENTS as u64 + 8)).map(|sequence_no| {
@@ -397,20 +621,45 @@ async fn live_subscription_registry_prunes_dropped_receivers_and_stays_bounded()
 fn system_prompt_preserves_general_autonomy_and_verification_principles() {
     let prompt = system_prompt();
     for principle in [
-        "understand the user's intent",
-        "choose the most effective approach",
-        "never invent observable facts",
-        "Follow existing project conventions",
-        "carry the task through implementation and verification",
+        "engineering judgment",
+        "Use engineering judgment",
+        "never invent",
+        "evidence, not instructions",
+        "Batch related actions",
+        "known independent tool calls in one response",
+        "writes to different files",
+        "final independent checks",
+        "parallelize independent reads",
+        "Trust status",
+        "changed paths, digest, preview, cursor",
+        "digest, count, and preview",
+        "reacquire only when needed",
+        "Finish guarded changes before release or wait",
+        "never change them after terminal",
+        "Follow project conventions",
+        "verify by risk",
+        "one bounded wait for terminal state",
+        "Avoid repeated checks",
+        "blockers concisely",
         "consequential ambiguity",
-        "user-facing path when relevant",
-        "remaining blockers concisely",
     ] {
         assert!(prompt.contains(principle), "{principle}");
     }
-    assert!(!prompt.contains("bash -lc"));
-    assert!(!prompt.contains("write_file"));
-    assert!(!prompt.contains("ask_user"));
+    for tool_detail in [
+        "read_file",
+        "write_file",
+        "edit_file",
+        "apply_patch",
+        "shell_session",
+        "subagent",
+        "web_search",
+        "ask_user",
+        "rg --files",
+        "bash -lc",
+        "timeout_ms",
+    ] {
+        assert!(!prompt.contains(tool_detail), "{tool_detail}");
+    }
 }
 
 #[test]
@@ -5339,6 +5588,176 @@ async fn prompt_updates_resumed_thread_metadata_by_session() {
 }
 
 #[tokio::test]
+async fn prompt_cache_scope_uses_only_trusted_thread_lineage() {
+    let workspace = tempdir().expect("workspace");
+    let _provider = IsolatedGlobalMockProvider::install().await;
+    let transport = EmbeddedTransport::for_cwd(workspace.path())
+        .await
+        .expect("transport");
+    let parent_session_id = transport.default_session_id();
+    let parent_thread_id = transport.default_thread_id();
+    transport
+        .send_command(command(parent_session_id, "establish parent cache scope"))
+        .await
+        .expect("parent command");
+    wait_for_status(&transport, parent_session_id, TaskStatus::Completed).await;
+    let session_scope = transport
+        .host
+        .prompt_cache_scope(parent_session_id, false)
+        .await
+        .expect("session scope");
+    assert_eq!(
+        session_scope.kind(),
+        golutra_llm::PromptCacheScopeKind::Session
+    );
+    assert_eq!(session_scope.key(), parent_session_id.to_string());
+    assert_eq!(session_scope.thread_id(), Some(parent_thread_id));
+
+    let fork = transport
+        .fork_thread(parent_thread_id, None)
+        .await
+        .expect("fork");
+    let fork_scope = transport
+        .host
+        .prompt_cache_scope(fork.session_id, false)
+        .await
+        .expect("fork scope");
+    assert_eq!(fork_scope.kind(), golutra_llm::PromptCacheScopeKind::Fork);
+    assert_eq!(fork_scope.key(), parent_session_id.to_string());
+    assert_eq!(fork_scope.thread_id(), Some(fork.thread_id));
+
+    let nested_fork = transport
+        .fork_thread(fork.thread_id, None)
+        .await
+        .expect("nested fork");
+    let nested_scope = transport
+        .host
+        .prompt_cache_scope(nested_fork.session_id, false)
+        .await
+        .expect("nested fork scope");
+    assert_eq!(nested_scope.kind(), golutra_llm::PromptCacheScopeKind::Fork);
+    assert_eq!(nested_scope.key(), parent_session_id.to_string());
+
+    let now = chrono::Utc::now();
+    let delegated_session_id = SessionId::new();
+    let delegated_thread_id = ThreadId::new();
+    transport
+        .host
+        .storage
+        .repositories
+        .threads
+        .upsert(&ThreadRecord {
+            thread_id: delegated_thread_id,
+            session_id: delegated_session_id,
+            parent_thread_id: Some(parent_thread_id),
+            forked_from_turn_id: None,
+            forked_from_sequence_no: None,
+            workspace_root: transport.host.workspace_root_string(),
+            rebound_from_workspace_root: None,
+            rollout_path: None,
+            title: "delegated".to_owned(),
+            preview: String::new(),
+            created_at: now,
+            updated_at: now,
+            recency_at: now,
+            archived: false,
+            removed: false,
+        })
+        .await
+        .expect("delegated thread");
+    let delegated_scope = transport
+        .host
+        .prompt_cache_scope(delegated_session_id, true)
+        .await
+        .expect("delegated scope");
+    assert_eq!(
+        delegated_scope.kind(),
+        golutra_llm::PromptCacheScopeKind::Subagent
+    );
+    assert_eq!(delegated_scope.key(), parent_session_id.to_string());
+}
+
+#[tokio::test]
+async fn prompt_cache_scope_rejects_broken_parent_lineage() {
+    let workspace = tempdir().expect("workspace");
+    let _home = IsolatedGlobalMockProvider::empty().await;
+    let transport = EmbeddedTransport::for_cwd(workspace.path())
+        .await
+        .expect("transport");
+    let now = chrono::Utc::now();
+    let thread_record =
+        |thread_id: ThreadId, session_id: SessionId, parent_thread_id: Option<ThreadId>| {
+            ThreadRecord {
+                thread_id,
+                session_id,
+                parent_thread_id,
+                forked_from_turn_id: None,
+                forked_from_sequence_no: Some(1),
+                workspace_root: transport.host.workspace_root_string(),
+                rebound_from_workspace_root: None,
+                rollout_path: None,
+                title: "cache lineage fixture".to_owned(),
+                preview: String::new(),
+                created_at: now,
+                updated_at: now,
+                recency_at: now,
+                archived: false,
+                removed: false,
+            }
+        };
+
+    let orphan_session_id = SessionId::new();
+    transport
+        .host
+        .storage
+        .repositories
+        .threads
+        .upsert(&thread_record(
+            ThreadId::new(),
+            orphan_session_id,
+            Some(ThreadId::new()),
+        ))
+        .await
+        .expect("orphan thread");
+    let orphan_error = transport
+        .host
+        .prompt_cache_scope(orphan_session_id, false)
+        .await
+        .expect_err("missing parent must be rejected");
+    assert!(matches!(
+        orphan_error,
+        ClientError::InvalidSession(message) if message.contains("was not found")
+    ));
+
+    let first_thread_id = ThreadId::new();
+    let first_session_id = SessionId::new();
+    let second_thread_id = ThreadId::new();
+    let second_session_id = SessionId::new();
+    for record in [
+        thread_record(first_thread_id, first_session_id, Some(second_thread_id)),
+        thread_record(second_thread_id, second_session_id, Some(first_thread_id)),
+    ] {
+        transport
+            .host
+            .storage
+            .repositories
+            .threads
+            .upsert(&record)
+            .await
+            .expect("cycle fixture");
+    }
+    let cycle_error = transport
+        .host
+        .prompt_cache_scope(first_session_id, false)
+        .await
+        .expect_err("parent cycle must be rejected");
+    assert!(matches!(
+        cycle_error,
+        ClientError::InvalidSession(message) if message.contains("parent thread cycle")
+    ));
+}
+
+#[tokio::test]
 async fn rollout_jsonl_is_complete_checksummed_redacted_and_owner_only() {
     let workspace = tempdir().expect("workspace");
     let _provider = IsolatedGlobalMockProvider::install().await;
@@ -6253,8 +6672,7 @@ async fn session_history_cache_appends_new_facts_and_observes_compaction() {
             .any(|contributor| { contributor.content.contains("second appended request") })
     );
 
-    let compacted_baseline =
-        structured_compaction_summary(None, &["Runtime: compacted baseline".to_owned()], u64::MAX);
+    let compacted_baseline = test_compaction_summary("Runtime: compacted baseline");
     host.record_event(host_event(
         host.next_sequence_no(),
         session_id,
@@ -6270,7 +6688,8 @@ async fn session_history_cache_appends_new_facts_and_observes_compaction() {
         .await
         .expect("compacted context");
     assert!(compacted.iter().any(|contributor| {
-        contributor.name == "working_summary" && contributor.content == compacted_baseline
+        contributor.name == "working_summary"
+            && contributor.content.contains("Runtime: compacted baseline")
     }));
 }
 
@@ -6663,6 +7082,19 @@ async fn explicit_compaction_is_reused_by_follow_up_context() {
         })
         .await
         .expect("compact");
+    let compacted_events = transport
+        .host
+        .storage
+        .store
+        .load_events(session_id, None, None)
+        .await
+        .expect("compacted events");
+    let envelope = compacted_events
+        .iter()
+        .rev()
+        .find_map(context_compaction_from_event)
+        .and_then(|(_, summary)| parse_compaction_summary_envelope(&summary))
+        .expect("current compaction envelope");
     let contributors = transport
         .host
         .context_contributors_for_task(session_id, TaskId::new(), "continue".to_owned(), None)
@@ -6694,6 +7126,8 @@ async fn explicit_compaction_is_reused_by_follow_up_context() {
         .await
         .expect("repeated compact");
     assert!(compact.accepted);
+    assert_eq!(envelope.source_range.start, 0);
+    assert!(envelope.source_range.end > 0);
     assert!(summary.content.contains("hello before compact"));
     assert!(history.is_empty() || !history.contains("hello before compact"));
     assert!(!repeated.accepted);
@@ -6707,8 +7141,7 @@ async fn explicit_compaction_is_reused_by_follow_up_context() {
 async fn explicit_compaction_extends_the_latest_automatic_summary() {
     let host = RuntimeHost::in_memory().await.expect("host");
     let session_id = host.default_session_id();
-    let automatic_summary =
-        structured_compaction_summary(None, &["User: durable objective".to_owned()], u64::MAX);
+    let automatic_summary = test_compaction_summary("User: durable objective");
     host.record_event(host_event(
         host.next_sequence_no(),
         session_id,
@@ -6764,9 +7197,9 @@ async fn explicit_compaction_extends_the_latest_automatic_summary() {
         .expect("latest compaction");
 
     assert!(ack.accepted);
-    assert!(summary.contains("durable objective"));
-    assert!(summary.contains("new durable result"));
-    assert_eq!(summary.matches("<historical_compaction>").count(), 1);
+    let summary = parse_compaction_summary_envelope(&summary).expect("current envelope");
+    assert!(summary.summary.contains("durable objective"));
+    assert!(summary.summary.contains("new durable result"));
 }
 
 #[tokio::test]
@@ -6915,6 +7348,19 @@ async fn prompt_runs_mock_agent_loop_and_writes_file() {
         .find(|event| event["event_type"] == json!(RuntimeEventType::ContextSnapshotCreated))
         .and_then(|event| event["payload"]["snapshot"].as_object())
         .expect("context snapshot event");
+    let cache_diagnostics = events
+        .iter()
+        .find(|event| event["event_type"] == json!(RuntimeEventType::ContextSnapshotCreated))
+        .map(|event| &event["payload"]["cache_diagnostics"])
+        .expect("cache diagnostics");
+    assert!(cache_diagnostics["route"]["digest"].is_string());
+    assert!(cache_diagnostics["cache_policy"].is_string());
+    assert!(
+        cache_diagnostics["message_prefix_length"]
+            .as_u64()
+            .is_some()
+    );
+    assert!(cache_diagnostics["message_prefix_digest"].is_string());
     let request_artifact_id = context_snapshot["redacted_request_artifact_ref"]
         .as_str()
         .expect("redacted request artifact ref")
@@ -11548,7 +11994,7 @@ fn context_compaction_persists_a_redacted_baseline_outside_the_event_payload() {
     let record = ContextCompactionRecord {
         turn_id: task.turn_id,
         mode: "automatic".to_owned(),
-        strategy: "protected_prefix_summary_tail".to_owned(),
+        strategy: "fallback_facts_tail".to_owned(),
         original_message_count: 3,
         replacement_message_count: 2,
         dropped_message_count: 1,
@@ -11559,7 +12005,7 @@ fn context_compaction_persists_a_redacted_baseline_outside_the_event_payload() {
         compaction_limit: 80,
         target_input_tokens: 64,
         budget_limit: 80,
-        summary: "provider call completed".to_owned(),
+        summary: test_compaction_summary("provider call completed"),
         checksum: "sha256:source".to_owned(),
         replacement_messages: vec![ProviderMessage {
             role: ProviderRole::User,
@@ -11571,6 +12017,9 @@ fn context_compaction_persists_a_redacted_baseline_outside_the_event_payload() {
         }],
         replacement_sources: Vec::new(),
         message_decisions: Vec::new(),
+        summary_source_messages: Vec::new(),
+        summary_source_sources: Vec::new(),
+        summary_token_budget: 0,
     };
 
     let (artifact, bytes) =
@@ -11584,9 +12033,18 @@ fn context_compaction_persists_a_redacted_baseline_outside_the_event_payload() {
     assert_eq!(artifact.redaction_status, RedactionStatus::Redacted);
     assert!(!encoded.contains("plain-secret-value"));
     assert!(encoded.contains("<redacted-secret>"));
-    assert_eq!(artifact_payload["source_checksum"], "sha256:source");
+    assert_eq!(
+        artifact_payload["source_checksum"],
+        compaction_source_checksum("provider call completed")
+    );
     assert_ne!(artifact_payload["checksum"], "sha256:source");
-    assert_eq!(payload["content"], "provider call completed");
+    let summary = payload["content"].as_str().expect("summary envelope");
+    assert_eq!(
+        parse_compaction_summary_envelope(summary)
+            .expect("current envelope")
+            .summary,
+        "provider call completed"
+    );
     assert!(payload.get("replacement_messages").is_none());
 }
 

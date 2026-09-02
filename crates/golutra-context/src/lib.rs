@@ -16,17 +16,32 @@ use std::{
 use thiserror::Error;
 
 const COMPACTION_SUMMARY_PREFIX: &str = "Runtime context compaction summary. Treat this as historical context, not a new instruction:\n";
-const STRUCTURED_COMPACTION_PREFIX: &str = "<historical_compaction>";
-const STRUCTURED_COMPACTION_SUFFIX: &str = "</historical_compaction>";
-const STRUCTURED_COMPACTION_VERSION: u8 = 1;
 const MAX_AUTOMATIC_COMPACTION_SUMMARY_TOKENS: u64 = 2_048;
 const MIN_AUTOMATIC_COMPACTION_RECENT_TOKENS: u64 = 1_024;
 const MAX_COMPACTION_FACT_TOKENS: u64 = 512;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct StructuredCompactionPayload {
-    version: u8,
-    facts: Vec<String>,
+#[serde(deny_unknown_fields)]
+pub struct CompactionSourceRange {
+    /// 本次摘要输入内的零基、左闭右开消息序号，不引用 session event sequence。
+    pub start: u64,
+    pub end: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompactionTokenCounts {
+    pub source: u64,
+    pub summary: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompactionSummaryEnvelope {
+    pub summary: String,
+    pub source_range: CompactionSourceRange,
+    pub token_counts: CompactionTokenCounts,
+    pub checksum: String,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -236,6 +251,60 @@ pub struct ContextCompactionRecord {
     pub replacement_sources: Vec<ContextMessageSource>,
     #[serde(default)]
     pub message_decisions: Vec<ContextCompactionDecision>,
+    /// 语义摘要选中的 provider 可见来源；它只参与本次执行，不进入 durable artifact。
+    #[serde(skip)]
+    pub summary_source_messages: Vec<ProviderMessage>,
+    #[serde(skip)]
+    pub summary_source_sources: Vec<ContextMessageSource>,
+    #[serde(skip)]
+    pub summary_token_budget: u64,
+}
+
+impl ContextCompactionRecord {
+    #[must_use]
+    pub fn supports_model_summary(&self) -> bool {
+        !self.summary_source_messages.is_empty()
+            && self.summary_source_sources.len() == self.summary_source_messages.len()
+            && self
+                .summary_source_sources
+                .iter()
+                .all(|source| source.visibility.is_model_visible())
+    }
+
+    /// 用 provider 生成的语义摘要替换紧急退路，同时保留来源身份与压缩预算。
+    pub fn apply_model_summary(&mut self, summary: &str) -> bool {
+        let Some(previous) = parse_compaction_summary_envelope(&self.summary) else {
+            return false;
+        };
+        let rendered = compaction_summary_envelope(
+            summary,
+            previous.source_range,
+            previous.token_counts.source,
+            previous.checksum,
+            self.summary_token_budget,
+        );
+        if rendered.is_empty() {
+            return false;
+        }
+        let Some(summary_message) = self.replacement_messages.get_mut(self.protected_prefix_len)
+        else {
+            return false;
+        };
+        let Some(summary_source) = self.replacement_sources.get(self.protected_prefix_len) else {
+            return false;
+        };
+        if summary_source.origin != "compaction_summary" {
+            return false;
+        }
+        summary_message.content = format!("{COMPACTION_SUMMARY_PREFIX}{rendered}");
+        self.summary = rendered;
+        self.strategy = "model_summary_tail".to_owned();
+        self.replacement_estimated_tokens = estimate_message_tokens(&self.replacement_messages)
+            .saturating_add(self.planned_tool_tokens);
+        self.replacement_message_count = self.replacement_messages.len();
+        self.checksum = serialized_digest(&self.replacement_messages);
+        true
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -450,7 +519,7 @@ impl ContextWindowManager {
             .min(compaction_limit);
         let target_available = target_limit.saturating_sub(protected_tokens);
         let minimum_summary_reserve = estimate_tokens(COMPACTION_SUMMARY_PREFIX)
-            .saturating_add(estimate_tokens(&render_structured_compaction(&[])))
+            .saturating_add(estimate_tokens(&empty_compaction_summary_envelope()))
             .saturating_add(16);
         // 摘要使用绝对上限，最近上下文使用绝对保留额；窗口增大时不会按比例
         // 放大摘要，窗口较小时仍为最新完整消息组保留至少一个 token。
@@ -488,8 +557,7 @@ impl ContextWindowManager {
                 .cloned()
                 .unwrap_or(tail.len().saturating_sub(1)..tail.len());
             retained = compact_message_group(&tail[latest_group], tail_budget);
-            // This path rewrites content/tool arguments, so the original
-            // estimates no longer describe the replacement messages.
+            // 此分支会重写正文和工具参数，原始估算不再代表替换后的消息。
             retained_message_tokens = estimate_message_tokens(&retained);
         }
         let dropped_end = tail.len().saturating_sub(retained.len());
@@ -505,10 +573,25 @@ impl ContextWindowManager {
         };
         let summary_overhead = estimate_message_tokens(std::slice::from_ref(&summary_message));
         let normalized_sources = normalized_message_sources(messages, message_sources);
-        let summary = summarize_messages(
-            dropped,
-            &normalized_sources[protected_prefix_len..protected_prefix_len + dropped_end],
-            summary_reserve.saturating_sub(summary_overhead),
+        let summary_source_sources =
+            normalized_sources[protected_prefix_len..protected_prefix_len + dropped_end].to_vec();
+        let summary_token_budget = summary_reserve.saturating_sub(summary_overhead);
+        let fallback_summary =
+            fallback_compaction_summary(dropped, &summary_source_sources, summary_token_budget);
+        let source_range = CompactionSourceRange {
+            start: 0,
+            end: u64::try_from(dropped_end).unwrap_or(u64::MAX),
+        };
+        let source_tokens = sum_estimates(
+            &message_estimates
+                [protected_prefix_len..protected_prefix_len.saturating_add(dropped_end)],
+        );
+        let summary = compaction_summary_envelope(
+            &fallback_summary,
+            source_range,
+            source_tokens,
+            serialized_digest(dropped),
+            summary_token_budget,
         );
         let mut replacement_messages = protected;
         let mut replacement_sources = normalized_sources[..protected_prefix_len].to_vec();
@@ -585,7 +668,7 @@ impl ContextWindowManager {
             mode: "automatic".to_owned(),
             // 压缩上限就是当前 provider budget；保留真实的策略名，避免
             // 已不存在的 active-working-set 分支污染评估和回放指标。
-            strategy: "protected_prefix_summary_tail".to_owned(),
+            strategy: "fallback_facts_tail".to_owned(),
             original_message_count: messages.len(),
             replacement_message_count: replacement_messages.len(),
             dropped_message_count,
@@ -601,6 +684,9 @@ impl ContextWindowManager {
             replacement_messages,
             replacement_sources,
             message_decisions,
+            summary_source_messages: dropped.to_vec(),
+            summary_source_sources,
+            summary_token_budget,
         }))
     }
 }
@@ -1029,11 +1115,13 @@ pub fn provider_request_from_plan(
         task_id,
         turn_id,
         session_id: None,
+        cache_scope: None,
         provider_id: provider_id.into(),
         model_id: model_id.into(),
         messages: plan.messages.clone(),
         tools,
         cache_policy: golutra_core::PromptCachePolicy::Auto,
+        max_output_tokens: None,
     }
 }
 
@@ -1200,6 +1288,7 @@ fn is_dynamic_context_source(source: &ContextMessageSource) -> bool {
     matches!(
         contributor,
         "memory"
+            | "workspace_entries"
             | "conversation_history"
             | "project_skills"
             | "objective"
@@ -1352,6 +1441,10 @@ fn context_snapshot_from_request_with_estimates_and_tool_digests_and_message_dig
             index: u32::try_from(index).unwrap_or(u32::MAX),
             role: format!("{:?}", message.role).to_lowercase(),
             content_digest: digest_bytes(message.content.as_bytes()),
+            wire_digest: message_digests
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| provider_message_digest(message)),
             estimated_tokens: message_estimates[index],
             tool_call_ids: message
                 .tool_calls
@@ -1396,6 +1489,12 @@ fn context_snapshot_from_request_with_estimates_and_tool_digests_and_message_dig
         generation_config_digest: None,
         budget_snapshot: plan.budget_snapshot.clone(),
         canonical_request_digest,
+        cache_scope_key: request
+            .cache_scope
+            .as_ref()
+            .map(|scope| scope.key().to_owned())
+            .or_else(|| request.session_id.map(|id| id.to_string()))
+            .or_else(|| Some(session_id.to_string())),
         redacted_request_artifact_ref: None,
         restricted_request_artifact_ref: None,
         estimate_source: "character_div_4".to_owned(),
@@ -1596,12 +1695,20 @@ fn canonical_provider_request_digest(
     tool_schema_digests: &[String],
 ) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"golutra-provider-request-v3\0");
+    digest.update(b"golutra-provider-request-v4\0");
     digest_field(&mut digest, request.provider_id.as_bytes());
     digest_field(&mut digest, request.model_id.as_bytes());
     digest_field(
         &mut digest,
         format!("{:?}", request.cache_policy).as_bytes(),
+    );
+    digest_field(
+        &mut digest,
+        request
+            .max_output_tokens
+            .map(|tokens| tokens.to_string())
+            .unwrap_or_default()
+            .as_bytes(),
     );
     digest_field(
         &mut digest,
@@ -2105,7 +2212,7 @@ fn compact_message_group(messages: &[ProviderMessage], budget: u64) -> Vec<Provi
         .collect()
 }
 
-fn summarize_messages(
+fn fallback_compaction_summary(
     messages: &[ProviderMessage],
     message_sources: &[ContextMessageSource],
     token_budget: u64,
@@ -2130,9 +2237,10 @@ fn summarize_messages(
                     .map(|_| message.content.as_str())
             });
         if let Some(summary) = embedded_summary
-            && parse_structured_compaction(summary).is_some()
+            .and_then(parse_compaction_summary_envelope)
+            .map(|envelope| envelope.summary)
         {
-            previous_summary.get_or_insert_with(|| summary.to_owned());
+            previous_summary.get_or_insert(summary);
             continue;
         }
         let line = compaction_fact_from_message(message);
@@ -2144,7 +2252,7 @@ fn summarize_messages(
         }
     }
     lines.reverse();
-    structured_compaction_summary(previous_summary.as_deref(), &lines, token_budget)
+    deterministic_compaction_fallback(previous_summary.as_deref(), &lines, token_budget)
 }
 
 fn compaction_fact_from_message(message: &ProviderMessage) -> String {
@@ -2170,12 +2278,9 @@ fn compaction_fact_from_message(message: &ProviderMessage) -> String {
     format!("{prefix}{}", compact_text(&message.content, content_budget))
 }
 
-/// 将历史事实编码为扁平、token 有界的 canonical 摘要。
-///
-/// 旧格式不会被隐式解释；当前格式会先展开 facts 再合并新事实，因此连续压缩
-/// 不会产生递归标签或重复包装。
+/// 仅在 provider 无法完成摘要时使用的本地紧急退路；正常压缩会用模型语义摘要替换它。
 #[must_use]
-pub fn structured_compaction_summary(
+pub fn deterministic_compaction_fallback(
     previous_summary: Option<&str>,
     lines: &[String],
     token_budget: u64,
@@ -2183,94 +2288,172 @@ pub fn structured_compaction_summary(
     if token_budget == 0 {
         return String::new();
     }
-    let empty = render_structured_compaction(&[]);
-    if token_budget != u64::MAX && estimate_tokens(&empty) > token_budget {
-        return String::new();
-    }
-
-    let mut candidates = previous_summary
-        .and_then(parse_structured_compaction)
-        .unwrap_or_default();
-    for line in lines {
-        let fact = line.split_whitespace().collect::<Vec<_>>().join(" ");
-        if !fact.is_empty() && candidates.last() != Some(&fact) {
-            candidates.push(fact);
-        }
-    }
-    if candidates.is_empty() {
-        return String::new();
-    }
-
-    let base_tokens = estimate_tokens(&empty);
-    let available = token_budget.saturating_sub(base_tokens);
+    let previous = previous_summary
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|previous| {
+            compact_text(
+                previous,
+                if lines.is_empty() {
+                    token_budget
+                } else {
+                    token_budget.div_ceil(2)
+                },
+            )
+        })
+        .filter(|value| !value.is_empty());
+    let previous_tokens = previous.as_deref().map_or(0, estimate_tokens);
+    let recent_budget = token_budget
+        .saturating_sub(previous_tokens)
+        .saturating_sub(u64::from(previous.is_some()));
     let mut used = 0_u64;
-    let mut selected_reversed = Vec::new();
-    for fact in candidates.iter().rev() {
-        let encoded = serde_json::Value::String(fact.clone()).to_string();
-        let fact_tokens = estimate_tokens(&encoded).saturating_add(1);
-        if used.saturating_add(fact_tokens) > available {
+    let mut recent_reversed = Vec::new();
+    for line in lines.iter().rev() {
+        let fact = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if fact.is_empty() || recent_reversed.last() == Some(&fact) {
+            continue;
+        }
+        let fact_tokens = estimate_tokens(&fact).saturating_add(1);
+        if used.saturating_add(fact_tokens) > recent_budget {
+            if recent_reversed.is_empty() {
+                let fitted = compact_text(&fact, recent_budget);
+                if !fitted.is_empty() {
+                    recent_reversed.push(fitted);
+                }
+            }
             break;
         }
         used = used.saturating_add(fact_tokens);
-        selected_reversed.push(fact.clone());
+        recent_reversed.push(fact);
     }
-    selected_reversed.reverse();
+    recent_reversed.reverse();
+    let mut sections = previous.into_iter().collect::<Vec<_>>();
+    sections.extend(recent_reversed);
+    if sections.is_empty() {
+        return String::new();
+    }
+    sections.join("\n")
+}
 
-    if selected_reversed.is_empty() {
-        let mut newest = compact_text(candidates.last().map_or("", String::as_str), available);
-        while !newest.is_empty()
-            && estimate_tokens(&render_structured_compaction(std::slice::from_ref(&newest)))
-                > token_budget
-        {
-            newest.pop();
-        }
-        if !newest.is_empty() {
-            selected_reversed.push(newest);
-        }
+#[must_use]
+pub fn compaction_summary_envelope(
+    summary: &str,
+    source_range: CompactionSourceRange,
+    source_tokens: u64,
+    checksum: String,
+    token_budget: u64,
+) -> String {
+    let summary = summary.trim();
+    if summary.is_empty() || source_range.end < source_range.start {
+        return String::new();
     }
-
-    let mut rendered = render_structured_compaction(&selected_reversed);
-    while token_budget != u64::MAX && estimate_tokens(&rendered) > token_budget {
-        if selected_reversed.len() > 1 {
-            selected_reversed.remove(0);
-        } else if let Some(fact) = selected_reversed.pop() {
-            let mut fitted = compact_text(&fact, available);
-            while !fitted.is_empty()
-                && estimate_tokens(&render_structured_compaction(std::slice::from_ref(&fitted)))
-                    > token_budget
-            {
-                fitted.pop();
-            }
-            if !fitted.is_empty() {
-                selected_reversed.push(fitted);
-            }
-        } else {
-            break;
-        }
-        rendered = render_structured_compaction(&selected_reversed);
-    }
+    let render = |summary: &str| {
+        let envelope = CompactionSummaryEnvelope {
+            token_counts: CompactionTokenCounts {
+                source: source_tokens,
+                summary: estimate_tokens(summary),
+            },
+            summary: summary.to_owned(),
+            source_range: source_range.clone(),
+            checksum: checksum.clone(),
+        };
+        render_compaction_summary_envelope(&envelope)
+    };
+    let rendered = render(summary);
     if token_budget == u64::MAX || estimate_tokens(&rendered) <= token_budget {
-        rendered
-    } else {
-        empty
+        return rendered;
     }
+
+    // JSON 转义后的长度仍随摘要前缀单调增长；按字符边界二分可把超限收缩
+    // 从逐字符重复序列化降为对数次，同时不会切断 UTF-8。
+    let characters = summary.chars().collect::<Vec<_>>();
+    let mut lower = 1_usize;
+    let mut upper = characters.len().saturating_sub(1);
+    let mut best = None;
+    while lower <= upper {
+        let middle = lower + (upper - lower) / 2;
+        let candidate = characters[..middle].iter().collect::<String>();
+        let rendered = render(&candidate);
+        if estimate_tokens(&rendered) <= token_budget {
+            best = Some(rendered);
+            lower = middle.saturating_add(1);
+        } else {
+            upper = middle.saturating_sub(1);
+        }
+    }
+    best.unwrap_or_default()
 }
 
-fn parse_structured_compaction(value: &str) -> Option<Vec<String>> {
-    let payload = value
-        .trim()
-        .strip_prefix(STRUCTURED_COMPACTION_PREFIX)?
-        .strip_suffix(STRUCTURED_COMPACTION_SUFFIX)?;
-    let parsed = serde_json::from_str::<StructuredCompactionPayload>(payload).ok()?;
-    (parsed.version == STRUCTURED_COMPACTION_VERSION).then_some(parsed.facts)
+#[must_use]
+pub fn parse_compaction_summary_envelope(value: &str) -> Option<CompactionSummaryEnvelope> {
+    let parsed = serde_json::from_str::<CompactionSummaryEnvelope>(value.trim()).ok()?;
+    let checksum = parsed.checksum.strip_prefix("sha256:")?;
+    if parsed.summary.trim().is_empty()
+        || parsed.source_range.end < parsed.source_range.start
+        || parsed.token_counts.summary != estimate_tokens(&parsed.summary)
+        || checksum.len() != 64
+        || !checksum.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some(parsed)
 }
 
-fn render_structured_compaction(facts: &[String]) -> String {
-    let payload = serde_json::json!({
-        "version": STRUCTURED_COMPACTION_VERSION,
-        "facts": facts,
-    });
-    format!("{STRUCTURED_COMPACTION_PREFIX}{payload}{STRUCTURED_COMPACTION_SUFFIX}")
+#[must_use]
+pub fn fit_compaction_summary_envelope(value: &str, token_budget: u64) -> String {
+    let Some(envelope) = parse_compaction_summary_envelope(value) else {
+        return String::new();
+    };
+    compaction_summary_envelope(
+        &envelope.summary,
+        envelope.source_range,
+        envelope.token_counts.source,
+        envelope.checksum,
+        token_budget,
+    )
+}
+
+#[must_use]
+pub fn compaction_context_content(value: &str) -> Option<String> {
+    parse_compaction_summary_envelope(value)
+        .map(|_| format!("{COMPACTION_SUMMARY_PREFIX}{}", value.trim()))
+}
+
+#[must_use]
+pub fn fit_compaction_context_content(value: &str, token_budget: u64) -> Option<String> {
+    let envelope_budget = token_budget.saturating_sub(estimate_tokens(COMPACTION_SUMMARY_PREFIX));
+    let envelope = fit_compaction_summary_envelope(value, envelope_budget);
+    compaction_context_content(&envelope)
+        .filter(|content| token_budget == u64::MAX || estimate_tokens(content) <= token_budget)
+}
+
+#[must_use]
+pub fn compaction_summary_from_context_content(value: &str) -> Option<CompactionSummaryEnvelope> {
+    let value = value
+        .strip_prefix(COMPACTION_SUMMARY_PREFIX)
+        .unwrap_or(value);
+    parse_compaction_summary_envelope(value)
+}
+
+#[must_use]
+pub fn compaction_source_checksum<T: Serialize + ?Sized>(value: &T) -> String {
+    serialized_digest(value)
+}
+
+fn render_compaction_summary_envelope(envelope: &CompactionSummaryEnvelope) -> String {
+    serde_json::to_string(envelope).unwrap_or_default()
+}
+
+fn empty_compaction_summary_envelope() -> String {
+    render_compaction_summary_envelope(&CompactionSummaryEnvelope {
+        summary: String::new(),
+        source_range: CompactionSourceRange { start: 0, end: 0 },
+        token_counts: CompactionTokenCounts {
+            source: 0,
+            summary: 0,
+        },
+        checksum: digest_bytes(&[]),
+    })
 }
 
 fn compact_text(value: &str, token_budget: u64) -> String {
@@ -2364,6 +2547,58 @@ mod tests {
     }
 
     #[test]
+    fn workspace_entry_snapshot_is_dynamic_for_prefix_accounting() {
+        let builder = ContextBuilder::default();
+        let messages = vec![
+            ProviderMessage {
+                role: ProviderRole::System,
+                content: "system".to_owned(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+                metadata: Default::default(),
+            },
+            ProviderMessage {
+                role: ProviderRole::User,
+                content: "entries".to_owned(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+                metadata: Default::default(),
+            },
+            ProviderMessage {
+                role: ProviderRole::User,
+                content: "objective".to_owned(),
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+                metadata: Default::default(),
+            },
+        ];
+        let sources = vec![
+            ContextMessageSource {
+                contributor: "system".to_owned(),
+                source_refs: Vec::new(),
+                origin: "initial_contributor".to_owned(),
+                visibility: ModelInputVisibility::ModelVisible,
+            },
+            ContextMessageSource {
+                contributor: "workspace_entries".to_owned(),
+                source_refs: Vec::new(),
+                origin: "initial_contributor".to_owned(),
+                visibility: ModelInputVisibility::ModelVisible,
+            },
+            ContextMessageSource {
+                contributor: "objective".to_owned(),
+                source_refs: Vec::new(),
+                origin: "initial_contributor".to_owned(),
+                visibility: ModelInputVisibility::ModelVisible,
+            },
+        ];
+        assert_eq!(builder.stable_prefix_len(&messages, &sources), 1);
+    }
+
+    #[test]
     fn provider_tool_order_is_canonical() {
         let task_id = TaskId::new();
         let turn_id = TurnId::new();
@@ -2399,6 +2634,26 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["read_file", "shell"]
         );
+    }
+
+    #[test]
+    fn provider_request_digest_includes_the_output_limit() {
+        let task_id = TaskId::new();
+        let turn_id = TurnId::new();
+        let plan = ContextBuilder::default()
+            .build(task_id, turn_id, Vec::new())
+            .expect("context plan");
+        let mut request =
+            provider_request_from_plan(&plan, task_id, turn_id, "mock", "model", Vec::new());
+
+        let unbounded = canonical_provider_request_digest(&request, &[]);
+        request.max_output_tokens = Some(2_048);
+        let first_limit = canonical_provider_request_digest(&request, &[]);
+        request.max_output_tokens = Some(1_024);
+        let second_limit = canonical_provider_request_digest(&request, &[]);
+
+        assert_ne!(unbounded, first_limit);
+        assert_ne!(first_limit, second_limit);
     }
 
     #[test]
@@ -2470,6 +2725,13 @@ mod tests {
         let latest_tool = record.replacement_messages.last().expect("tool retained");
         assert_eq!(latest_tool.tool_call_id.as_deref(), Some("call-7"));
         assert!(!record.summary.is_empty());
+        let envelope =
+            parse_compaction_summary_envelope(&record.summary).expect("summary envelope");
+        assert_eq!(envelope.source_range.start, 0);
+        assert_eq!(
+            envelope.source_range.end,
+            u64::try_from(record.dropped_message_count).expect("message count")
+        );
         assert_eq!(
             record.replacement_sources.len(),
             record.replacement_messages.len()
@@ -2565,7 +2827,7 @@ mod tests {
 
         assert_eq!(record.budget_limit, 16_384);
         assert_eq!(record.compaction_limit, 16_384);
-        assert_eq!(record.strategy, "protected_prefix_summary_tail");
+        assert_eq!(record.strategy, "fallback_facts_tail");
         assert!(record.replacement_estimated_tokens <= record.target_input_tokens);
         assert!(record.replacement_estimated_tokens < original_tokens);
     }
@@ -2654,7 +2916,7 @@ mod tests {
             tool_calls: Vec::new(),
             metadata: Default::default(),
         };
-        let summary = summarize_messages(
+        let summary = fallback_compaction_summary(
             &[
                 message("oldest-observation "),
                 message("newest-observation "),
@@ -2668,35 +2930,35 @@ mod tests {
     }
 
     #[test]
-    fn structured_compaction_is_flat_bounded_and_current_schema_only() {
-        let first =
-            structured_compaction_summary(None, &["User: initial objective".to_owned()], 160);
-        let second = structured_compaction_summary(
-            Some(&first),
-            &[format!("Assistant: recent result {}", "x".repeat(400))],
+    fn compaction_envelope_is_bounded_strict_and_current_schema_only() {
+        let rendered = compaction_summary_envelope(
+            &format!("semantic summary {}", "x".repeat(400)),
+            CompactionSourceRange { start: 10, end: 20 },
+            900,
+            digest_bytes(b"source"),
             160,
         );
-        let from_unsupported = structured_compaction_summary(
-            Some("legacy unstructured summary"),
-            &["User: canonical fact".to_owned()],
-            160,
-        );
-        let unsupported_only =
-            structured_compaction_summary(Some("legacy unstructured summary"), &[], 160);
+        let parsed = parse_compaction_summary_envelope(&rendered).expect("current envelope");
 
-        assert!(estimate_tokens(&second) <= 160);
-        assert!(second.starts_with(STRUCTURED_COMPACTION_PREFIX));
-        assert!(second.ends_with(STRUCTURED_COMPACTION_SUFFIX));
-        assert_eq!(second.matches(STRUCTURED_COMPACTION_PREFIX).count(), 1);
-        assert!(second.contains("recent result"));
-        assert!(!from_unsupported.contains("legacy unstructured summary"));
-        assert!(from_unsupported.contains("canonical fact"));
-        assert!(unsupported_only.is_empty());
+        assert!(estimate_tokens(&rendered) <= 160);
+        assert!(parsed.summary.contains("semantic summary"));
+        assert_eq!(
+            parsed.source_range,
+            CompactionSourceRange { start: 10, end: 20 }
+        );
+        assert_eq!(parsed.token_counts.source, 900);
+        assert_eq!(
+            parsed.token_counts.summary,
+            estimate_tokens(&parsed.summary)
+        );
+        assert!(parse_compaction_summary_envelope("legacy unstructured summary").is_none());
+        let with_unknown = rendered.replacen('{', "{\"version\":1,", 1);
+        assert!(parse_compaction_summary_envelope(&with_unknown).is_none());
     }
 
     #[test]
     fn repeated_automatic_compaction_flattens_the_previous_summary() {
-        let first = summarize_messages(
+        let first_fallback = fallback_compaction_summary(
             &[ProviderMessage {
                 role: ProviderRole::User,
                 content: "initial durable fact".to_owned(),
@@ -2708,7 +2970,14 @@ mod tests {
             &[],
             160,
         );
-        let second = summarize_messages(
+        let first = compaction_summary_envelope(
+            &first_fallback,
+            CompactionSourceRange { start: 0, end: 1 },
+            10,
+            digest_bytes(b"first"),
+            160,
+        );
+        let second = fallback_compaction_summary(
             &[
                 ProviderMessage {
                     role: ProviderRole::User,
@@ -2731,7 +3000,6 @@ mod tests {
             160,
         );
 
-        assert_eq!(second.matches(STRUCTURED_COMPACTION_PREFIX).count(), 1);
         assert!(second.contains("initial durable fact"));
         assert!(second.contains("new durable fact"));
         assert!(estimate_tokens(&second) <= 160);
@@ -2739,8 +3007,13 @@ mod tests {
 
     #[test]
     fn automatic_compaction_flattens_a_durable_working_summary() {
-        let previous =
-            structured_compaction_summary(None, &["User: durable objective".to_owned()], 160);
+        let previous = compaction_summary_envelope(
+            "User: durable objective",
+            CompactionSourceRange { start: 0, end: 1 },
+            10,
+            digest_bytes(b"previous"),
+            160,
+        );
         let messages = [
             ProviderMessage {
                 role: ProviderRole::User,
@@ -2774,9 +3047,8 @@ mod tests {
             },
         ];
 
-        let summary = summarize_messages(&messages, &sources, 160);
+        let summary = fallback_compaction_summary(&messages, &sources, 160);
 
-        assert_eq!(summary.matches(STRUCTURED_COMPACTION_PREFIX).count(), 1);
         assert!(summary.contains("durable objective"));
         assert!(summary.contains("new durable result"));
         assert!(estimate_tokens(&summary) <= 160);
@@ -2817,7 +3089,7 @@ mod tests {
 
         assert!(estimate_tokens(&record.summary) <= MAX_AUTOMATIC_COMPACTION_SUMMARY_TOKENS);
         assert!(retained_tokens >= MIN_AUTOMATIC_COMPACTION_RECENT_TOKENS);
-        assert!(record.summary.starts_with(STRUCTURED_COMPACTION_PREFIX));
+        assert!(parse_compaction_summary_envelope(&record.summary).is_some());
     }
 
     #[test]

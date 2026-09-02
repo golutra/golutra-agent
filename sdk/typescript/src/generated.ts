@@ -1161,6 +1161,11 @@ export interface ContextProjection {
 }
 export interface ContextSnapshot {
   budget_snapshot: TokenBudgetSnapshot;
+  /**
+   * provider adapter 使用的稳定且不含敏感信息的缓存作用域。键只能是
+   * session UUID 或可信的父线程作用域，绝不包含请求正文或凭据。
+   */
+  cache_scope_key?: string | null;
   canonical_request_digest: string;
   contributor_manifest: ContextContributorSnapshot[];
   created_at: string;
@@ -1219,6 +1224,10 @@ export interface ContextMessageSnapshot {
   role: string;
   source_refs?: string[];
   tool_call_ids: string[];
+  /**
+   * 完整 provider message wire 的摘要，包含工具调用参数和协议元数据。
+   */
+  wire_digest?: string;
   [k: string]: unknown;
 }
 export interface CostRecord {

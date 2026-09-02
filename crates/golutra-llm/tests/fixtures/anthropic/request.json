@@ -29,11 +29,17 @@
     ],
     "model": "claude-test",
     "stream": false,
-    "system": "You are concise.",
+    "system": [
+      {
+        "type": "text",
+        "text": "You are concise.",
+        "cache_control": {"type": "ephemeral", "ttl": "5m"}
+      }
+    ],
     "tools": [
       {
         "name": "read_file",
-        "description": "Read a UTF-8 text file in the workspace.",
+        "description": "Read workspace lines; use offset/limit and continuation.next_offset.",
         "input_schema": {
           "type": "object",
           "properties": {"path": {"type": "string"}},

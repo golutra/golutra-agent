@@ -2577,26 +2577,63 @@ impl RuntimeHost {
             .as_ref()
             .map(|(sequence_no, _)| *sequence_no)
             .unwrap_or_default();
-        let lines = effective_model_history_events(
+        let history = effective_model_history_events(
             events
                 .iter()
                 .filter(|event| event.sequence_no > compacted_after),
         )
         .into_iter()
-        .filter_map(conversation_history_line)
+        .filter_map(|event| {
+            let contributor = conversation_history_contributor(event)?;
+            let fallback_line = conversation_history_line(event)?;
+            Some((
+                ProviderMessage {
+                    role: contributor.role,
+                    content: contributor.content,
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: Vec::new(),
+                    metadata: Default::default(),
+                },
+                fallback_line,
+            ))
+        })
         .collect::<Vec<_>>();
-        if lines.is_empty() {
+        if history.is_empty() {
             return Ok(CommandAck {
                 command_id: command.command_id,
                 accepted: false,
                 reason: Some("session has no new conversation history to compact".to_owned()),
             });
         }
-        let summary = structured_compaction_summary(
-            latest_compaction
-                .as_ref()
-                .map(|(_, content)| content.as_str()),
+        let previous_summary = latest_compaction
+            .as_ref()
+            .and_then(|(_, content)| parse_compaction_summary_envelope(content))
+            .map(|envelope| envelope.summary);
+        let lines = history
+            .iter()
+            .map(|(_, line)| line.clone())
+            .collect::<Vec<_>>();
+        let source_messages = history
+            .iter()
+            .map(|(message, _)| message.clone())
+            .collect::<Vec<_>>();
+        let source_range = CompactionSourceRange {
+            start: 0,
+            end: u64::try_from(source_messages.len()).unwrap_or(u64::MAX),
+        };
+        let source_tokens = estimate_message_tokens(&source_messages);
+        let source_checksum = compaction_source_checksum(&source_messages);
+        let fallback = deterministic_compaction_fallback(
+            previous_summary.as_deref(),
             &lines,
+            EXPLICIT_COMPACTION_TOKEN_BUDGET,
+        );
+        let mut summary = compaction_summary_envelope(
+            &fallback,
+            source_range.clone(),
+            source_tokens,
+            source_checksum.clone(),
             EXPLICIT_COMPACTION_TOKEN_BUDGET,
         );
         let active_task_id = self
@@ -2606,6 +2643,155 @@ impl RuntimeHost {
             .state(session_id, None)
             .await?
             .active_task_id;
+        let trace_ids = active_task_id
+            .or_else(|| events.iter().rev().find_map(|event| event.task_id))
+            .zip(events.iter().rev().find_map(|event| event.turn_id));
+        let mut strategy = "fallback_facts";
+        if !self.force_mock_provider
+            && let Some((task_id, turn_id)) = trace_ids
+        {
+            let prompt_cache_scope = self
+                .prompt_cache_scope(session_id, false)
+                .await?
+                .compaction();
+            let provider_config_paths = self.provider_config_paths.clone();
+            let provider_route_cache = Arc::clone(&self.execution.provider_route_cache);
+            let provider_plan = run_blocking(move || {
+                let mut cache = provider_route_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                cached_mock_provider_plan(
+                    &mut cache,
+                    provider_config_paths.as_ref(),
+                    &json!({}),
+                    "compact conversation history",
+                )
+            })
+            .await?
+            .ok();
+            if let Some(provider_plan) = provider_plan {
+                let contract = provider_plan.provider.contract();
+                if contract.native_protocol != "in_memory"
+                    && let Some(provider_request) = compaction_summary_request(
+                        task_id,
+                        turn_id,
+                        &contract,
+                        prompt_cache_scope,
+                        previous_summary,
+                        &source_messages,
+                        EXPLICIT_COMPACTION_TOKEN_BUDGET,
+                    )
+                    && let Some(context_snapshot) = compaction_summary_context_snapshot(
+                        &provider_plan.context_builder,
+                        session_id,
+                        &provider_request,
+                    )
+                {
+                    let budget_snapshot_ref = context_snapshot.budget_snapshot.snapshot_id;
+                    let request_id = provider_request.request_id;
+                    let trace_task = HostedAgentTask {
+                        session_id,
+                        task_id,
+                        turn_id,
+                        payload: json!({}),
+                    };
+                    self.record_auxiliary_trace_observation(
+                        &trace_task,
+                        AgentLoopTraceEvent::ContextSnapshotCaptured {
+                            snapshot: context_snapshot,
+                            request: provider_request.clone(),
+                        },
+                    )
+                    .await?;
+                    self.record_auxiliary_trace_observation(
+                        &trace_task,
+                        AgentLoopTraceEvent::ProviderStarted {
+                            request_id,
+                            provider_id: contract.provider_id.clone(),
+                            model_id: contract.model_id.clone(),
+                        },
+                    )
+                    .await?;
+                    let cache_identity = provider_plan
+                        .provider
+                        .cache_identity_for_request(&provider_request);
+                    match tokio::time::timeout(
+                        provider_plan.provider_session_policy.request_timeout,
+                        provider_plan.provider.complete(provider_request.clone()),
+                    )
+                    .await
+                    {
+                        Ok(Ok(response)) => {
+                            let usage = auxiliary_provider_usage_record(
+                                &provider_request,
+                                &response,
+                                Some(session_id),
+                                budget_snapshot_ref,
+                                &contract.cost_model,
+                                cache_identity,
+                            );
+                            self.record_auxiliary_trace_observation(
+                                &trace_task,
+                                AgentLoopTraceEvent::TokenUsageRecorded(usage),
+                            )
+                            .await?;
+                            let model_summary = response
+                                .message
+                                .as_ref()
+                                .map(|message| message.content.trim().to_owned())
+                                .filter(|content| !content.is_empty());
+                            self.record_auxiliary_trace_observation(
+                                &trace_task,
+                                AgentLoopTraceEvent::ProviderCompleted {
+                                    request_id,
+                                    provider_id: contract.provider_id,
+                                    model_id: contract.model_id,
+                                    response,
+                                },
+                            )
+                            .await?;
+                            if let Some(model_summary) = model_summary {
+                                let candidate = compaction_summary_envelope(
+                                    &model_summary,
+                                    source_range,
+                                    source_tokens,
+                                    source_checksum,
+                                    EXPLICIT_COMPACTION_TOKEN_BUDGET,
+                                );
+                                if !candidate.is_empty() {
+                                    summary = candidate;
+                                    strategy = "model_summary";
+                                }
+                            }
+                        }
+                        Ok(Err(error)) => {
+                            self.record_auxiliary_trace_observation(
+                                &trace_task,
+                                AgentLoopTraceEvent::ProviderFailed {
+                                    request_id,
+                                    provider_id: contract.provider_id,
+                                    model_id: contract.model_id,
+                                    error: error.to_string(),
+                                },
+                            )
+                            .await?;
+                        }
+                        Err(_) => {
+                            self.record_auxiliary_trace_observation(
+                                &trace_task,
+                                AgentLoopTraceEvent::ProviderFailed {
+                                    request_id,
+                                    provider_id: contract.provider_id,
+                                    model_id: contract.model_id,
+                                    error: "compaction summary request timed out".to_owned(),
+                                },
+                            )
+                            .await?;
+                        }
+                    }
+                }
+            }
+        }
         self.record_event(host_event(
             self.next_sequence_no(),
             session_id,
@@ -2617,6 +2803,7 @@ impl RuntimeHost {
                 "content": summary,
                 "command_id": command.command_id,
                 "mode": "explicit",
+                "strategy": strategy,
             }),
         ))
         .await?;
