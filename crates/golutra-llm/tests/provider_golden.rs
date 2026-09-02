@@ -9,9 +9,9 @@ use golutra_core::{
 use golutra_llm::{
     GenaiProviderAdapter, GenaiProviderConfig, LlmProvider, OpenAiCompatibleProvider,
     OpenAiCompatibleProviderConfig, OpenAiResponsesProvider, OpenAiResponsesProviderConfig,
-    ProviderError, ProviderFinishReason, ProviderGenerationConfig, ProviderMessage,
-    ProviderProtocol, ProviderReasoningEffort, ProviderRequest, ProviderRole, ProviderStreamEvent,
-    ProviderToolCall,
+    ProviderCacheCapabilities, ProviderError, ProviderFinishReason, ProviderGenerationConfig,
+    ProviderMessage, ProviderProtocol, ProviderReasoningEffort, ProviderRequest, ProviderRole,
+    ProviderStreamEvent, ProviderToolCall, UsageSource,
 };
 use secrecy::SecretString;
 use serde::Deserialize;
@@ -284,6 +284,7 @@ async fn openai_compatible_provider_matches_goldens() {
             protocol: ProviderProtocol::OpenAiCompatible,
             generation_config: ProviderGenerationConfig::default(),
             custom_headers: Default::default(),
+            cache_capabilities: None,
         },
         Arc::new(RefreshingCredential),
     )
@@ -437,6 +438,126 @@ async fn openai_compatible_custom_headers_are_applied_without_debug_values() {
     );
     assert!(!captured.headers.contains_key("session-id"));
     assert!(!debug.contains("fake-supplemental-key"));
+}
+
+#[tokio::test]
+async fn native_genai_affinity_headers_follow_cache_capability_gate() {
+    let custom_headers = json!({
+        "Session-Id": "custom-session-must-not-win",
+        "X-Client-Request-Id": "custom-request-must-not-win",
+        "X-Session-Affinity": "custom-affinity-must-not-win",
+        "X-Safe-Header": "preserved"
+    })
+    .to_string();
+    let disabled_capabilities =
+        serde_json::to_string(&ProviderCacheCapabilities::disabled()).expect("disabled JSON");
+
+    let (base_url, captured) =
+        spawn_provider(200, include_str!("fixtures/anthropic/text_response.json")).await;
+    let config = GenaiProviderAdapter::config_from_env_reader(|key| match key {
+        "GOLUTRA_PROVIDER_PROTOCOL" => Some("anthropic".to_owned()),
+        "GOLUTRA_PROVIDER_API_KEY" => Some(TEST_API_KEY.to_owned()),
+        "GOLUTRA_PROVIDER_MODEL" => Some("claude-test".to_owned()),
+        "GOLUTRA_PROVIDER_BASE_URL" => Some(format!("{base_url}/v1")),
+        "GOLUTRA_PROVIDER_CUSTOM_HEADERS" => Some(custom_headers.clone()),
+        "GOLUTRA_PROVIDER_CACHE_CAPABILITIES" => Some(disabled_capabilities.clone()),
+        _ => None,
+    })
+    .expect("disabled native provider config");
+    let provider = GenaiProviderAdapter::from_config(config);
+    let session_id = SessionId::new();
+    let mut request = simple_request("claude-test");
+    request.session_id = Some(session_id);
+    request.cache_policy = PromptCachePolicy::None;
+    provider
+        .complete(request)
+        .await
+        .expect("disabled native provider request");
+    let captured = captured.await.expect("disabled native request capture");
+    assert_eq!(
+        captured.headers.get("x-safe-header").map(String::as_str),
+        Some("preserved")
+    );
+    for header in [
+        "session-id",
+        "session_id",
+        "x-client-request-id",
+        "x-session-affinity",
+    ] {
+        assert!(
+            !captured.headers.contains_key(header),
+            "disabled native request carried reserved affinity header {header}"
+        );
+    }
+
+    let enabled_capabilities =
+        serde_json::to_string(&ProviderCacheCapabilities::anthropic_with_affinity())
+            .expect("enabled JSON");
+    let (base_url, captured) = spawn_provider_sequence(vec![
+        TestProviderResponse::json(200, include_str!("fixtures/anthropic/text_response.json")),
+        TestProviderResponse::json(200, include_str!("fixtures/anthropic/text_response.json")),
+    ])
+    .await;
+    let config = GenaiProviderAdapter::config_from_env_reader(|key| match key {
+        "GOLUTRA_PROVIDER_PROTOCOL" => Some("anthropic".to_owned()),
+        "GOLUTRA_PROVIDER_API_KEY" => Some(TEST_API_KEY.to_owned()),
+        "GOLUTRA_PROVIDER_MODEL" => Some("claude-test".to_owned()),
+        "GOLUTRA_PROVIDER_BASE_URL" => Some(format!("{base_url}/v1")),
+        "GOLUTRA_PROVIDER_AUTH_PROVIDER" => Some("custom-anthropic".to_owned()),
+        "GOLUTRA_PROVIDER_CUSTOM_HEADERS" => Some(custom_headers.clone()),
+        "GOLUTRA_PROVIDER_CACHE_CAPABILITIES" => Some(enabled_capabilities.clone()),
+        _ => None,
+    })
+    .expect("enabled native provider config");
+    let provider = GenaiProviderAdapter::from_config(config);
+    let session_id = SessionId::new();
+    let mut request = simple_request("claude-test");
+    request.session_id = Some(session_id);
+    provider
+        .complete(request.clone())
+        .await
+        .expect("enabled native provider request");
+    let mut uncached_request = request;
+    uncached_request.cache_policy = PromptCachePolicy::None;
+    provider
+        .complete(uncached_request)
+        .await
+        .expect("explicitly uncached native provider request");
+    let captured = captured.await.expect("enabled native request capture");
+    assert_eq!(captured.len(), 2);
+    let expected_affinity = session_id.to_string();
+    assert_eq!(
+        captured[0]
+            .headers
+            .get("x-session-affinity")
+            .map(String::as_str),
+        Some(expected_affinity.as_str())
+    );
+    assert_eq!(
+        captured[0].headers.get("x-safe-header").map(String::as_str),
+        Some("preserved")
+    );
+    for header in ["session-id", "session_id", "x-client-request-id"] {
+        assert!(
+            !captured[0].headers.contains_key(header),
+            "enabled native request carried undeclared affinity header {header}"
+        );
+    }
+    for header in [
+        "session-id",
+        "session_id",
+        "x-client-request-id",
+        "x-session-affinity",
+    ] {
+        assert!(
+            !captured[1].headers.contains_key(header),
+            "explicitly uncached native request carried affinity header {header}"
+        );
+    }
+    assert_eq!(
+        captured[1].headers.get("x-safe-header").map(String::as_str),
+        Some("preserved")
+    );
 }
 
 #[tokio::test]
@@ -662,6 +783,7 @@ async fn openai_responses_auto_summary_preserves_reasoning_effort_and_parallel_t
             ..ProviderGenerationConfig::default()
         },
         custom_headers: Default::default(),
+        cache_capabilities: None,
     });
 
     provider
@@ -761,7 +883,7 @@ async fn openai_responses_projects_stable_cache_identity_and_retention() {
         TestProviderResponse::sse(200, response),
     ])
     .await;
-    let provider = openai_responses_provider(base_url);
+    let provider = openai_responses_generic_provider(base_url);
     let session_id = SessionId::new();
     let mut first = simple_request("gpt-golden");
     first.session_id = Some(session_id);
@@ -810,11 +932,11 @@ async fn openai_responses_projects_stable_cache_identity_and_retention() {
         assert_eq!(request.body["prompt_cache_retention"], "24h");
     }
     assert_eq!(
-        requests[0].headers.get("session-id").map(String::as_str),
+        requests[0].headers.get("session_id").map(String::as_str),
         Some(session_header.as_str())
     );
     assert_eq!(
-        requests[1].headers.get("session-id").map(String::as_str),
+        requests[1].headers.get("session_id").map(String::as_str),
         Some(session_header.as_str())
     );
     assert!(requests[3].body.get("prompt_cache_key").is_none());
@@ -847,6 +969,58 @@ async fn openai_responses_default_policy_leaves_retention_to_provider() {
         requests[0].headers.get("session-id").map(String::as_str),
         Some(session_header.as_str())
     );
+}
+
+#[tokio::test]
+async fn openai_responses_disabled_capability_does_not_leak_upstream_cache_defaults() {
+    let (base_url, captured) = spawn_provider_sequence(vec![TestProviderResponse::sse(
+        200,
+        include_str!("fixtures/openai-responses/text-response.sse"),
+    )])
+    .await;
+    let provider = OpenAiResponsesProvider::from_config(OpenAiResponsesProviderConfig {
+        api_key: TEST_API_KEY.to_owned(),
+        api_key_env: "GOLDEN_TEST_API_KEY".to_owned(),
+        provider_id: "unknown-responses-gateway".to_owned(),
+        base_url,
+        model_id: "gpt-5.6".to_owned(),
+        generation_config: ProviderGenerationConfig::default(),
+        custom_headers: Default::default(),
+        cache_capabilities: Some(ProviderCacheCapabilities::disabled()),
+    });
+    let session_id = SessionId::new();
+    let mut request = simple_request("gpt-5.6");
+    request.session_id = Some(session_id);
+    request.cache_policy = PromptCachePolicy::Long;
+
+    provider
+        .complete(request)
+        .await
+        .expect("disabled Responses request");
+    let requests = captured.await.expect("disabled Responses capture");
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    for field in [
+        "prompt_cache_key",
+        "prompt_cache_retention",
+        "prompt_cache_options",
+    ] {
+        assert!(
+            request.body.get(field).is_none(),
+            "disabled capability must omit {field}"
+        );
+    }
+    for header in [
+        "session-id",
+        "session_id",
+        "x-session-affinity",
+        "x-client-request-id",
+    ] {
+        assert!(
+            !request.headers.contains_key(header),
+            "disabled capability must omit affinity header {header}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -911,6 +1085,7 @@ async fn github_copilot_adapter_adds_provider_required_headers() {
             protocol: ProviderProtocol::OpenAiCompatible,
             generation_config: ProviderGenerationConfig::default(),
             custom_headers: Default::default(),
+            cache_capabilities: None,
         },
         Arc::new(RefreshingCredential),
     );
@@ -966,6 +1141,13 @@ async fn live_provider_smoke_is_opt_in_and_never_reads_normal_user_credentials()
     if let (Some(api_key), Some(base_url), Some(model)) =
         (responses_key, responses_base_url, responses_model)
     {
+        let mut request = simple_request(&model);
+        request.messages = vec![message(
+            ProviderRole::User,
+            "只回复中文：这是一次真实 Responses 缓存 smoke。",
+        )];
+        request.session_id = Some(SessionId::new());
+        request.cache_policy = PromptCachePolicy::Auto;
         let response = OpenAiResponsesProvider::from_config(OpenAiResponsesProviderConfig {
             api_key,
             api_key_env: "GOLUTRA_LIVE_OPENAI_RESPONSES_API_KEY".to_owned(),
@@ -977,11 +1159,37 @@ async fn live_provider_smoke_is_opt_in_and_never_reads_normal_user_credentials()
                 ..ProviderGenerationConfig::default()
             },
             custom_headers: Default::default(),
+            cache_capabilities: None,
         })
-        .complete(simple_request(&model))
+        .complete(request)
         .await
         .expect("OpenAI Responses live smoke");
-        assert!(response.message.is_some() || !response.tool_calls.is_empty());
+        let content = response
+            .message
+            .as_ref()
+            .map(|message| message.content.as_str())
+            .unwrap_or_default();
+        assert!(
+            content
+                .chars()
+                .any(|character| ('\u{4e00}'..='\u{9fff}').contains(&character)),
+            "Responses live smoke must return CJK text"
+        );
+        assert!(
+            response.usage.input_tokens.is_some()
+                && response.usage.output_tokens.is_some()
+                && response.usage.total_tokens.is_some(),
+            "Responses live smoke must return complete token usage"
+        );
+        assert_eq!(
+            response.usage.usage_source,
+            UsageSource::Provider,
+            "Responses live smoke usage must come from the provider"
+        );
+        assert!(
+            response.usage.cached_input_tokens.is_some(),
+            "Responses live smoke must expose cache read, including a real zero"
+        );
     } else {
         eprintln!("skipping OpenAI Responses live smoke: dedicated env is incomplete");
     }
@@ -1017,6 +1225,7 @@ async fn live_provider_smoke_is_opt_in_and_never_reads_normal_user_credentials()
                 ..ProviderGenerationConfig::default()
             },
             custom_headers: Default::default(),
+            cache_capabilities: None,
         });
 
         let response = provider
@@ -1095,11 +1304,25 @@ fn provider(case: ProtocolCase, base_url: String) -> GenaiProviderAdapter {
             ..ProviderGenerationConfig::default()
         },
         custom_headers: Default::default(),
+        cache_capabilities: None,
     })
 }
 
 fn openai_responses_provider(base_url: String) -> OpenAiResponsesProvider {
     openai_responses_provider_with_model(base_url, "gpt-golden")
+}
+
+fn openai_responses_generic_provider(base_url: String) -> OpenAiResponsesProvider {
+    OpenAiResponsesProvider::from_config(OpenAiResponsesProviderConfig {
+        api_key: TEST_API_KEY.to_owned(),
+        api_key_env: "GOLDEN_TEST_API_KEY".to_owned(),
+        provider_id: "openai-responses-golden".to_owned(),
+        base_url,
+        model_id: "gpt-golden".to_owned(),
+        generation_config: ProviderGenerationConfig::default(),
+        custom_headers: Default::default(),
+        cache_capabilities: Some(ProviderCacheCapabilities::responses()),
+    })
 }
 
 fn openai_responses_provider_with_model(
@@ -1115,6 +1338,7 @@ fn openai_responses_provider_with_model(
             model_id: model_id.to_owned(),
             generation_config: ProviderGenerationConfig::default(),
             custom_headers: Default::default(),
+            cache_capabilities: Some(ProviderCacheCapabilities::codex_responses()),
         },
         Arc::new(RefreshingCredential),
     )

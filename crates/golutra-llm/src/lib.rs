@@ -31,11 +31,11 @@ mod provider_config;
 pub use genai_adapter::{GenaiProviderAdapter, GenaiProviderConfig};
 pub use openai_responses::{OpenAiResponsesProvider, OpenAiResponsesProviderConfig};
 pub(crate) use provider_config::{
-    apply_generation_config_to_openai_body, configured_or_first_env, custom_headers_from_reader,
-    env_mapping, first_env, generation_config_from_reader, is_false, missing_env_error,
-    normalize_protocol_value, protocol_spec, redacted_native_from_reader,
-    redacted_openai_from_reader, redacted_openai_responses_from_reader, sanitize_provider_error,
-    selected_protocol_from_reader,
+    apply_generation_config_to_openai_body, cache_capabilities_from_reader,
+    configured_or_first_env, custom_headers_from_reader, env_mapping, first_env,
+    generation_config_from_reader, is_false, missing_env_error, normalize_protocol_value,
+    protocol_spec, redacted_native_from_reader, redacted_openai_from_reader,
+    redacted_openai_responses_from_reader, sanitize_provider_error, selected_protocol_from_reader,
 };
 pub use provider_config::{
     normalize_openai_base_url, validate_native_base_url, validate_openai_base_url,
@@ -51,6 +51,8 @@ const GOLUTRA_PROVIDER_GENERATION_CONFIG: &str = "GOLUTRA_PROVIDER_GENERATION_CO
 pub const GOLUTRA_PROVIDER_CUSTOM_HEADERS: &str = "GOLUTRA_PROVIDER_CUSTOM_HEADERS";
 /// 非敏感的 provider route identity；只用于声明能力选择，不包含凭据或用户内容。
 pub const GOLUTRA_PROVIDER_ROUTE_ID: &str = "GOLUTRA_PROVIDER_ROUTE_ID";
+/// 非敏感的缓存能力声明；由配置层传入，适配器只执行声明而不猜测网关能力。
+pub const GOLUTRA_PROVIDER_CACHE_CAPABILITIES: &str = "GOLUTRA_PROVIDER_CACHE_CAPABILITIES";
 const GOLUTRA_PROVIDER_AUTH_PROVIDER: &str = "GOLUTRA_PROVIDER_AUTH_PROVIDER";
 const OPENAI_API_KEY: &str = "OPENAI_API_KEY";
 const OPENAI_MODEL: &str = "OPENAI_MODEL";
@@ -81,21 +83,233 @@ const SESSION_AFFINITY_HEADER: &str = "session-id";
 const SESSION_ID_HEADER: &str = "session_id";
 const CLIENT_REQUEST_ID_HEADER: &str = "x-client-request-id";
 const SESSION_AFFINITY_ALIAS_HEADER: &str = "x-session-affinity";
-const EMPTY_AFFINITY_HEADERS: &[&str] = &[];
-const CODEX_AFFINITY_HEADERS: &[&str] = &[SESSION_AFFINITY_HEADER, CLIENT_REQUEST_ID_HEADER];
-const RESPONSES_AFFINITY_HEADERS: &[&str] = &[SESSION_ID_HEADER, CLIENT_REQUEST_ID_HEADER];
-const COMPATIBLE_AFFINITY_HEADERS: &[&str] = &[
-    SESSION_ID_HEADER,
-    CLIENT_REQUEST_ID_HEADER,
-    SESSION_AFFINITY_ALIAS_HEADER,
-];
-const ANTHROPIC_AFFINITY_HEADERS: &[&str] = &[SESSION_AFFINITY_ALIAS_HEADER];
 const RESERVED_AFFINITY_HEADERS: &[&str] = &[
     SESSION_AFFINITY_HEADER,
     SESSION_ID_HEADER,
     CLIENT_REQUEST_ID_HEADER,
     SESSION_AFFINITY_ALIAS_HEADER,
 ];
+
+/// Provider 支持的会话亲和 header。只允许这些已知 wire 名称，避免自定义
+/// header 绕过能力门控或把凭据/用户内容误带到上游。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProviderAffinityHeader {
+    #[serde(rename = "session_id")]
+    SessionId,
+    #[serde(rename = "session-id")]
+    SessionDashId,
+    #[serde(rename = "x-client-request-id")]
+    ClientRequestId,
+    #[serde(rename = "x-session-affinity")]
+    SessionAffinity,
+}
+
+impl ProviderAffinityHeader {
+    #[must_use]
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::SessionId => SESSION_ID_HEADER,
+            Self::SessionDashId => SESSION_AFFINITY_HEADER,
+            Self::ClientRequestId => CLIENT_REQUEST_ID_HEADER,
+            Self::SessionAffinity => SESSION_AFFINITY_ALIAS_HEADER,
+        }
+    }
+
+    const fn bit(self) -> u8 {
+        match self {
+            Self::SessionId => 1 << 0,
+            Self::SessionDashId => 1 << 1,
+            Self::ClientRequestId => 1 << 2,
+            Self::SessionAffinity => 1 << 3,
+        }
+    }
+}
+
+/// provider 的缓存能力矩阵。该结构是配置的一部分，而不是由 URL/hostname
+/// 推断出来的运行时事实；同一协议可用不同声明安全地服务不同网关。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderCacheCapabilities {
+    #[serde(default)]
+    pub prompt_cache_key: bool,
+    #[serde(default)]
+    pub supports_long_retention: bool,
+    #[serde(default)]
+    pub supports_cache_control: bool,
+    #[serde(default)]
+    pub affinity_headers: Vec<ProviderAffinityHeader>,
+}
+
+impl ProviderCacheCapabilities {
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self::default()
+    }
+
+    /// 通用 Responses 配置，等价于 Pi 的默认 session cache 约定。
+    #[must_use]
+    pub fn responses() -> Self {
+        Self {
+            prompt_cache_key: true,
+            supports_long_retention: true,
+            supports_cache_control: true,
+            affinity_headers: vec![
+                ProviderAffinityHeader::SessionId,
+                ProviderAffinityHeader::ClientRequestId,
+            ],
+        }
+    }
+
+    /// ChatGPT/Codex Responses 后端使用连字符形式的 session header，且不
+    /// 假定通用 Responses 的 retention 扩展字段。
+    #[must_use]
+    pub fn codex_responses() -> Self {
+        Self {
+            prompt_cache_key: true,
+            supports_long_retention: false,
+            supports_cache_control: false,
+            affinity_headers: vec![
+                ProviderAffinityHeader::SessionDashId,
+                ProviderAffinityHeader::ClientRequestId,
+            ],
+        }
+    }
+
+    #[must_use]
+    pub fn anthropic() -> Self {
+        Self {
+            prompt_cache_key: false,
+            supports_long_retention: true,
+            supports_cache_control: true,
+            affinity_headers: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn anthropic_with_affinity() -> Self {
+        Self {
+            affinity_headers: vec![ProviderAffinityHeader::SessionAffinity],
+            ..Self::anthropic()
+        }
+    }
+
+    /// OpenAI-compatible 网关的显式 preset。只有配置入口选择该 preset 时
+    /// 才会启用缓存；未知兼容网关继续保持 disabled。
+    #[must_use]
+    pub fn compatible() -> Self {
+        Self {
+            prompt_cache_key: true,
+            supports_long_retention: true,
+            supports_cache_control: true,
+            affinity_headers: vec![
+                ProviderAffinityHeader::SessionId,
+                ProviderAffinityHeader::ClientRequestId,
+                ProviderAffinityHeader::SessionAffinity,
+            ],
+        }
+    }
+
+    #[must_use]
+    pub fn for_protocol(protocol: ProviderProtocol) -> Self {
+        match protocol {
+            ProviderProtocol::OpenAiResponses => Self::responses(),
+            ProviderProtocol::Anthropic => Self::anthropic(),
+            // 兼容端点的缓存语义并不由协议本身保证，默认关闭，等待显式
+            // profile/preset 声明。
+            ProviderProtocol::OpenAiCompatible
+            | ProviderProtocol::Gemini
+            | ProviderProtocol::VertexAi
+            | ProviderProtocol::Genai
+            | ProviderProtocol::Mock => Self::disabled(),
+        }
+    }
+
+    /// 配置入口的一次性 preset 选择。适配器热路径不会再调用此方法。
+    #[must_use]
+    pub fn for_provider(protocol: ProviderProtocol, provider_id: &str) -> Self {
+        let provider_id = canonical_provider_identity(provider_id);
+        match protocol {
+            ProviderProtocol::Anthropic
+                if matches!(
+                    provider_id.as_str(),
+                    "fireworks" | "fireworks-ai" | "cloudflare" | "cloudflare-workers-ai" | "groq"
+                ) =>
+            {
+                Self::anthropic_with_affinity()
+            }
+            ProviderProtocol::Anthropic => Self::anthropic(),
+            ProviderProtocol::OpenAiResponses
+                if matches!(
+                    provider_id.as_str(),
+                    "openai-chatgpt" | "chatgpt" | "chatgpt-codex" | "codex"
+                ) =>
+            {
+                Self::codex_responses()
+            }
+            ProviderProtocol::OpenAiResponses => Self::responses(),
+            ProviderProtocol::OpenAiCompatible
+                if matches!(provider_id.as_str(), "openai" | "golutra" | "golutra-agent") =>
+            {
+                Self::compatible()
+            }
+            _ => Self::disabled(),
+        }
+    }
+
+    pub fn validate_for_protocol(&self, protocol: ProviderProtocol) -> Result<(), String> {
+        let mut seen = BTreeMap::new();
+        for header in &self.affinity_headers {
+            if seen.insert(header.wire_name(), ()).is_some() {
+                return Err(format!(
+                    "provider cache affinity header `{}` is configured more than once",
+                    header.wire_name()
+                ));
+            }
+        }
+        if self.prompt_cache_key
+            && !matches!(
+                protocol,
+                ProviderProtocol::OpenAiResponses | ProviderProtocol::OpenAiCompatible
+            )
+        {
+            return Err(format!(
+                "prompt_cache_key is not supported by protocol `{}`",
+                protocol.id()
+            ));
+        }
+        let cache_protocol = matches!(
+            protocol,
+            ProviderProtocol::OpenAiResponses
+                | ProviderProtocol::OpenAiCompatible
+                | ProviderProtocol::Anthropic
+        );
+        if !cache_protocol
+            && (self.supports_long_retention
+                || self.supports_cache_control
+                || !self.affinity_headers.is_empty())
+        {
+            return Err(format!(
+                "cache capabilities are not supported by protocol `{}`",
+                protocol.id()
+            ));
+        }
+        if self.supports_long_retention && !self.prompt_cache_key && !self.supports_cache_control {
+            return Err(
+                "supports_long_retention requires prompt_cache_key or cache_control".to_owned(),
+            );
+        }
+        if !self.prompt_cache_key
+            && !self.supports_cache_control
+            && !self.affinity_headers.is_empty()
+        {
+            return Err(
+                "affinity headers require an enabled cache key or cache control capability"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProviderCacheMode {
@@ -107,78 +321,83 @@ pub(crate) enum ProviderCacheMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProviderCacheProfile {
     pub(crate) mode: ProviderCacheMode,
-    affinity_headers: &'static [&'static str],
+    affinity_mask: u8,
+    supports_prompt_cache_key: bool,
+    supports_cache_control: bool,
     supports_long_retention: bool,
 }
 
 impl ProviderCacheProfile {
-    /// 按声明的 provider identity 解析缓存能力。
-    ///
-    /// 这里不读取 URL/hostname：路由迁移到其他网关时不会静默改变 wire
-    /// 合约。显式 Responses/Anthropic 协议声明缓存支持；兼容协议必须使用
-    /// 已知 identity，未知网关保持保守关闭。
-    fn for_provider(protocol: ProviderProtocol, provider_id: &str) -> Self {
-        let provider_id = canonical_provider_identity(provider_id);
-        let (mode, affinity_headers, supports_long_retention) = match protocol {
-            ProviderProtocol::Anthropic => (
-                ProviderCacheMode::Anthropic,
-                match provider_id.as_str() {
-                    "fireworks"
-                    | "fireworks-ai"
-                    | "cloudflare"
-                    | "cloudflare-workers-ai"
-                    | "groq" => ANTHROPIC_AFFINITY_HEADERS,
-                    _ => EMPTY_AFFINITY_HEADERS,
-                },
-                true,
-            ),
-            ProviderProtocol::OpenAiResponses => (
-                ProviderCacheMode::Responses,
-                match provider_id.as_str() {
-                    "openai-chatgpt" | "chatgpt" | "chatgpt-codex" | "codex" => {
-                        CODEX_AFFINITY_HEADERS
-                    }
-                    // 显式 Responses 路由即使使用自定义显示名也具备缓存能力，
-                    // 统一使用通用 header 对。
-                    _ => RESPONSES_AFFINITY_HEADERS,
-                },
-                true,
-            ),
-            ProviderProtocol::OpenAiCompatible => match provider_id.as_str() {
-                "openai" | "golutra" | "golutra-agent" => (
-                    ProviderCacheMode::Responses,
-                    if provider_id == "golutra" || provider_id == "golutra-agent" {
-                        COMPATIBLE_AFFINITY_HEADERS
-                    } else {
-                        RESPONSES_AFFINITY_HEADERS
-                    },
-                    true,
-                ),
-                _ => (ProviderCacheMode::Disabled, EMPTY_AFFINITY_HEADERS, false),
-            },
-            _ => (ProviderCacheMode::Disabled, EMPTY_AFFINITY_HEADERS, false),
+    fn from_capabilities(
+        protocol: ProviderProtocol,
+        capabilities: &ProviderCacheCapabilities,
+    ) -> Self {
+        let mode = match protocol {
+            ProviderProtocol::OpenAiResponses | ProviderProtocol::OpenAiCompatible => {
+                ProviderCacheMode::Responses
+            }
+            ProviderProtocol::Anthropic => ProviderCacheMode::Anthropic,
+            _ => ProviderCacheMode::Disabled,
         };
+        let valid = capabilities.validate_for_protocol(protocol).is_ok();
+        let mut affinity_mask = 0;
+        if valid {
+            for header in &capabilities.affinity_headers {
+                affinity_mask |= header.bit();
+            }
+        }
         Self {
-            mode,
-            affinity_headers,
-            supports_long_retention,
+            mode: if valid {
+                mode
+            } else {
+                ProviderCacheMode::Disabled
+            },
+            affinity_mask,
+            supports_prompt_cache_key: valid && capabilities.prompt_cache_key,
+            supports_cache_control: valid && capabilities.supports_cache_control,
+            supports_long_retention: valid && capabilities.supports_long_retention,
         }
     }
 
-    fn prompt_cache_key(self, policy: PromptCachePolicy) -> bool {
-        policy != PromptCachePolicy::None && self.mode == ProviderCacheMode::Responses
+    #[cfg(test)]
+    fn for_provider(protocol: ProviderProtocol, provider_id: &str) -> Self {
+        Self::from_capabilities(
+            protocol,
+            &ProviderCacheCapabilities::for_provider(protocol, provider_id),
+        )
     }
 
-    fn affinity_headers(self, policy: PromptCachePolicy) -> &'static [&'static str] {
+    fn prompt_cache_key(self, policy: PromptCachePolicy) -> bool {
+        policy != PromptCachePolicy::None
+            && self.mode == ProviderCacheMode::Responses
+            && self.supports_prompt_cache_key
+    }
+
+    fn affinity_headers(self, policy: PromptCachePolicy) -> Vec<&'static str> {
         if policy == PromptCachePolicy::None {
-            EMPTY_AFFINITY_HEADERS
+            Vec::new()
         } else {
-            self.affinity_headers
+            let mut headers = Vec::with_capacity(4);
+            for header in [
+                ProviderAffinityHeader::SessionId,
+                ProviderAffinityHeader::SessionDashId,
+                ProviderAffinityHeader::ClientRequestId,
+                ProviderAffinityHeader::SessionAffinity,
+            ] {
+                if self.affinity_mask & header.bit() != 0 {
+                    headers.push(header.wire_name());
+                }
+            }
+            headers
         }
     }
 
     fn supports_long_retention(self, policy: PromptCachePolicy) -> bool {
         policy == PromptCachePolicy::Long && self.supports_long_retention
+    }
+
+    fn supports_cache_control(self, policy: PromptCachePolicy) -> bool {
+        policy != PromptCachePolicy::None && self.supports_cache_control
     }
 
     /// 主会话遵循 provider 的默认 retention。长期保留仍由调用方通过
@@ -998,6 +1217,8 @@ pub struct OpenAiCompatibleProviderConfig {
     pub protocol: ProviderProtocol,
     pub generation_config: ProviderGenerationConfig,
     pub custom_headers: ProviderHttpHeaders,
+    /// 已验证的 provider 缓存能力；缺省时使用协议级保守默认值。
+    pub cache_capabilities: Option<ProviderCacheCapabilities>,
 }
 
 impl fmt::Debug for OpenAiCompatibleProvider {
@@ -1135,9 +1356,9 @@ impl OpenAiCompatibleProvider {
             )),
             api_key_env: GOLUTRA_PROVIDER_API_KEY.to_owned(),
             provider_id: "openai-compatible".to_owned(),
-            cache_profile: ProviderCacheProfile::for_provider(
+            cache_profile: ProviderCacheProfile::from_capabilities(
                 ProviderProtocol::OpenAiCompatible,
-                "openai-compatible",
+                &ProviderCacheCapabilities::disabled(),
             ),
             base_url,
             model_id: model_id.into(),
@@ -1162,8 +1383,12 @@ impl OpenAiCompatibleProvider {
         credential: Arc<dyn CredentialProvider>,
     ) -> Self {
         let base_url = normalize_openai_base_url(&config.base_url);
-        let cache_profile =
-            ProviderCacheProfile::for_provider(config.protocol, &config.provider_id);
+        let default_capabilities = ProviderCacheCapabilities::for_protocol(config.protocol);
+        let capabilities = config
+            .cache_capabilities
+            .as_ref()
+            .unwrap_or(&default_capabilities);
+        let cache_profile = ProviderCacheProfile::from_capabilities(config.protocol, capabilities);
         Self {
             credential,
             api_key_env: config.api_key_env,
@@ -1214,20 +1439,25 @@ impl OpenAiCompatibleProvider {
             .map_err(|message| ProviderError::NotConfigured { message })?;
         let generation_config = generation_config_from_reader(&reader)?;
         let custom_headers = custom_headers_from_reader(&reader)?;
+        let provider_id = reader(GOLUTRA_PROVIDER_AUTH_PROVIDER)
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| reader(GOLUTRA_PROVIDER_ROUTE_ID).filter(|value| !value.trim().is_empty()))
+            .unwrap_or_else(|| "openai-compatible".to_owned());
+        let cache_capabilities = Some(cache_capabilities_from_reader(
+            &reader,
+            protocol,
+            &provider_id,
+        )?);
         Ok(OpenAiCompatibleProviderConfig {
             api_key,
             api_key_env,
-            provider_id: reader(GOLUTRA_PROVIDER_AUTH_PROVIDER)
-                .filter(|value| !value.trim().is_empty())
-                .or_else(|| {
-                    reader(GOLUTRA_PROVIDER_ROUTE_ID).filter(|value| !value.trim().is_empty())
-                })
-                .unwrap_or_else(|| "openai-compatible".to_owned()),
+            provider_id,
             base_url,
             model_id,
             protocol,
             generation_config,
             custom_headers,
+            cache_capabilities,
         })
     }
 

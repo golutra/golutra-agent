@@ -3,7 +3,7 @@ use std::{fmt, sync::Arc};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use genai::{
-    Client, ModelIden, ServiceTarget, WebConfig,
+    Client, Headers, ModelIden, ServiceTarget, WebConfig,
     adapter::AdapterKind,
     chat::{
         CacheControl, ChatMessage, ChatOptions, ChatRequest, ChatStreamEvent, ContentPart,
@@ -20,11 +20,12 @@ use secrecy::ExposeSecret;
 use serde_json::{Value, json};
 
 use super::{
-    GOLUTRA_PROVIDER_AUTH_PROVIDER, GOLUTRA_PROVIDER_ROUTE_ID, LlmProvider, ProviderCacheMode,
-    ProviderCacheProfile, ProviderError, ProviderErrorMetadata, ProviderFinishReason,
-    ProviderGenerationConfig, ProviderHttpHeaders, ProviderMessage, ProviderProbeResult,
-    ProviderProtocol, ProviderRequest, ProviderResponse, ProviderRole, ProviderStreamEvent,
-    ProviderToolCall, ProviderUsage, UsageSource, configured_or_first_env,
+    GOLUTRA_PROVIDER_AUTH_PROVIDER, GOLUTRA_PROVIDER_ROUTE_ID, LlmProvider,
+    ProviderCacheCapabilities, ProviderCacheMode, ProviderCacheProfile, ProviderError,
+    ProviderErrorMetadata, ProviderFinishReason, ProviderGenerationConfig, ProviderHttpHeaders,
+    ProviderMessage, ProviderProbeResult, ProviderProtocol, ProviderRequest, ProviderResponse,
+    ProviderRole, ProviderStreamEvent, ProviderToolCall, ProviderUsage, RESERVED_AFFINITY_HEADERS,
+    UsageSource, cache_capabilities_from_reader, configured_or_first_env,
     custom_headers_from_reader, env_mapping, first_env, generation_config_from_reader,
     missing_env_error, protocol_capabilities, provider_tool_schema_for_contract,
     request_id_from_headers, retry_after_from_headers, sanitize_provider_error,
@@ -41,6 +42,8 @@ pub struct GenaiProviderConfig {
     pub protocol: ProviderProtocol,
     pub generation_config: ProviderGenerationConfig,
     pub custom_headers: ProviderHttpHeaders,
+    /// 已验证的 provider 缓存能力；缺省时使用协议级安全默认值。
+    pub cache_capabilities: Option<ProviderCacheCapabilities>,
 }
 
 #[derive(Clone)]
@@ -96,15 +99,25 @@ impl GenaiProviderAdapter {
         credential: Arc<dyn CredentialProvider>,
     ) -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut default_headers = config.custom_headers.to_header_map();
+        // 亲和 header 只能由已验证的 cache profile 按请求注入，不能由自定义
+        // 默认 header 绕过 disabled 或 PromptCachePolicy::None 门控。
+        for header in RESERVED_AFFINITY_HEADERS {
+            default_headers.remove(*header);
+        }
         let web_config = WebConfig::default()
             .with_connect_timeout(std::time::Duration::from_secs(10))
             // ProviderSession enforces per-event idle and buffered request
             // deadlines; keep the adapter's coarse total timeout out of the
             // way of an active long-running stream.
             .with_timeout(std::time::Duration::from_secs(3_600))
-            .with_default_headers(config.custom_headers.to_header_map());
-        let cache_profile =
-            ProviderCacheProfile::for_provider(config.protocol, &config.provider_id);
+            .with_default_headers(default_headers);
+        let default_capabilities = ProviderCacheCapabilities::for_protocol(config.protocol);
+        let capabilities = config
+            .cache_capabilities
+            .as_ref()
+            .unwrap_or(&default_capabilities);
+        let cache_profile = ProviderCacheProfile::from_capabilities(config.protocol, capabilities);
         Self {
             config,
             credential,
@@ -158,6 +171,11 @@ impl GenaiProviderAdapter {
             .filter(|value| !value.trim().is_empty())
             .or_else(|| reader(GOLUTRA_PROVIDER_ROUTE_ID).filter(|value| !value.trim().is_empty()))
             .unwrap_or_else(|| protocol.id().to_owned());
+        let cache_capabilities = Some(cache_capabilities_from_reader(
+            &reader,
+            protocol,
+            &provider_id,
+        )?);
         Ok(GenaiProviderConfig {
             api_key,
             api_key_env,
@@ -167,6 +185,7 @@ impl GenaiProviderAdapter {
             protocol,
             generation_config,
             custom_headers: custom_headers_from_reader(&reader)?,
+            cache_capabilities,
         })
     }
 
@@ -251,7 +270,8 @@ impl GenaiProviderAdapter {
             self.cache_identity_for_request(request).as_ref(),
             request.cache_policy,
             self.cache_profile,
-        )?;
+        )?
+        .with_extra_headers(self.affinity_headers(request));
         let api_key = self
             .credential
             .credential(force_refresh)
@@ -302,7 +322,8 @@ impl GenaiProviderAdapter {
             self.cache_identity_for_request(request).as_ref(),
             request.cache_policy,
             self.cache_profile,
-        )?;
+        )?
+        .with_extra_headers(self.affinity_headers(request));
         let mut force_refresh = false;
         let response = loop {
             let api_key = self
@@ -332,7 +353,10 @@ impl GenaiProviderAdapter {
         let mut tool_delta_index = 0_usize;
         while let Some(event) = stream.next().await {
             match event.map_err(map_genai_error)? {
-                ChatStreamEvent::Start | ChatStreamEvent::ThoughtSignatureChunk(_) => {}
+                ChatStreamEvent::Start
+                | ChatStreamEvent::ThoughtSignatureChunk(_)
+                // 心跳只用于保持长流活跃，不属于模型可见数据。
+                | ChatStreamEvent::Heartbeat => {}
                 ChatStreamEvent::Chunk(chunk) => {
                     if !chunk.content.is_empty() {
                         on_event(ProviderStreamEvent::TextDelta {
@@ -367,6 +391,17 @@ impl GenaiProviderAdapter {
             message: "native provider stream ended before a terminal event".to_owned(),
         })?;
         provider_response_from_genai_stream(end, &model_id)
+    }
+
+    fn affinity_headers(&self, request: &ProviderRequest) -> Headers {
+        let affinity_id = request.affinity_id();
+        let headers = self
+            .cache_profile
+            .affinity_headers(request.cache_policy)
+            .into_iter()
+            .map(|name| (name.to_owned(), affinity_id.clone()))
+            .collect::<Vec<_>>();
+        Headers::from(headers)
     }
 }
 
@@ -588,7 +623,8 @@ pub(crate) fn genai_chat_options(
     options = match (cache_profile.mode, cache_policy) {
         (_, PromptCachePolicy::None) | (ProviderCacheMode::Disabled, _) => options,
         (ProviderCacheMode::Responses, PromptCachePolicy::Long)
-            if cache_profile.supports_long_retention(cache_policy) =>
+            if cache_profile.supports_long_retention(cache_policy)
+                && cache_profile.supports_cache_control(cache_policy) =>
         {
             options.with_cache_control(CacheControl::Ephemeral24h)
         }
@@ -597,12 +633,18 @@ pub(crate) fn genai_chat_options(
         }
         (ProviderCacheMode::Responses, PromptCachePolicy::Long) => options,
         (ProviderCacheMode::Anthropic, PromptCachePolicy::Long)
-            if cache_profile.supports_long_retention(cache_policy) =>
+            if cache_profile.supports_long_retention(cache_policy)
+                && cache_profile.supports_cache_control(cache_policy) =>
         {
             options.with_cache_control(CacheControl::Ephemeral1h)
         }
-        (ProviderCacheMode::Anthropic, PromptCachePolicy::Auto | PromptCachePolicy::Short) => {
+        (ProviderCacheMode::Anthropic, PromptCachePolicy::Auto | PromptCachePolicy::Short)
+            if cache_profile.supports_cache_control(cache_policy) =>
+        {
             options.with_cache_control(CacheControl::Ephemeral5m)
+        }
+        (ProviderCacheMode::Anthropic, PromptCachePolicy::Auto | PromptCachePolicy::Short) => {
+            options
         }
         (ProviderCacheMode::Anthropic, PromptCachePolicy::Long) => options,
     };
@@ -1129,6 +1171,7 @@ mod tests {
             protocol: ProviderProtocol::Anthropic,
             generation_config: ProviderGenerationConfig::default(),
             custom_headers: ProviderHttpHeaders::default(),
+            cache_capabilities: None,
         });
 
         let debug = format!("{provider:?}");

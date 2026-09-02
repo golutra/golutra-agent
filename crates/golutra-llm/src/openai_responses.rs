@@ -11,7 +11,7 @@ use genai::{
 };
 use golutra_auth::{CredentialProvider, FixedCredentialProvider};
 use golutra_core::{PromptCachePolicy, ProviderContract};
-use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
+use reqwest::header::{ACCEPT, ACCEPT_ENCODING, HeaderMap, HeaderValue, USER_AGENT};
 use secrecy::ExposeSecret;
 use serde_json::{Value, json};
 
@@ -23,19 +23,34 @@ use super::genai_adapter::{
 use super::{
     GOLUTRA_PROVIDER_AUTH_PROVIDER, GOLUTRA_PROVIDER_ROUTE_ID, LlmProvider,
     MAX_PROVIDER_MESSAGE_BYTES, MAX_PROVIDER_RESPONSE_BYTES, MAX_PROVIDER_TOOL_ARGUMENT_BYTES,
-    MAX_PROVIDER_TOOL_CALL_ID_BYTES, MAX_PROVIDER_TOOL_NAME_BYTES, ProviderCacheProfile,
-    ProviderError, ProviderErrorMetadata, ProviderFinishReason, ProviderGenerationConfig,
-    ProviderHttpHeaders, ProviderMessage, ProviderMessageMetadata, ProviderProbeResult,
-    ProviderProtocol, ProviderRequest, ProviderResponse, ProviderRole, ProviderStreamEvent,
-    ProviderUsage, RESERVED_AFFINITY_HEADERS, configured_or_first_env, custom_headers_from_reader,
-    env_mapping, first_env, generation_config_from_reader, missing_env_error,
-    protocol_capabilities, provider_credential_error, provider_http_client,
-    provider_http_error_with_headers, provider_transport_error, response_json_or_error,
-    sanitize_provider_error, validate_native_base_url,
+    MAX_PROVIDER_TOOL_CALL_ID_BYTES, MAX_PROVIDER_TOOL_NAME_BYTES, ProviderCacheCapabilities,
+    ProviderCacheProfile, ProviderError, ProviderErrorMetadata, ProviderFinishReason,
+    ProviderGenerationConfig, ProviderHttpHeaders, ProviderMessage, ProviderMessageMetadata,
+    ProviderProbeResult, ProviderProtocol, ProviderRequest, ProviderResponse, ProviderRole,
+    ProviderStreamEvent, ProviderUsage, RESERVED_AFFINITY_HEADERS, cache_capabilities_from_reader,
+    configured_or_first_env, custom_headers_from_reader, env_mapping, first_env,
+    generation_config_from_reader, missing_env_error, protocol_capabilities,
+    provider_credential_error, provider_http_client, provider_http_error_with_headers,
+    provider_transport_error, response_json_or_error, sanitize_provider_error,
+    validate_native_base_url,
 };
 
 const CHATGPT_ACCOUNT_ID_HEADER: &str = "ChatGPT-Account-Id";
 const DEFAULT_PROVIDER_ID: &str = "openai-chatgpt";
+
+/// SSE 首帧通常很小，压缩会让代理等待更多字节后才刷新。Responses 使用
+/// 独立的无压缩 client，并保留 TCP_NODELAY、连接池和 HTTP/2 keep-alive。
+fn responses_web_config() -> WebConfig {
+    let mut default_headers = HeaderMap::new();
+    default_headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+    WebConfig {
+        gzip: false,
+        default_headers: Some(default_headers),
+        ..WebConfig::default()
+    }
+    .with_connect_timeout(std::time::Duration::from_secs(10))
+    .with_timeout(std::time::Duration::from_secs(3_600))
+}
 
 struct StreamedToolCall {
     index: usize,
@@ -52,6 +67,8 @@ pub struct OpenAiResponsesProviderConfig {
     pub model_id: String,
     pub generation_config: ProviderGenerationConfig,
     pub custom_headers: ProviderHttpHeaders,
+    /// 已验证的 provider 缓存能力；缺省时仅使用协议级安全默认值。
+    pub cache_capabilities: Option<ProviderCacheCapabilities>,
 }
 
 #[derive(Clone)]
@@ -107,12 +124,16 @@ impl OpenAiResponsesProvider {
         credential: Arc<dyn CredentialProvider>,
     ) -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let web_config = WebConfig::default()
-            .with_connect_timeout(std::time::Duration::from_secs(10))
-            .with_timeout(std::time::Duration::from_secs(3_600));
-        let cache_profile = ProviderCacheProfile::for_provider(
+        let web_config = responses_web_config();
+        let default_capabilities =
+            ProviderCacheCapabilities::for_protocol(ProviderProtocol::OpenAiResponses);
+        let capabilities = config
+            .cache_capabilities
+            .as_ref()
+            .unwrap_or(&default_capabilities);
+        let cache_profile = ProviderCacheProfile::from_capabilities(
             ProviderProtocol::OpenAiResponses,
-            &config.provider_id,
+            capabilities,
         );
         Self {
             credential,
@@ -153,6 +174,11 @@ impl OpenAiResponsesProvider {
             .filter(|value| !value.trim().is_empty())
             .or_else(|| reader(GOLUTRA_PROVIDER_ROUTE_ID).filter(|value| !value.trim().is_empty()))
             .unwrap_or_else(|| DEFAULT_PROVIDER_ID.to_owned());
+        let cache_capabilities = Some(cache_capabilities_from_reader(
+            &reader,
+            ProviderProtocol::OpenAiResponses,
+            &provider_id,
+        )?);
         Ok(OpenAiResponsesProviderConfig {
             api_key,
             api_key_env,
@@ -161,6 +187,7 @@ impl OpenAiResponsesProvider {
             model_id,
             generation_config,
             custom_headers: custom_headers_from_reader(&reader)?,
+            cache_capabilities,
         })
     }
 
@@ -409,7 +436,7 @@ impl OpenAiResponsesProvider {
                     Err(error) => return Err(map_responses_genai_error(error)),
                 };
                 match event {
-                    ChatStreamEvent::Start => {}
+                    ChatStreamEvent::Start | ChatStreamEvent::Heartbeat => {}
                     ChatStreamEvent::ThoughtSignatureChunk(chunk) => {
                         add_stream_bytes(&mut captured_response_bytes, chunk.content.len())?;
                     }
@@ -762,11 +789,32 @@ mod tests {
             model_id: "gpt-test".to_owned(),
             generation_config: ProviderGenerationConfig::default(),
             custom_headers: ProviderHttpHeaders::default(),
+            cache_capabilities: None,
         });
 
         let debug = format!("{provider:?}");
         assert!(!debug.contains("secret-responses-key"));
         assert!(debug.contains("TEST_RESPONSES_KEY"));
+    }
+
+    #[test]
+    fn responses_stream_uses_uncompressed_low_latency_transport() {
+        let config = responses_web_config();
+        assert!(!config.gzip);
+        assert!(config.tcp_nodelay);
+        assert_eq!(
+            config
+                .default_headers
+                .as_ref()
+                .and_then(|headers| headers.get(ACCEPT_ENCODING))
+                .and_then(|value| value.to_str().ok()),
+            Some("identity")
+        );
+        assert_eq!(
+            config.connect_timeout,
+            Some(std::time::Duration::from_secs(10))
+        );
+        assert_eq!(config.timeout, Some(std::time::Duration::from_secs(3_600)));
     }
 
     #[test]
@@ -850,6 +898,7 @@ mod tests {
             model_id: "gpt-test".to_owned(),
             generation_config: ProviderGenerationConfig::default(),
             custom_headers,
+            cache_capabilities: None,
         });
 
         let request = provider

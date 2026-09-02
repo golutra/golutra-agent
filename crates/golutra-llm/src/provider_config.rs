@@ -37,6 +37,41 @@ where
     ProviderHttpHeaders::from_resolved(values)
 }
 
+/// 读取显式缓存能力声明。缺少声明时只在配置入口选择一次安全 preset；
+/// 适配器不会根据 URL、hostname 或每轮请求重新猜测能力。
+pub(crate) fn cache_capabilities_from_reader<F>(
+    reader: &F,
+    protocol: ProviderProtocol,
+    provider_id: &str,
+) -> Result<ProviderCacheCapabilities, ProviderError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let Some(raw) = reader(GOLUTRA_PROVIDER_CACHE_CAPABILITIES)
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(ProviderCacheCapabilities::for_provider(
+            protocol,
+            provider_id,
+        ));
+    };
+    let capabilities =
+        serde_json::from_str::<ProviderCacheCapabilities>(&raw).map_err(|error| {
+            ProviderError::NotConfigured {
+                message: format!(
+                    "{GOLUTRA_PROVIDER_CACHE_CAPABILITIES} must be valid JSON: {error}"
+                ),
+            }
+        })?;
+    capabilities
+        .validate_for_protocol(protocol)
+        .map_err(|message| ProviderError::NotConfigured {
+            message: format!("{GOLUTRA_PROVIDER_CACHE_CAPABILITIES} is invalid: {message}"),
+        })?;
+    Ok(capabilities)
+}
+
 pub(crate) fn env_mapping(protocol: ProviderProtocol) -> ProviderEnvMapping {
     match protocol {
         ProviderProtocol::Mock => ProviderEnvMapping {

@@ -460,6 +460,7 @@ fn provider_install_plan_accepts_native_live_protocols() {
         oauth: None,
         generation_config: None,
         custom_headers: Vec::new(),
+        cache_capabilities: Some(golutra_llm::ProviderCacheCapabilities::anthropic()),
         enabled: true,
     };
     let plan = ProviderInstallPlan {
@@ -754,6 +755,131 @@ async fn runtime_env_uses_dynamic_secret_provider_instead_of_serializing_key() {
         Some("custom".to_owned())
     );
     assert_eq!(resolved.expose_secret(), "profile-secret");
+}
+
+#[test]
+fn runtime_env_exports_declared_cache_capabilities() {
+    let profile = ProviderProfile::openai_compatible(
+        "golutra",
+        "https://api.golutra.cn/v1",
+        "gpt-5.5",
+        env_credential("GOLUTRA_CACHE_CAPABILITY_TEST_KEY"),
+    )
+    .expect("profile");
+    let settings = ProviderSettings {
+        version: PROVIDER_SETTINGS_VERSION,
+        active_profile: Some("golutra".to_owned()),
+        profiles: vec![profile],
+    };
+    let home = tempdir().expect("home");
+    let auth = AuthService::new(
+        home.path(),
+        Arc::new(golutra_auth::MemorySecretStore::default()),
+    )
+    .expect("auth");
+
+    let runtime = runtime_env_from_settings(&settings, &auth).expect("runtime env");
+    let encoded = runtime
+        .get(GOLUTRA_PROVIDER_CACHE_CAPABILITIES)
+        .expect("cache capabilities");
+    let decoded =
+        serde_json::from_str::<ProviderCacheCapabilities>(&encoded).expect("cache capability JSON");
+
+    assert_eq!(decoded, ProviderCacheCapabilities::compatible());
+}
+
+#[test]
+fn runtime_env_uses_oauth_route_identity_for_cache_capabilities() {
+    let mut descriptor = oauth_descriptor();
+    descriptor.provider_id = "openai-chatgpt".to_owned();
+    let profile = ProviderProfile {
+        name: "account-profile".to_owned(),
+        protocol: ProviderProtocol::OpenAiResponses,
+        model_id: Some("gpt-5.5".to_owned()),
+        base_url: Some("https://chatgpt.com/backend-api/codex".to_owned()),
+        credential_ref: Some(oauth_credential()),
+        oauth: Some(descriptor),
+        generation_config: None,
+        custom_headers: Vec::new(),
+        cache_capabilities: None,
+        enabled: true,
+    };
+    let settings = ProviderSettings {
+        version: PROVIDER_SETTINGS_VERSION,
+        active_profile: Some("account-profile".to_owned()),
+        profiles: vec![profile],
+    };
+    let home = tempdir().expect("home");
+    let auth = AuthService::new(
+        home.path(),
+        Arc::new(golutra_auth::MemorySecretStore::default()),
+    )
+    .expect("auth");
+
+    let runtime = runtime_env_from_settings(&settings, &auth).expect("runtime env");
+    let capabilities = runtime
+        .get(GOLUTRA_PROVIDER_CACHE_CAPABILITIES)
+        .and_then(|value| serde_json::from_str::<ProviderCacheCapabilities>(&value).ok())
+        .expect("cache capabilities");
+
+    assert_eq!(
+        runtime.get(GOLUTRA_PROVIDER_ROUTE_ID).as_deref(),
+        Some("openai-chatgpt")
+    );
+    assert_eq!(capabilities, ProviderCacheCapabilities::codex_responses());
+}
+
+#[test]
+fn runtime_env_keeps_unknown_compatible_gateway_cache_disabled() {
+    let mut profile = ProviderProfile::openai_compatible(
+        "private-gateway",
+        "https://gateway.example/v1",
+        "model",
+        env_credential("GOLUTRA_UNKNOWN_GATEWAY_TEST_KEY"),
+    )
+    .expect("profile");
+    profile.cache_capabilities = None;
+    let settings = ProviderSettings {
+        version: PROVIDER_SETTINGS_VERSION,
+        active_profile: Some("private-gateway".to_owned()),
+        profiles: vec![profile],
+    };
+    let home = tempdir().expect("home");
+    let auth = AuthService::new(
+        home.path(),
+        Arc::new(golutra_auth::MemorySecretStore::default()),
+    )
+    .expect("auth");
+
+    let runtime = runtime_env_from_settings(&settings, &auth).expect("runtime env");
+    let capabilities = runtime
+        .get(GOLUTRA_PROVIDER_CACHE_CAPABILITIES)
+        .and_then(|value| serde_json::from_str::<ProviderCacheCapabilities>(&value).ok())
+        .expect("cache capabilities");
+
+    assert_eq!(capabilities, ProviderCacheCapabilities::disabled());
+}
+
+#[test]
+fn runtime_env_rejects_cache_capabilities_for_the_wrong_protocol() {
+    let mut profile = ProviderProfile::mock();
+    profile.cache_capabilities = Some(ProviderCacheCapabilities::responses());
+    let settings = ProviderSettings {
+        version: PROVIDER_SETTINGS_VERSION,
+        active_profile: Some("mock".to_owned()),
+        profiles: vec![profile],
+    };
+    let home = tempdir().expect("home");
+    let auth = AuthService::new(
+        home.path(),
+        Arc::new(golutra_auth::MemorySecretStore::default()),
+    )
+    .expect("auth");
+
+    let error = runtime_env_from_settings(&settings, &auth)
+        .expect_err("mock cannot advertise Responses cache fields");
+
+    assert!(error.to_string().contains("prompt_cache_key"));
 }
 
 #[test]

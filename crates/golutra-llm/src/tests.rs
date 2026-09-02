@@ -1412,7 +1412,11 @@ fn provider_cache_profile_gates_compatible_gateway_fields() {
     assert!(golutra.prompt_cache_key(golutra_core::PromptCachePolicy::Auto));
     assert_eq!(
         golutra.affinity_headers(golutra_core::PromptCachePolicy::Auto),
-        COMPATIBLE_AFFINITY_HEADERS
+        vec![
+            SESSION_ID_HEADER,
+            CLIENT_REQUEST_ID_HEADER,
+            SESSION_AFFINITY_ALIAS_HEADER
+        ]
     );
     assert!(golutra.supports_long_retention(golutra_core::PromptCachePolicy::Long));
     assert_eq!(
@@ -1424,7 +1428,7 @@ fn provider_cache_profile_gates_compatible_gateway_fields() {
         ProviderCacheProfile::for_provider(ProviderProtocol::OpenAiResponses, "openai-chatgpt");
     assert_eq!(
         codex.affinity_headers(golutra_core::PromptCachePolicy::Auto),
-        CODEX_AFFINITY_HEADERS
+        vec![SESSION_AFFINITY_HEADER, CLIENT_REQUEST_ID_HEADER]
     );
 
     let anthropic = ProviderCacheProfile::for_provider(ProviderProtocol::Anthropic, "anthropic");
@@ -1462,6 +1466,60 @@ fn provider_cache_profile_gates_compatible_gateway_fields() {
 }
 
 #[test]
+fn provider_cache_capabilities_are_explicit_and_round_trip() {
+    let declared = ProviderCacheCapabilities::compatible();
+    let encoded = serde_json::to_string(&declared).expect("encode cache capabilities");
+    let decoded: ProviderCacheCapabilities =
+        serde_json::from_str(&encoded).expect("decode cache capabilities");
+    assert_eq!(decoded, declared);
+    decoded
+        .validate_for_protocol(ProviderProtocol::OpenAiCompatible)
+        .expect("compatible capabilities are valid");
+
+    let invalid = ProviderCacheCapabilities {
+        prompt_cache_key: false,
+        supports_long_retention: false,
+        supports_cache_control: false,
+        affinity_headers: vec![ProviderAffinityHeader::SessionId],
+    };
+    assert!(
+        invalid
+            .validate_for_protocol(ProviderProtocol::OpenAiCompatible)
+            .is_err()
+    );
+
+    let unsupported = ProviderCacheCapabilities {
+        supports_cache_control: true,
+        ..ProviderCacheCapabilities::disabled()
+    };
+    assert!(
+        unsupported
+            .validate_for_protocol(ProviderProtocol::Gemini)
+            .is_err()
+    );
+}
+
+#[test]
+fn explicit_cache_capabilities_override_provider_identity() {
+    let encoded = serde_json::to_string(&ProviderCacheCapabilities::compatible())
+        .expect("encode capabilities");
+    let config = OpenAiCompatibleProvider::config_from_env_reader(|key| match key {
+        "GOLUTRA_PROVIDER_API_KEY" => Some("test-key".to_owned()),
+        "GOLUTRA_PROVIDER_MODEL" => Some("model".to_owned()),
+        "GOLUTRA_PROVIDER_BASE_URL" => Some("https://arbitrary.example/v1".to_owned()),
+        GOLUTRA_PROVIDER_ROUTE_ID => Some("unregistered-gateway".to_owned()),
+        GOLUTRA_PROVIDER_CACHE_CAPABILITIES => Some(encoded.clone()),
+        _ => None,
+    })
+    .expect("explicit capability config");
+    assert_eq!(config.provider_id, "unregistered-gateway");
+    assert_eq!(
+        config.cache_capabilities,
+        Some(ProviderCacheCapabilities::compatible())
+    );
+}
+
+#[test]
 fn provider_adapters_expose_capability_gated_cache_policy() {
     let responses = OpenAiResponsesProvider::from_config(OpenAiResponsesProviderConfig {
         api_key: "test-key".to_owned(),
@@ -1471,6 +1529,7 @@ fn provider_adapters_expose_capability_gated_cache_policy() {
         model_id: "model".to_owned(),
         generation_config: ProviderGenerationConfig::default(),
         custom_headers: ProviderHttpHeaders::default(),
+        cache_capabilities: None,
     });
     assert_eq!(
         responses.preferred_cache_policy(),
@@ -1486,6 +1545,7 @@ fn provider_adapters_expose_capability_gated_cache_policy() {
         protocol: ProviderProtocol::OpenAiCompatible,
         generation_config: ProviderGenerationConfig::default(),
         custom_headers: ProviderHttpHeaders::default(),
+        cache_capabilities: None,
     });
     assert_eq!(
         unknown.preferred_cache_policy(),
@@ -1505,11 +1565,9 @@ fn provider_route_identity_is_read_without_using_endpoint_host() {
     .expect("Responses config");
     assert_eq!(config.provider_id, "golutra");
 
-    let profile =
-        ProviderCacheProfile::for_provider(ProviderProtocol::OpenAiResponses, &config.provider_id);
     assert_eq!(
-        profile.affinity_headers(golutra_core::PromptCachePolicy::Auto),
-        RESPONSES_AFFINITY_HEADERS
+        config.cache_capabilities,
+        Some(ProviderCacheCapabilities::responses())
     );
 }
 

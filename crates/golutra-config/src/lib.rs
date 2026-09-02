@@ -12,9 +12,10 @@ use golutra_auth::{
     OAuthProviderDescriptor, SecretKind, SecretStore,
 };
 use golutra_llm::{
-    ConfiguredProvider, GOLUTRA_PROVIDER_CUSTOM_HEADERS, GOLUTRA_PROVIDER_ROUTE_ID, ModelCatalog,
-    ProviderGenerationConfig, ProviderHeaderConfig, ProviderHeaderValue, ProviderProtocol,
-    validate_native_base_url, validate_openai_base_url,
+    ConfiguredProvider, GOLUTRA_PROVIDER_CACHE_CAPABILITIES, GOLUTRA_PROVIDER_CUSTOM_HEADERS,
+    GOLUTRA_PROVIDER_ROUTE_ID, ModelCatalog, ProviderCacheCapabilities, ProviderGenerationConfig,
+    ProviderHeaderConfig, ProviderHeaderValue, ProviderProtocol, validate_native_base_url,
+    validate_openai_base_url,
 };
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
@@ -397,6 +398,9 @@ pub struct ProviderProfile {
     pub generation_config: Option<ProviderGenerationConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub custom_headers: Vec<ProviderHeaderConfig>,
+    /// provider 缓存/亲和能力的显式声明，避免适配器按网关地址猜测。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_capabilities: Option<ProviderCacheCapabilities>,
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
@@ -413,6 +417,7 @@ impl ProviderProfile {
             oauth: None,
             generation_config: None,
             custom_headers: Vec::new(),
+            cache_capabilities: None,
             enabled: true,
         }
     }
@@ -440,8 +445,10 @@ impl ProviderProfile {
         credential_ref: CredentialRef,
     ) -> Result<Self, ConfigError> {
         let base_url = normalize_provider_base_url(protocol, &base_url.into())?;
+        let name = name.into();
         let profile = Self {
-            name: name.into(),
+            cache_capabilities: Some(ProviderCacheCapabilities::for_provider(protocol, &name)),
+            name,
             protocol,
             model_id: Some(model_id.into()),
             base_url: Some(base_url),
@@ -514,6 +521,11 @@ impl ProviderProfile {
             if let ProviderHeaderValue::Environment { key } = &header.value {
                 validate_env_key(key)?;
             }
+        }
+        if let Some(capabilities) = &self.cache_capabilities {
+            capabilities
+                .validate_for_protocol(self.protocol)
+                .map_err(ConfigError::Validation)?;
         }
         Ok(())
     }
@@ -832,7 +844,7 @@ pub fn runtime_env_from_settings(
             .as_ref()
             .map(|oauth| oauth.provider_id.clone())
             .unwrap_or_else(|| profile.name.clone());
-        values.insert(GOLUTRA_PROVIDER_ROUTE_ID.to_owned(), route_id);
+        values.insert(GOLUTRA_PROVIDER_ROUTE_ID.to_owned(), route_id.clone());
         values.insert(
             "GOLUTRA_PROVIDER_PROTOCOL".to_owned(),
             profile.protocol.id().to_owned(),
@@ -844,6 +856,17 @@ pub fn runtime_env_from_settings(
             } else {
                 "live".to_owned()
             },
+        );
+        let cache_capabilities = profile.cache_capabilities.clone().unwrap_or_else(|| {
+            ProviderCacheCapabilities::for_provider(profile.protocol, &route_id)
+        });
+        cache_capabilities
+            .validate_for_protocol(profile.protocol)
+            .map_err(ConfigError::Validation)?;
+        values.insert(
+            GOLUTRA_PROVIDER_CACHE_CAPABILITIES.to_owned(),
+            serde_json::to_string(&cache_capabilities)
+                .map_err(|error| ConfigError::Json(error.to_string()))?,
         );
         if let Some(model_id) = &profile.model_id {
             values.insert("GOLUTRA_PROVIDER_MODEL".to_owned(), model_id.clone());

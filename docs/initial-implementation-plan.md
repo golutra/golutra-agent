@@ -448,7 +448,7 @@ Provider 内部模型：
 
 已确定配置项：
 
-- `genai` crate 已固定为 `0.7.0-beta.12`；升级必须先更新所有协议 golden fixture 并通过 wire diff 审查。
+- `genai` crate 已固定为 `0.7.0-beta.18`；升级必须先更新所有协议 golden fixture 并通过 wire diff 审查。
 - 内置 provider/model catalog 已包含 declared capability，OpenAI-compatible probe 可从模型目录更新 streaming、tools、JSON Schema、reasoning、vision、context window 和 max output；discovered 与 declared source 明确区分。
 - 当前 context 预算使用确定性的字符近似估算，并在 attribution 中标记为 `tokenizer`/`estimated`；provider 返回 usage 时以 provider facts 为准，缺失值保持 unknown，不伪装为 0。引入模型专用 tokenizer 属于精度优化，不是 runtime 正确性缺口。
 

@@ -189,6 +189,8 @@ fn migrate_legacy_provider_settings(
             .profiles
             .into_iter()
             .map(|profile| {
+                let profile_name = profile.name.clone();
+                let profile_protocol = profile.protocol;
                 let credential_ref = if profile.protocol == ProviderProtocol::Mock {
                     None
                 } else {
@@ -224,7 +226,7 @@ fn migrate_legacy_provider_settings(
                     }
                 };
                 Ok(ProviderProfile {
-                    name: profile.name,
+                    name: profile_name.clone(),
                     protocol: profile.protocol,
                     model_id: profile.model_id,
                     base_url: profile.base_url,
@@ -232,6 +234,10 @@ fn migrate_legacy_provider_settings(
                     oauth: None,
                     generation_config: profile.generation_config,
                     custom_headers: Vec::new(),
+                    cache_capabilities: Some(ProviderCacheCapabilities::for_provider(
+                        profile_protocol,
+                        &profile_name,
+                    )),
                     enabled: profile.enabled,
                 })
             })

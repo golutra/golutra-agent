@@ -51,9 +51,9 @@ Golutra 不直接复制 qwen-code 的配置文件形状。Golutra 的核心仍�
 
 ## 当前状态
 
-截至 2026-08-21：
+截至 2026-09-02：
 
-- `golutra-llm` 已有 `MockProvider`、独立 OpenAI-compatible live adapter、基于固定 `rust-genai 0.7.0-beta.12` 的 `GenaiProviderAdapter`，以及显式使用其 `OpenAIResp` adapter 的 Responses 薄适配。
+- `golutra-llm` 已有 `MockProvider`、独立 OpenAI-compatible live adapter、基于固定 `rust-genai 0.7.0-beta.18` 的 `GenaiProviderAdapter`，以及显式使用其 `OpenAIResp` adapter 的 Responses 薄适配。
 - 默认 provider 是 mock。
 - CLI 已支持 `golutra provider login`、`set-key`、`oauth-login`、`logout` 和 `use`；`provider login` 可填写 `--enable-thinking`、`--reasoning-effort low|medium|high|xhigh`、`--context-window-size <n>`、`--max-tokens <n>`。TUI 首次进入会检查 provider onboarding 状态。
 - 如果全局用户配置没有 active provider profile，TUI 会打开 provider setup；用户可以先选 Golutra API、Third-party Providers、Custom Provider 或 mock，再按 qwen-code 风格选择协议、base URL、凭据存储、推荐或自定义 model 和高级生成配置，最后在 review 页确认脱敏 install plan 后保存。交互输入的 API key 默认进入 `$GOLUTRA_HOME/credentials.json`，也可只保存已有 envKey 引用。
@@ -71,7 +71,7 @@ Golutra 不直接复制 qwen-code 的配置文件形状。Golutra 的核心仍�
 - OpenAI-compatible adapter 已支持 `OPENAI_API_KEY`、`OPENAI_MODEL`、`OPENAI_BASE_URL` 作为兼容 fallback。
 - provider protocol catalog 已注册且可执行 `mock`、`openai-compatible`、`openai-responses`、`anthropic`、`gemini`、`vertex-ai` 和 `genai`。
 - `anthropic` 强制使用 Anthropic Messages wire，`gemini` 使用 generateContent，`vertex-ai` 使用 Vertex generateContent 和 bearer/OAuth token，`genai` 根据 model namespace 选择 rust-genai adapter；它们统一映射 tool round-trip、usage、reasoning effort、finish reason 和脱敏错误。
-- live HTTP 调用使用 10 秒 connect timeout 和 120 秒总 timeout；OpenAI-compatible 已使用 SSE 增量读取并按顺序产生 text/tool/usage stream event，truncated/malformed stream 显式失败。SSE 与 genai captured raw metadata 都执行 16 MiB 响应边界，assistant message、tool id/name/arguments 另有更小字段上限。
+- live HTTP 调用使用 10 秒 connect timeout；`GenaiProviderAdapter` 和 Responses adapter 的粗粒度请求上限为 3600 秒，独立 OpenAI-compatible client 使用 300 秒 read-idle 上限，活动流仍由 `ProviderSession` 的事件 deadline 收口。OpenAI-compatible 已使用 SSE 增量读取并按顺序产生 text/tool/usage stream event，truncated/malformed stream 显式失败。SSE 与 genai captured raw metadata 都执行 16 MiB 响应边界，assistant message、tool id/name/arguments 另有更小字段上限。
 - CLI/env base URL 会做 P0 规范化：例如 `api.golutra.cn` 会解析成 `https://api.golutra.cn/v1`。TUI provider setup 为了对齐 qwen-code 的交互校验，要求用户输入 `http://` 或 `https://` 开头的 endpoint；Golutra 官方 preset 默认填入 `https://api.golutra.cn/v1`。
 - CLI 已提供 `golutra provider protocols`、`golutra provider current` 和 `golutra provider probe`，输出只包含协议目录、脱敏配置与 probe 结果，不输出 API key。
 - provider/auth 配置持久化到 `$GOLUTRA_HOME/provider.json` v2；workspace `.golutra` 不再作为 provider 配置来源。v2 使用原子写和 owner-only 权限，只保存 `credential_ref`、OAuth descriptor 与非敏感 provider metadata，不保存 API key 或 token。交互 secret 进入独立的 owner-only `$GOLUTRA_HOME/credentials.json`，CI/headless 配置可保存只读 env ref；v1 `env` map 会在 provider settings lock 内一次性迁移到 disk SecretStore，迁移失败会恢复 secret 并保留原配置。
@@ -85,6 +85,41 @@ Golutra 不直接复制 qwen-code 的配置文件形状。Golutra 的核心仍�
 - Custom Provider 的 CLI/TUI/profile 已支持 literal 与 env-ref custom headers；Authorization、Host、Content-Length 等 transport header 和疑似明文 secret 会在保存前拒绝，runtime debug 只暴露 header 名称。
 - 任务执行中遇到缺失/损坏 provider 配置会进入 durable `ProviderAuthRequired` 和 `WaitingAuthentication`；任一已 attach 客户端可在完成 verified install 后提交 `ProviderConfigured/ProviderAuthSubmitted` 使原任务从安全边界继续，也可提交 `ProviderAuthCancelled` 取消。该链路已有 embedded 与跨进程 daemon 回归。
 - TUI 已有 provider onboarding gate 和 `/auth` setup；已有 active provider 时不会首屏打断，但输入 `/auth` 可随时重新打开同一套选型并覆盖同名 profile。Web 首次 provider onboarding 不在当前产品范围，CLI 非交互场景保持结构化诊断。
+
+## 缓存能力与会话亲和
+
+缓存字段不是按 endpoint 字符串猜测，而是在配置入口一次性解析为
+`ProviderCacheCapabilities`，随后由 adapter 在热路径只执行已验证的声明。配置使用
+`GOLUTRA_PROVIDER_CACHE_CAPABILITIES` 传递，未知字段会被拒绝：
+
+```json
+{
+  "prompt_cache_key": true,
+  "supports_long_retention": true,
+  "supports_cache_control": true,
+  "affinity_headers": ["session_id", "x-client-request-id"]
+}
+```
+
+字段含义和默认策略如下：
+
+| 协议/路由 | 请求字段 | 亲和 header | 默认行为 |
+| --- | --- | --- | --- |
+| 通用 `openai-responses` | `prompt_cache_key`；声明长期能力时才发送 `prompt_cache_retention` | `session_id`、`x-client-request-id` | Responses preset |
+| ChatGPT/Codex Responses | `prompt_cache_key`；不假定长期 retention 或 `cache_control` | `session-id`、`x-client-request-id` | Codex preset |
+| `anthropic` | 仅按声明发送 `cache_control`（5m/1h） | 默认无；明确声明后才发送 `x-session-affinity` | Anthropic preset |
+| 已登记的 OpenAI-compatible（如 `golutra`） | 按显式声明发送 key/retention | 按显式声明发送 | compatible preset |
+| 未登记的 OpenAI-compatible | 不发送缓存字段或亲和 header | 无 | 保守 disabled |
+
+`prompt_cache_key`、retention、`cache_control` 和 affinity header 是相互独立的能力
+开关；配置校验会拒绝协议不支持的组合、重复 header，以及没有缓存能力却声明亲和
+header 的配置。自定义 header 不能覆盖这些保留名称。
+
+Responses 的现代 GPT-5.6+ `prompt_cache_options` 由 `rust-genai` 按原生 endpoint
+能力门控：只在它确认支持的 OpenAI endpoint 上生成；自定义网关不会被强行注入未知
+字段。因而 `disabled` 在自定义 Responses 网关上可以保持请求完全无缓存字段，而不
+改变 reasoning、工具或失败语义。能力声明仍以 provider 实际文档/探测结果为准，不能
+把一次命中率或同一 base URL 当作永久能力证明。
 
 ## 目标架构
 
