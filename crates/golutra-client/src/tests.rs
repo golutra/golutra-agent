@@ -632,6 +632,7 @@ fn system_prompt_preserves_general_autonomy_and_verification_principles() {
         "parallelize independent reads",
         "Trust status",
         "changed paths, digest, preview, cursor",
+        "digest, count, and preview",
         "reacquire only when needed",
         "Finish guarded changes before release or wait",
         "never change them after terminal",

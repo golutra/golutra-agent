@@ -559,6 +559,171 @@ class CompareLongBenchmarkTest(unittest.TestCase):
         records = benchmark.collect_tool_call_records("golutra", stdout, None)
         self.assertEqual(len(records), 2)
 
+    def test_tool_accounting_marks_revalidation_after_a_workspace_change(self) -> None:
+        def runtime(event_type: str, event_id: str, payload: dict) -> dict:
+            return {
+                "type": "runtime.event",
+                "event": {
+                    "id": event_id,
+                    "event_type": event_type,
+                    "payload": payload,
+                },
+            }
+
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                runtime("tool_started", "read-1", {"tool_name": "read_file", "arguments": {"path": "a"}}),
+                runtime("tool_completed", "read-result-1", {"tool_name": "read_file", "status": "ok"}),
+                runtime("tool_started", "write-1", {"tool_name": "write_file", "arguments": {"path": "b", "content": "x"}}),
+                runtime(
+                    "tool_completed",
+                    "write-result-1",
+                    {
+                        "tool_name": "write_file",
+                        "status": "ok",
+                        "structured_facts": {"changed": True, "workspace_change_count": 1},
+                    },
+                ),
+                runtime("tool_started", "read-2", {"tool_name": "read_file", "arguments": {"path": "a"}}),
+                runtime("tool_completed", "read-result-2", {"tool_name": "read_file", "status": "ok"}),
+            )
+        )
+        metrics = {"tool_call_count": 3, "tool_result_count": 3}
+        benchmark.apply_tool_call_accounting(metrics, "golutra", stdout, None)
+        self.assertEqual(metrics["model_tool_call_count"], 3)
+        self.assertEqual(metrics["repeated_tool_call_count"], 1)
+        self.assertEqual(metrics["state_changed_revalidation_count"], 1)
+        self.assertEqual(metrics["avoidable_repeat_tool_call_count"], 0)
+        self.assertEqual(metrics["necessary_tool_call_count"], 3)
+        self.assertTrue(metrics["tool_call_ledger"][2]["state_changed_revalidation"])
+        self.assertFalse(metrics["tool_call_ledger"][2]["avoidable_repeat"])
+
+    def test_tool_accounting_marks_only_complete_same_state_repeats_avoidable(self) -> None:
+        def runtime(event_type: str, event_id: str, payload: dict) -> dict:
+            return {
+                "type": "runtime.event",
+                "event": {
+                    "id": event_id,
+                    "event_type": event_type,
+                    "payload": payload,
+                },
+            }
+
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                runtime("tool_started", "read-1", {"tool_name": "read_file", "arguments": {"path": "a"}}),
+                runtime("tool_completed", "read-result-1", {"tool_name": "read_file", "status": "ok"}),
+                runtime("tool_started", "read-2", {"tool_name": "read_file", "arguments": {"path": "a"}}),
+                runtime("tool_completed", "read-result-2", {"tool_name": "read_file", "status": "ok"}),
+            )
+        )
+        metrics = {"tool_call_count": 2, "tool_result_count": 2}
+        benchmark.apply_tool_call_accounting(metrics, "golutra", stdout, None)
+        self.assertEqual(metrics["repeated_tool_call_count"], 1)
+        self.assertEqual(metrics["avoidable_repeat_tool_call_count"], 1)
+        self.assertEqual(metrics["state_changed_revalidation_count"], 0)
+        self.assertEqual(metrics["necessary_tool_call_count"], 1)
+
+    def test_tool_accounting_never_downgrades_failed_repeats_to_avoidable(self) -> None:
+        def runtime(event_type: str, event_id: str, payload: dict, **event_fields: object) -> dict:
+            event = {
+                "id": event_id,
+                "event_type": event_type,
+                "payload": payload,
+                **event_fields,
+            }
+            return {"type": "runtime.event", "event": event}
+
+        stdout = "\n".join(
+            json.dumps(item)
+            for item in (
+                runtime(
+                    "tool_started",
+                    "read-1",
+                    {"tool_name": "read_file", "arguments": {"path": "a"}},
+                ),
+                runtime(
+                    "tool_completed",
+                    "result-1",
+                    {"tool_name": "read_file"},
+                    status="failed",
+                ),
+                runtime(
+                    "tool_started",
+                    "read-2",
+                    {"tool_name": "read_file", "arguments": {"path": "a"}},
+                ),
+                runtime(
+                    "tool_completed",
+                    "result-2",
+                    {"tool_name": "read_file"},
+                    status="failed",
+                ),
+            )
+        )
+        metrics = {"tool_call_count": 2, "tool_result_count": 2}
+        benchmark.apply_tool_call_accounting(metrics, "golutra", stdout, None)
+
+        self.assertEqual(metrics["repeated_tool_call_count"], 1)
+        self.assertEqual(metrics["avoidable_repeat_tool_call_count"], 0)
+        self.assertEqual(metrics["necessary_tool_call_count"], 2)
+
+    def test_markdown_report_exposes_repeat_and_verifier_read_breakdowns(self) -> None:
+        def turn() -> dict:
+            return {
+                "workspace_verifier_pass": True,
+                "runtime_terminal_success": True,
+                "process_return_code": 0,
+                "strict_passed": True,
+                "verification_attempts": [],
+                "repair_attempts": 0,
+                "metrics": {
+                    "prompt_tokens": 10,
+                    "uncached_input_tokens": 2,
+                    "cache_read_tokens": 8,
+                    "output_tokens": 3,
+                    "provider_total_tokens": 13,
+                    "tool_call_count": 4,
+                    "necessary_tool_call_count": 3,
+                    "repeated_tool_call_count": 1,
+                    "avoidable_repeat_tool_call_count": 1,
+                    "state_changed_revalidation_count": 0,
+                    "background_wait_count": 1,
+                    "verifier_read_count": 1,
+                    "request_count": 2,
+                    "elapsed_ms": 100,
+                    "provider_first_token_ms": 10,
+                },
+            }
+
+        report = {
+            "generated_at": "now",
+            "conditions": {
+                "model": "test",
+                "reasoning_effort": "medium",
+                "fixture_digest": "fixture",
+                "measurement_mode": "test",
+            },
+            "summary": {
+                engine: benchmark.aggregate_turns([turn()])
+                for engine in benchmark.ENGINE_NAMES
+            },
+            "stages": [
+                {
+                    "stage": 1,
+                    "scenario": "test",
+                    **{engine: turn() for engine in benchmark.ENGINE_NAMES},
+                }
+            ],
+        }
+        markdown = benchmark.markdown_report(report)
+        self.assertIn("Avoidable repeated calls", markdown)
+        self.assertIn("State-changed revalidations", markdown)
+        self.assertIn("Verifier reads", markdown)
+        self.assertIn("Verifier runs", markdown)
+
     def test_verifier_cache_rejects_an_identity_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory) / "workspace"

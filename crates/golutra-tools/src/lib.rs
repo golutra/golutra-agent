@@ -1318,6 +1318,45 @@ impl ToolRuntime {
         }
     }
 
+    /// Resolve the workspace identities used by the runtime keyed-write
+    /// scheduler. The returned paths use the same policy resolution as the
+    /// actual mutation implementation, so lexical aliases and existing
+    /// symlink boundaries cannot be scheduled as unrelated writes. An empty
+    /// vector means the request is not a keyed mutation and must be treated as
+    /// an exclusive operation by the caller.
+    pub async fn resolve_keyed_write_paths(
+        &self,
+        request: &ToolRequest,
+    ) -> Result<Vec<PathBuf>, ToolError> {
+        if !matches!(
+            request.tool_name.as_str(),
+            "write_file" | "edit_file" | "apply_patch"
+        ) {
+            return Ok(Vec::new());
+        }
+        let contract = self
+            .registry
+            .contract(&request.tool_name)
+            .ok_or_else(|| ToolError::UnknownTool(request.tool_name.clone()))?;
+        self.registry
+            .validate_tool_arguments(contract, &request.arguments)?;
+        match request.tool_name.as_str() {
+            "write_file" => {
+                let path = string_arg(&request.arguments, "path")?;
+                Ok(vec![self.resolve_tool_path("write_file", path, false)?])
+            }
+            "edit_file" => {
+                let path = string_arg(&request.arguments, "path")?;
+                Ok(vec![self.resolve_tool_path("edit_file", path, true)?])
+            }
+            "apply_patch" => {
+                let patch = string_arg(&request.arguments, "patch")?;
+                self.resolved_patch_paths(&patch).await
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
     pub async fn execute_with_policy(
         &self,
         request: ToolRequest,

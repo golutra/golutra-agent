@@ -911,7 +911,7 @@ pub(crate) fn system_prompt() -> String {
         "Batch related actions: issue known independent tool calls in one response, including writes to different files and final independent checks; parallelize independent reads.",
         "Use error path candidates. Trust status, output, changed paths, digest, preview, cursor; reacquire only when needed.",
         "Finish guarded changes before release or wait; never change them after terminal. Background starts return immediately; finish required work, then use one bounded wait for terminal state.",
-        "After successful mutation, use status, changed paths, digest, and preview. Avoid repeated checks unless state changed, ambiguity remains, or required.",
+        "After successful mutation, use status, changed paths, digest, count, and preview. Avoid repeated checks: reread only when state changes, facts are incomplete, ambiguity remains, or a requirement asks.",
         "Follow project conventions; verify by risk; report outcome, validation, blockers concisely. Ask when consequential ambiguity remains.",
     ]
     .join("\n")
@@ -1184,6 +1184,7 @@ mod tests {
         assert!(prompt.contains("parallelize independent reads"));
         assert!(prompt.contains("Trust status"));
         assert!(prompt.contains("changed paths, digest, preview, cursor"));
+        assert!(prompt.contains("digest, count, and preview"));
         assert!(prompt.contains("reacquire only when needed"));
         assert!(prompt.contains("Finish guarded changes before release or wait"));
         assert!(prompt.contains("never change them after terminal"));

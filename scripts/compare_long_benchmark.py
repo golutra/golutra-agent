@@ -811,7 +811,10 @@ def aggregate_turns(turns: list[dict[str, Any]]) -> dict[str, Any]:
         "model_tool_call_count",
         "necessary_tool_call_count",
         "repeated_tool_call_count",
+        "avoidable_repeat_tool_call_count",
+        "state_changed_revalidation_count",
         "background_wait_count",
+        "verifier_read_count",
         "unclassified_tool_call_count",
         "request_count",
     ):
@@ -1038,6 +1041,7 @@ def _append_tool_call_record(
     item: dict[str, Any] | None = None,
     tool_name: str | None = None,
     ordinal: int | None = None,
+    event_order: int | None = None,
 ) -> None:
     name = tool_name or _tool_name_from_event(event, payload)
     if not name or name == "external_verifier":
@@ -1082,6 +1086,8 @@ def _append_tool_call_record(
             "tool_name": name,
             "argument_digest": argument_digest,
             "source": source,
+            "_event_order": event_order if event_order is not None else len(records),
+            "_call_id": call_id,
             "background_wait": (
                 name in {"process_poll", "process_reconnect"}
                 or (
@@ -1092,6 +1098,149 @@ def _append_tool_call_record(
             ),
         }
     )
+
+
+def _event_completion_status(event: dict[str, Any], payload: dict[str, Any]) -> str | None:
+    """Return a normalized terminal status when an event carries one."""
+    envelope = payload.get("envelope")
+    envelope = envelope if isinstance(envelope, dict) else {}
+    for container in (payload, envelope, event):
+        value = container.get("status")
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+    return None
+
+
+def _event_is_tool_completion(event_type: str) -> bool:
+    return event_type in {
+        "tool_completed",
+        "tool_result",
+        "tool_execution_end",
+        "tool_call_completed",
+        "tool_execution_completed",
+        "item.completed",
+    } or event_type.endswith(("tool_completed", "tool_execution_end"))
+
+
+def _completion_facts(payload: dict[str, Any]) -> dict[str, Any]:
+    envelope = payload.get("envelope")
+    if isinstance(envelope, dict):
+        facts = envelope.get("structured_facts")
+        if isinstance(facts, dict):
+            return facts
+    for key in ("structured_facts", "facts", "result"):
+        facts = payload.get(key)
+        if isinstance(facts, dict):
+            return facts
+    return {}
+
+
+def _completion_is_success(status: str | None, payload: dict[str, Any]) -> bool:
+    """Treat an unmarked completion as usable, but never a marked error."""
+    if status in {"error", "failed", "blocked", "cancelled", "timeout", "timed_out"}:
+        return False
+    envelope = payload.get("envelope")
+    envelope = envelope if isinstance(envelope, dict) else {}
+    for container in (payload, envelope):
+        if container.get("is_error") is True or container.get("isError") is True:
+            return False
+        if isinstance(container.get("error"), (str, dict, list)):
+            return False
+    return True
+
+
+def _completion_changed_workspace(
+    tool_name: str | None,
+    status: str | None,
+    payload: dict[str, Any],
+) -> bool:
+    """Conservatively identify a completed mutation that changes state.
+
+    Unknown successful mutation facts are treated as changed. That prevents a
+    report from incorrectly calling a later verification read avoidable when a
+    provider omitted its detailed change count.
+    """
+    if tool_name not in {"write_file", "edit_file", "apply_patch"}:
+        return False
+    if status in {"error", "failed", "blocked", "cancelled", "timeout", "timed_out"}:
+        return False
+    facts = _completion_facts(payload)
+    if facts.get("idempotent") is True and facts.get("changed") is False:
+        return False
+    if facts.get("changed") is False and facts.get("workspace_mutation_detected") is False:
+        count = facts.get("workspace_change_count", facts.get("changed_file_count"))
+        if isinstance(count, (int, float)) and not isinstance(count, bool) and count <= 0:
+            return False
+    return True
+
+
+def _annotate_tool_call_records(
+    records: list[dict[str, Any]],
+    events: list[tuple[dict[str, Any], float | None]],
+) -> None:
+    """Attach non-sensitive execution state used by the accounting report."""
+    completions: list[
+        tuple[int, str | None, str | None, str | None, dict[str, Any]]
+    ] = []
+    for event_order, (event, _arrival) in enumerate(events):
+        event_type = str(event.get("event_type") or event.get("type") or "")
+        if not _event_is_tool_completion(event_type):
+            continue
+        payload = paired.event_payload(event)
+        name = _tool_name_from_event(event, payload)
+        call_id = _tool_event_id(event, payload, None)
+        status = _event_completion_status(event, payload)
+        completions.append((event_order, name, call_id, status, payload))
+
+    # A few providers use a result id distinct from the start id. Pair those
+    # records by tool name and occurrence while preferring an exact id match.
+    records_by_name: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        record["workspace_epoch"] = 0
+        record["fact_complete"] = False
+        record["result_success"] = False
+        records_by_name.setdefault(str(record["tool_name"]), []).append(record)
+
+    # Mark terminal facts. Exact IDs are authoritative; name pairing is only a
+    # fallback for legacy/provider streams that do not share IDs.
+    for _order, name, call_id, status, payload in completions:
+        matched = False
+        if isinstance(call_id, str) and call_id:
+            for record in records:
+                if record.get("_call_id") == call_id:
+                    record["fact_complete"] = True
+                    record["result_success"] = (
+                        record.get("result_success") is True
+                        or _completion_is_success(status, payload)
+                    )
+                    matched = True
+                    break
+        if not matched and name:
+            candidates = records_by_name.get(name, [])
+            for record in candidates:
+                if not record.get("fact_complete"):
+                    record["fact_complete"] = True
+                    record["result_success"] = _completion_is_success(status, payload)
+                    break
+
+    state_change_orders = [
+        order
+        for order, name, _call_id, status, payload in completions
+        if _completion_changed_workspace(
+            name,
+            status,
+            payload,
+        )
+    ]
+    state_change_orders.sort()
+    for record in records:
+        order = int(record.get("_event_order", 0))
+        record["workspace_epoch"] = sum(change < order for change in state_change_orders)
+        record["verifier_read"] = str(record["tool_name"]).startswith("contract_") or str(
+            record["tool_name"]
+        ) in {"workspace_verifier", "external_verifier"}
+    # Internal fields are intentionally retained only until accounting has
+    # classified the record; they never enter the durable report ledger.
 
 
 def _normalized_long_benchmark_events(
@@ -1149,9 +1298,10 @@ def collect_tool_call_records(
     seen_ids: set[str] = set()
     seen_events: set[str] = set()
     completed_fallback: list[
-        tuple[dict[str, Any], dict[str, Any], dict[str, Any], int]
+        tuple[dict[str, Any], dict[str, Any], dict[str, Any], int, int]
     ] = []
-    for event, _ in _normalized_long_benchmark_events(engine, stdout, line_times_ms):
+    events = _normalized_long_benchmark_events(engine, stdout, line_times_ms)
+    for event_order, (event, _arrival) in enumerate(events):
         event_type = str(event.get("event_type") or event.get("type") or "")
         payload = paired.event_payload(event)
         if engine == "golutra":
@@ -1163,17 +1313,24 @@ def collect_tool_call_records(
                     event,
                     payload,
                     source="runtime",
+                    event_order=event_order,
                 )
             elif event_type == "provider_completed":
                 calls = payload.get("provider_tool_calls")
                 if isinstance(calls, list):
                     for ordinal, call in enumerate(calls):
                         if isinstance(call, dict):
-                            completed_fallback.append((event, call, call, ordinal))
+                            completed_fallback.append((event, call, call, ordinal, event_order))
         elif engine == "pi":
             if event_type == "tool_execution_start":
                 _append_tool_call_record(
-                    records, seen_ids, seen_events, event, payload, source="execution"
+                    records,
+                    seen_ids,
+                    seen_events,
+                    event,
+                    payload,
+                    source="execution",
+                    event_order=event_order,
                 )
             elif event_type == "message_end":
                 message = event.get("message")
@@ -1191,6 +1348,7 @@ def collect_tool_call_records(
                                 item=block,
                                 tool_name=str(block.get("name") or "") or None,
                                 ordinal=ordinal,
+                                event_order=event_order,
                             )
         else:
             item = event.get("item")
@@ -1218,11 +1376,11 @@ def collect_tool_call_records(
                     tool_name=item_type,
                 )
             elif event_type == "item.completed":
-                completed_fallback.append((event, item, item, 0))
+                completed_fallback.append((event, item, item, 0, event_order))
     direct_record_count = len(records)
     # 某些 Codex/provider 版本只发 completed 项；仅在找不到对应 started 操作时
     # 补入，并按单个调用处理，保证一次操作只计一次。
-    for event, item, payload, ordinal in completed_fallback:
+    for event, item, payload, ordinal, event_order in completed_fallback:
         candidate_id = _tool_event_id(event, payload, item)
         if candidate_id and candidate_id in seen_ids:
             continue
@@ -1248,7 +1406,9 @@ def collect_tool_call_records(
             item=item,
             tool_name=fallback_name,
             ordinal=ordinal,
+            event_order=event_order,
         )
+    _annotate_tool_call_records(records, events)
     return records
 
 
@@ -1262,8 +1422,12 @@ def apply_tool_call_accounting(
     parser_count = as_int(metrics.get("tool_call_count")) or 0
     observed_count = max(parser_count, len(records))
     signatures: dict[tuple[str, str], int] = {}
+    previous_records: dict[tuple[str, str], list[dict[str, Any]]] = {}
     repeated = 0
+    avoidable_repeats = 0
+    state_changed_revalidations = 0
     waits = 0
+    verifier_reads = 0
     unclassified = max(0, observed_count - len(records))
     ledger: list[dict[str, Any]] = []
     for index, record in enumerate(records):
@@ -1276,10 +1440,25 @@ def apply_tool_call_accounting(
             signatures[signature] = occurrence
             if occurrence > 1:
                 repeated += 1
+                prior = previous_records[signature][-1]
+                if int(record.get("workspace_epoch", 0)) > int(
+                    prior.get("workspace_epoch", 0)
+                ):
+                    state_changed_revalidations += 1
+                elif (
+                    record.get("fact_complete") is True
+                    and record.get("result_success") is True
+                    and prior.get("fact_complete") is True
+                    and prior.get("result_success") is True
+                ):
+                    avoidable_repeats += 1
+            previous_records.setdefault(signature, []).append(record)
         else:
             unclassified += 1
         is_wait = record.get("background_wait") is True
         waits += int(is_wait)
+        verifier_read = record.get("verifier_read") is True
+        verifier_reads += int(verifier_read)
         if len(ledger) < MAX_TOOL_CALL_LEDGER_ENTRIES:
             ledger.append(
                 {
@@ -1289,20 +1468,45 @@ def apply_tool_call_accounting(
                     "source": record.get("source"),
                     "background_wait": is_wait,
                     "repeated": occurrence > 1,
+                    "avoidable_repeat": (
+                        occurrence > 1
+                        and record.get("workspace_epoch", 0)
+                        == previous_records[signature][-2].get("workspace_epoch", 0)
+                        and record.get("fact_complete") is True
+                        and record.get("result_success") is True
+                        and previous_records[signature][-2].get("fact_complete") is True
+                        and previous_records[signature][-2].get("result_success") is True
+                    )
+                    if signature is not None and occurrence > 1
+                    else False,
+                    "state_changed_revalidation": (
+                        occurrence > 1
+                        and record.get("workspace_epoch", 0)
+                        > previous_records[signature][-2].get("workspace_epoch", 0)
+                    )
+                    if signature is not None and occurrence > 1
+                    else False,
+                    "verifier_read": verifier_read,
                 }
             )
     metrics["model_tool_call_count"] = observed_count
-    metrics["necessary_tool_call_count"] = max(0, observed_count - repeated)
+    metrics["necessary_tool_call_count"] = max(0, observed_count - avoidable_repeats)
     metrics["repeated_tool_call_count"] = repeated
+    metrics["avoidable_repeat_tool_call_count"] = avoidable_repeats
+    metrics["state_changed_revalidation_count"] = state_changed_revalidations
     metrics["background_wait_count"] = waits
+    metrics["verifier_read_count"] = verifier_reads
     metrics["unclassified_tool_call_count"] = unclassified
     metrics["tool_call_ledger"] = ledger
     metrics["tool_call_ledger_truncated"] = len(records) > MAX_TOOL_CALL_LEDGER_ENTRIES
     metrics["tool_call_accounting"] = {
         "model_calls": observed_count,
-        "necessary_calls_lower_bound": max(0, observed_count - repeated),
+        "necessary_calls_lower_bound": max(0, observed_count - avoidable_repeats),
         "repeated_calls_observed": repeated,
+        "avoidable_repeats": avoidable_repeats,
+        "state_changed_revalidations": state_changed_revalidations,
         "background_wait_calls": waits,
+        "verifier_read_calls": verifier_reads,
         "unclassified_calls": unclassified,
         "result_events": as_int(metrics.get("tool_result_count")),
         "source": engine,
@@ -1407,7 +1611,10 @@ def merge_repair_metrics(
         "model_tool_call_count",
         "necessary_tool_call_count",
         "repeated_tool_call_count",
+        "avoidable_repeat_tool_call_count",
+        "state_changed_revalidation_count",
         "background_wait_count",
+        "verifier_read_count",
         "unclassified_tool_call_count",
         "request_count",
         "elapsed_ms",
@@ -1465,7 +1672,10 @@ def merge_repair_metrics(
         "model_calls": merged.get("model_tool_call_count"),
         "necessary_calls_lower_bound": merged.get("necessary_tool_call_count"),
         "repeated_calls_observed": merged.get("repeated_tool_call_count"),
+        "avoidable_repeats": merged.get("avoidable_repeat_tool_call_count"),
+        "state_changed_revalidations": merged.get("state_changed_revalidation_count"),
         "background_wait_calls": merged.get("background_wait_count"),
+        "verifier_read_calls": merged.get("verifier_read_count"),
         "unclassified_calls": merged.get("unclassified_tool_call_count"),
         "result_events": merged.get("tool_result_count"),
         "source": "primary_plus_repair",
@@ -1682,7 +1892,10 @@ def markdown_report(report: dict[str, Any]) -> str:
         ("Tool calls", "tool_call_count"),
         ("Necessary calls (lower bound)", "necessary_tool_call_count"),
         ("Repeated calls observed", "repeated_tool_call_count"),
+        ("Avoidable repeated calls", "avoidable_repeat_tool_call_count"),
+        ("State-changed revalidations", "state_changed_revalidation_count"),
         ("Background waits", "background_wait_count"),
+        ("Verifier reads", "verifier_read_count"),
         ("Unclassified calls", "unclassified_tool_call_count"),
         ("Verifier runs", "verifier_runs"),
         ("Verifier cache hits", "verifier_cache_hits"),
@@ -1722,8 +1935,8 @@ def markdown_report(report: dict[str, Any]) -> str:
             "",
             "## Per Turn",
             "",
-            "| Stage | Scenario | Engine | Workspace verifier | Runtime terminal | Return code | Strict | E2E | Prompt | Uncached | Cache read | Hit | Output | Requests | Tools | Necessary | Repeated | BG waits | Verifier | Repairs | Provider TTFT |",
-            "| ---: | --- | --- | --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| Stage | Scenario | Engine | Workspace verifier | Runtime terminal | Return code | Strict | E2E | Prompt | Uncached | Cache read | Hit | Output | Requests | Tools | Necessary | Repeated | Avoidable | Revalidation | BG waits | Verifier runs | Verifier reads | Repairs | Provider TTFT |",
+            "| ---: | --- | --- | --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         )
     )
     for stage in report["stages"]:
@@ -1738,7 +1951,7 @@ def markdown_report(report: dict[str, Any]) -> str:
                 else "unknown"
             )
             lines.append(
-                "| {stage} | {scenario} | {engine} | {workspace} | {runtime} | {return_code} | {strict} | {elapsed} | {prompt} | {uncached} | {read} | {hit} | {output} | {requests} | {tools} | {necessary} | {repeated} | {waits} | {verifier} | {repairs} | {ttft} |".format(
+                "| {stage} | {scenario} | {engine} | {workspace} | {runtime} | {return_code} | {strict} | {elapsed} | {prompt} | {uncached} | {read} | {hit} | {output} | {requests} | {tools} | {necessary} | {repeated} | {avoidable} | {revalidation} | {waits} | {verifier_runs} | {verifier_reads} | {repairs} | {ttft} |".format(
                     stage=stage["stage"],
                     scenario=stage.get("scenario", "unknown"),
                     engine=engine,
@@ -1756,8 +1969,11 @@ def markdown_report(report: dict[str, Any]) -> str:
                     tools=display(metric.get("tool_call_count")),
                     necessary=display(metric.get("necessary_tool_call_count")),
                     repeated=display(metric.get("repeated_tool_call_count")),
+                    avoidable=display(metric.get("avoidable_repeat_tool_call_count")),
+                    revalidation=display(metric.get("state_changed_revalidation_count")),
                     waits=display(metric.get("background_wait_count")),
-                    verifier=display(len(turn.get("verification_attempts", []))),
+                    verifier_runs=display(len(turn.get("verification_attempts", []))),
+                    verifier_reads=display(metric.get("verifier_read_count")),
                     repairs=display(turn.get("repair_attempts")),
                     ttft=display(metric.get("provider_first_token_ms"), milliseconds=True),
                 )
@@ -1975,7 +2191,10 @@ def _merge_accounting_snapshots(
         "model_tool_call_count",
         "necessary_tool_call_count",
         "repeated_tool_call_count",
+        "avoidable_repeat_tool_call_count",
+        "state_changed_revalidation_count",
         "background_wait_count",
+        "verifier_read_count",
         "unclassified_tool_call_count",
     )
     merged = {field: (as_int(primary.get(field)) or 0) + (as_int(repair.get(field)) or 0) for field in fields}
@@ -1996,7 +2215,10 @@ def _merge_accounting_snapshots(
         "model_calls": merged["model_tool_call_count"],
         "necessary_calls_lower_bound": merged["necessary_tool_call_count"],
         "repeated_calls_observed": merged["repeated_tool_call_count"],
+        "avoidable_repeats": merged["avoidable_repeat_tool_call_count"],
+        "state_changed_revalidations": merged["state_changed_revalidation_count"],
         "background_wait_calls": merged["background_wait_count"],
+        "verifier_read_calls": merged["verifier_read_count"],
         "unclassified_calls": merged["unclassified_tool_call_count"],
         "result_events": None,
         "source": "retained_artifacts",
@@ -2030,7 +2252,10 @@ def reclassify_call_accounting(
             "model_tool_call_count",
             "necessary_tool_call_count",
             "repeated_tool_call_count",
+            "avoidable_repeat_tool_call_count",
+            "state_changed_revalidation_count",
             "background_wait_count",
+            "verifier_read_count",
             "unclassified_tool_call_count",
             "tool_call_ledger",
             "tool_call_ledger_truncated",

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -1321,6 +1321,81 @@ impl LlmProvider for ParallelReadProvider {
                 Some(ProviderMessage {
                     role: ProviderRole::Assistant,
                     content: "parallel inspection complete".to_owned(),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: Vec::new(),
+                    metadata: Default::default(),
+                }),
+                Vec::new(),
+                ProviderFinishReason::Stop,
+            )
+        };
+        Ok(ProviderResponse {
+            response_id: golutra_core::ProviderResponseId::new(),
+            message,
+            tool_calls,
+            usage: ProviderUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                reasoning_tokens: None,
+                cached_input_tokens: None,
+                total_tokens: Some(15),
+                usage_source: UsageSource::Estimated,
+                raw: json!({"round": call}),
+            },
+            finish_reason,
+            raw_metadata: json!({"round": call}),
+        })
+    }
+
+    fn contract(&self) -> golutra_core::ProviderContract {
+        self.contract.clone()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ParallelWriteProvider {
+    calls: Arc<AtomicUsize>,
+    saw_source_order: Arc<AtomicBool>,
+    contract: golutra_core::ProviderContract,
+}
+
+#[async_trait]
+impl LlmProvider for ParallelWriteProvider {
+    async fn complete(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let (message, tool_calls, finish_reason) = if call == 0 {
+            (
+                None,
+                vec![
+                    ProviderToolCall {
+                        tool_call_id: "write-first".to_owned(),
+                        tool_name: "write_file".to_owned(),
+                        arguments: json!({"path": "first.txt", "content": "first\n"}),
+                    },
+                    ProviderToolCall {
+                        tool_call_id: "write-second".to_owned(),
+                        tool_name: "write_file".to_owned(),
+                        arguments: json!({"path": "second.txt", "content": "second\n"}),
+                    },
+                ],
+                ProviderFinishReason::ToolCalls,
+            )
+        } else {
+            let result_ids = request
+                .messages
+                .iter()
+                .filter(|message| message.role == ProviderRole::Tool)
+                .filter_map(|message| message.tool_call_id.as_deref())
+                .collect::<Vec<_>>();
+            self.saw_source_order.store(
+                result_ids == ["write-first", "write-second"],
+                Ordering::SeqCst,
+            );
+            (
+                Some(ProviderMessage {
+                    role: ProviderRole::Assistant,
+                    content: "writes complete".to_owned(),
                     tool_call_id: None,
                     tool_name: None,
                     tool_calls: Vec::new(),
@@ -3758,6 +3833,39 @@ impl BeforeSideEffectRecorder for FailingCheckpointRecorder {
     ) -> Result<(), AgentLoopError> {
         Err(AgentLoopError::Checkpoint(
             "forced checkpoint persistence failure".to_owned(),
+        ))
+    }
+}
+
+#[derive(Debug)]
+struct PartiallyFailingCheckpointRecorder {
+    second_failed: AtomicBool,
+    second_failed_notify: Notify,
+}
+
+#[async_trait]
+impl BeforeSideEffectRecorder for PartiallyFailingCheckpointRecorder {
+    async fn persist_before_side_effect(
+        &self,
+        request: &golutra_tools::ToolRequest,
+        _before_images: &[golutra_tools::FileBeforeImage],
+        _complete: bool,
+    ) -> Result<(), AgentLoopError> {
+        if request
+            .arguments
+            .get("path")
+            .and_then(|value| value.as_str())
+            == Some("first.txt")
+        {
+            if !self.second_failed.load(Ordering::SeqCst) {
+                self.second_failed_notify.notified().await;
+            }
+            return Ok(());
+        }
+        self.second_failed.store(true, Ordering::SeqCst);
+        self.second_failed_notify.notify_waiters();
+        Err(AgentLoopError::Checkpoint(
+            "forced checkpoint persistence failure for second mutation".to_owned(),
         ))
     }
 }
@@ -6251,6 +6359,243 @@ async fn mixed_tool_batch_parallelizes_adjacent_reads_around_side_effects() {
     assert!(
         first_completed < second_read_start,
         "the side-effect boundary must follow the first read group"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disjoint_file_mutations_are_batched_and_replayed_in_source_order() {
+    let workspace = tempdir().expect("workspace");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let saw_source_order = Arc::new(AtomicBool::new(false));
+    let provider = ParallelWriteProvider {
+        calls: calls.clone(),
+        saw_source_order: saw_source_order.clone(),
+        contract: MockProvider::text_response("unused").contract(),
+    };
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+    let agent_loop = AgentLoop::new(provider, ContextBuilder::default(), executor);
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        agent_loop.run(AgentTaskRequest {
+            session_id: SessionId::new(),
+            task_id: TaskId::new(),
+            turn_id: TurnId::new(),
+            objective: "write both independent files".to_owned(),
+            completion_criteria: Vec::new(),
+            output_schema: None,
+            touched_code: false,
+            contributors: Vec::new(),
+            tools: vec!["write_file".to_owned()],
+        }),
+    )
+    .await
+    .expect("parallel writes must not deadlock")
+    .expect("parallel write outcome");
+
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(saw_source_order.load(Ordering::SeqCst));
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("first.txt")).expect("first output"),
+        "first\n"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("second.txt")).expect("second output"),
+        "second\n"
+    );
+    assert_eq!(
+        outcome
+            .tool_reports
+            .iter()
+            .map(|report| report.envelope.tool_name.as_str())
+            .collect::<Vec<_>>(),
+        ["write_file", "write_file"]
+    );
+}
+
+#[tokio::test]
+async fn keyed_write_batch_converges_lexical_aliases_and_keeps_distinct_paths_parallel() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(workspace.path().join("same.txt"), "before\n").expect("fixture");
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+    let first = ProviderToolCall {
+        tool_call_id: "first".to_owned(),
+        tool_name: "write_file".to_owned(),
+        arguments: json!({"path": "same.txt", "content": "one\n"}),
+    };
+    let alias = ProviderToolCall {
+        tool_call_id: "alias".to_owned(),
+        tool_name: "write_file".to_owned(),
+        arguments: json!({"path": "./same.txt", "content": "two\n"}),
+    };
+    let distinct = ProviderToolCall {
+        tool_call_id: "distinct".to_owned(),
+        tool_name: "write_file".to_owned(),
+        arguments: json!({"path": "other.txt", "content": "other\n"}),
+    };
+    let first_kind = provider_parallel_batch_kind(
+        &first,
+        AgentToolProfile::Coding,
+        executor.registry(),
+        &executor,
+    )
+    .await;
+    let alias_kind = provider_parallel_batch_kind(
+        &alias,
+        AgentToolProfile::Coding,
+        executor.registry(),
+        &executor,
+    )
+    .await;
+    let distinct_kind = provider_parallel_batch_kind(
+        &distinct,
+        AgentToolProfile::Coding,
+        executor.registry(),
+        &executor,
+    )
+    .await;
+    let (
+        ParallelBatchKind::KeyedWrite(first_paths),
+        ParallelBatchKind::KeyedWrite(alias_paths),
+        ParallelBatchKind::KeyedWrite(distinct_paths),
+    ) = (first_kind, alias_kind, distinct_kind)
+    else {
+        panic!("file writes should use keyed scheduling");
+    };
+    assert_eq!(first_paths, alias_paths);
+    assert!(first_paths.is_disjoint(&distinct_paths));
+}
+
+#[test]
+fn parallel_batch_accepts_only_compatible_disjoint_operations() {
+    let path = PathBuf::from("workspace/file.txt");
+    let mut same_path = ParallelBatchKind::KeyedWrite(BTreeSet::from([path.clone()]));
+    assert!(!extend_parallel_batch(
+        &mut same_path,
+        ParallelBatchKind::KeyedWrite(BTreeSet::from([path.clone()])),
+    ));
+    assert_eq!(
+        same_path,
+        ParallelBatchKind::KeyedWrite(BTreeSet::from([path.clone()])),
+        "an overlapping write must remain an ordering boundary"
+    );
+
+    let mut disjoint = ParallelBatchKind::KeyedWrite(BTreeSet::from([path]));
+    assert!(extend_parallel_batch(
+        &mut disjoint,
+        ParallelBatchKind::KeyedWrite(BTreeSet::from([PathBuf::from("workspace/other.txt")])),
+    ));
+    assert!(matches!(disjoint, ParallelBatchKind::KeyedWrite(paths) if paths.len() == 2));
+
+    let mut reads = ParallelBatchKind::SharedRead;
+    assert!(extend_parallel_batch(
+        &mut reads,
+        ParallelBatchKind::SharedRead,
+    ));
+    assert!(!extend_parallel_batch(
+        &mut reads,
+        ParallelBatchKind::Exclusive,
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn parallel_mutation_checkpoint_failure_prevents_all_writes() {
+    let workspace = tempdir().expect("workspace");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = ParallelWriteProvider {
+        calls: calls.clone(),
+        saw_source_order: Arc::new(AtomicBool::new(false)),
+        contract: MockProvider::text_response("unused").contract(),
+    };
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+    let mut agent_loop = AgentLoop::new(provider, ContextBuilder::default(), executor);
+    agent_loop.before_side_effect_recorder = Some(Arc::new(FailingCheckpointRecorder));
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        agent_loop.run(AgentTaskRequest {
+            session_id: SessionId::new(),
+            task_id: TaskId::new(),
+            turn_id: TurnId::new(),
+            objective: "checkpoint both writes before execution".to_owned(),
+            completion_criteria: Vec::new(),
+            output_schema: None,
+            touched_code: false,
+            contributors: Vec::new(),
+            tools: vec!["write_file".to_owned()],
+        }),
+    )
+    .await
+    .expect("parallel checkpoint failure must not hang")
+    .expect("parallel checkpoint failure is reported as a tool result");
+
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(!workspace.path().join("first.txt").exists());
+    assert!(!workspace.path().join("second.txt").exists());
+    assert_eq!(
+        outcome
+            .tool_reports
+            .iter()
+            .filter(|report| report.envelope.tool_name == "write_file")
+            .count(),
+        2
+    );
+    assert!(
+        outcome
+            .tool_reports
+            .iter()
+            .filter(|report| report.envelope.tool_name == "write_file")
+            .all(|report| report.envelope.status == ToolResultStatus::Error)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn partial_parallel_checkpoint_failure_prevents_successful_sibling_write() {
+    let workspace = tempdir().expect("workspace");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = ParallelWriteProvider {
+        calls: calls.clone(),
+        saw_source_order: Arc::new(AtomicBool::new(false)),
+        contract: MockProvider::text_response("unused").contract(),
+    };
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+    let mut agent_loop = AgentLoop::new(provider, ContextBuilder::default(), executor);
+    agent_loop.before_side_effect_recorder = Some(Arc::new(PartiallyFailingCheckpointRecorder {
+        second_failed: AtomicBool::new(false),
+        second_failed_notify: Notify::new(),
+    }));
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        agent_loop.run(AgentTaskRequest {
+            session_id: SessionId::new(),
+            task_id: TaskId::new(),
+            turn_id: TurnId::new(),
+            objective: "abort the write batch when one checkpoint fails".to_owned(),
+            completion_criteria: Vec::new(),
+            output_schema: None,
+            touched_code: false,
+            contributors: Vec::new(),
+            tools: vec!["write_file".to_owned()],
+        }),
+    )
+    .await
+    .expect("partial checkpoint failure must not hang")
+    .expect("partial checkpoint failure is reported as tool results");
+
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(!workspace.path().join("first.txt").exists());
+    assert!(!workspace.path().join("second.txt").exists());
+    let write_reports = outcome
+        .tool_reports
+        .iter()
+        .filter(|report| report.envelope.tool_name == "write_file")
+        .collect::<Vec<_>>();
+    assert_eq!(write_reports.len(), 2);
+    assert!(
+        write_reports
+            .iter()
+            .all(|report| report.envelope.status == ToolResultStatus::Error)
     );
 }
 

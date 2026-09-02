@@ -1,6 +1,6 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    path::{Component, Path},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    path::{Component, Path, PathBuf},
     sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
 };
@@ -43,10 +43,11 @@ use golutra_llm::{
 use golutra_policy::approval_resource_matches;
 use golutra_protocol::{AgentExecutionMode, AgentToolProfile, ExternalVerificationSpec};
 use golutra_tools::{
-    CONTRACT_FILE_CONTENT_VERIFIER_TOOL, CONTRACT_PATH_VERIFIER_TOOL, FileBeforeImage, ToolError,
-    ToolExecutionReport, ToolInvocation, ToolRegistry, ToolRequest, ToolRuntime,
-    VerifierExecutionRequest, is_pi_plus_tool, model_visible_tool_result_with_token_budget,
-    redact_tool_arguments, shell_request_is_strictly_read_only,
+    CONTRACT_FILE_CONTENT_VERIFIER_TOOL, CONTRACT_PATH_VERIFIER_TOOL, FileBeforeImage,
+    SideEffectPreparation, ToolError, ToolExecutionReport, ToolInvocation, ToolRegistry,
+    ToolRequest, ToolRuntime, VerifierExecutionRequest, is_pi_plus_tool,
+    model_visible_tool_result_with_token_budget, redact_tool_arguments,
+    shell_request_is_strictly_read_only,
 };
 use golutra_verify::VerificationInput;
 use serde_json::{Value, json};
@@ -409,7 +410,7 @@ impl From<PendingAgentTurn> for ConfiguredPendingAgentTurn {
 }
 
 #[derive(Debug)]
-struct PreparedParallelReadCall {
+struct PreparedParallelCall {
     provider_tool_call_id: String,
     failure_signature: String,
     failure_family: String,
@@ -418,10 +419,18 @@ struct PreparedParallelReadCall {
     policy: PolicyEvaluation,
     governance: RuntimeGovernorDecision,
     tool_call_count: u32,
+    preparation: Option<SideEffectPreparation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ParallelBatchKind {
+    SharedRead,
+    KeyedWrite(BTreeSet<PathBuf>),
+    Exclusive,
 }
 
 #[derive(Debug)]
-struct ParallelReadOutcome {
+struct ParallelCallOutcome {
     provider_tool_call_id: String,
     failure_signature: String,
     failure_family: String,
@@ -429,6 +438,14 @@ struct ParallelReadOutcome {
     report: ToolExecutionReport,
     progress: Vec<ToolProgress>,
     tool_call_count: u32,
+}
+
+#[derive(Debug)]
+enum ParallelCheckpointOutcome {
+    Ready,
+    Error(String),
+    Cancelled,
+    TimedOut,
 }
 
 /// 单次 provider 工具尝试的元数据。执行报告保持不可变；旁路表让最终验收能够
@@ -2166,23 +2183,34 @@ where
                     },
                     &mut message_token_total,
                 );
-                // 只并行相邻且明确无副作用的读取。文件变更或进程操作是严格的
-                // 顺序边界，两侧读取不能互相竞态；结果仍按 provider 原顺序提交，
-                // 只消除混合工具批次中可避免的等待。
+                // 只并行相邻且明确安全的共享读取或互不相交的文件写入。
+                // 进程、网络和其他副作用仍是严格顺序边界；结果按 provider
+                // 原顺序提交，执行并行只消除独立操作间可避免的等待。
                 let replay_context_active = replay_context
                     .as_ref()
                     .is_some_and(|context| !context.allow_parallel_reads);
                 let mut pending_tool_calls = provider_response.tool_calls.into_iter().peekable();
-                let mut stop_after_parallel_read_batch = false;
+                let mut stop_after_parallel_batch = false;
                 while let Some(first_tool_call) = pending_tool_calls.next() {
                     let mut batch_tool_calls = vec![first_tool_call];
-                    if !replay_context_active
-                        && provider_tool_call_is_parallel_read_safe(
+                    // Shared reads and disjoint canonical-path writes are the
+                    // only batches eligible for concurrent execution. Every
+                    // other operation remains an explicit ordering boundary.
+                    let mut batch_kind = if replay_context_active {
+                        ParallelBatchKind::Exclusive
+                    } else {
+                        provider_parallel_batch_kind(
                             &batch_tool_calls[0],
                             current_tool_profile,
                             self.tool_executor.registry(),
+                            &self.tool_executor,
                         )
-                    {
+                        .await
+                    };
+                    if matches!(
+                        batch_kind,
+                        ParallelBatchKind::SharedRead | ParallelBatchKind::KeyedWrite(_)
+                    ) {
                         loop {
                             if batch_tool_calls.len() >= PARALLEL_READ_CONCURRENCY_LIMIT {
                                 break;
@@ -2190,11 +2218,14 @@ where
                             let Some(next_tool_call) = pending_tool_calls.peek() else {
                                 break;
                             };
-                            if !provider_tool_call_is_parallel_read_safe(
+                            let next_kind = provider_parallel_batch_kind(
                                 next_tool_call,
                                 current_tool_profile,
                                 self.tool_executor.registry(),
-                            ) {
+                                &self.tool_executor,
+                            )
+                            .await;
+                            if !extend_parallel_batch(&mut batch_kind, next_kind) {
                                 break;
                             }
                             batch_tool_calls.push(
@@ -2205,8 +2236,10 @@ where
                         }
                     }
 
-                    let mut parallel_read_outcomes = VecDeque::new();
-                    if batch_tool_calls.len() > 1 {
+                    let mut parallel_call_outcomes = VecDeque::new();
+                    if batch_tool_calls.len() > 1
+                        && !matches!(&batch_kind, ParallelBatchKind::Exclusive)
+                    {
                         control.wait_until_runnable().await?;
                         let mut prepared = Vec::with_capacity(batch_tool_calls.len());
                         let mut parallel_failure_signatures = HashSet::new();
@@ -2278,7 +2311,27 @@ where
                                 prepared.clear();
                                 break;
                             }
-                            prepared.push(PreparedParallelReadCall {
+                            let preparation =
+                                if matches!(&batch_kind, ParallelBatchKind::KeyedWrite(_)) {
+                                    match await_runtime_operation(
+                                        self.tool_executor.prepare_side_effect_snapshot(&request),
+                                        &control.cancellation,
+                                        runtime_deadline,
+                                    )
+                                    .await
+                                    {
+                                        RuntimeOperationOutcome::Completed(Ok(preparation)) => {
+                                            Some(preparation)
+                                        }
+                                        _ => {
+                                            prepared.clear();
+                                            break;
+                                        }
+                                    }
+                                } else {
+                                    None
+                                };
+                            prepared.push(PreparedParallelCall {
                                 provider_tool_call_id,
                                 failure_signature,
                                 failure_family,
@@ -2287,6 +2340,7 @@ where
                                 policy,
                                 governance,
                                 tool_call_count: batch_tool_call_count,
+                                preparation,
                             });
                         }
                         if prepared.len() == batch_tool_calls.len() {
@@ -2318,16 +2372,18 @@ where
                             tool_call_count = prepared
                                 .last()
                                 .map_or(tool_call_count, |call| call.tool_call_count);
-                            parallel_read_outcomes = invoke_parallel_read_calls(
+                            parallel_call_outcomes = invoke_parallel_calls(
                                 &self.tool_executor,
                                 prepared,
                                 control.cancellation.clone(),
                                 runtime_deadline,
+                                self.before_side_effect_recorder.clone(),
+                                control.pause.clone(),
                             )
                             .await;
                         }
                     }
-                    let parallel_read_batch = !parallel_read_outcomes.is_empty();
+                    let parallel_batch = !parallel_call_outcomes.is_empty();
                     for tool_call in batch_tool_calls {
                         let (
                             provider_tool_call_id,
@@ -2338,14 +2394,14 @@ where
                             prepared_objective_validation,
                             result_tool_call_count,
                             mut report,
-                        ) = if let Some(outcome) = parallel_read_outcomes.pop_front() {
+                        ) = if let Some(outcome) = parallel_call_outcomes.pop_front() {
                             debug_assert_eq!(
                                 outcome.provider_tool_call_id, tool_call.tool_call_id,
-                                "parallel read outcomes retain provider source order"
+                                "parallel outcomes retain provider source order"
                             );
                             debug_assert_eq!(
                                 outcome.report.envelope.tool_name, tool_call.tool_name,
-                                "parallel read outcome matches its source call"
+                                "parallel outcome matches its source call"
                             );
                             for progress in outcome.progress {
                                 trace(AgentLoopTraceEvent::ToolProgress(progress));
@@ -2909,8 +2965,8 @@ where
                                 reason: reason.clone(),
                             });
                             guard_reason = Some(reason);
-                            if parallel_read_batch {
-                                stop_after_parallel_read_batch = true;
+                            if parallel_batch {
+                                stop_after_parallel_batch = true;
                             } else {
                                 finish_runtime_step(
                                     &mut step_machine,
@@ -2924,8 +2980,8 @@ where
                             }
                         }
                         if !permits_continuation {
-                            if parallel_read_batch {
-                                stop_after_parallel_read_batch = true;
+                            if parallel_batch {
+                                stop_after_parallel_batch = true;
                             } else {
                                 finish_runtime_step(
                                     &mut step_machine,
@@ -2939,11 +2995,11 @@ where
                             }
                         }
                     }
-                    if stop_after_parallel_read_batch {
+                    if stop_after_parallel_batch {
                         break;
                     }
                 }
-                if stop_after_parallel_read_batch {
+                if stop_after_parallel_batch {
                     finish_runtime_step(
                         &mut step_machine,
                         step_snapshot.clone(),
@@ -4815,17 +4871,182 @@ fn provider_tool_call_is_parallel_read_safe(
             })
 }
 
-async fn invoke_parallel_read_calls(
+/// Extend a currently selected batch only when the next operation has the
+/// same safe execution mode. File mutations are keyed by their resolved
+/// workspace identities; any overlap remains a strict ordering boundary.
+fn extend_parallel_batch(current: &mut ParallelBatchKind, next: ParallelBatchKind) -> bool {
+    match (current, next) {
+        (ParallelBatchKind::SharedRead, ParallelBatchKind::SharedRead) => true,
+        (ParallelBatchKind::KeyedWrite(existing), ParallelBatchKind::KeyedWrite(next)) => {
+            if existing.iter().any(|path| next.contains(path)) {
+                return false;
+            }
+            existing.extend(next);
+            true
+        }
+        _ => false,
+    }
+}
+
+async fn provider_parallel_batch_kind(
+    tool_call: &ProviderToolCall,
+    profile: AgentToolProfile,
+    registry: &ToolRegistry,
     tool_executor: &ToolRuntime,
-    prepared: Vec<PreparedParallelReadCall>,
+) -> ParallelBatchKind {
+    if provider_tool_call_is_parallel_read_safe(tool_call, profile, registry) {
+        return ParallelBatchKind::SharedRead;
+    }
+    if !matches!(
+        tool_call.tool_name.as_str(),
+        "write_file" | "edit_file" | "apply_patch"
+    ) || !is_pi_plus_tool(&tool_call.tool_name)
+        || !tool_allowed_for_profile(&tool_call.tool_name, profile, registry)
+        || registry
+            .contract(&tool_call.tool_name)
+            .is_none_or(|contract| contract.side_effect_type != SideEffectType::File)
+    {
+        return ParallelBatchKind::Exclusive;
+    }
+    let request = ToolRequest {
+        tool_call_id: golutra_core::ToolCallId::new(),
+        provider_tool_call_id: Some(tool_call.tool_call_id.clone()),
+        session_id: SessionId::new(),
+        turn_id: None,
+        tool_name: tool_call.tool_name.clone(),
+        arguments: tool_call.arguments.clone(),
+    };
+    match tool_executor.resolve_keyed_write_paths(&request).await {
+        Ok(paths) if !paths.is_empty() => {
+            ParallelBatchKind::KeyedWrite(paths.into_iter().collect())
+        }
+        _ => ParallelBatchKind::Exclusive,
+    }
+}
+
+async fn invoke_parallel_calls(
+    tool_executor: &ToolRuntime,
+    prepared: Vec<PreparedParallelCall>,
     cancellation: CancellationToken,
     runtime_deadline: Option<tokio::time::Instant>,
-) -> VecDeque<ParallelReadOutcome> {
+    before_side_effect_recorder: Option<Arc<dyn BeforeSideEffectRecorder>>,
+    pause: watch::Receiver<bool>,
+) -> VecDeque<ParallelCallOutcome> {
+    // 先让整批 checkpoint 完成，再允许任一 mutation 产生副作用；否则一个
+    // 成功 checkpoint 可能在同批另一个失败结果返回前提前写入工作区。
+    if let Some(recorder) = before_side_effect_recorder.as_ref()
+        && prepared.iter().any(|call| call.preparation.is_some())
+    {
+        let checkpoint_deadline = runtime_deadline;
+        let checkpoint_cancellation = cancellation.clone();
+        let checkpoint_jobs = prepared
+            .iter()
+            .map(|call| {
+                (
+                    call.request.clone(),
+                    call.preparation.as_ref().map(|preparation| {
+                        (preparation.before_images.clone(), preparation.complete)
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        let checkpoint_futures = checkpoint_jobs
+            .into_iter()
+            .map(move |(request, preparation)| {
+                let recorder = recorder.clone();
+                let cancellation = checkpoint_cancellation.clone();
+                let runtime_deadline = checkpoint_deadline;
+                async move {
+                    let Some((before_images, complete)) = preparation else {
+                        return ParallelCheckpointOutcome::Ready;
+                    };
+                    match await_runtime_operation(
+                        recorder.persist_before_side_effect(&request, &before_images, complete),
+                        &cancellation,
+                        runtime_deadline,
+                    )
+                    .await
+                    {
+                        RuntimeOperationOutcome::Completed(Ok(())) => {
+                            ParallelCheckpointOutcome::Ready
+                        }
+                        RuntimeOperationOutcome::Completed(Err(error)) => {
+                            ParallelCheckpointOutcome::Error(error.to_string())
+                        }
+                        RuntimeOperationOutcome::Cancelled => ParallelCheckpointOutcome::Cancelled,
+                        RuntimeOperationOutcome::TimedOut => ParallelCheckpointOutcome::TimedOut,
+                    }
+                }
+            });
+        let checkpoint_outcomes = stream::iter(checkpoint_futures)
+            .buffered(PARALLEL_READ_CONCURRENCY_LIMIT)
+            .collect::<Vec<_>>()
+            .await;
+        if checkpoint_outcomes
+            .iter()
+            .any(|outcome| !matches!(outcome, ParallelCheckpointOutcome::Ready))
+        {
+            let mut outcomes = VecDeque::with_capacity(prepared.len());
+            for (prepared, checkpoint) in prepared.into_iter().zip(checkpoint_outcomes) {
+                let PreparedParallelCall {
+                    provider_tool_call_id,
+                    failure_signature,
+                    failure_family,
+                    blocked_family_failures,
+                    request,
+                    policy,
+                    tool_call_count,
+                    ..
+                } = prepared;
+                let error_request = request.clone();
+                let error_policy = policy.clone();
+                let report = match checkpoint {
+                    ParallelCheckpointOutcome::Ready => {
+                        tool_executor
+                            .execution_error_report_with_hints(
+                                error_request,
+                                error_policy,
+                                "a sibling side-effect checkpoint failed; no mutation was executed",
+                            )
+                            .await
+                    }
+                    ParallelCheckpointOutcome::Error(error) => {
+                        tool_executor
+                            .execution_error_report_with_hints(error_request, error_policy, error)
+                            .await
+                    }
+                    ParallelCheckpointOutcome::Cancelled => tool_executor
+                        .cancelled_execution_report(
+                            error_request,
+                            error_policy,
+                            "tool call cancelled while persisting its side-effect checkpoint",
+                        ),
+                    ParallelCheckpointOutcome::TimedOut => tool_executor.deadline_exceeded_report(
+                        error_request,
+                        error_policy,
+                        "side-effect checkpoint",
+                    ),
+                };
+                outcomes.push_back(ParallelCallOutcome {
+                    provider_tool_call_id,
+                    failure_signature,
+                    failure_family,
+                    blocked_family_failures,
+                    report,
+                    progress: Vec::new(),
+                    tool_call_count,
+                });
+            }
+            return outcomes;
+        }
+    }
+
     let futures = prepared.into_iter().map(|prepared| {
         let executor = tool_executor.clone();
         let cancellation = cancellation.clone();
+        let pause = pause.clone();
         async move {
-            let PreparedParallelReadCall {
+            let PreparedParallelCall {
                 provider_tool_call_id,
                 failure_signature,
                 failure_family,
@@ -4834,10 +5055,30 @@ async fn invoke_parallel_read_calls(
                 policy,
                 governance: _,
                 tool_call_count,
+                preparation,
             } = prepared;
             let error_request = request.clone();
             let error_policy = policy.clone();
+            let mut pause = pause;
+            if let Err(error) = wait_until_runnable_with_receiver(&mut pause, &cancellation).await {
+                return ParallelCallOutcome {
+                    provider_tool_call_id,
+                    failure_signature,
+                    failure_family,
+                    blocked_family_failures,
+                    report: executor.cancelled_execution_report(
+                        error_request,
+                        error_policy,
+                        &error.to_string(),
+                    ),
+                    progress: Vec::new(),
+                    tool_call_count,
+                };
+            }
             let mut invocation = ToolInvocation::new(request, policy, false);
+            if let Some(preparation) = preparation {
+                invocation = invocation.with_preparation(preparation);
+            }
             if let Some(deadline) = runtime_deadline {
                 invocation = invocation.with_deadline(deadline);
             }
@@ -4858,7 +5099,7 @@ async fn invoke_parallel_read_calls(
                         .await
                 }
             };
-            ParallelReadOutcome {
+            ParallelCallOutcome {
                 provider_tool_call_id,
                 failure_signature,
                 failure_family,
@@ -4919,6 +5160,29 @@ enum RuntimeOperationOutcome<T> {
     Completed(T),
     Cancelled,
     TimedOut,
+}
+
+async fn wait_until_runnable_with_receiver(
+    pause: &mut watch::Receiver<bool>,
+    cancellation: &CancellationToken,
+) -> Result<(), AgentLoopError> {
+    loop {
+        if cancellation.is_cancelled() {
+            return Err(AgentLoopError::Cancelled);
+        }
+        if !*pause.borrow() {
+            return Ok(());
+        }
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(AgentLoopError::Cancelled),
+            changed = pause.changed() => {
+                if changed.is_err() {
+                    return Err(AgentLoopError::Cancelled);
+                }
+            }
+        }
+    }
 }
 
 async fn await_runtime_operation<F>(

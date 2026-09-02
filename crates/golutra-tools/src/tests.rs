@@ -5414,6 +5414,39 @@ fn request_for_session(session_id: SessionId, tool_name: &str, arguments: Value)
     }
 }
 
+#[tokio::test]
+async fn keyed_write_paths_share_policy_identity_and_deduplicate_patch_targets() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(workspace.path().join("same.txt"), "before\n").expect("fixture");
+    let executor = executor(workspace.path());
+
+    let first = executor
+        .resolve_keyed_write_paths(&request(
+            "write_file",
+            json!({"path": "./same.txt", "content": "one\n"}),
+        ))
+        .await
+        .expect("write path resolves");
+    let second = executor
+        .resolve_keyed_write_paths(&request(
+            "edit_file",
+            json!({
+                "path": "./same.txt",
+                "edits": [{"old_text": "before", "new_text": "two"}]
+            }),
+        ))
+        .await
+        .expect("edit path resolves");
+    assert_eq!(first, second);
+
+    let patch = "*** Begin Patch\n*** Update File: same.txt\n@@\n-before\n+after\n*** End Patch\n";
+    let patch_paths = executor
+        .resolve_keyed_write_paths(&request("apply_patch", json!({"patch": patch})))
+        .await
+        .expect("patch paths resolve");
+    assert_eq!(patch_paths, first);
+}
+
 fn artifact_text(report: &ToolExecutionReport) -> String {
     String::from_utf8_lossy(&report.artifact_contents[0].bytes).into_owned()
 }
