@@ -414,6 +414,7 @@ async fn interrupted_exec_finalizes_its_recoverable_run_checkpoint() {
     let workspace = tempdir().expect("workspace");
     let export_parent = tempdir().expect("export parent");
     let state_dir = export_parent.path().join("interrupted-runtime");
+    let shell_started = workspace.path().join(".interruptible-shell-started");
     install_mock_provider(home.path());
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_golutra-cli"))
@@ -426,6 +427,7 @@ async fn interrupted_exec_finalizes_its_recoverable_run_checkpoint() {
         .arg("auto")
         .arg("sleep before completing")
         .env("GOLUTRA_HOME", home.path())
+        .env("GOLUTRA_TEST_INTERRUPTIBLE_SHELL_MARKER", &shell_started)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
@@ -464,9 +466,23 @@ async fn interrupted_exec_finalizes_its_recoverable_run_checkpoint() {
             .expect("valid checkpoint manifest");
     assert_eq!(checkpoint["terminal_outcome"]["kind"], "in_progress");
 
-    // Give run_exec time to enter its signal-aware event loop after the
-    // atomic checkpoint rename becomes visible.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait for the real tool process to cross its start marker. This avoids
+    // guessing at scheduler timing after the initial checkpoint is published.
+    let mut marker_seen = false;
+    for _ in 0..1200 {
+        if shell_started.is_file() {
+            marker_seen = true;
+            break;
+        }
+        if child.try_wait().expect("poll interruptible exec").is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        shell_started.is_file() && marker_seen,
+        "interruptible shell did not start"
+    );
     let pid = child.id().expect("exec process id");
     let signal = Command::new("kill")
         .arg("-INT")
