@@ -4719,25 +4719,7 @@ fn core_or_requested_optional_tool(tool_name: &str, objective: &str) -> bool {
                 "网上",
             ],
         ),
-        "shell_session" => objective_mentions_any(
-            objective,
-            &[
-                "background",
-                "background process",
-                "long-running",
-                "long running",
-                "async",
-                "asynchronous",
-                "process session",
-                "wait for the process",
-                "shell_session",
-                "后台",
-                "长运行",
-                "异步",
-                "进程",
-                "等待进程",
-            ],
-        ),
+        "shell_session" => objective_requests_background_session(objective),
         "subagent" => objective_mentions_any(
             objective,
             &[
@@ -4754,6 +4736,53 @@ fn core_or_requested_optional_tool(tool_name: &str, objective: &str) -> bool {
         ),
         _ => true,
     }
+}
+
+/// 只在目标明确要求后台进程生命周期时暴露会话工具。
+///
+/// “long-running task”通常描述代理任务本身，而不是要启动的子进程；
+/// 将这类泛化词当作能力请求会让每一轮请求携带无用的 schema。这里保留
+/// 明确的启动、等待、轮询和终止语义，避免削弱模型处理真实后台任务的能力。
+fn objective_requests_background_session(objective: &str) -> bool {
+    objective_mentions_any(
+        objective,
+        &[
+            "shell_session",
+            "background process",
+            "background command",
+            "background job",
+            "run in background",
+            "running in background",
+            "process session",
+            "wait for the process",
+            "wait for process",
+            "process state",
+            "poll process",
+            "resume process",
+            "terminate process",
+            "long-running process",
+            "long running process",
+            "long-running command",
+            "long running command",
+            "long-running server",
+            "long running server",
+            "long-running service",
+            "long running service",
+            "asynchronous process",
+            "async process",
+            "后台进程",
+            "后台命令",
+            "后台运行",
+            "后台任务",
+            "等待进程",
+            "进程状态",
+            "轮询进程",
+            "终止进程",
+            "长时间运行的进程",
+            "长运行进程",
+            "异步进程",
+        ],
+    )
 }
 
 fn objective_mentions_any(objective: &str, phrases: &[&str]) -> bool {

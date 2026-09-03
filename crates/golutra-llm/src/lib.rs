@@ -2331,10 +2331,10 @@ pub fn provider_tool_description(tool_name: &str) -> &'static str {
             "Create a new UTF-8 file or completely rewrite one; returns status and digest."
         }
         "edit_file" => {
-            "Change one UTF-8 file with exact, non-overlapping edits[]; batch disjoint edits; returns status, digest, preview."
+            "Edit one UTF-8 file with exact, non-overlapping edits[]; batch disjoint edits; returns status, digest, preview."
         }
         "apply_patch" => {
-            "Atomically apply a unified or Begin/Update/Add/Delete patch for related multi-file changes; returns status, digest, preview."
+            "Atomically apply one unified or Begin/Update/Add/Delete patch; batch related multi-file changes; returns status, digest, preview."
         }
         "web_search" => "Search the network when enabled; return source-backed results.",
         "shell_session" => {

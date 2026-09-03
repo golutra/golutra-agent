@@ -121,6 +121,64 @@ pub struct ContextBuildPlan {
     pub trimmed_contributors: Vec<String>,
 }
 
+/// 返回快照中可在下一轮请求复用的前导消息数量。
+///
+/// 快照只保留脱敏后的 contributor/origin，因此这里复用与
+/// `ContextBuilder::stable_prefix_len` 相同的边界规则；动态历史一旦出现，
+/// 后续消息都不能被诊断为稳定前缀。
+#[must_use]
+pub fn stable_prefix_message_count(snapshot: &ContextSnapshot) -> usize {
+    snapshot
+        .message_manifest
+        .iter()
+        .take_while(|message| {
+            !snapshot_message_is_dynamic(message)
+                && !matches!(message.role.as_str(), "assistant" | "tool")
+        })
+        .count()
+}
+
+/// 估算快照中稳定前缀的 token 数。该值只用于诊断，不替代 provider 返回的
+/// usage；动态消息或工具结果不会混入这个计数。
+#[must_use]
+pub fn stable_prefix_token_estimate(snapshot: &ContextSnapshot) -> u64 {
+    let count = stable_prefix_message_count(snapshot);
+    snapshot.message_manifest[..count]
+        .iter()
+        .map(|message| message.estimated_tokens)
+        .fold(0_u64, u64::saturating_add)
+}
+
+fn snapshot_message_is_dynamic(message: &ContextMessageSnapshot) -> bool {
+    let contributor = message.contributor.as_str();
+    matches!(
+        contributor,
+        "memory"
+            | "workspace_entries"
+            | "conversation_history"
+            | "project_skills"
+            | "objective"
+            | "user_message"
+            | "assistant_recent"
+            | "runtime_context"
+            | "verification_feedback"
+            | "tool_result_excerpt"
+            | "working_summary"
+    ) || contributor.starts_with("history:")
+        || contributor.starts_with("replay_message_")
+        || matches!(
+            message.origin.as_str(),
+            "pending_turn"
+                | "compaction_summary"
+                | "runtime_history"
+                | "tool_result_compaction"
+                | "runtime_recovery"
+                | "runtime_deadline_advisory"
+                | "runtime_progress_advisory"
+                | "verification_feedback"
+        )
+}
+
 /// Return a stable identity for the first `message_count` messages in a plan.
 ///
 /// The provider reports only an aggregate input-token count, so the runtime
@@ -956,13 +1014,37 @@ impl ContextBuilder {
             .iter()
             .map(provider_message_digest)
             .collect::<Vec<_>>();
+        // 回放保留完整 provider wire，但只有开头连续的 system 区块可复用。
+        // 历史、用户回合、assistant 调用和工具结果都属于动态状态，恢复时
+        // 不得把它们错误固定到 provider 缓存键中。
+        let mut replay_prefix_open = true;
+        let replay_sources = messages
+            .iter()
+            .enumerate()
+            .map(|(index, message)| {
+                let stable = replay_prefix_open && message.role == ProviderRole::System;
+                replay_prefix_open = stable;
+                let contributor = if stable {
+                    format!("replay_static_prefix_{index}")
+                } else {
+                    format!("replay_message_{index}")
+                };
+                let origin = if stable {
+                    "deterministic_replay_static_prefix"
+                } else {
+                    "deterministic_replay"
+                };
+                (contributor, origin.to_owned(), stable)
+            })
+            .collect::<Vec<_>>();
         let contributor_manifest = messages
             .iter()
             .enumerate()
             .map(|(index, message)| {
                 let estimated_tokens = message_estimates[index];
+                let (contributor, _, _) = &replay_sources[index];
                 ContextContributorSnapshot {
-                    name: format!("replay_message_{index}"),
+                    name: contributor.clone(),
                     role: format!("{:?}", message.role).to_lowercase(),
                     source_refs: vec![format!("replay:provider-message:{index}")],
                     included: true,
@@ -981,16 +1063,20 @@ impl ContextBuilder {
         let message_sources = messages
             .iter()
             .enumerate()
-            .map(|(index, _)| ContextMessageSource {
-                contributor: format!("replay_message_{index}"),
-                source_refs: vec![format!("replay:provider-message:{index}")],
-                origin: "deterministic_replay".to_owned(),
-                visibility: ModelInputVisibility::ModelVisible,
+            .map(|(index, _)| {
+                let (contributor, origin, _) = &replay_sources[index];
+                ContextMessageSource {
+                    contributor: contributor.clone(),
+                    source_refs: vec![format!("replay:provider-message:{index}")],
+                    origin: origin.clone(),
+                    visibility: ModelInputVisibility::ModelVisible,
+                }
             })
             .collect();
         Ok(ContextBuildPlan {
-            contributors: (0..messages.len())
-                .map(|index| format!("replay_message_{index}"))
+            contributors: replay_sources
+                .iter()
+                .map(|(contributor, _, _)| contributor.clone())
                 .collect(),
             contributor_manifest,
             messages,
@@ -2596,6 +2682,119 @@ mod tests {
             },
         ];
         assert_eq!(builder.stable_prefix_len(&messages, &sources), 1);
+    }
+
+    #[test]
+    fn replay_marks_only_leading_system_block_as_stable_prefix() {
+        let builder = ContextBuilder::default();
+        let message = |role: ProviderRole, content: &str| ProviderMessage {
+            role,
+            content: content.to_owned(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+            metadata: Default::default(),
+        };
+        let plan = builder
+            .build_from_messages(
+                TaskId::new(),
+                TurnId::new(),
+                vec![
+                    message(ProviderRole::System, "system"),
+                    message(ProviderRole::System, "project"),
+                    message(ProviderRole::User, "previous request"),
+                    message(ProviderRole::System, "late system must be dynamic"),
+                    message(ProviderRole::Tool, "tool result"),
+                ],
+            )
+            .expect("replay context plan");
+
+        assert_eq!(
+            builder.stable_prefix_len(&plan.messages, &plan.message_sources),
+            2
+        );
+        assert!(
+            plan.message_sources[0]
+                .contributor
+                .starts_with("replay_static_prefix_")
+        );
+        assert!(
+            plan.message_sources[1]
+                .contributor
+                .starts_with("replay_static_prefix_")
+        );
+        assert_eq!(
+            plan.message_sources[0].origin,
+            "deterministic_replay_static_prefix"
+        );
+        assert!(
+            plan.message_sources[2]
+                .contributor
+                .starts_with("replay_message_")
+        );
+        assert!(
+            plan.message_sources[3]
+                .contributor
+                .starts_with("replay_message_")
+        );
+        assert_eq!(plan.message_sources[2].origin, "deterministic_replay");
+    }
+
+    #[test]
+    fn replay_starting_with_dynamic_message_does_not_create_a_stable_prefix() {
+        let builder = ContextBuilder::default();
+        let plan = builder
+            .build_from_messages(
+                TaskId::new(),
+                TurnId::new(),
+                vec![ProviderMessage {
+                    role: ProviderRole::User,
+                    content: "request".to_owned(),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: Vec::new(),
+                    metadata: Default::default(),
+                }],
+            )
+            .expect("replay context plan");
+        assert_eq!(
+            builder.stable_prefix_len(&plan.messages, &plan.message_sources),
+            0
+        );
+        assert_eq!(plan.message_sources[0].origin, "deterministic_replay");
+    }
+
+    #[test]
+    fn snapshot_stable_prefix_excludes_dynamic_tail() {
+        let task_id = TaskId::new();
+        let turn_id = TurnId::new();
+        let system = ProviderMessage {
+            role: ProviderRole::System,
+            content: "stable".to_owned(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+            metadata: Default::default(),
+        };
+        let user = ProviderMessage {
+            role: ProviderRole::User,
+            content: "dynamic request".to_owned(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+            metadata: Default::default(),
+        };
+        let plan = ContextBuilder::default()
+            .build_from_messages(task_id, turn_id, vec![system, user])
+            .expect("context plan");
+        let request =
+            provider_request_from_plan(&plan, task_id, turn_id, "mock", "model", Vec::new());
+        let snapshot = context_snapshot_from_request(SessionId::new(), &plan, &request);
+        assert_eq!(stable_prefix_message_count(&snapshot), 1);
+        assert_eq!(
+            stable_prefix_token_estimate(&snapshot),
+            snapshot.message_manifest[0].estimated_tokens
+        );
     }
 
     #[test]

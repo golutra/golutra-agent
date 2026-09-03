@@ -1,6 +1,9 @@
 //! Runtime 领域记录与持久化协议事件之间的转换。
 
-use golutra_context::{ContextCompactionRecord, parse_compaction_summary_envelope};
+use golutra_context::{
+    ContextCompactionRecord, parse_compaction_summary_envelope, stable_prefix_message_count,
+    stable_prefix_token_estimate,
+};
 use golutra_core::{
     Actor, ActorKind, ArtifactId, ArtifactRecord, CommandId, ContextSnapshot, EventId, LoopAction,
     RedactionStatus, SessionId, TaskContract, TaskId, TaskStatus, ThreadId, TurnId,
@@ -1196,9 +1199,11 @@ fn context_cache_diagnostics(
     snapshot: &ContextSnapshot,
     request: Option<&ProviderRequest>,
 ) -> Value {
+    let stable_prefix_length = stable_prefix_message_count(snapshot);
     let manifest = snapshot
         .message_manifest
         .iter()
+        .take(stable_prefix_length)
         .map(|message| {
             json!({
                 "index": message.index,
@@ -1210,7 +1215,9 @@ fn context_cache_diagnostics(
         })
         .collect::<Vec<_>>();
     let prefix_bytes = serde_json::to_vec(&manifest).unwrap_or_default();
-    let prefix_digest = context_message_wire_prefix_digest(snapshot);
+    let prefix_digest =
+        context_message_wire_prefix_digest_for_count(snapshot, stable_prefix_length)
+            .expect("stable prefix length is bounded by the message manifest");
     let tool_digest = digest_json_value(&snapshot.tool_schema_digests);
     let provider_id = request
         .map(|request| request.provider_id.as_str())
@@ -1225,11 +1232,7 @@ fn context_cache_diagnostics(
     let cache_policy = request
         .map(|request| json!(request.cache_policy))
         .unwrap_or_else(|| Value::String("unknown".to_owned()));
-    let message_prefix_token_estimate = snapshot
-        .message_manifest
-        .iter()
-        .map(|message| message.estimated_tokens)
-        .fold(0_u64, u64::saturating_add);
+    let message_prefix_token_estimate = stable_prefix_token_estimate(snapshot);
     json!({
         "scope_key": snapshot.cache_scope_key,
         "route": {
@@ -1239,7 +1242,11 @@ fn context_cache_diagnostics(
         },
         "cache_policy": cache_policy,
         "message_count": snapshot.message_manifest.len(),
-        "message_prefix_length": snapshot.message_manifest.len(),
+        "message_prefix_length": stable_prefix_length,
+        "dynamic_message_count": snapshot
+            .message_manifest
+            .len()
+            .saturating_sub(stable_prefix_length),
         "message_prefix_bytes": prefix_bytes.len(),
         "message_prefix_token_estimate": message_prefix_token_estimate,
         "message_prefix_digest": prefix_digest,
@@ -1251,6 +1258,7 @@ fn context_cache_diagnostics(
     })
 }
 
+#[cfg(test)]
 fn context_message_wire_prefix_digest(snapshot: &ContextSnapshot) -> String {
     context_message_wire_prefix_digest_for_count(snapshot, snapshot.message_manifest.len())
         .expect("full context snapshot prefix is always in range")
@@ -1529,12 +1537,12 @@ mod tests {
         assert_eq!(diagnostics["route"]["provider_id"], "mock");
         assert_eq!(diagnostics["route"]["model_id"], "mock-model");
         assert!(diagnostics["route"]["digest"].is_string());
-        assert_eq!(diagnostics["message_prefix_length"], 2);
+        assert_eq!(diagnostics["message_prefix_length"], 1);
+        assert_eq!(diagnostics["dynamic_message_count"], 1);
         assert!(diagnostics["message_prefix_bytes"].as_u64().is_some());
-        assert!(
-            diagnostics["message_prefix_token_estimate"]
-                .as_u64()
-                .is_some()
+        assert_eq!(
+            diagnostics["message_prefix_token_estimate"],
+            payload["snapshot"]["message_manifest"][0]["estimated_tokens"]
         );
         assert!(diagnostics["message_prefix_digest"].is_string());
         assert!(diagnostics["canonical_request_digest"].is_string());

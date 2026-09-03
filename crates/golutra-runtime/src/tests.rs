@@ -5854,7 +5854,7 @@ fn coding_tool_surface_adds_optional_capabilities_only_when_requested() {
         &contract,
         AgentToolProfile::Coding,
         executor.registry(),
-        "search the web and delegate a check in the background",
+        "search the web and delegate a check in a background process session",
     );
     assert!(optional.iter().any(|tool| tool.tool_name == "web_search"));
     assert!(optional.iter().any(|tool| tool.tool_name == "subagent"));
@@ -5899,6 +5899,20 @@ fn coding_tool_surface_adds_background_capability_only_when_requested() {
     assert!(!generic.iter().any(|tool| tool.tool_name == "web_search"));
     assert!(!generic.iter().any(|tool| tool.tool_name == "subagent"));
 
+    let long_task = provider_tools_for_turn(
+        &all_tools,
+        &contract,
+        AgentToolProfile::Coding,
+        executor.registry(),
+        "complete this long-running task and keep the code maintainable",
+    );
+    assert!(
+        !long_task
+            .iter()
+            .any(|tool| tool.tool_name == "shell_session"),
+        "a long agent task is not itself a background process request"
+    );
+
     let explicit = provider_tools_for_turn(
         &all_tools,
         &contract,
@@ -5911,6 +5925,15 @@ fn coding_tool_surface_adds_background_capability_only_when_requested() {
             .iter()
             .any(|tool| tool.tool_name == "shell_session")
     );
+
+    let server = provider_tools_for_turn(
+        &all_tools,
+        &contract,
+        AgentToolProfile::Coding,
+        executor.registry(),
+        "start a long-running server and wait for the process state",
+    );
+    assert!(server.iter().any(|tool| tool.tool_name == "shell_session"));
 }
 
 #[test]
