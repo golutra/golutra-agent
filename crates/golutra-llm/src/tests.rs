@@ -1165,11 +1165,32 @@ fn trusted_parent_cache_scopes_use_readable_wire_keys() {
         assert_eq!(scope.key(), key);
         assert_eq!(scope.thread_id(), Some(thread_id));
     }
+    let session_scope = PromptCacheScope::session(session_id, Some(thread_id));
+    assert_eq!(session_scope.key(), session_id.to_string());
+    let compaction_scope = session_scope.compaction();
+    assert_eq!(compaction_scope.kind(), PromptCacheScopeKind::Compaction);
+    assert_eq!(compaction_scope.session_id(), session_id);
+    assert_eq!(compaction_scope.thread_id(), Some(thread_id));
+    assert_eq!(compaction_scope.key(), format!("{session_id}:compaction"));
+
+    let mut compaction_request = request();
+    compaction_request.session_id = Some(session_id);
+    compaction_request.cache_policy = golutra_core::PromptCachePolicy::Auto;
+    compaction_request.cache_scope = Some(compaction_scope);
     assert_eq!(
-        PromptCacheScope::session(session_id, Some(thread_id))
-            .compaction()
-            .key(),
-        session_id.to_string()
+        compaction_request.affinity_id(),
+        format!("{session_id}:compaction")
+    );
+    let mut live_request = request();
+    live_request.session_id = Some(session_id);
+    live_request.cache_policy = golutra_core::PromptCachePolicy::Auto;
+    live_request.cache_scope = Some(session_scope);
+    assert_ne!(
+        live_request.cache_identity().expect("live identity").key,
+        compaction_request
+            .cache_identity()
+            .expect("compaction identity")
+            .key
     );
 }
 

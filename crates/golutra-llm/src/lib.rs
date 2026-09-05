@@ -563,11 +563,13 @@ impl PromptCacheScope {
 
     #[must_use]
     pub fn compaction(&self) -> Self {
+        // 摘要请求与实时会话的 prompt 形状不同；保留可信 lineage，同时隔离上游
+        // prompt-cache entry，避免摘要请求驱逐正常 session/fork 前缀。
         Self {
             session_id: self.session_id,
             thread_id: self.thread_id,
             kind: PromptCacheScopeKind::Compaction,
-            key: self.key.clone(),
+            key: format!("{}:compaction", self.key),
         }
     }
 
@@ -645,7 +647,7 @@ impl ProviderRequest {
 
     /// 为稳定的 wire 作用域构造 provider 本地观测身份。
     /// provider、模型和路由只保留为本地元数据；上游 key 仅使用可读的 session
-    /// 或可信父线程作用域。
+    /// 或可信父线程/辅助请求作用域。
     #[must_use]
     pub fn cache_identity_with_namespace(&self, namespace: &str) -> Option<CacheIdentity> {
         let session_id = self.session_id?;

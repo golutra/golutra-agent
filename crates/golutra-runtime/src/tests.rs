@@ -3872,7 +3872,7 @@ fn compaction_summary_request_is_structured_tool_free_and_output_bounded() {
     assert_eq!(request.cache_policy, PromptCachePolicy::Auto);
     assert_eq!(
         request.cache_scope.as_ref().expect("cache scope").key(),
-        session_id.to_string()
+        format!("{session_id}:compaction")
     );
     assert_eq!(request.max_output_tokens, Some(512));
     assert_eq!(source["previous_summary"], "existing checkpoint");
