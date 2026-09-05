@@ -432,6 +432,7 @@ def parse_codex(
     events = list(json_lines_with_times(capture.stdout, capture.stdout_line_times_ms))
     thread_id = None
     completed = False
+    turn_started_ms = None
     terminal_ms = None
     first_observable_ms = None
     final_message = ""
@@ -439,6 +440,8 @@ def parse_codex(
     tools: dict[str, str] = {}
     for event, observed_ms in events:
         event_type = event.get("type")
+        if event_type == "turn.started" and turn_started_ms is None:
+            turn_started_ms = observed_ms
         if event_type == "thread.started":
             candidate = event.get("thread_id")
             thread_id = str(candidate) if candidate else thread_id
@@ -476,7 +479,11 @@ def parse_codex(
     metrics["first_token_ms"] = (
         round(first_observable_ms, 1) if first_observable_ms is not None else None
     )
-    metrics["turn_first_token_ms"] = metrics["first_token_ms"]
+    metrics["turn_first_token_ms"] = (
+        round(first_observable_ms - turn_started_ms, 1)
+        if first_observable_ms is not None and turn_started_ms is not None
+        and first_observable_ms >= turn_started_ms else None
+    )
     metrics["first_observable_source"] = "codex_first_non_todo_item"
     metrics["final_message"] = final_message
     metrics["tool_call_count"] = len(tools)
@@ -877,6 +884,21 @@ def aggregate_turns(turns: list[dict[str, Any]]) -> dict[str, Any]:
         for request in turn.get("metrics", {}).get("provider_requests", [])
         if isinstance(request, dict)
     ]
+    # 只比较实际暴露的长输入请求时序；缺少 request 数据的产品保持 unknown。
+    long_requests = [
+        request for request in provider_requests
+        if isinstance(request.get("prompt_tokens"), int)
+        and request["prompt_tokens"] >= 16_384
+    ]
+    summary["long_request_count"] = len(long_requests) if provider_requests else None
+    for source, target in (("ttft_ms", "ttft"), ("terminal_latency_ms", "terminal")):
+        timings = [
+            float(request[source]) for request in long_requests
+            if isinstance(request.get(source), (int, float))
+        ]
+        summary[f"long_request_{target}_samples"] = len(timings) if provider_requests else None
+        summary[f"long_request_{target}_p50_ms"] = quantile(timings, 0.5)
+        summary[f"long_request_{target}_p95_ms"] = quantile(timings, 0.95)
     diagnosed_requests = [
         request
         for request in provider_requests
@@ -1905,6 +1927,12 @@ def markdown_report(report: dict[str, Any]) -> str:
         ("End-to-end P50", "elapsed_p50_ms"),
         ("First observable P50", "first_observable_p50_ms"),
         ("Provider TTFT P50", "provider_ttft_p50_ms"),
+        ("Long-input requests (>=16K)", "long_request_count"),
+        ("Long-input TTFT samples", "long_request_ttft_samples"),
+        ("Long-input TTFT P50", "long_request_ttft_p50_ms"),
+        ("Long-input TTFT P95", "long_request_ttft_p95_ms"),
+        ("Long-input terminal samples", "long_request_terminal_samples"),
+        ("Long-input terminal P95", "long_request_terminal_p95_ms"),
     )
     for label, key in rows:
         values = []
@@ -1978,6 +2006,7 @@ def markdown_report(report: dict[str, Any]) -> str:
                     ttft=display(metric.get("provider_first_token_ms"), milliseconds=True),
                 )
             )
+    lines.extend(timing_breakdown(report))
     lines.extend(
         (
             "",
@@ -1993,11 +2022,35 @@ def markdown_report(report: dict[str, Any]) -> str:
             "- Call accounting stores only tool names and argument digests. `Necessary calls` is a conservative lower bound; an exact repeated name/digest is reported as observed repetition, not silently suppressed or declared invalid.",
             "- Background waits count only explicit `shell_session` wait or process poll/reconnect operations. Verifier checks and repair turns are reported separately from model tool calls.",
             "- This is one controlled sample per product, not a population-level latency claim. Network order rotates by stage to reduce, not eliminate, upstream timing bias.",
+            "- Long-input request percentiles use nearest-rank on observed requests with at least 16,384 prompt tokens; sample counts are reported and missing timings are not zero-filled. These are descriptive values, not statistically established production P95. First-observable and provider-TTFT percentiles also use nearest-rank; E2E P50 uses the arithmetic median.",
             "",
         )
     )
     lines.extend(comparison_findings(report))
     return "\n".join(lines)
+
+
+def timing_breakdown(report: dict[str, Any]) -> list[str]:
+    """复用原始单调时钟指标，区分进程准备与 provider 等待，不改变计时起点。"""
+    lines = [
+        "", "## First Output Breakdown", "",
+        "| Stage | Engine | Before turn | Context preparation | Provider to first delta | Turn to first observable | Process to first observable |",
+        "| ---: | --- | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for stage in report["stages"]:
+        for engine in ENGINE_NAMES:
+            metrics = stage.get(engine, {}).get("metrics", {})
+            first = metrics.get("first_token_ms")
+            turn_first = metrics.get("turn_first_token_ms")
+            before_turn = (
+                round(first - turn_first, 1)
+                if isinstance(first, (int, float)) and isinstance(turn_first, (int, float))
+                else None
+            )
+            values = [before_turn, metrics.get("model_prep_ms"), metrics.get("provider_first_token_ms"), turn_first, first]
+            rendered = " | ".join(display(value, milliseconds=True) for value in values)
+            lines.append(f"| {stage['stage']} | {engine} | {rendered} |")
+    return lines
 
 
 def percentage_delta(value: Any, baseline: Any) -> str:
@@ -2096,15 +2149,15 @@ def comparison_findings(report: dict[str, Any]) -> list[str]:
         "",
         "## Findings",
         "",
-        "### Advantages",
+        "### Measured tradeoffs",
         "",
         f"- Golutra first observable P50 is {display(golutra.get('first_observable_p50_ms'), milliseconds=True)}, versus Pi {display(pi.get('first_observable_p50_ms'), milliseconds=True)} and Codex {display(codex.get('first_observable_p50_ms'), milliseconds=True)}; the measured winner is {first_winner[1]} at {display(first_winner[0], milliseconds=True)}.",
         f"- Golutra cache hit ratio is {ratio_display(golutra.get('cache_hit_ratio'))}, versus Pi {ratio_display(pi.get('cache_hit_ratio'))} and Codex {ratio_display(codex.get('cache_hit_ratio'))}; the measured cache-ratio winner is {cache_winner[1]} at {ratio_display(cache_winner[0])}.",
         "- Golutra exposes provider-round timing, request counts, and detailed usage coverage that are unavailable from Codex's JSON output.",
         "",
-        "### Gaps",
+        "### Cost and completion",
         "",
-        f"- Golutra provider total is {display(golutra.get('provider_total_tokens'))} ({percentage_delta(golutra.get('provider_total_tokens'), pi.get('provider_total_tokens'))} vs Pi), with {display(golutra.get('output_tokens'))} output tokens; extra tool/reasoning turns drive the excess.",
+        f"- Golutra provider total is {display(golutra.get('provider_total_tokens'))} ({percentage_delta(golutra.get('provider_total_tokens'), pi.get('provider_total_tokens'))} vs Pi), with {display(golutra.get('output_tokens'))} output tokens. Aggregate counts alone do not explain model decisions or prove which calls were unnecessary.",
         f"- End-to-end total is {display(golutra.get('elapsed_total_ms'), milliseconds=True)} ({percentage_delta(golutra.get('elapsed_total_ms'), pi.get('elapsed_total_ms'))} vs Pi; {percentage_delta(golutra.get('elapsed_total_ms'), codex.get('elapsed_total_ms'))} vs Codex). Golutra makes {display(golutra.get('tool_call_count'))} tool calls versus Pi {display(pi.get('tool_call_count'))} and Codex {display(codex.get('tool_call_count'))}.",
     ]
     if failed_details:

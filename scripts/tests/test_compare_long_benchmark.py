@@ -163,6 +163,51 @@ class CompareLongBenchmarkTest(unittest.TestCase):
         self.assertEqual(summary["stable_prefix_miss_requests"], 1)
         self.assertEqual(summary["stable_prefix_miss_uncached_tokens"], 1_200)
 
+    def test_long_request_percentiles_exclude_short_and_unknown_timings(self) -> None:
+        requests = [
+            {"prompt_tokens": 16_384, "ttft_ms": index * 100, "terminal_latency_ms": index * 1_000}
+            for index in range(1, 21)
+        ]
+        requests.extend([
+            {"prompt_tokens": 16_383, "ttft_ms": 99_999},
+            {"prompt_tokens": 20_000, "ttft_ms": None},
+        ])
+        summary = benchmark.aggregate_turns([{"metrics": {"provider_requests": requests}}])
+        self.assertEqual(summary["long_request_count"], 21)
+        self.assertEqual(summary["long_request_ttft_samples"], 20)
+        self.assertEqual(summary["long_request_ttft_p50_ms"], 1_000)
+        self.assertEqual(summary["long_request_ttft_p95_ms"], 1_900)
+        self.assertEqual(summary["long_request_terminal_p95_ms"], 19_000)
+        unknown = benchmark.aggregate_turns([{"metrics": {}}])
+        self.assertIsNone(unknown["long_request_count"])
+        self.assertIsNone(unknown["long_request_ttft_p95_ms"])
+
+    def test_timing_breakdown_separates_startup_and_preserves_unknown(self) -> None:
+        rows = benchmark.timing_breakdown({"stages": [{
+            "stage": 1,
+            "golutra": {"metrics": {"first_token_ms": 1_500, "turn_first_token_ms": 1_200,
+                                     "model_prep_ms": 200, "provider_first_token_ms": 1_000}},
+            "codex": {"metrics": {"first_token_ms": 800}},
+        }]})
+        self.assertIn("| 1 | golutra | 300 ms | 200 ms | 1,000 ms | 1,200 ms | 1,500 ms |", rows)
+        self.assertIn("| 1 | codex | unknown | unknown | unknown | unknown | 800 ms |", rows)
+
+    def test_codex_turn_timing_requires_an_observed_turn_start(self) -> None:
+        item = {"type": "item.started", "item": {"type": "command_execution", "id": "cmd"}}
+        for events, arrivals, expected in [
+            ([item], [800.0], None),
+            ([{"type": "turn.started"}, item], [300.0, 800.0], 500.0),
+        ]:
+            capture = benchmark.paired.ProcessCapture(
+                stdout="\n".join(json.dumps(event) for event in events),
+                stderr="", return_code=0, elapsed_ms=900.0,
+                stdout_line_times_ms=arrivals,
+            )
+            metrics, _, _ = benchmark.parse_codex(capture, None)
+            self.assertEqual(metrics["first_token_ms"], 800.0)
+            self.assertEqual(metrics["turn_first_token_ms"], expected)
+            self.assertIsNone(metrics["provider_first_token_ms"])
+
     def test_subtract_cumulative_usage(self) -> None:
         current = {
             "input_tokens": 100,

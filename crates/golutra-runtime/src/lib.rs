@@ -149,6 +149,37 @@ fn active_working_set_soft_limit(hard_budget: u64) -> Option<u64> {
     )
 }
 
+fn compact_context_with_headroom(
+    plan: &ContextBuildPlan,
+    protected_prefix_len: usize,
+    observed_prefix: Option<ObservedContextPrefix>,
+) -> Result<Option<ContextCompactionRecord>, ContextError> {
+    let hard_limit = plan.budget_snapshot.budget_limit;
+    let soft_limit = active_working_set_soft_limit(hard_limit).unwrap_or(hard_limit);
+    let compact = |limit| {
+        ContextWindowManager::new(limit).compact_if_needed_with_observed_prefix(
+            plan.budget_snapshot.turn_id,
+            protected_prefix_len,
+            &plan.messages,
+            &plan.message_sources,
+            &plan.message_estimates,
+            plan.budget_snapshot.planned_tool_tokens,
+            observed_prefix,
+        )
+    };
+    match compact(soft_limit) {
+        // 大静态前缀可能放不进软目标，但仍可在硬窗口内保留安全的摘要与 tail。
+        // 这里只重选区间，模型摘要始终最多调用一次。
+        Err(_)
+            if soft_limit < hard_limit
+                && plan.budget_snapshot.planned_input_tokens > hard_limit =>
+        {
+            compact(hard_limit)
+        }
+        result => result,
+    }
+}
+
 /// 根据剩余 provider 输入预算确定性地选择结果上限。普通回合允许常见读取和
 /// 后台输出一次完整返回；只有上下文窗口紧张时才收缩，并为下一轮 provider
 /// 请求预留少量空间，以免过早触发压缩。
@@ -278,11 +309,8 @@ impl AgentReplayContext {
         }
     }
 
-    /// Preserve the last provider tool surface when an exact cross-task
-    /// message replay is too large for the current context window.  The
-    /// runtime deliberately receives no historical messages here; it builds a
-    /// fresh, budgeted context and uses this surface only to avoid an
-    /// unnecessary tool-schema cache boundary.
+    /// 完整 replay 超出宿主存储保护上限时，仅继承已验证的工具面。
+    /// 普通 token 超预算仍交给 runtime 摘要，不应走此信息有损的退路。
     #[must_use]
     pub fn for_resume_tool_surface(tools: Vec<ToolContract>) -> Self {
         Self::for_resume(Vec::new(), tools)
@@ -526,24 +554,35 @@ fn lexical_workspace_path_key(path: &str, workspace_root: &Path) -> String {
     components.join("/")
 }
 
-/// Project a tool result against the facts already visible in this activity
-/// plan. A repeated successful read keeps status, digest, and continuation
-/// metadata but omits a second copy of the file body. Durable reports remain
-/// untouched and the caller still executes every model-requested read.
+/// 仅在同一窗口正文完整进入当前上下文后去重，避免紧预算下的半份正文阻断
+/// 后续合法重读。工具仍真实执行，持久化报告保持完整，变化后的 digest 重新投影。
 fn model_visible_tool_result_for_active_plan(
     report: &ToolExecutionReport,
     max_tokens: u64,
     seen_read_facts: &mut HashSet<ReadFactIdentity>,
     workspace_root: &Path,
 ) -> String {
-    let repeated_read = read_fact_identity(report, workspace_root)
-        .is_some_and(|identity| !seen_read_facts.insert(identity));
-    if repeated_read {
+    let identity = read_fact_identity(report, workspace_root);
+    if identity
+        .as_ref()
+        .is_some_and(|identity| seen_read_facts.contains(identity))
+    {
         let mut compact_envelope = report.envelope.clone();
         compact_envelope.model_visible_excerpt = None;
         model_visible_tool_result_with_token_budget(&compact_envelope, max_tokens)
     } else {
-        model_visible_tool_result_with_token_budget(&report.envelope, max_tokens)
+        let projection = model_visible_tool_result_with_token_budget(&report.envelope, max_tokens);
+        if let Some(identity) = identity
+            && let Some(expected) = report.envelope.model_visible_excerpt.as_deref()
+            && !expected.is_empty()
+            && report.envelope.structured_facts["model_visible_truncated"] != true
+            && projection
+                .split_once("\n--- output ---\n")
+                .is_some_and(|(_, body)| body == expected)
+        {
+            seen_read_facts.insert(identity);
+        }
+        projection
     }
 }
 
@@ -1502,7 +1541,8 @@ where
         let mut plan = base_plan;
         let mut message_token_total = plan.estimated_message_tokens();
         let mut observed_context_usage: Option<ObservedContextUsage> = None;
-        let context_window_manager = self.context_builder.window_manager();
+        let compaction_limit = active_working_set_soft_limit(plan.budget_snapshot.budget_limit)
+            .unwrap_or(plan.budget_snapshot.budget_limit);
         let mut turn_state = TurnState::new(current_turn_id);
         let mut pending_turn_at_boundary: Option<TakenPendingTurn> = None;
 
@@ -1682,73 +1722,20 @@ where
                         planned_tool_tokens,
                         observed_prefix,
                     );
-                // 活动工作集是延迟敏感路径，使用本地 facts/tail 整理，避免为
-                // 每次软压缩增加一次 provider 往返并破坏同线程缓存前缀。真正
-                // 超出 provider 硬窗口时才请求语义摘要。
-                if let Some(soft_limit) =
-                    active_working_set_soft_limit(plan.budget_snapshot.budget_limit)
-                    && plan.budget_snapshot.planned_input_tokens > soft_limit
-                {
-                    trace(AgentLoopTraceEvent::ContextCompactionStarted {
-                        original_input_tokens: plan.budget_snapshot.planned_input_tokens,
-                        budget_limit: soft_limit,
-                    });
-                    let soft_manager = ContextWindowManager::new(soft_limit);
-                    match soft_manager.compact_if_needed_with_observed_prefix(
-                        current_turn_id,
-                        protected_prefix_len,
-                        &plan.messages,
-                        &plan.message_sources,
-                        &plan.message_estimates,
-                        planned_tool_tokens,
-                        observed_prefix,
-                    ) {
-                        Ok(Some(mut record)) => {
-                            record.mode = "active_working_set".to_owned();
-                            record.strategy = "fallback_facts_tail".to_owned();
-                            record.summary_source_messages.clear();
-                            record.summary_source_sources.clear();
-                            record.summary_token_budget = 0;
-                            message_token_total = plan.replace_messages(
-                                record.replacement_messages.clone(),
-                                record.replacement_sources.clone(),
-                            );
-                            plan.budget_snapshot.planned_input_tokens =
-                                record.replacement_estimated_tokens;
-                            plan.budget_snapshot.planned_summary_tokens =
-                                estimate_tokens(&record.summary);
-                            observed_context_usage = None;
-                            seen_read_facts.clear();
-                            trace(AgentLoopTraceEvent::ContextAutoCompacted(record));
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            trace(AgentLoopTraceEvent::ContextCompactionFailed {
-                                planned_input_tokens: plan.budget_snapshot.planned_input_tokens,
-                                budget_limit: soft_limit,
-                                reason: format!("active working-set compaction: {error}"),
-                            });
-                        }
-                    }
-                }
-                if plan.budget_snapshot.planned_input_tokens > plan.budget_snapshot.budget_limit {
-                    let compaction_limit = plan.budget_snapshot.budget_limit;
+                // 只在预算边界压缩；所有丢失历史的路径共用模型摘要，facts 仅为
+                // 摘要不可用时的退路。压缩目标留有余量，避免后续每轮重新摘要。
+                if plan.budget_snapshot.planned_input_tokens > compaction_limit {
                     trace(AgentLoopTraceEvent::ContextCompactionStarted {
                         original_input_tokens: plan.budget_snapshot.planned_input_tokens,
                         budget_limit: compaction_limit,
                     });
-                    match context_window_manager.compact_if_needed_with_observed_prefix(
-                        current_turn_id,
+                    match compact_context_with_headroom(
+                        &plan,
                         protected_prefix_len,
-                        &plan.messages,
-                        &plan.message_sources,
-                        &plan.message_estimates,
-                        planned_tool_tokens,
                         observed_prefix,
                     ) {
                         Ok(Some(mut record)) => {
-                            if record.mode != "active_working_set"
-                                && record.supports_model_summary()
+                            if record.supports_model_summary()
                                 && primary_contract.native_protocol != "in_memory"
                                 && let Some(summary) = self
                                     .semantic_compaction_summary(

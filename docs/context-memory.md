@@ -17,7 +17,7 @@
 
 - `ContextBuilder` 按 contributor 构建 stable system prompt、canonical workspace environment context、会话摘要、project memory、evidence 和工具说明；当前使用字符数近似 token、静态预算和按 contributor 截断，`TokenBudgetSnapshot` 的 policy 仍是 `p0_static_budget`。
 - provider response 后会记录 `TokenUsageRecord`；provider request 前会保存稳定 digest、redacted request artifact、逐 message 的 contributor/source/origin、tool schema manifest 和逐 contributor 内容引用，因此 developer trace 可以证明每条模型可见输入来自哪里。provider 给出的 input token 总数按 contributor 的保守估算做 largest-remainder 分配，分配和必须严格等于 provider 总数，同时明确标记 `proportional_provider_total`，不把比例估算伪装成 provider 原生逐消息计数。没有 model-aware tokenizer 时，估算字段继续标记为字符近似。
-- compact 是 durable command/event；除 provider hard limit 外，单个 task 的活跃模型 working set 达到 16,384 个估算 input token 时也会主动滚动压缩。每条原消息记录 `protected/retained/summarized` 决策，`CompactionRecord` 同时记录 hard budget、实际触发阈值和目标 token，合成 summary 聚合被替换消息的 source refs，保留尾部消息继续沿用原 contributor。完整 event、tool artifact 和 restricted replay request 不删除，只是不再自动回灌模型。后续 turn 会复用 compact summary，同一 session 的历史不会作为完整 transcript 无界增长。
+- compact 是 durable command/event；接近当前 provider 输入预算时统一生成模型摘要，不使用独立的 16,384 token 历史硬截断。每条原消息记录 `protected/retained/summarized` 决策，`CompactionRecord` 同时记录 hard budget、实际触发阈值和目标 token，合成 summary 聚合被替换消息的 source refs，保留尾部消息继续沿用原 contributor。完整 event、tool artifact 和 restricted replay request 不删除，只是不再自动回灌模型。后续 turn 会复用 compact summary，同一 session 的历史不会作为完整 transcript 无界增长。
 - `MemoryStore` 按 canonical cwd hash 持久化到 `$GOLUTRA_HOME/state/workspaces/<cwd-hash>/memory.json`，写入通过跨进程文件锁和临时文件原子替换；文件 I/O 使用 `spawn_blocking`，不会阻塞 async runtime worker。Unix runtime 目录为 `0700`、memory/lock 文件为 `0600`。
 - 成功任务可从 durable evidence 生成 project-scoped `MemoryCandidate`；RuntimeHost 只调用 quarantine，候选带 structured claim、默认 30 天 expiry 和 invalidation refs。单次成功不会进入 active memory。
 - 每轮 task 会记录 `MemoryRetrieved`，只有 active、未过期且与 query 相关的 project memory 才进入 context；完整 memory 记录不直接当作 prompt 历史。
@@ -263,7 +263,9 @@ budget_state
 触发动作：
 
 - planned input 超过 contributor 初始预算：先 trim 低相关 memory 和 history contributor。
-- task 内多轮消息超过 16,384 token 活跃 working-set 阈值：在 provider hard limit 之前触发 rolling compact；如果 protected prefix 本身已超过该阈值，则保留 prefix 并继续由 provider hard limit 兜底。
+- task 内多轮消息接近 provider 输入预算时统一触发模型摘要：有限且不低于 64 Ki token 的预算预留 `max(10%, 8 Ki token)`，较小窗口直接使用硬预算。摘要后保留完整最近消息组并留出增长余量，不在每轮发起摘要。
+- resume 将通过身份和配对校验的原始 transcript 交给 runtime；不再提前用本地 facts 替换历史。宿主消息数和字节上限仍用于资源保护。
+- 历史读取结果先按 token 保留，再在最终可见窗口去重；只有相同窗口的完整正文仍可见，且省略确实更短时才替换重复正文。
 - tool output token 占比过高：要求工具改为 summary + artifact ref。
 - retry / fallback 成本过高：LoopDecision 可转为 ask_user 或 blocked。
 - evaluation / debug 需要深度分析时，只读 `TokenUsageRecord` 和 artifact，不重新把完整上下文塞回模型。
@@ -350,7 +352,7 @@ CompactionRecord
 - 不能丢失未解决问题、权限状态、修改文件和关键 evidence。
 - 活动会话树和 token budget 负责选择待摘要区间与最近完整 tail；context 层不承担主摘要语义。
 - 自动压缩和显式 `/compact` 都使用当前 provider 发起无工具的语义摘要请求；模型接收保留角色的完整待压缩历史和可选上一版摘要，返回固定章节的 continuation checkpoint。摘要输出按本轮预算设置单请求上限，自动压缩的流式增量不进入用户界面，但请求仍产生 ProviderStarted、TokenUsageRecorded、ProviderCompleted 或 ProviderFailed。
-- 摘要请求使用独立 affinity，不改变正常会话的稳定 cache chain。provider 不可用、请求失败或返回空内容时，才使用有界的确定性 facts 退路。
+- 摘要请求继承父线程 cache scope，但使用独立摘要提示；它不承诺命中正常会话的消息前缀。压缩后动态历史会改变，稳定 system/project/tools 保持不变。provider 不可用、摘要输入超预算、请求失败或返回空内容时，才使用有界的确定性 facts 退路。
 - durable summary 只保存严格的 canonical envelope：`summary`、`source_range`、`token_counts`、`checksum`。`source_range` 是本次摘要输入内零基、左闭右开的消息序号，不混用 session event sequence；旧 facts schema 不解析、不迁移。
 - compact 前后的 context projection 必须可 replay。
 - compact 只改变模型投影；原 RuntimeEvent、tool output artifact、evidence 和 owner-only replay request 必须继续保留。
@@ -372,6 +374,14 @@ ToolResultEnvelope
 ```
 
 模型默认只看摘要、结构化事实和必要片段。完整输出进入 artifact store。
+
+`read_file`、`shell` 和 `shell_session` 的摘录共用 UTF-8 字节边界，报告层最多保留 16 KiB，
+最终投影按工具类型及剩余 token 预算缩小，不再提前用 2,048 字符裁剪进程输出。
+发生任何 provider 可见裁剪时，读取标记 `model_visible_truncated`，进程输出标记
+`output_truncated`；捕获层原始字节数与完整证据仍独立记录。退出码、权威 PID、cursor
+及续读事实继续保留，不能把截断输出当作完整验证证据。
+活动轮读取去重只登记已完整投影的正文；紧预算、报告层裁剪或 compaction 移除正文后，
+相同读取仍会重新提供内容。所有模型请求的工具仍真实执行，不自动跳过读取或验证。
 
 ### MemoryRetriever
 

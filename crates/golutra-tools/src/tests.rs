@@ -1031,6 +1031,126 @@ fn model_visible_read_output_keeps_raw_newlines_and_beats_json_embedding() {
 }
 
 #[test]
+fn model_visible_tool_result_preserves_complete_common_process_output() {
+    let output = "x".repeat(3_051);
+    for tool_name in ["shell", "shell_session"] {
+        let request = request(tool_name, json!({}));
+        let policy = execution_policy(&request, PolicyDecision::Allow, "test");
+        let report = success_report(
+            request,
+            "process completed",
+            json!({"exit_code": 0, "output_truncated": false}),
+            output.clone(),
+            Vec::new(),
+            policy,
+        );
+        assert_eq!(
+            report.envelope.model_visible_excerpt.as_deref(),
+            Some(output.as_str())
+        );
+        assert_eq!(report.envelope.structured_facts["output_truncated"], false);
+        let (header, body) =
+            parse_model_visible_tool_result(&model_visible_tool_result(&report.envelope));
+        assert_eq!(body.as_deref(), Some(output.as_str()), "{tool_name}");
+        assert_ne!(header["structured_facts"]["output_truncated"], true);
+        assert_eq!(artifact_text(&report), output);
+    }
+}
+
+#[test]
+fn model_visible_tool_result_marks_process_excerpt_capture_clipping() {
+    let output = "中文输出\n".repeat(2_048);
+    for tool_name in ["shell", "shell_session"] {
+        let request = request(tool_name, json!({}));
+        let policy = execution_policy(&request, PolicyDecision::Allow, "test");
+        let report = success_report(
+            request,
+            "process completed",
+            json!({"exit_code": 0, "output_truncated": false}),
+            output.clone(),
+            Vec::new(),
+            policy,
+        );
+        assert_eq!(report.envelope.structured_facts["output_truncated"], true);
+        let excerpt = report
+            .envelope
+            .model_visible_excerpt
+            .as_deref()
+            .expect("excerpt");
+        assert!(excerpt.len() <= MAX_MODEL_TOOL_RESULT_EXCERPT_BYTES);
+        assert!(output.starts_with(excerpt));
+        assert_eq!(artifact_text(&report), output);
+    }
+}
+
+#[test]
+fn model_visible_tool_result_marks_final_budget_clipping_and_keeps_process_facts() {
+    let output = "中文输出\n".repeat(1_024);
+    for (tool_name, marker) in [
+        ("read_file", "model_visible_truncated"),
+        ("shell", "output_truncated"),
+        ("shell_session", "output_truncated"),
+    ] {
+        let envelope = projection_envelope(
+            tool_name,
+            ToolResultStatus::Ok,
+            "completed",
+            json!({
+                "path": "result.txt", "continuation": {"next_offset": 201},
+                "authoritative_pid": 123, "output_cursor": 321, "terminal": true,
+                "exit_code": 0, "output_truncated": false,
+            }),
+            Some(&output),
+        );
+        let serialized = model_visible_tool_result_with_limit(&envelope, 1_024);
+        let (header, body) = parse_model_visible_tool_result(&serialized);
+        assert!(serialized.len() <= 1_024, "{tool_name}");
+        assert_eq!(header["status"], "ok");
+        assert_eq!(header["structured_facts"][marker], true, "{tool_name}");
+        let body = body.expect("bounded output");
+        assert!(output.starts_with(&body));
+        assert!(body.len() < output.len());
+        if tool_name == "read_file" {
+            assert_eq!(
+                header["structured_facts"]["continuation"]["next_offset"],
+                201
+            );
+        } else {
+            assert_eq!(header["structured_facts"]["authoritative_pid"], 123);
+            assert_eq!(header["structured_facts"]["output_cursor"], 321);
+            assert_eq!(header["structured_facts"]["exit_code"], 0);
+        }
+    }
+}
+
+#[test]
+fn model_visible_tool_result_keeps_clipping_truth_for_unusual_facts() {
+    for facts in [
+        Value::String("unstructured output".to_owned()),
+        json!({"process_id": "x".repeat(4_096), "reason": "r".repeat(4_096),
+               "next_action": {"action": "a".repeat(4_096)}}),
+    ] {
+        let envelope = projection_envelope(
+            "shell",
+            ToolResultStatus::Error,
+            &"failure ".repeat(512),
+            facts,
+            Some(&"output\n".repeat(1_024)),
+        );
+        let serialized = model_visible_tool_result_with_limit(&envelope, 1_024);
+        let (header, _) = parse_model_visible_tool_result(&serialized);
+        assert!(serialized.len() <= 1_024);
+        assert_eq!(header["status"], "error");
+        assert_eq!(header["structured_facts"]["output_truncated"], true);
+        assert!(
+            header["summary"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+    }
+}
+
+#[test]
 fn model_visible_tool_result_keeps_failure_facts_and_size_bound() {
     let envelope = projection_envelope(
         "shell",

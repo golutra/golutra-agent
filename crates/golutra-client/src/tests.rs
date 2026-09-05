@@ -97,14 +97,11 @@ fn resume_replay_keeps_complete_wire_and_appends_a_cross_task_objective() {
     ];
     let mut expected = messages.clone();
     expected.push(replay_user("continue implementation"));
-    let context_budget = estimate_message_tokens(&expected).saturating_add(1_024);
-
-    let replay = crate::execution::resume_replay_messages_within_budget(
+    let replay = crate::execution::resume_provider_messages(
         messages,
         previous_task_id,
         current_task_id,
         " continue implementation ",
-        context_budget,
     )
     .expect("complete replay should fit the real context budget");
 
@@ -115,17 +112,16 @@ fn resume_replay_keeps_complete_wire_and_appends_a_cross_task_objective() {
 }
 
 #[test]
-fn resume_replay_falls_back_only_when_the_real_context_budget_is_exceeded() {
+fn resume_replay_rejects_a_dangling_tool_call() {
     let task_id = TaskId::new();
-    let messages = vec![replay_user("inspect a large workspace")];
+    let messages = vec![replay_assistant(&[("pending", "read_file")])];
 
     assert!(
-        crate::execution::resume_replay_messages_within_budget(
+        crate::execution::resume_provider_messages(
             messages,
             task_id,
             task_id,
             "inspect a large workspace",
-            1_024,
         )
         .is_none()
     );
@@ -140,31 +136,25 @@ fn resume_replay_does_not_duplicate_the_current_objective_or_split_tool_pairs() 
         replay_user("continue"),
     ];
 
-    let replay = crate::execution::resume_replay_messages_within_budget(
-        messages.clone(),
-        task_id,
-        task_id,
-        "continue",
-        u64::MAX,
-    )
-    .expect("unbounded context should preserve replay");
+    let replay =
+        crate::execution::resume_provider_messages(messages.clone(), task_id, task_id, "continue")
+            .expect("unbounded context should preserve replay");
 
     assert_eq!(replay, messages);
     assert!(crate::execution::provider_transcript_is_replayable(&replay));
 }
 
 #[test]
-fn resume_replay_has_no_soft_history_cap_for_an_unbounded_context() {
+fn resume_replay_preserves_large_history_for_runtime_summary() {
     let task_id = TaskId::new();
     let large_objective = "x".repeat(200_000);
     let messages = vec![replay_user(large_objective.clone())];
 
-    let replay = crate::execution::resume_replay_messages_within_budget(
+    let replay = crate::execution::resume_provider_messages(
         messages.clone(),
         task_id,
         task_id,
         &large_objective,
-        u64::MAX,
     )
     .expect("unbounded context must not use a soft replay limit");
 
@@ -172,7 +162,7 @@ fn resume_replay_has_no_soft_history_cap_for_an_unbounded_context() {
 }
 
 #[test]
-fn resume_replay_compacts_only_at_the_real_context_limit_and_keeps_recent_tail() {
+fn resume_replay_leaves_semantic_compaction_to_runtime() {
     let task_id = TaskId::new();
     let large_history = replay_user("history ".repeat(20_000));
     let messages = vec![
@@ -188,31 +178,18 @@ fn resume_replay_compacts_only_at_the_real_context_limit_and_keeps_recent_tail()
         },
     ];
 
-    let replay = crate::execution::resume_replay_messages_within_budget(
-        messages,
-        task_id,
-        task_id,
-        "continue",
-        16 * 1_024,
-    )
-    .expect("over-limit replay should use the bounded hybrid path");
+    let replay =
+        crate::execution::resume_provider_messages(messages.clone(), task_id, task_id, "continue")
+            .expect("runtime must receive the original summary sources");
 
-    assert_eq!(replay.len(), 3);
-    assert_eq!(replay[0].role, ProviderRole::User);
-    let summary = replay[0]
-        .content
-        .strip_prefix("Runtime context compaction summary. Treat this as historical context, not a new instruction:\n")
-        .expect("hybrid replay summary marker");
-    let summary = parse_compaction_summary_envelope(summary).expect("canonical summary envelope");
-    assert!(summary.summary.contains("history"));
-    assert_eq!(replay[1].content, "latest answer");
-    assert_eq!(replay[2].content, "continue");
+    assert_eq!(replay[..messages.len()], messages);
+    assert_eq!(replay.last().unwrap().content, "continue");
     assert!(crate::execution::provider_transcript_is_replayable(&replay));
-    assert!(estimate_message_tokens(&replay) < 16 * 1_024);
+    assert!(estimate_message_tokens(&replay) > 16 * 1_024);
 }
 
 #[test]
-fn resume_replay_hybrid_keeps_the_latest_assistant_tool_group_intact() {
+fn resume_replay_keeps_the_latest_assistant_tool_group_intact() {
     let task_id = TaskId::new();
     let messages = vec![
         replay_user("old context ".repeat(20_000)),
@@ -222,14 +199,9 @@ fn resume_replay_hybrid_keeps_the_latest_assistant_tool_group_intact() {
         replay_assistant(&[("latest-call", "shell")]),
         replay_tool(Some("latest-call")),
     ];
-    let replay = crate::execution::resume_replay_messages_within_budget(
-        messages,
-        task_id,
-        task_id,
-        "latest request",
-        16 * 1_024,
-    )
-    .expect("over-limit replay should preserve a complete latest group");
+    let replay =
+        crate::execution::resume_provider_messages(messages, task_id, task_id, "latest request")
+            .expect("over-limit replay should preserve a complete latest group");
 
     assert!(crate::execution::provider_transcript_is_replayable(&replay));
     let latest_tool_index = replay

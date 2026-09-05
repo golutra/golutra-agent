@@ -302,6 +302,43 @@ fn repeated_read_projection_preserves_continuation_under_a_tight_budget() {
 }
 
 #[test]
+fn repeated_read_projection_reopens_body_after_tight_budget_clipping() {
+    let workspace = Path::new("/workspace");
+    let body = "complete file body\n".repeat(200);
+    let report = read_fact_report("src/lib.rs", "sha256:one", 0, 200, &body);
+    let mut seen = HashSet::new();
+
+    let clipped = model_visible_tool_result_for_active_plan(&report, 256, &mut seen, workspace);
+    assert!(!clipped.contains(&body));
+    assert!(
+        seen.is_empty(),
+        "clipped output is not a complete read fact"
+    );
+
+    let full = model_visible_tool_result_for_active_plan(&report, 2_048, &mut seen, workspace);
+    assert!(full.contains(&body));
+    assert_eq!(seen.len(), 1);
+    let repeated = model_visible_tool_result_for_active_plan(&report, 2_048, &mut seen, workspace);
+    assert!(!repeated.contains(&body));
+    assert!(repeated.contains("next_offset"));
+}
+
+#[test]
+fn repeated_read_projection_does_not_deduplicate_capture_clipped_body() {
+    let workspace = Path::new("/workspace");
+    let mut report = read_fact_report("src/lib.rs", "sha256:one", 0, 200, "partial body");
+    report.envelope.structured_facts["model_visible_truncated"] = true.into();
+    let mut seen = HashSet::new();
+
+    for _ in 0..2 {
+        let result =
+            model_visible_tool_result_for_active_plan(&report, 2_048, &mut seen, workspace);
+        assert!(result.contains("partial body"));
+        assert!(seen.is_empty());
+    }
+}
+
+#[test]
 fn provider_tool_schema_change_invalidates_observed_prefix() {
     let plan = ContextBuilder::default()
         .build(
@@ -3455,15 +3492,18 @@ async fn accumulated_tool_messages_are_compacted_and_the_turn_continues() {
 }
 
 #[tokio::test]
-async fn active_working_set_uses_local_facts_without_summary_request() {
-    {
+async fn active_working_set_uses_model_summary_with_explicit_fallback() {
+    for summary in [
+        Some("Preserved the ledger transaction invariants.".to_owned()),
+        None,
+    ] {
         let workspace = tempdir().expect("workspace");
         let executor =
             BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
         let summary_calls = Arc::new(AtomicUsize::new(0));
         let primary_calls = Arc::new(AtomicUsize::new(0));
         let provider = ActiveWorkingSetProvider {
-            summary: None,
+            summary: summary.clone(),
             summary_calls: Arc::clone(&summary_calls),
             primary_calls: Arc::clone(&primary_calls),
         };
@@ -3511,11 +3551,7 @@ async fn active_working_set_uses_local_facts_without_summary_request() {
         let record = trace
             .iter()
             .find_map(|event| match event {
-                AgentLoopTraceEvent::ContextAutoCompacted(record)
-                    if record.mode == "active_working_set" =>
-                {
-                    Some(record)
-                }
+                AgentLoopTraceEvent::ContextAutoCompacted(record) => Some(record),
                 _ => None,
             })
             .expect("active working-set compaction");
@@ -3523,20 +3559,185 @@ async fn active_working_set_uses_local_facts_without_summary_request() {
             parse_compaction_summary_envelope(&record.summary).expect("summary envelope");
 
         assert_eq!(outcome.final_message.as_deref(), Some("task complete"));
-        // Soft working-set compaction is deliberately local: a provider round
-        // is reserved for hard-window compaction, so this path cannot add a
-        // hidden summary request or alter the cacheable thread prefix.
-        assert_eq!(summary_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(summary_calls.load(Ordering::SeqCst), 1);
         assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(record.strategy, "fallback_facts_tail");
-        assert!(record.summary_source_messages.is_empty());
-        assert!(record.summary_source_sources.is_empty());
-        assert!(
-            envelope
-                .summary
-                .contains("changed_files=jobledger/model.py")
+        assert!(record.supports_model_summary());
+        assert!(record.replacement_estimated_tokens <= record.compaction_limit);
+        if let Some(summary) = summary {
+            assert_eq!(record.strategy, "model_summary_tail");
+            assert_eq!(envelope.summary, summary);
+        } else {
+            assert_eq!(record.strategy, "fallback_facts_tail");
+            assert!(
+                envelope
+                    .summary
+                    .contains("changed_files=jobledger/model.py")
+            );
+            assert!(envelope.summary.contains("checkpoint_checksum=sha256:def"));
+        }
+    }
+}
+
+#[test]
+fn compaction_headroom_does_not_block_a_large_valid_static_prefix() {
+    let hard_limit = 64 * 1_024;
+    let context_builder = ContextBuilder::new(ContextBudgetPolicy {
+        context_window: 80 * 1_024,
+        max_output: 8 * 1_024,
+        budget_limit: hard_limit,
+        action_if_exceeded: BudgetOverflowAction::Compact,
+    });
+    let contributor = |name: &str, role, content| ContextContributor {
+        name: name.to_owned(),
+        role,
+        content,
+        token_budget_hint: 0,
+        source_refs: Vec::new(),
+    };
+    let plan = context_builder
+        .build(
+            TaskId::new(),
+            TurnId::new(),
+            vec![
+                contributor("system", ProviderRole::System, "s".repeat(60_000 * 4)),
+                contributor("history:old", ProviderRole::User, "history ".repeat(5_000)),
+                contributor("objective", ProviderRole::User, "continue".to_owned()),
+            ],
+        )
+        .expect("oversized plan deferred to compaction");
+    assert!(plan.message_estimates[0] > active_working_set_soft_limit(hard_limit).unwrap());
+    assert!(plan.budget_snapshot.planned_input_tokens > hard_limit);
+    let record = compact_context_with_headroom(&plan, 1, None)
+        .expect("hard budget still allows compaction")
+        .expect("compaction needed");
+    assert_eq!(record.compaction_limit, hard_limit);
+    assert_eq!(record.replacement_messages[0], plan.messages[0]);
+    assert!(record.replacement_estimated_tokens <= hard_limit);
+}
+
+#[tokio::test]
+async fn resume_compaction_summarizes_original_history_before_the_primary_request() {
+    let system = ContextContributor {
+        name: "system".to_owned(),
+        role: ProviderRole::System,
+        content: "Use real execution evidence.".to_owned(),
+        token_budget_hint: 0,
+        source_refs: Vec::new(),
+    };
+    let message = |role, content: String| ProviderMessage {
+        role,
+        content,
+        tool_call_id: None,
+        tool_name: None,
+        tool_calls: Vec::new(),
+        metadata: Default::default(),
+    };
+    let mut messages = vec![message(ProviderRole::System, system.content.clone())];
+    messages.extend((0..30).map(|index| {
+        message(
+            ProviderRole::User,
+            format!("original-history-{index} {}", "details ".repeat(200)),
+        )
+    }));
+    let mut call = message(ProviderRole::Assistant, String::new());
+    call.tool_calls.push(ProviderToolCall {
+        tool_call_id: "latest-read".to_owned(),
+        tool_name: "read_file".to_owned(),
+        arguments: json!({"path": "src/ledger.py"}),
+    });
+    messages.push(call);
+    let mut result = message(ProviderRole::Tool, "latest complete read".to_owned());
+    result.tool_call_id = Some("latest-read".to_owned());
+    result.tool_name = Some("read_file".to_owned());
+    messages.push(result);
+    messages.push(message(
+        ProviderRole::User,
+        "continue implementation".to_owned(),
+    ));
+    let total = estimate_message_tokens(&messages);
+    for (budget, expected_summaries) in [(total * 2, 0), (total * 9 / 10, 1)] {
+        let workspace = tempdir().expect("workspace");
+        let executor =
+            BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+        let summary_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ActiveWorkingSetProvider {
+            summary: Some("Keep ledger ordering and checksum invariants.".to_owned()),
+            summary_calls: Arc::clone(&summary_calls),
+            primary_calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let agent_loop = AgentLoop::new(
+            provider,
+            ContextBuilder::new(ContextBudgetPolicy {
+                context_window: budget + 8_192,
+                max_output: 8_192,
+                budget_limit: budget,
+                action_if_exceeded: BudgetOverflowAction::Compact,
+            }),
+            executor,
         );
-        assert!(envelope.summary.contains("checkpoint_checksum=sha256:def"));
+        let request = AgentTaskRequest {
+            session_id: SessionId::new(),
+            task_id: TaskId::new(),
+            turn_id: TurnId::new(),
+            objective: "continue implementation".to_owned(),
+            completion_criteria: Vec::new(),
+            output_schema: None,
+            touched_code: false,
+            contributors: vec![system.clone()],
+            tools: Vec::new(),
+        };
+        let run = AgentRun::new(request)
+            .with_replay_context(AgentReplayContext::for_resume(messages.clone(), Vec::new()));
+        let (_handle, control) = agent_execution_channel(1);
+        let mut trace = Vec::new();
+        agent_loop
+            .run_with_control_trace_contract_and_replay_context(
+                run,
+                control,
+                |event| trace.push(event),
+                AgentTurnOverrides::default(),
+            )
+            .await
+            .expect("resumed outcome");
+        assert_eq!(summary_calls.load(Ordering::SeqCst), expected_summaries);
+        let primary = trace
+            .iter()
+            .filter_map(|event| match event {
+                AgentLoopTraceEvent::ContextSnapshotCaptured { request, .. }
+                    if request
+                        .messages
+                        .first()
+                        .is_some_and(|msg| msg.content == system.content) =>
+                {
+                    Some(request)
+                }
+                _ => None,
+            })
+            .next_back()
+            .expect("primary request");
+        assert!(estimate_message_tokens(&primary.messages) <= budget);
+        assert_eq!(
+            &primary.messages[primary.messages.len() - 3..],
+            &messages[messages.len() - 3..]
+        );
+        if expected_summaries == 0 {
+            assert_eq!(primary.messages, messages);
+        } else {
+            assert!(primary.messages[1].content.contains("Keep ledger ordering"));
+            let record = trace
+                .iter()
+                .find_map(|event| match event {
+                    AgentLoopTraceEvent::ContextAutoCompacted(record) => Some(record),
+                    _ => None,
+                })
+                .expect("compaction record");
+            assert!(
+                record.summary_source_messages[0]
+                    .content
+                    .contains("original-history-0")
+            );
+            assert_eq!(record.strategy, "model_summary_tail");
+        }
     }
 }
 

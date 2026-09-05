@@ -1,10 +1,7 @@
 //! Context construction, task supervision, AgentLoop, and provider auth lifecycles.
 
 use super::*;
-use golutra_context::{
-    ContextMessageSource, ContextWindowManager, ModelInputVisibility, estimate_message_tokens,
-    estimate_tokens, fit_compaction_context_content,
-};
+use golutra_context::{estimate_tokens, fit_compaction_context_content};
 use golutra_llm::{
     LlmProvider, PromptCacheScope, ProviderGenerationConfig, ProviderMessage, ProviderRequest,
     ProviderRole,
@@ -27,9 +24,6 @@ const MAX_WORKING_SUMMARY_TOKENS: u64 = 2_048;
 const ACTIVE_PATH_COMPACTION_MAX_DEPTH: u32 = 65_536;
 const MAX_RESUME_PROVIDER_REQUEST_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_RESUME_PROVIDER_MESSAGES: usize = 16_384;
-// 精确 replay 只有在能放进当前窗口时才有价值；超出后强行保留会把
-// 动态历史标成稳定前缀，阻止 compaction 并让每个后续请求重复支付全文。
-const RESUME_REPLAY_HEADROOM_TOKENS: u64 = 1_024;
 fn memory_candidate_limit(context_budget: u64) -> usize {
     if context_budget == 0 {
         return 0;
@@ -122,7 +116,6 @@ impl RuntimeHost {
         objective: &str,
         provider: &ConfiguredProvider,
         cache_scope: &PromptCacheScope,
-        context_budget: u64,
     ) -> Result<Option<AgentReplayContext>, ClientError> {
         if objective.trim().is_empty() {
             return Ok(None);
@@ -182,20 +175,16 @@ impl RuntimeHost {
             return Ok(None);
         }
 
-        let replay_messages = resume_replay_messages_within_budget(
+        let replay_messages = resume_provider_messages(
             previous.messages,
             previous.task_id,
             current_task_id,
             objective,
-            context_budget,
         );
         Ok(Some(match replay_messages {
             Some(messages) => AgentReplayContext::for_resume(messages, previous.tools),
-            // The provider request has already passed identity and wire
-            // validation above. A size miss is therefore a deliberate
-            // compaction boundary, not a corrupted replay. Keep the last tool
-            // surface while rebuilding history from durable facts and the
-            // latest compaction checkpoint.
+            // 已通过身份与 wire 校验；追加目标越过宿主消息上限时，只继承
+            // 工具面并重建历史。普通 token 超预算由 runtime 统一摘要。
             None => AgentReplayContext::for_resume_tool_surface(previous.tools),
         }))
     }
@@ -360,15 +349,13 @@ impl RuntimeHost {
     }
 }
 
-/// 构造 resume 使用的 provider transcript，并遵守真实上下文预算。只要完整
-/// transcript 能放进 provider 的有效窗口，就原样回放，使上一请求继续作为
-/// 下一请求前缀；只有真实接近硬窗口时才走 canonical 压缩路径。
-pub(crate) fn resume_replay_messages_within_budget(
+/// 恢复完整 transcript 并追加当前目标；由 runtime 在发送前统一执行预算和
+/// 模型摘要，不能在这里提前丢失摘要需要的历史。宿主的消息数与字节上限仍生效。
+pub(crate) fn resume_provider_messages(
     mut messages: Vec<ProviderMessage>,
     previous_task_id: TaskId,
     current_task_id: TaskId,
     objective: &str,
-    context_budget: u64,
 ) -> Option<Vec<ProviderMessage>> {
     let objective = objective.trim();
     if objective.is_empty() {
@@ -389,84 +376,11 @@ pub(crate) fn resume_replay_messages_within_budget(
     if messages.len() > MAX_RESUME_PROVIDER_MESSAGES {
         return None;
     }
-    let replay_tokens = estimate_message_tokens(&messages).saturating_add(if append_objective {
-        estimate_message_tokens(std::slice::from_ref(&objective_message))
-    } else {
-        0
-    });
-    let replay_limit = (context_budget != u64::MAX)
-        .then(|| context_budget.saturating_sub(RESUME_REPLAY_HEADROOM_TOKENS));
-    let replay_over_limit = replay_limit.is_some_and(|limit| replay_tokens > limit);
-    if !replay_over_limit {
-        if append_objective {
-            messages.push(objective_message);
-        }
-        return Some(messages);
+    if append_objective {
+        messages.push(objective_message);
     }
-
-    // 当前目标是回合边界而不是历史材料。先把它从压缩来源中移出，再在选择
-    // 后缀后追加，确保超大的旧 transcript 不会遮蔽当前请求。
-    if !append_objective {
-        let _ = messages.pop();
-    }
-    let compaction_limit = replay_limit?;
-    let protected_prefix_len = messages
-        .iter()
-        .take_while(|message| message.role == ProviderRole::System)
-        .count();
-    let message_sources = replay_message_sources(&messages, protected_prefix_len);
-    let message_estimates = messages
-        .iter()
-        .map(golutra_context::estimate_message_token)
-        .collect::<Vec<_>>();
-    let record = ContextWindowManager::new(compaction_limit)
-        .compact_if_needed_with_estimates(
-            TurnId::new(),
-            protected_prefix_len,
-            &messages,
-            &message_sources,
-            &message_estimates,
-            0,
-        )
-        .ok()
-        .flatten()?;
-    let mut hybrid = record.replacement_messages;
-    hybrid.push(objective_message);
-
-    if context_budget != u64::MAX && estimate_message_tokens(&hybrid) > compaction_limit {
-        return None;
-    }
-    (hybrid.len() <= MAX_RESUME_PROVIDER_MESSAGES && provider_transcript_is_replayable(&hybrid))
-        .then_some(hybrid)
-}
-
-/// 附加普通上下文压缩使用的模型可见来源契约。来源列表只在本次 resume 中
-/// 存在，不会持久化；这样回放压缩可以复用 canonical envelope/checksum 实现。
-fn replay_message_sources(
-    messages: &[ProviderMessage],
-    protected_prefix_len: usize,
-) -> Vec<ContextMessageSource> {
-    messages
-        .iter()
-        .enumerate()
-        .map(|(index, _)| {
-            let stable = index < protected_prefix_len;
-            ContextMessageSource {
-                contributor: if stable {
-                    format!("replay_static_prefix_{index}")
-                } else {
-                    format!("replay_message_{index}")
-                },
-                source_refs: vec![format!("replay:provider-message:{index}")],
-                origin: if stable {
-                    "deterministic_replay_static_prefix".to_owned()
-                } else {
-                    "deterministic_replay".to_owned()
-                },
-                visibility: ModelInputVisibility::ModelVisible,
-            }
-        })
-        .collect()
+    (messages.len() <= MAX_RESUME_PROVIDER_MESSAGES && provider_transcript_is_replayable(&messages))
+        .then_some(messages)
 }
 
 pub(crate) fn provider_transcript_is_replayable(messages: &[ProviderMessage]) -> bool {
@@ -1473,7 +1387,6 @@ impl RuntimeHost {
                 &objective,
                 &provider,
                 &prompt_cache_scope,
-                context_budget,
             )
             .await?;
         let legacy_task = LegacyTaskAdapter::new(&task.payload, &objective);

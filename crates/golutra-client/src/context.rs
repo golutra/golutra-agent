@@ -529,7 +529,6 @@ pub(crate) fn history_contributors_with_budget<'a>(
         }
     }
 
-    deduplicate_historical_read_results(&mut groups);
     retain_history_groups(groups, token_budget)
 }
 
@@ -555,7 +554,6 @@ pub(crate) fn history_contributors_from_cached_facts<'a>(
             groups.push(vec![contributor]);
         }
     }
-    deduplicate_historical_read_results(&mut groups);
     retain_history_groups(groups, token_budget)
 }
 
@@ -569,31 +567,27 @@ struct HistoricalReadIdentity {
     output_digest: String,
 }
 
-/// 同一活动路径中重复成功读取通常只是在确认前一事实。保留第一次正文可
-/// 继续作为 cache prefix，后续投影只携带可行动事实；durable 事件和真实工具
-/// 执行完全不变。只有含正文的投影会登记为已见，避免压缩后的旧摘要遮蔽新正文。
-fn deduplicate_historical_read_results(groups: &mut [Vec<ContextContributor>]) {
+/// 仅在最终保留窗口内去重；先去重再裁剪会留下找不到正文的省略标记。
+/// 保留第一次完整正文，不改 durable 事实或真实工具执行。
+fn deduplicate_historical_read_results(contributors: &mut [ContextContributor]) {
     let mut seen = HashSet::<HistoricalReadIdentity>::new();
-    for group in groups {
-        for contributor in group {
-            let Some((identity, has_output)) = historical_read_identity(&contributor.content)
-            else {
-                continue;
-            };
-            if !has_output {
-                continue;
-            }
-            if seen.insert(identity) {
-                continue;
-            }
-            contributor.content = historical_tool_result_without_output(&contributor.content);
+    for contributor in contributors {
+        let Some(identity) = historical_read_identity(&contributor.content) else {
+            continue;
+        };
+        if seen.insert(identity) {
+            continue;
+        }
+        let compacted = historical_tool_result_without_output(&contributor.content);
+        if estimate_tokens(&compacted) < estimate_tokens(&contributor.content) {
+            contributor.content = compacted;
         }
     }
 }
 
 /// 从模型可见历史封套提取读取窗口身份。成功投影的 bytes/offset 等冗余字段
 /// 可能已被压缩，因此同时使用正文摘要；正文不进入身份字符串或日志。
-fn historical_read_identity(content: &str) -> Option<(HistoricalReadIdentity, bool)> {
+fn historical_read_identity(content: &str) -> Option<HistoricalReadIdentity> {
     let inner = content
         .strip_prefix(HISTORICAL_TOOL_RESULT_PREFIX)?
         .strip_suffix(HISTORICAL_TOOL_RESULT_SUFFIX)?;
@@ -631,7 +625,7 @@ fn historical_read_identity(content: &str) -> Option<(HistoricalReadIdentity, bo
         continuation,
         output_digest: format!("sha256:{:x}", Sha256::digest(output.unwrap_or_default())),
     };
-    Some((identity, true))
+    Some(identity)
 }
 
 fn historical_tool_result_without_output(content: &str) -> String {
@@ -676,7 +670,9 @@ fn retain_history_groups(
     token_budget: u64,
 ) -> Vec<ContextContributor> {
     if token_budget == u64::MAX {
-        return groups.into_iter().flatten().collect();
+        let mut retained = groups.into_iter().flatten().collect::<Vec<_>>();
+        deduplicate_historical_read_results(&mut retained);
+        return retained;
     }
 
     let mut remaining = token_budget;
@@ -697,7 +693,9 @@ fn retain_history_groups(
         break;
     }
     retained.reverse();
-    retained.into_iter().flatten().collect()
+    let mut retained = retained.into_iter().flatten().collect::<Vec<_>>();
+    deduplicate_historical_read_results(&mut retained);
+    retained
 }
 
 fn fit_history_group(group: &[ContextContributor], token_budget: u64) -> Vec<ContextContributor> {
@@ -1531,52 +1529,114 @@ mod tests {
         );
     }
 
+    fn read_history_fixture(
+        path: &str,
+        offset: u64,
+        output: &str,
+        status: &str,
+    ) -> ContextContributor {
+        let content = format!(
+            "{HISTORICAL_TOOL_RESULT_PREFIX}{}{}",
+            serde_json::json!({
+                "tool_name": "read_file",
+                "status": status,
+                "structured_facts": {
+                    "path": path,
+                    "content_digest": "sha256:file",
+                    "offset": offset,
+                    "limit": 20,
+                    "continuation": {"next_offset": offset + 20}
+                }
+            }),
+            if output.is_empty() {
+                HISTORICAL_TOOL_RESULT_SUFFIX.to_owned()
+            } else {
+                format!("{HISTORICAL_TOOL_OUTPUT_SEPARATOR}{output}{HISTORICAL_TOOL_RESULT_SUFFIX}")
+            }
+        );
+        ContextContributor {
+            name: format!("history:{path}:{offset}:{status}"),
+            role: ProviderRole::User,
+            content,
+            token_budget_hint: 0,
+            source_refs: Vec::new(),
+        }
+    }
+
     #[test]
     fn historical_duplicate_read_keeps_one_body_and_preserves_window_boundaries() {
-        let contributor = |path: &str, offset: u64, output: &str, status: &str| {
-            let content = format!(
-                "{HISTORICAL_TOOL_RESULT_PREFIX}{}{}",
-                serde_json::json!({
-                    "tool_name": "read_file",
-                    "status": status,
-                    "structured_facts": {
-                        "path": path,
-                        "content_digest": "sha256:file",
-                        "offset": offset,
-                        "limit": 20,
-                        "continuation": {"next_offset": offset + 20}
-                    }
-                }),
-                if output.is_empty() {
-                    HISTORICAL_TOOL_RESULT_SUFFIX.to_owned()
-                } else {
-                    format!(
-                        "{HISTORICAL_TOOL_OUTPUT_SEPARATOR}{output}{HISTORICAL_TOOL_RESULT_SUFFIX}"
-                    )
-                }
-            );
-            ContextContributor {
-                name: format!("history:{path}:{offset}:{status}"),
-                role: ProviderRole::User,
-                content,
-                token_budget_hint: 0,
-                source_refs: Vec::new(),
-            }
-        };
-        let mut groups = vec![
-            vec![contributor("src/./ledger.py", 0, "line one", "ok")],
-            vec![contributor("src/ledger.py", 0, "line one", "ok")],
-            vec![contributor("src/ledger.py", 20, "line two", "ok")],
-            vec![contributor("src/ledger.py", 0, "line one", "error")],
+        let output = "line one\n".repeat(40);
+        let mut retained = vec![
+            read_history_fixture("src/./ledger.py", 0, &output, "ok"),
+            read_history_fixture("src/ledger.py", 0, &output, "ok"),
+            read_history_fixture("src/ledger.py", 20, "line two", "ok"),
+            read_history_fixture("src/ledger.py", 0, &output, "error"),
         ];
 
-        deduplicate_historical_read_results(&mut groups);
+        deduplicate_historical_read_results(&mut retained);
 
-        assert!(groups[0][0].content.contains("line one"));
-        assert!(groups[1][0].content.contains("repeated successful read"));
-        assert!(!groups[1][0].content.contains("\n--- output ---\nline one"));
-        assert!(groups[2][0].content.contains("line two"));
-        assert!(groups[3][0].content.contains("line one"));
+        assert!(retained[0].content.contains("line one"));
+        assert!(retained[1].content.contains("repeated successful read"));
+        assert!(!retained[1].content.contains("\n--- output ---\nline one"));
+        assert!(retained[2].content.contains("line two"));
+        assert!(retained[3].content.contains("line one"));
+    }
+
+    #[test]
+    fn historical_duplicate_read_never_references_an_evicted_or_truncated_body() {
+        let body = read_history_fixture("src/ledger.py", 0, &"中文 line\n".repeat(40), "ok");
+        let body_tokens = estimate_tokens(&body.content);
+        let facts = (0..3)
+            .map(|index| CachedHistoryFact {
+                sequence_no: index,
+                task_id: None,
+                turn_id: Some(TurnId::new()),
+                contributor: body.clone(),
+            })
+            .collect::<Vec<_>>();
+        for budget in [
+            0,
+            1,
+            body_tokens - 1,
+            body_tokens,
+            body_tokens + 10,
+            body_tokens * 2,
+            u64::MAX,
+        ] {
+            let retained = history_contributors_from_cached_facts(&facts, budget);
+            let direct = retain_history_groups(vec![vec![body.clone()]; 3], budget);
+            assert_eq!(
+                retained
+                    .iter()
+                    .map(|item| &item.content)
+                    .collect::<Vec<_>>(),
+                direct.iter().map(|item| &item.content).collect::<Vec<_>>()
+            );
+            assert!(
+                retained
+                    .iter()
+                    .map(|item| estimate_tokens(&item.content))
+                    .sum::<u64>()
+                    <= budget
+            );
+            let mut has_body = false;
+            for item in &retained {
+                if item.content.contains("repeated successful read") {
+                    assert!(has_body, "omission without visible body at budget {budget}");
+                }
+                has_body |= item.content == body.content;
+            }
+            if budget >= body_tokens {
+                assert!(has_body, "latest full read must survive at budget {budget}");
+            }
+        }
+    }
+
+    #[test]
+    fn historical_duplicate_read_does_not_expand_a_short_result() {
+        let body = read_history_fixture("a.txt", 0, "ok", "ok");
+        let retained = retain_history_groups(vec![vec![body.clone()]; 2], u64::MAX);
+        assert!(retained.iter().all(|item| item.content == body.content));
     }
 
     #[test]

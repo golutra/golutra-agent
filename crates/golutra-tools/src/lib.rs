@@ -27,7 +27,6 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_EXCERPT_LIMIT: usize = 2048;
-const DEFAULT_READ_EXCERPT_BYTES: usize = 16 * 1024;
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
 /// Maximum raw content retained by a built-in tool artifact.
 pub const MAX_TOOL_ARTIFACT_CONTENT_BYTES: usize = 16 * 1024 * 1024;
@@ -4180,17 +4179,19 @@ fn report(
     let (redacted_output, redaction_status) = redact_sensitive_text(&raw_output);
     let redacted_summary = redact_sensitive_text(summary).0;
     let mut structured_facts = structured_facts;
-    if request.tool_name == "read_file"
-        && redacted_output.len() > DEFAULT_READ_EXCERPT_BYTES
+    if let Some(truncation_key) = model_output_truncation_key(&request.tool_name)
+        && redacted_output.len() > MAX_MODEL_TOOL_RESULT_EXCERPT_BYTES
         && let Value::Object(facts) = &mut structured_facts
     {
-        // 请求的行窗口可能完整，但 provider 可见摘录仍受字节上限约束；显式
-        // 保留这个区别，避免模型把被截断的行误判为 EOF。
-        facts.insert("model_visible_truncated".to_owned(), Value::Bool(true));
-        facts.insert(
-            "model_visible_bytes".to_owned(),
-            Value::Number((DEFAULT_READ_EXCERPT_BYTES as u64).into()),
-        );
+        // 捕获完整不等于模型看到完整；摘录裁剪必须显式暴露，避免把缺失尾部
+        // 当作 EOF 或完整进程输出。实际请求预算还会在最终投影处再次校验。
+        facts.insert(truncation_key.to_owned(), Value::Bool(true));
+        if request.tool_name == "read_file" {
+            facts.insert(
+                "model_visible_bytes".to_owned(),
+                Value::Number((MAX_MODEL_TOOL_RESULT_EXCERPT_BYTES as u64).into()),
+            );
+        }
     }
     let structured_facts = redact_sensitive_value(structured_facts);
     let artifact = artifact_for(&request, &redacted_output, redaction_status);
@@ -4214,10 +4215,10 @@ fn report(
         // 文件副作用的完整内容已经保存在 artifact 中；再次回显会让每个
         // 后续 turn 重复支付相同 token，模型只需状态摘要和结构化 digest。
         Some(redacted_summary.clone())
-    } else if request.tool_name == "read_file" {
+    } else if model_output_truncation_key(&request.tool_name).is_some() {
         Some(bounded_text_bytes(
             &redacted_output,
-            DEFAULT_READ_EXCERPT_BYTES,
+            MAX_MODEL_TOOL_RESULT_EXCERPT_BYTES,
         ))
     } else {
         Some(excerpt(&redacted_output, DEFAULT_EXCERPT_LIMIT))
@@ -4851,7 +4852,7 @@ pub fn model_visible_tool_result_with_limit(
             "shell" | "shell_session" => (
                 selected_model_facts(&facts, PROCESS_MODEL_FACTS),
                 summary,
-                excerpt.map(|value| bounded_text(&value, MAX_MODEL_TOOL_OUTPUT_CHARS)),
+                excerpt,
                 envelope.status != ToolResultStatus::Ok,
                 true,
             ),
@@ -4921,14 +4922,40 @@ pub fn model_visible_tool_result_with_limit(
             object.insert("model_visible_excerpt".to_owned(), Value::String(excerpt));
         }
     }
-    let header = serialize_model_tool_projection(
-        projection,
+    let mut header = serialize_model_tool_projection(
+        projection.clone(),
         &envelope.tool_name,
         envelope.status,
         &summary,
         max_bytes,
     );
+    if let Some(excerpt) = inline_excerpt.as_deref().filter(|value| !value.is_empty())
+        && header.len() + MODEL_OUTPUT_SEPARATOR.len() + excerpt.len() > max_bytes
+        && let Some(key) = model_output_truncation_key(&envelope.tool_name)
+    {
+        // 最终预算包含 JSON 头部，不能只在原始输出处判断截断。先写事实再
+        // 重新计算正文空间，保证 UTF-8、总字节上限与截断状态一致。
+        if !projection["structured_facts"].is_object() {
+            projection["structured_facts"] = json!({});
+        }
+        projection["structured_facts"][key] = Value::Bool(true);
+        header = serialize_model_tool_projection(
+            projection,
+            &envelope.tool_name,
+            envelope.status,
+            &summary,
+            max_bytes,
+        );
+    }
     append_model_visible_excerpt(header, inline_excerpt.as_deref(), max_bytes)
+}
+
+fn model_output_truncation_key(tool_name: &str) -> Option<&'static str> {
+    match tool_name {
+        "read_file" => Some("model_visible_truncated"),
+        "shell" | "shell_session" => Some("output_truncated"),
+        _ => None,
+    }
 }
 
 const READ_FILE_MODEL_FACTS: &[&str] = &[
@@ -5108,17 +5135,19 @@ fn remove_true_fact(object: &mut serde_json::Map<String, Value>, key: &str) {
     }
 }
 
+const MODEL_OUTPUT_SEPARATOR: &str = "\n--- output ---\n";
+
 fn append_model_visible_excerpt(header: String, excerpt: Option<&str>, max_bytes: usize) -> String {
-    const SEPARATOR: &str = "\n--- output ---\n";
     let Some(excerpt) = excerpt.filter(|value| !value.is_empty()) else {
         return header;
     };
-    let available = max_bytes.saturating_sub(header.len().saturating_add(SEPARATOR.len()));
+    let available =
+        max_bytes.saturating_sub(header.len().saturating_add(MODEL_OUTPUT_SEPARATOR.len()));
     if available == 0 {
         return header;
     }
     let excerpt = bounded_text_bytes(excerpt, available);
-    format!("{header}{SEPARATOR}{excerpt}")
+    format!("{header}{MODEL_OUTPUT_SEPARATOR}{excerpt}")
 }
 
 fn project_search_model_facts(value: &Value) -> Value {
@@ -5283,6 +5312,11 @@ fn serialize_model_tool_projection(
         // 预算异常紧时仍返回可解析的核心状态；正常调用的最小预算足以容纳
         // tool_name、status 以及上面的专属事实和摘要。
         let mut minimal = model_tool_result_base(tool_name, status);
+        if let Some(key) = model_output_truncation_key(tool_name)
+            && original_facts.get(key) == Some(&Value::Bool(true))
+        {
+            minimal["structured_facts"] = json!({key: true});
+        }
         if keep_summary {
             minimal["summary"] = Value::String(bounded_text_bytes(
                 summary,
@@ -5351,6 +5385,7 @@ fn model_fact_mandatory(tool_name: &str) -> &'static [&'static str] {
             "has_more",
             "eof",
             "truncated",
+            "model_visible_truncated",
             "error",
             "reason",
             "timed_out",
@@ -5378,6 +5413,8 @@ fn model_fact_mandatory(tool_name: &str) -> &'static [&'static str] {
             "process_state",
             "exit_code",
             "output_cursor",
+            "output_truncated",
+            "output_lost",
             "timed_out",
             "cancelled",
             "terminal",
