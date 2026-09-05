@@ -1421,7 +1421,7 @@ fn provider_cache_profile_gates_compatible_gateway_fields() {
     assert!(golutra.supports_long_retention(golutra_core::PromptCachePolicy::Long));
     assert_eq!(
         golutra.preferred_cache_policy(),
-        golutra_core::PromptCachePolicy::Auto
+        golutra_core::PromptCachePolicy::Long
     );
 
     let codex =
@@ -1461,7 +1461,7 @@ fn provider_cache_profile_gates_compatible_gateway_fields() {
     );
     assert_eq!(
         responses_custom.preferred_cache_policy(),
-        golutra_core::PromptCachePolicy::Auto
+        golutra_core::PromptCachePolicy::Long
     );
 }
 
@@ -1533,7 +1533,7 @@ fn provider_adapters_expose_capability_gated_cache_policy() {
     });
     assert_eq!(
         responses.preferred_cache_policy(),
-        golutra_core::PromptCachePolicy::Auto
+        golutra_core::PromptCachePolicy::Long
     );
 
     let unknown = OpenAiCompatibleProvider::from_config(OpenAiCompatibleProviderConfig {

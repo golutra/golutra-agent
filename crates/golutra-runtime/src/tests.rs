@@ -1067,6 +1067,75 @@ impl LlmProvider for SemanticSummaryProvider {
 }
 
 #[derive(Debug, Clone)]
+struct ActiveWorkingSetProvider {
+    summary: Option<String>,
+    summary_calls: Arc<AtomicUsize>,
+    primary_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl LlmProvider for ActiveWorkingSetProvider {
+    async fn complete(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+        let is_summary = request.messages.first().is_some_and(|message| {
+            message.role == ProviderRole::System
+                && message.content == COMPACTION_SUMMARY_SYSTEM_PROMPT
+        });
+        let content = if is_summary {
+            self.summary_calls.fetch_add(1, Ordering::SeqCst);
+            self.summary.clone()
+        } else {
+            self.primary_calls.fetch_add(1, Ordering::SeqCst);
+            Some("task complete".to_owned())
+        };
+        Ok(ProviderResponse {
+            response_id: golutra_core::ProviderResponseId::new(),
+            message: content.map(|content| ProviderMessage {
+                role: ProviderRole::Assistant,
+                content,
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+                metadata: Default::default(),
+            }),
+            tool_calls: Vec::new(),
+            usage: ProviderUsage {
+                input_tokens: Some(80),
+                output_tokens: Some(6),
+                reasoning_tokens: None,
+                cached_input_tokens: Some(0),
+                total_tokens: Some(86),
+                usage_source: UsageSource::Provider,
+                raw: json!({"input_tokens_details": {"cached_tokens": 0}}),
+            },
+            finish_reason: ProviderFinishReason::Stop,
+            raw_metadata: json!({}),
+        })
+    }
+
+    fn supports_buffered_transport(&self) -> bool {
+        false
+    }
+
+    fn contract(&self) -> golutra_core::ProviderContract {
+        golutra_core::ProviderContract {
+            provider_id: "active-working-set".to_owned(),
+            model_id: "summary-model".to_owned(),
+            native_protocol: "openai_responses_sse".to_owned(),
+            stream_event_mapping: "test".to_owned(),
+            tool_call_mapping: "none".to_owned(),
+            usage_mapping: "test".to_owned(),
+            reasoning_mapping: "test".to_owned(),
+            finish_reason_mapping: "test".to_owned(),
+            error_mapping: "test".to_owned(),
+            rate_limit_mapping: "test".to_owned(),
+            cost_model: "zero".to_owned(),
+            capability_matrix_ref: None,
+            golden_fixture_refs: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct SupportThenDeliveryProvider {
     calls: Arc<AtomicUsize>,
     contract: golutra_core::ProviderContract,
@@ -3383,6 +3452,92 @@ async fn accumulated_tool_messages_are_compacted_and_the_turn_continues() {
             ..
         }
     )));
+}
+
+#[tokio::test]
+async fn active_working_set_uses_local_facts_without_summary_request() {
+    {
+        let workspace = tempdir().expect("workspace");
+        let executor =
+            BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
+        let summary_calls = Arc::new(AtomicUsize::new(0));
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ActiveWorkingSetProvider {
+            summary: None,
+            summary_calls: Arc::clone(&summary_calls),
+            primary_calls: Arc::clone(&primary_calls),
+        };
+        let context_builder = ContextBuilder::new(ContextBudgetPolicy {
+            context_window: 80 * 1_024,
+            max_output: 8 * 1_024,
+            budget_limit: ACTIVE_WORKING_SET_MIN_HARD_BUDGET_TOKENS,
+            action_if_exceeded: BudgetOverflowAction::Compact,
+        });
+        let contributors = (0..14)
+            .map(|index| ContextContributor {
+                name: "conversation_history".to_owned(),
+                role: ProviderRole::User,
+                content: format!(
+                    "history-{index} changed_files=jobledger/model.py \
+                     content_digest=sha256:abc checkpoint_checksum=sha256:def \
+                     verification=python3-test-passed {}",
+                    "detail token ".repeat(1_300)
+                ),
+                token_budget_hint: 0,
+                source_refs: vec![format!("history:{index}")],
+            })
+            .collect();
+        let agent_loop = AgentLoop::new(provider, context_builder, executor);
+        let mut trace = Vec::new();
+
+        let outcome = agent_loop
+            .run_with_trace(
+                AgentTaskRequest {
+                    session_id: SessionId::new(),
+                    task_id: TaskId::new(),
+                    turn_id: TurnId::new(),
+                    objective: "continue from the retained facts".to_owned(),
+                    completion_criteria: Vec::new(),
+                    output_schema: None,
+                    touched_code: false,
+                    contributors,
+                    tools: Vec::new(),
+                },
+                |event| trace.push(event),
+            )
+            .await
+            .expect("active working-set outcome");
+
+        let record = trace
+            .iter()
+            .find_map(|event| match event {
+                AgentLoopTraceEvent::ContextAutoCompacted(record)
+                    if record.mode == "active_working_set" =>
+                {
+                    Some(record)
+                }
+                _ => None,
+            })
+            .expect("active working-set compaction");
+        let envelope =
+            parse_compaction_summary_envelope(&record.summary).expect("summary envelope");
+
+        assert_eq!(outcome.final_message.as_deref(), Some("task complete"));
+        // Soft working-set compaction is deliberately local: a provider round
+        // is reserved for hard-window compaction, so this path cannot add a
+        // hidden summary request or alter the cacheable thread prefix.
+        assert_eq!(summary_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(record.strategy, "fallback_facts_tail");
+        assert!(record.summary_source_messages.is_empty());
+        assert!(record.summary_source_sources.is_empty());
+        assert!(
+            envelope
+                .summary
+                .contains("changed_files=jobledger/model.py")
+        );
+        assert!(envelope.summary.contains("checkpoint_checksum=sha256:def"));
+    }
 }
 
 #[tokio::test]
@@ -5895,9 +6050,9 @@ fn coding_tool_surface_adds_background_capability_only_when_requested() {
         executor.registry(),
         "implement the task and keep the code maintainable",
     );
-    assert!(!generic.iter().any(|tool| tool.tool_name == "shell_session"));
     assert!(!generic.iter().any(|tool| tool.tool_name == "web_search"));
     assert!(!generic.iter().any(|tool| tool.tool_name == "subagent"));
+    assert!(!generic.iter().any(|tool| tool.tool_name == "shell_session"));
 
     let long_task = provider_tools_for_turn(
         &all_tools,
@@ -5909,8 +6064,7 @@ fn coding_tool_surface_adds_background_capability_only_when_requested() {
     assert!(
         !long_task
             .iter()
-            .any(|tool| tool.tool_name == "shell_session"),
-        "a long agent task is not itself a background process request"
+            .any(|tool| tool.tool_name == "shell_session")
     );
 
     let explicit = provider_tools_for_turn(
@@ -5934,6 +6088,22 @@ fn coding_tool_surface_adds_background_capability_only_when_requested() {
         "start a long-running server and wait for the process state",
     );
     assert!(server.iter().any(|tool| tool.tool_name == "shell_session"));
+
+    let read_only = provider_tools_for_turn(
+        &all_tools,
+        &TaskContract {
+            workspace_change: WorkspaceChangeRequirement::Forbidden,
+            ..contract
+        },
+        AgentToolProfile::Coding,
+        executor.registry(),
+        "inspect the workspace without changing it",
+    );
+    assert!(
+        !read_only
+            .iter()
+            .any(|tool| tool.tool_name == "shell_session")
+    );
 }
 
 #[test]

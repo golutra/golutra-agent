@@ -400,11 +400,16 @@ impl ProviderCacheProfile {
         policy != PromptCachePolicy::None && self.supports_cache_control
     }
 
-    /// 主会话遵循 provider 的默认 retention。长期保留仍由调用方通过
-    /// `PromptCachePolicy::Long` 显式请求，并在 `supports_long_retention`
-    /// 中做能力门控，避免把长期策略隐式写入每一轮请求。
+    /// 对明确声明长期保留能力的 Responses/兼容网关，主会话默认保持长期
+    /// retention，使跨回合和 resume 不依赖上游短 TTL。未知网关、Codex
+    /// 专用 profile 与不支持长期保留的 provider 继续使用保守的 Auto。
+    /// Anthropic 保留其短 TTL 默认值；显式 Long 仍由调用方控制。
     fn preferred_cache_policy(self) -> PromptCachePolicy {
-        PromptCachePolicy::Auto
+        if self.mode == ProviderCacheMode::Responses && self.supports_long_retention {
+            PromptCachePolicy::Long
+        } else {
+            PromptCachePolicy::Auto
+        }
     }
 }
 

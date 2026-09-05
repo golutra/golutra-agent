@@ -945,7 +945,7 @@ async fn openai_responses_projects_stable_cache_identity_and_retention() {
 }
 
 #[tokio::test]
-async fn openai_responses_default_policy_leaves_retention_to_provider() {
+async fn codex_responses_default_policy_leaves_retention_to_provider() {
     let response = include_str!("fixtures/openai-responses/text-response.sse");
     let (base_url, captured) =
         spawn_provider_sequence(vec![TestProviderResponse::sse(200, response)]).await;
