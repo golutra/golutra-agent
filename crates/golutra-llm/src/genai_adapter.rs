@@ -122,7 +122,10 @@ impl GenaiProviderAdapter {
             config,
             credential,
             cache_profile,
-            client: Client::builder().with_web_config(web_config).build(),
+            client: Client::builder()
+                .with_web_config(web_config)
+                .build()
+                .expect("static genai client configuration is valid"),
         }
     }
 

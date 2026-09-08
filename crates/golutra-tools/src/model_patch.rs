@@ -369,7 +369,12 @@ pub(crate) fn render(
                 let original = std::str::from_utf8(original).map_err(|_| {
                     format!("update target is not valid UTF-8: {}", file.path.display())
                 })?;
-                let edited = apply_hunks(original, hunks)?;
+                let edited = apply_hunks(original, hunks).map_err(|error| {
+                    format!(
+                        "model patch update failed for `{}`: {error}",
+                        file.path.display()
+                    )
+                })?;
                 if let Some(move_path) = &file.move_path {
                     if lexical_path_identity(move_path) == lexical_path_identity(&file.path) {
                         return Err("move destination must differ from the source".to_owned());

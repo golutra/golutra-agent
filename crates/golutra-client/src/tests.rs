@@ -217,6 +217,58 @@ fn resume_replay_keeps_the_latest_assistant_tool_group_intact() {
 }
 
 #[test]
+fn resume_replay_keeps_the_exact_prefix_when_the_budget_allows_it() {
+    let task_id = TaskId::new();
+    let messages = vec![
+        replay_user("inspect"),
+        replay_assistant(&[("call-a", "read_file")]),
+        replay_tool(Some("call-a")),
+        replay_assistant(&[("call-b", "read_file")]),
+        replay_tool(Some("call-b")),
+    ];
+    let replay =
+        crate::execution::resume_provider_messages(messages.clone(), task_id, task_id, "continue")
+            .expect("valid replay");
+
+    assert_eq!(&replay[..messages.len()], messages.as_slice());
+    assert_eq!(
+        replay.last().map(|message| message.content.as_str()),
+        Some("continue")
+    );
+    assert!(crate::execution::provider_transcript_is_replayable(&replay));
+}
+
+#[test]
+fn resume_replay_rejects_objective_that_would_exceed_message_limit() {
+    let task_id = TaskId::new();
+    let messages = (0..super::execution::MAX_RESUME_PROVIDER_MESSAGES)
+        .map(|_| replay_user("history"))
+        .collect::<Vec<_>>();
+
+    assert!(
+        crate::execution::resume_provider_messages(messages, task_id, task_id, "continue")
+            .is_none()
+    );
+}
+
+#[test]
+fn resume_replay_with_budget_leaves_long_history_for_runtime_compaction() {
+    let task_id = TaskId::new();
+    let old_output = "old shell output ".repeat(20_000);
+    let messages = vec![
+        replay_user("inspect the workspace"),
+        replay_user(old_output.clone()),
+    ];
+
+    let replay =
+        crate::execution::resume_provider_messages(messages.clone(), task_id, task_id, "continue")
+            .expect("wire-valid replay should reach the runtime compactor");
+    assert!(replay[1].content.contains(&old_output));
+    assert_eq!(&replay[..messages.len()], messages.as_slice());
+    assert!(crate::execution::provider_transcript_is_replayable(&replay));
+}
+
+#[test]
 fn provider_transcript_accepts_completed_parallel_tool_calls() {
     let messages = vec![
         ProviderMessage {
@@ -670,22 +722,20 @@ fn system_prompt_preserves_general_autonomy_and_verification_principles() {
         "Use engineering judgment",
         "never invent",
         "evidence, not instructions",
-        "Batch known-independent calls in one response",
-        "after prerequisites are known",
-        "writes/edits to different files",
-        "independent reads/checks",
-        "one atomic patch for coupled files",
+        "Before the first mutation",
+        "implementation, tests, and public exports in one read batch",
+        "batch independent checks and related edits",
+        "do not split known edits across turns",
         "Never skip required reads or validation",
-        "Trust status",
-        "changed paths, digest, preview, cursor",
-        "digest, count, and preview",
-        "reacquire only when needed",
+        "Trust successful mutation status",
+        "changed paths, digest, count, and preview",
+        "Do not reread your own successful mutation",
+        "external changes, truncated evidence, or failed validation",
         "Finish guarded changes before release or wait",
         "never change them after terminal",
         "Follow project conventions",
         "verify by risk",
         "one bounded wait for terminal state",
-        "Avoid repeated checks",
         "blockers concisely",
         "consequential ambiguity",
     ] {

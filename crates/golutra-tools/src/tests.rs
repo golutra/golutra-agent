@@ -246,14 +246,14 @@ async fn registry_contains_p0_tools() {
     assert_eq!(
         names,
         vec![
-            "apply_patch",
-            "edit_file",
             "read_file",
             "shell",
+            "edit_file",
+            "write_file",
+            "apply_patch",
             "shell_session",
-            "subagent",
             "web_search",
-            "write_file"
+            "subagent",
         ]
     );
     assert!(registry.contract("list_dir").is_some());
@@ -1943,6 +1943,45 @@ async fn edit_file_rejects_non_unique_whitespace_targets_without_partial_writes(
 }
 
 #[tokio::test]
+async fn edit_file_mismatch_exposes_current_content_for_one_exact_retry() {
+    let workspace = tempdir().expect("workspace");
+    let path = workspace.path().join("src.txt");
+    let original = "header\napi_key=plain-secret-value\nactual\n";
+    fs::write(&path, original).expect("fixture");
+    let executor = executor(workspace.path());
+
+    let report = executor
+        .execute(
+            request(
+                "edit_file",
+                json!({
+                    "path": "src.txt",
+                    "edits": [{"old_text": "missing", "new_text": "changed"}]
+                }),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("mismatch report");
+
+    assert_eq!(report.envelope.status, ToolResultStatus::Error);
+    let facts = &report.envelope.structured_facts;
+    assert_eq!(facts["error_kind"], "edit_target_not_found");
+    assert_eq!(facts["path"], "src.txt");
+    assert_eq!(facts["content_digest"], checksum(original.as_bytes()));
+    assert_eq!(facts["current_content_truncated"], false);
+    let projected = model_visible_tool_result(&report.envelope);
+    let (projection, _) = parse_model_visible_tool_result(&projected);
+    assert!(
+        projection["structured_facts"]["current_content"]
+            .as_str()
+            .is_some_and(|content| content.contains("<redacted-secret>"))
+    );
+    assert!(!projected.contains("plain-secret-value"));
+    assert_eq!(fs::read_to_string(path).expect("unchanged"), original);
+}
+
+#[tokio::test]
 async fn edit_file_requires_the_canonical_edits_array() {
     let workspace = tempdir().expect("workspace");
     fs::write(workspace.path().join("src.txt"), "before").expect("fixture");
@@ -2155,9 +2194,66 @@ async fn apply_patch_rejects_ambiguous_model_context_without_partial_writes() {
         .expect_err("ambiguous model context must be rejected");
 
     assert!(error.to_string().contains("ambiguous"));
+    assert!(error.to_string().contains("one.txt"));
     assert_eq!(
         fs::read_to_string(workspace.path().join("one.txt")).expect("unchanged"),
         "same\nother\nsame\n"
+    );
+}
+
+#[tokio::test]
+async fn patch_context_failure_exposes_bounded_current_file_for_one_exact_retry() {
+    let workspace = tempdir().expect("workspace");
+    let original = "header\napi_key=plain-secret-value\nactual\n";
+    fs::write(workspace.path().join("one.txt"), original).expect("fixture");
+    let executor = executor(workspace.path());
+    let patch = concat!(
+        "*** Begin Patch\n",
+        "*** Update File: one.txt\n",
+        "@@\n",
+        "-missing\n",
+        "+changed\n",
+        "*** End Patch\n",
+    );
+    let request = request("apply_patch", json!({"patch": patch}));
+    let policy = executor.evaluate(&request).expect("policy evaluates");
+    let error = executor
+        .execute(request.clone(), CancellationToken::new())
+        .await
+        .expect_err("strict context mismatch must fail");
+    let report = executor
+        .execution_error_report_with_hints(request, policy, error.to_string())
+        .await;
+
+    assert_eq!(report.envelope.status, ToolResultStatus::Error);
+    let facts = &report.envelope.structured_facts;
+    assert_eq!(facts["error_kind"], "patch_context_mismatch");
+    assert_eq!(facts["path"], "one.txt");
+    assert_eq!(facts["content_digest"], checksum(original.as_bytes()));
+    assert_eq!(facts["current_content_truncated"], false);
+    assert!(facts["current_content"].as_str().is_some_and(|content| {
+        content.contains("header") && content.contains("<redacted-secret>")
+    }));
+    assert!(
+        facts["next_action"]
+            .as_str()
+            .is_some_and(|action| action.contains("retry once"))
+    );
+    let projected = model_visible_tool_result(&report.envelope);
+    let (projection, _) = parse_model_visible_tool_result(&projected);
+    assert_eq!(
+        projection["structured_facts"]["error_kind"],
+        "patch_context_mismatch"
+    );
+    assert!(
+        projection["structured_facts"]["current_content"]
+            .as_str()
+            .is_some_and(|content| content.contains("<redacted-secret>"))
+    );
+    assert!(!projected.contains("plain-secret-value"));
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("one.txt")).expect("unchanged"),
+        original
     );
 }
 

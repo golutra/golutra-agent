@@ -46,7 +46,7 @@ use golutra_tools::{
     CONTRACT_FILE_CONTENT_VERIFIER_TOOL, CONTRACT_PATH_VERIFIER_TOOL, FileBeforeImage,
     SideEffectPreparation, ToolError, ToolExecutionReport, ToolInvocation, ToolRegistry,
     ToolRequest, ToolRuntime, VerifierExecutionRequest, is_pi_plus_tool,
-    model_visible_tool_result_with_token_budget, redact_tool_arguments,
+    model_visible_tool_result_with_token_budget, provider_tool_rank, redact_tool_arguments,
     shell_request_is_strictly_read_only,
 };
 use golutra_verify::VerificationInput;
@@ -125,6 +125,8 @@ pub use verification::RuntimeVerificationService;
 const PARALLEL_READ_CONCURRENCY_LIMIT: usize = 8;
 const DEFAULT_ACTIVE_TOOL_RESULT_TOKENS: u64 = 2_048;
 const MIN_ACTIVE_TOOL_RESULT_TOKENS: u64 = 256;
+// mutation 的 digest、计数和有界变更摘要足以支持下一步决策；完整内容仍在
+// artifact 中保存。较小上限避免成功写入后把同一事实再次推入长上下文。
 const MUTATION_ACTIVE_TOOL_RESULT_TOKENS: u64 = 1_024;
 // 大窗口只在接近真实输入上限时整理旧消息，避免固定小阈值破坏长任务的
 // 稳定前缀和语义。硬预算仍是最终边界；余量用于吸收估算误差和下一次工具结果。
@@ -487,17 +489,15 @@ struct ToolAttemptMetadata {
     recoverable_failure: bool,
 }
 
-/// Identity of a successful read fact already projected into the current
-/// activity plan. The requested lexical path is intentional: symlink aliases
-/// remain distinct, while `./` and `..` spelling variants converge. A content
-/// digest and window bounds prevent a changed file or a different continuation
-/// slice from being mistaken for a duplicate.
+/// 当前 plan 已投影的成功读取事实身份。这里有意使用请求路径的词法身份：
+/// symlink 别名保持区分，而 `./` 和 `..` 的写法会归一；内容、续读和正文
+/// digest 可避免把已变化的文件或不同窗口错误地视为同一事实。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ReadFactIdentity {
     path: String,
     content_digest: String,
-    offset: u64,
-    limit: u64,
+    continuation: String,
+    body_digest: String,
 }
 
 fn read_fact_identity(
@@ -520,14 +520,22 @@ fn read_fact_identity(
     if path.is_empty() {
         return None;
     }
+    let continuation = facts
+        .get("continuation")
+        .and_then(|value| serde_json::to_string(value).ok())
+        .unwrap_or_default();
+    let body_digest = report
+        .envelope
+        .model_visible_excerpt
+        .as_deref()
+        .filter(|body| !body.is_empty())
+        .map(|body| format!("sha256:{:x}", Sha256::digest(body.as_bytes())))
+        .unwrap_or_default();
     Some(ReadFactIdentity {
         path,
         content_digest: content_digest.to_owned(),
-        offset: facts.get("offset").and_then(Value::as_u64).unwrap_or(0),
-        limit: facts
-            .get("limit")
-            .and_then(Value::as_u64)
-            .unwrap_or(u64::MAX),
+        continuation,
+        body_digest,
     })
 }
 
@@ -583,6 +591,65 @@ fn model_visible_tool_result_for_active_plan(
             seen_read_facts.insert(identity);
         }
         projection
+    }
+}
+
+/// 从当前 provider plan 中恢复仍然可见的完整读取事实。新 turn 会继续携带
+/// 旧消息，因此只有正文确实仍在 plan 中时才允许省略下一次相同读取；紧预算
+/// 或 compaction 产生的事实头没有正文，不会进入集合。
+fn seed_seen_read_facts_from_plan(
+    messages: &[ProviderMessage],
+    seen_read_facts: &mut HashSet<ReadFactIdentity>,
+    workspace_root: &Path,
+) {
+    const OUTPUT_SEPARATOR: &str = "\n--- output ---\n";
+
+    for message in messages {
+        if message.role != ProviderRole::Tool || message.tool_name.as_deref() != Some("read_file") {
+            continue;
+        }
+        let Some((header, body)) = message.content.split_once(OUTPUT_SEPARATOR) else {
+            continue;
+        };
+        if body.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(header.trim()) else {
+            continue;
+        };
+        if value.get("status").and_then(Value::as_str) != Some("ok") {
+            continue;
+        }
+        let Some(facts) = value.get("structured_facts").and_then(Value::as_object) else {
+            continue;
+        };
+        if facts.get("model_visible_truncated") == Some(&Value::Bool(true)) {
+            continue;
+        }
+        let Some(content_digest) = facts.get("content_digest").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(path) = facts
+            .get("path")
+            .and_then(Value::as_str)
+            .or_else(|| facts.get("resolved_path").and_then(Value::as_str))
+        else {
+            continue;
+        };
+        let path = lexical_workspace_path_key(path, workspace_root);
+        if path.is_empty() || content_digest.trim().is_empty() {
+            continue;
+        }
+        let continuation = facts
+            .get("continuation")
+            .and_then(|value| serde_json::to_string(value).ok())
+            .unwrap_or_default();
+        seen_read_facts.insert(ReadFactIdentity {
+            path,
+            content_digest: content_digest.trim().to_owned(),
+            continuation,
+            body_digest: format!("sha256:{:x}", Sha256::digest(body.as_bytes())),
+        });
     }
 }
 
@@ -1408,9 +1475,9 @@ where
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         };
-        // 首轮仍按目标按需暴露可选能力；resume 会从已记录的 provider
-        // surface 继承工具。后续 turn 使用单向扩展，避免同一线程因目标措辞
-        // 变化而收缩工具目录并打断 provider 前缀缓存。
+        // Coding profile 从首轮固定暴露已批准的八个 provider 工具；resume
+        // 继续继承同一 surface。后续 turn 只在 profile/契约明确改变时重建，
+        // 避免目标措辞变化打断 provider 前缀缓存。
         let mut provider_tools = provider_tools_for_turn(
             &all_provider_tools,
             &current_task_contract,
@@ -1540,6 +1607,11 @@ where
         // 初始消息再立即覆盖的无效分配。
         let mut plan = base_plan;
         let mut message_token_total = plan.estimated_message_tokens();
+        seed_seen_read_facts_from_plan(
+            &plan.messages,
+            &mut seen_read_facts,
+            self.tool_executor.workspace_root(),
+        );
         let mut observed_context_usage: Option<ObservedContextUsage> = None;
         let compaction_limit = active_working_set_soft_limit(plan.budget_snapshot.budget_limit)
             .unwrap_or(plan.budget_snapshot.budget_limit);
@@ -1649,7 +1721,6 @@ where
                             current_task_contract.requires_workspace_evidence();
                         tool_reports.clear();
                         tool_attempts.clear();
-                        seen_read_facts.clear();
                         turn_state = TurnState::new(current_turn_id);
                         goal_ledger.original_objective = current_objective.clone();
                         goal_ledger.success_criteria = current_completion_criteria.clone();
@@ -1694,6 +1765,11 @@ where
                             visibility: ModelInputVisibility::ModelVisible,
                         },
                         &mut message_token_total,
+                    );
+                    seed_seen_read_facts_from_plan(
+                        &plan.messages,
+                        &mut seen_read_facts,
+                        self.tool_executor.workspace_root(),
                     );
                 }
                 let step_snapshot = step_machine.begin(current_turn_id);
@@ -4585,7 +4661,7 @@ fn provider_tools_for_turn(
     contract: &TaskContract,
     profile: AgentToolProfile,
     registry: &ToolRegistry,
-    objective: &str,
+    _objective: &str,
 ) -> Vec<ToolContract> {
     if matches!(profile, AgentToolProfile::None) {
         return Vec::new();
@@ -4595,8 +4671,6 @@ fn provider_tools_for_turn(
         .filter(|tool| {
             is_pi_plus_tool(&tool.tool_name)
                 && tool_allowed_for_profile(&tool.tool_name, profile, registry)
-                && (matches!(profile, AgentToolProfile::Full)
-                    || core_or_requested_optional_tool(&tool.tool_name, objective))
                 && (!matches!(
                     contract.workspace_change,
                     WorkspaceChangeRequirement::Forbidden
@@ -4605,7 +4679,7 @@ fn provider_tools_for_turn(
         .cloned()
         .map(|tool| project_tool_for_profile(tool, profile, registry))
         .collect::<Vec<_>>();
-    tools.sort_by(|left, right| left.tool_name.cmp(&right.tool_name));
+    sort_provider_tools(&mut tools);
     tools
 }
 
@@ -4644,9 +4718,9 @@ fn project_tool_for_profile(
     tool
 }
 
-/// 在单个执行线程内保持 provider 工具目录稳定，同时允许加入目标明确请求的
-/// 可选能力。只有当前 profile 和任务契约仍允许时才保留已有工具；profile
-/// 变化或显式禁用工具仍会形成真实缓存边界。
+/// 在单个执行线程内保持 provider 工具目录稳定。Coding profile 的八个已批准
+/// 工具从首个请求开始固定预声明，避免目标措辞变化或首次使用后台能力时重建
+/// provider schema；profile 变化或显式禁用工具仍会形成真实缓存边界。
 fn stable_provider_tools_for_turn(
     previous: &[ToolContract],
     mut candidate: Vec<ToolContract>,
@@ -4682,96 +4756,16 @@ fn stable_provider_tools_for_turn(
         known.insert(tool.tool_name.clone());
         candidate.push(project_tool_for_profile(tool.clone(), profile, registry));
     }
-    candidate.sort_by(|left, right| left.tool_name.cmp(&right.tool_name));
+    sort_provider_tools(&mut candidate);
     candidate
 }
 
-/// Coding profile 默认发送紧凑的本地编码工具面；网络搜索、子代理和后台
-/// 会话只有在目标明确需要时加入，并且在同一线程内只允许单向扩展。这样
-/// 常规任务不会为了未使用的生命周期能力支付 schema 和决策成本。
-/// Full profile 仍完整透传全部工具。
-fn core_or_requested_optional_tool(tool_name: &str, objective: &str) -> bool {
-    match tool_name {
-        "shell_session" => objective_requests_background_session(objective),
-        "web_search" => objective_mentions_any(
-            objective,
-            &[
-                "web search",
-                "web_search",
-                "search the web",
-                "internet",
-                "online",
-                "联网",
-                "网络搜索",
-                "网页搜索",
-                "网上",
-            ],
-        ),
-        "subagent" => objective_mentions_any(
-            objective,
-            &[
-                "subagent",
-                "sub-agent",
-                "child agent",
-                "delegate",
-                "delegat",
-                "parallel agent",
-                "子代理",
-                "子任务",
-                "委托",
-            ],
-        ),
-        _ => true,
-    }
-}
-
-/// 只有目标明确涉及后台进程生命周期时才暴露会话工具。普通的“长任务”
-/// 描述的是代理任务本身，不应被解释为需要后台进程。
-fn objective_requests_background_session(objective: &str) -> bool {
-    objective_mentions_any(
-        objective,
-        &[
-            "shell_session",
-            "background process",
-            "background command",
-            "background job",
-            "run in background",
-            "running in background",
-            "process session",
-            "wait for the process",
-            "wait for process",
-            "process state",
-            "poll process",
-            "resume process",
-            "terminate process",
-            "long-running process",
-            "long running process",
-            "long-running command",
-            "long running command",
-            "long-running server",
-            "long running server",
-            "long-running service",
-            "long running service",
-            "asynchronous process",
-            "async process",
-            "后台进程",
-            "后台命令",
-            "后台运行",
-            "后台任务",
-            "等待进程",
-            "进程状态",
-            "轮询进程",
-            "终止进程",
-            "长时间运行的进程",
-            "长运行进程",
-            "异步进程",
-        ],
-    )
-}
-
-fn objective_mentions_any(objective: &str, phrases: &[&str]) -> bool {
-    let normalized = objective.to_ascii_lowercase();
-    phrases.iter().any(|phrase| normalized.contains(phrase))
+fn sort_provider_tools(tools: &mut [ToolContract]) {
+    tools.sort_by(|left, right| {
+        provider_tool_rank(&left.tool_name)
+            .cmp(&provider_tool_rank(&right.tool_name))
+            .then_with(|| left.tool_name.cmp(&right.tool_name))
+    });
 }
 
 /// A user can explicitly request a pure response.  In that case sending the
@@ -5138,17 +5132,13 @@ fn provider_tool_snapshot(tools: &[ToolContract]) -> (Vec<String>, u64, String) 
         digests.push(digest);
         token_count = token_count.saturating_add(tokens);
     }
-    let digest = provider_tools_digest_from_digests(&mut digests);
+    let digest = provider_tools_digest_from_digests(&digests);
     (digests, token_count, digest)
 }
 
-fn provider_tools_digest_from_digests(digests: &mut [String]) -> String {
-    // `provider_tools_for_turn` returns name-sorted contracts. Keep the
-    // defensive ordering guarantee for external callers while avoiding a
-    // second allocation when the list is already canonical.
-    if !digests.windows(2).all(|pair| pair[0] <= pair[1]) {
-        digests.sort_unstable();
-    }
+fn provider_tools_digest_from_digests(digests: &[String]) -> String {
+    // 工具顺序会影响模型选择，也是 provider wire 的一部分；摘要必须保留
+    // 当前稳定顺序，才能准确诊断工具目录变化造成的缓存边界。
     let mut digest = Sha256::new();
     digest.update(b"[");
     for (index, value) in digests.iter().enumerate() {

@@ -795,6 +795,7 @@ async fn openai_responses_auto_summary_preserves_reasoning_effort_and_parallel_t
 
     assert_eq!(body["reasoning"]["summary"], "auto");
     assert_eq!(body["reasoning"]["effort"], "high");
+    assert_eq!(body["tool_choice"], "auto");
     assert_eq!(body["parallel_tool_calls"], true);
     assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
 }
@@ -967,6 +968,33 @@ async fn codex_responses_default_policy_leaves_retention_to_provider() {
     let session_header = session_id.to_string();
     assert_eq!(
         requests[0].headers.get("session-id").map(String::as_str),
+        Some(session_header.as_str())
+    );
+}
+
+#[tokio::test]
+async fn generic_responses_default_policy_leaves_retention_to_provider() {
+    let response = include_str!("fixtures/openai-responses/text-response.sse");
+    let (base_url, captured) =
+        spawn_provider_sequence(vec![TestProviderResponse::sse(200, response)]).await;
+    let provider = openai_responses_generic_provider(base_url);
+    let session_id = SessionId::new();
+    let mut request = simple_request("gpt-golden");
+    request.session_id = Some(session_id);
+    request.cache_policy = provider.preferred_cache_policy();
+
+    provider
+        .complete(request)
+        .await
+        .expect("automatic cache policy request");
+
+    let requests = captured.await.expect("Responses request capture");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].body["prompt_cache_key"], session_id.to_string());
+    assert!(requests[0].body.get("prompt_cache_retention").is_none());
+    let session_header = session_id.to_string();
+    assert_eq!(
+        requests[0].headers.get("session_id").map(String::as_str),
         Some(session_header.as_str())
     );
 }

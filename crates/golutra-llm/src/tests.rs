@@ -1399,7 +1399,7 @@ fn openai_request_output_limit_overrides_the_profile_default() {
 }
 
 #[test]
-fn openai_tools_request_parallel_tool_calls_explicitly() {
+fn openai_compatible_tools_request_leaves_tool_controls_to_provider_defaults() {
     let mut request = request();
     request.tools.push(golutra_core::ToolContract {
         tool_name: "read_file".to_owned(),
@@ -1423,8 +1423,8 @@ fn openai_tools_request_parallel_tool_calls_explicitly() {
         false,
     );
 
-    assert_eq!(body["tool_choice"], "auto");
-    assert_eq!(body["parallel_tool_calls"], true);
+    assert!(body.get("tool_choice").is_none());
+    assert!(body.get("parallel_tool_calls").is_none());
 }
 
 #[test]
@@ -1442,7 +1442,7 @@ fn provider_cache_profile_gates_compatible_gateway_fields() {
     assert!(golutra.supports_long_retention(golutra_core::PromptCachePolicy::Long));
     assert_eq!(
         golutra.preferred_cache_policy(),
-        golutra_core::PromptCachePolicy::Long
+        golutra_core::PromptCachePolicy::Auto
     );
 
     let codex =
@@ -1475,6 +1475,7 @@ fn provider_cache_profile_gates_compatible_gateway_fields() {
     let responses_custom =
         ProviderCacheProfile::for_provider(ProviderProtocol::OpenAiResponses, "custom-responses");
     assert!(responses_custom.prompt_cache_key(golutra_core::PromptCachePolicy::Long));
+    assert!(responses_custom.supports_long_retention(golutra_core::PromptCachePolicy::Long));
     assert!(
         responses_custom
             .affinity_headers(golutra_core::PromptCachePolicy::None)
@@ -1482,7 +1483,25 @@ fn provider_cache_profile_gates_compatible_gateway_fields() {
     );
     assert_eq!(
         responses_custom.preferred_cache_policy(),
-        golutra_core::PromptCachePolicy::Long
+        golutra_core::PromptCachePolicy::Auto
+    );
+}
+
+#[test]
+fn provider_cache_profile_keeps_long_retention_explicit() {
+    let responses =
+        ProviderCacheProfile::for_provider(ProviderProtocol::OpenAiResponses, "custom-responses");
+    assert!(responses.supports_long_retention(golutra_core::PromptCachePolicy::Long));
+    assert_eq!(
+        responses.preferred_cache_policy(),
+        golutra_core::PromptCachePolicy::Auto
+    );
+
+    let unknown =
+        ProviderCacheProfile::for_provider(ProviderProtocol::OpenAiCompatible, "unknown-gateway");
+    assert_eq!(
+        unknown.preferred_cache_policy(),
+        golutra_core::PromptCachePolicy::Auto
     );
 }
 
@@ -1554,7 +1573,7 @@ fn provider_adapters_expose_capability_gated_cache_policy() {
     });
     assert_eq!(
         responses.preferred_cache_policy(),
-        golutra_core::PromptCachePolicy::Long
+        golutra_core::PromptCachePolicy::Auto
     );
 
     let unknown = OpenAiCompatibleProvider::from_config(OpenAiCompatibleProviderConfig {

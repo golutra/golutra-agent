@@ -23,7 +23,7 @@ const MIN_RECENT_HISTORY_TOKENS: u64 = 1_024;
 const MAX_WORKING_SUMMARY_TOKENS: u64 = 2_048;
 const ACTIVE_PATH_COMPACTION_MAX_DEPTH: u32 = 65_536;
 const MAX_RESUME_PROVIDER_REQUEST_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_RESUME_PROVIDER_MESSAGES: usize = 16_384;
+pub(super) const MAX_RESUME_PROVIDER_MESSAGES: usize = 16_384;
 fn memory_candidate_limit(context_budget: u64) -> usize {
     if context_budget == 0 {
         return 0;
@@ -349,8 +349,8 @@ impl RuntimeHost {
     }
 }
 
-/// 恢复完整 transcript 并追加当前目标；由 runtime 在发送前统一执行预算和
-/// 模型摘要，不能在这里提前丢失摘要需要的历史。宿主的消息数与字节上限仍生效。
+/// 恢复完整 provider transcript 并追加当前目标。上下文预算和语义压缩统一由
+/// runtime 处理；这里改写旧消息会破坏稳定前缀，也会丢失模型摘要所需的来源。
 pub(crate) fn resume_provider_messages(
     mut messages: Vec<ProviderMessage>,
     previous_task_id: TaskId,
@@ -365,22 +365,33 @@ pub(crate) fn resume_provider_messages(
         .last()
         .is_some_and(|message| message.role == ProviderRole::User && message.content == objective);
     let append_objective = previous_task_id != current_task_id || !already_current_objective;
-    let objective_message = ProviderMessage {
-        role: ProviderRole::User,
-        content: objective.to_owned(),
-        tool_call_id: None,
-        tool_name: None,
-        tool_calls: Vec::new(),
-        metadata: Default::default(),
-    };
     if messages.len() > MAX_RESUME_PROVIDER_MESSAGES {
         return None;
     }
+
     if append_objective {
-        messages.push(objective_message);
+        messages.push(ProviderMessage {
+            role: ProviderRole::User,
+            content: objective.to_owned(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+            metadata: Default::default(),
+        });
     }
-    (messages.len() <= MAX_RESUME_PROVIDER_MESSAGES && provider_transcript_is_replayable(&messages))
+    // 当前目标也属于回放 wire；检查追加后的最终形状，避免已到上限的历史
+    // 仅通过前缀检查后在 resume 时再增长一条消息。
+    if messages.len() > MAX_RESUME_PROVIDER_MESSAGES {
+        return None;
+    }
+    (replay_wire_within_limit(&messages) && provider_transcript_is_replayable(&messages))
         .then_some(messages)
+}
+
+fn replay_wire_within_limit(messages: &[ProviderMessage]) -> bool {
+    serde_json::to_vec(messages)
+        .map(|bytes| bytes.len() <= MAX_RESUME_PROVIDER_REQUEST_BYTES as usize)
+        .unwrap_or(false)
 }
 
 pub(crate) fn provider_transcript_is_replayable(messages: &[ProviderMessage]) -> bool {
@@ -1343,17 +1354,22 @@ impl RuntimeHost {
         let workspace_root = self.execution_workspace_root()?;
         let policy = WorkspacePolicy::new(workspace_root.clone())
             .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
-        let mut tool_executor = self
-            .build_tool_executor(policy, workspace_root.clone(), requested_network, yolo)
-            .await?;
         let delegated_task = task
             .payload
             .get(crate::delegation::DELEGATED_TASK_MARKER)
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let prompt_cache_scope = self
-            .prompt_cache_scope(task.session_id, delegated_task)
-            .await?;
+        // 三项准备都只读取互相独立的配置或状态。并发启动可避免冷启动时
+        // 串行等待插件发现、血缘查询和 provider 路由解析；结果仍按原有
+        // 顺序解包，以保持多个准备失败时的错误优先级。
+        let provider_cancellation = control.cancellation_token();
+        let (tool_executor_result, prompt_cache_scope_result, provider_plan_result) = tokio::join!(
+            self.build_tool_executor(policy, workspace_root.clone(), requested_network, yolo),
+            self.prompt_cache_scope(task.session_id, delegated_task),
+            self.resolve_provider_plan_with_auth(&task, &objective, provider_cancellation,),
+        );
+        let mut tool_executor = tool_executor_result?;
+        let prompt_cache_scope = prompt_cache_scope_result?;
         tool_executor = tool_executor
             .with_task_delegation_backend(Arc::new(
                 crate::delegation::RuntimeTaskDelegationBackend::new(Arc::downgrade(&self)),
@@ -1368,9 +1384,7 @@ impl RuntimeHost {
             .into_iter()
             .map(|contract| contract.tool_name.clone())
             .collect::<Vec<_>>();
-        let provider_plan = self
-            .resolve_provider_plan_with_auth(&task, &objective, control.cancellation_token())
-            .await?;
+        let provider_plan = provider_plan_result?;
         let MockProviderPlan {
             provider,
             fallback_provider,
@@ -1380,15 +1394,25 @@ impl RuntimeHost {
             provider_session_policy,
         } = provider_plan;
         let context_budget = context_builder.budget_limit();
-        let resume_context = self
-            .resume_provider_context(
+        // 回放和 contributor 发现都没有副作用。并发执行可让恢复的长任务在
+        // 首次 provider 请求前少付出一次存储往返；结果仍在下方按原顺序检查。
+        let (resume_context_result, contributors_result) = tokio::join!(
+            self.resume_provider_context(
                 task.session_id,
                 task.task_id,
                 &objective,
                 &provider,
                 &prompt_cache_scope,
-            )
-            .await?;
+            ),
+            self.context_contributors_for_task_with_budget(
+                task.session_id,
+                task.task_id,
+                objective.clone(),
+                task.payload.get("output_schema"),
+                context_budget,
+            ),
+        );
+        let resume_context = resume_context_result?;
         let legacy_task = LegacyTaskAdapter::new(&task.payload, &objective);
         if !has_explicit_task_contract && should_apply_legacy_adapter(&task.payload, execution_mode)
         {
@@ -1417,15 +1441,7 @@ impl RuntimeHost {
             Some(fallback) => harness.with_fallback(fallback),
             None => harness,
         };
-        let contributors = self
-            .context_contributors_for_task_with_budget(
-                task.session_id,
-                task.task_id,
-                objective.clone(),
-                task.payload.get("output_schema"),
-                context_budget,
-            )
-            .await?;
+        let contributors = contributors_result?;
         let trace_recorder = HostedObservationRecorder::spawn(self.clone(), task.clone());
         let trace_tx = trace_recorder.sender();
         let observation_send_error = Arc::new(StdMutex::new(None));

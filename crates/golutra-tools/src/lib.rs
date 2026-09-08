@@ -81,6 +81,9 @@ const MAX_MODEL_TOOL_SEARCH_SNIPPET_CHARS: usize = 320;
 const MAX_READ_FILE_HINT_DEPTH: usize = 6;
 const MAX_READ_FILE_HINT_ENTRIES: usize = 2_048;
 const MAX_READ_FILE_HINT_CANDIDATES: usize = 8;
+// 严格补丁失败后只回传一次修复所需的当前正文；更大的文件必须显式续读，
+// 避免错误路径把整个源文件重复推入后续每个 provider 请求。
+const MAX_PATCH_RECOVERY_CONTENT_BYTES: usize = 3 * 1024;
 const EXTERNAL_TOOL_TIMEOUT_MS: u64 = if cfg!(test) { 100 } else { 30_000 };
 const MAX_VERIFIER_TIMEOUT_MS: u64 = 30 * 60 * 1_000;
 const MAX_VERIFIER_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
@@ -123,18 +126,28 @@ use builtin::BuiltinTool;
 /// 面向 provider 的稳定契约，保持默认模型工具面足够小。
 pub const PI_PLUS_TOOL_NAMES: [&str; 8] = [
     "read_file",
-    "write_file",
-    "edit_file",
     "shell",
-    "web_search",
-    "shell_session",
-    "subagent",
+    "edit_file",
+    "write_file",
     "apply_patch",
+    "shell_session",
+    "web_search",
+    "subagent",
 ];
 
 #[must_use]
 pub fn is_pi_plus_tool(tool_name: &str) -> bool {
     PI_PLUS_TOOL_NAMES.contains(&tool_name)
+}
+
+/// Provider 工具按常见工作流排列，让读取、命令、精确编辑和完整写入形成
+/// 稳定邻接；未知扩展工具保持在内置工具之后并按名称稳定排序。
+#[must_use]
+pub fn provider_tool_rank(tool_name: &str) -> usize {
+    PI_PLUS_TOOL_NAMES
+        .iter()
+        .position(|candidate| *candidate == tool_name)
+        .unwrap_or(PI_PLUS_TOOL_NAMES.len())
 }
 
 #[derive(Debug, Error)]
@@ -371,7 +384,11 @@ impl ToolRegistry {
             .values()
             .filter(|contract| is_pi_plus_tool(&contract.tool_name))
             .collect::<Vec<_>>();
-        contracts.sort_by(|left, right| left.tool_name.cmp(&right.tool_name));
+        contracts.sort_by(|left, right| {
+            provider_tool_rank(&left.tool_name)
+                .cmp(&provider_tool_rank(&right.tool_name))
+                .then_with(|| left.tool_name.cmp(&right.tool_name))
+        });
         contracts
     }
 
@@ -1802,10 +1819,14 @@ impl ToolRuntime {
 
     async fn execution_error_facts_with_hints(&self, request: &ToolRequest, reason: &str) -> Value {
         let mut facts = execution_error_facts(request, reason);
-        let Some(candidates) = self.read_file_path_candidates(request, reason).await else {
-            return facts;
-        };
-        if let Value::Object(object) = &mut facts {
+        if let Some(patch_facts) = self.patch_context_failure_facts(request, reason).await
+            && let (Value::Object(object), Value::Object(patch_facts)) = (&mut facts, patch_facts)
+        {
+            object.extend(patch_facts);
+        }
+        if let Some(candidates) = self.read_file_path_candidates(request, reason).await
+            && let Value::Object(object) = &mut facts
+        {
             object.insert("candidates".to_owned(), json!(candidates));
             object.insert(
                 "next_action".to_owned(),
@@ -1813,6 +1834,59 @@ impl ToolRuntime {
             );
         }
         facts
+    }
+
+    /// 严格匹配失败时返回一次重建补丁所需的最小当前事实，不尝试模糊匹配或
+    /// 改写模型请求。失败仍保持失败，原始错误继续完整进入 artifact。
+    async fn patch_context_failure_facts(
+        &self,
+        request: &ToolRequest,
+        reason: &str,
+    ) -> Option<Value> {
+        let error_kind = patch_context_error_kind(reason)?;
+        if request.tool_name != "apply_patch" {
+            return None;
+        }
+        let patch = request.arguments.get("patch").and_then(Value::as_str)?;
+        let parsed = model_patch::parse(patch).ok()?;
+        let source_path = parsed
+            .files
+            .iter()
+            .filter(|file| matches!(file.kind, model_patch::ModelPatchFileKind::Update(_)))
+            .find(|file| reason.contains(&format!("for `{}`", file.path.to_string_lossy())))
+            .or_else(|| {
+                let mut updates = parsed
+                    .files
+                    .iter()
+                    .filter(|file| matches!(file.kind, model_patch::ModelPatchFileKind::Update(_)));
+                let only = updates.next()?;
+                updates.next().is_none().then_some(only)
+            })?
+            .path
+            .clone();
+        let resolved_path = self
+            .resolve_tool_path("apply_patch", &source_path, true)
+            .ok()?;
+        let content = tokio::fs::read(&resolved_path).await.ok()?;
+        let text = std::str::from_utf8(&content).ok()?;
+        let mut facts = current_mutation_content_facts(&source_path, text);
+        let current_content_truncated = facts["current_content_truncated"] == true;
+        facts.insert(
+            "error_kind".to_owned(),
+            Value::String(error_kind.to_owned()),
+        );
+        facts.insert(
+            "next_action".to_owned(),
+            Value::String(
+                if current_content_truncated {
+                    "read only the failed file range needed for an exact patch, then retry once"
+                } else {
+                    "regenerate one exact patch from current_content and retry once; do not repeat workspace discovery"
+                }
+                .to_owned(),
+            ),
+        );
+        Some(Value::Object(facts))
     }
 
     async fn read_file_path_candidates(
@@ -2170,16 +2244,41 @@ impl ToolRuntime {
         let (edited, replacement_count) = match apply_file_edits(&original, &edits) {
             Ok(result) => result,
             Err(failure) => {
+                let mut facts = current_mutation_content_facts(Path::new(&path), &original);
+                let current_content_truncated = facts["current_content_truncated"] == true;
+                let error_kind = if failure.overlap {
+                    "edit_overlap"
+                } else if failure.search_found {
+                    "edit_target_not_unique"
+                } else {
+                    "edit_target_not_found"
+                };
+                facts.insert(
+                    "edit_index".to_owned(),
+                    Value::Number(failure.edit_index.into()),
+                );
+                facts.insert("search_found".to_owned(), Value::Bool(failure.search_found));
+                facts.insert("overlap".to_owned(), Value::Bool(failure.overlap));
+                facts.insert("replacements".to_owned(), Value::Number(0.into()));
+                facts.insert(
+                    "error_kind".to_owned(),
+                    Value::String(error_kind.to_owned()),
+                );
+                facts.insert(
+                    "next_action".to_owned(),
+                    Value::String(
+                        if current_content_truncated {
+                            "read only the failed file range needed for exact edits, then retry once"
+                        } else {
+                            "regenerate exact edits from current_content and retry once; do not repeat workspace discovery"
+                        }
+                        .to_owned(),
+                    ),
+                );
                 return Ok(error_report(
                     request,
                     &failure.summary,
-                    json!({
-                        "path": resolved_path,
-                        "edit_index": failure.edit_index,
-                        "search_found": failure.search_found,
-                        "overlap": failure.overlap,
-                        "replacements": 0,
-                    }),
+                    Value::Object(facts),
                     original,
                     policy,
                 ));
@@ -3773,6 +3872,43 @@ fn execution_error_facts(request: &ToolRequest, reason: &str) -> Value {
     Value::Object(facts)
 }
 
+fn patch_context_error_kind(reason: &str) -> Option<&'static str> {
+    if reason.contains("model patch context does not match") {
+        Some("patch_context_mismatch")
+    } else if reason.contains("model patch context is ambiguous") {
+        Some("patch_context_ambiguous")
+    } else {
+        None
+    }
+}
+
+fn current_mutation_content_facts(path: &Path, content: &str) -> serde_json::Map<String, Value> {
+    let (redacted, _) = redact_sensitive_text(content);
+    let current_content_truncated = redacted.len() > MAX_PATCH_RECOVERY_CONTENT_BYTES;
+    let (path, _) = redact_sensitive_text(&path.to_string_lossy());
+    serde_json::Map::from_iter([
+        (
+            "path".to_owned(),
+            Value::String(bounded_text(&path, MAX_PATH_ARGUMENT_CHARS)),
+        ),
+        (
+            "content_digest".to_owned(),
+            Value::String(checksum(content.as_bytes())),
+        ),
+        (
+            "current_content".to_owned(),
+            Value::String(bounded_text_bytes(
+                &redacted,
+                MAX_PATCH_RECOVERY_CONTENT_BYTES,
+            )),
+        ),
+        (
+            "current_content_truncated".to_owned(),
+            Value::Bool(current_content_truncated),
+        ),
+    ])
+}
+
 /// 将 checkpoint 失败转换为有限、可执行的模型事实。这里只描述下一步所需的
 /// 路径关系，不尝试修复目录或重放请求；完整 provider 错误仍保存在 artifact。
 fn add_checkpoint_error_facts(
@@ -4994,6 +5130,8 @@ const MUTATION_MODEL_FACTS: &[&str] = &[
     "changed",
     "idempotent",
     "content_digest",
+    "current_content",
+    "current_content_truncated",
     "changed_files",
     "changed_file_count",
     "workspace_change_count",
@@ -5003,9 +5141,11 @@ const MUTATION_MODEL_FACTS: &[&str] = &[
     "bytes",
     "replacements",
     "edit_count",
+    "edit_index",
     "error_kind",
     "conflict",
     "search_found",
+    "overlap",
     "max_bytes",
     "exit_code",
     "timed_out",
@@ -5015,6 +5155,7 @@ const MUTATION_MODEL_FACTS: &[&str] = &[
     "parent",
     "parent_missing",
     "action_required",
+    "next_action",
     "checkpointed_paths",
     "resolved_paths",
     "output_truncated",

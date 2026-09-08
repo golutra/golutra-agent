@@ -400,16 +400,11 @@ impl ProviderCacheProfile {
         policy != PromptCachePolicy::None && self.supports_cache_control
     }
 
-    /// 对明确声明长期保留能力的 Responses/兼容网关，主会话默认保持长期
-    /// retention，使跨回合和 resume 不依赖上游短 TTL。未知网关、Codex
-    /// 专用 profile 与不支持长期保留的 provider 继续使用保守的 Auto。
-    /// Anthropic 保留其短 TTL 默认值；显式 Long 仍由调用方控制。
+    /// 主会话默认遵循 provider 的短期缓存策略；长期保留能力只在调用方
+    /// 明确选择 `PromptCachePolicy::Long` 时生效，避免把请求分到不同缓存分片。
+    /// 未知网关同样保持 provider 默认策略，避免发送未声明的扩展字段。
     fn preferred_cache_policy(self) -> PromptCachePolicy {
-        if self.mode == ProviderCacheMode::Responses && self.supports_long_retention {
-            PromptCachePolicy::Long
-        } else {
-            PromptCachePolicy::Auto
-        }
+        PromptCachePolicy::Auto
     }
 }
 
@@ -2810,10 +2805,6 @@ fn openai_completion_body_with_identity(
     });
     if !request.tools.is_empty() {
         body["tools"] = Value::Array(request.tools.iter().map(openai_tool_schema).collect());
-        body["tool_choice"] = Value::String("auto".to_owned());
-        // 明确要求 provider 在一次响应中并行发出彼此独立的工具调用，
-        // 避免兼容端点因默认值差异把多文件任务退化为串行回合。
-        body["parallel_tool_calls"] = Value::Bool(true);
     }
     if streaming {
         body["stream"] = Value::Bool(true);

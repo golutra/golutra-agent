@@ -302,6 +302,53 @@ fn repeated_read_projection_preserves_continuation_under_a_tight_budget() {
 }
 
 #[test]
+fn repeated_read_projection_reuses_a_complete_body_from_the_existing_plan() {
+    let workspace = Path::new("/workspace");
+    let report = read_fact_report("src/lib.rs", "sha256:one", 0, 200, "body");
+    let first =
+        model_visible_tool_result_for_active_plan(&report, 2_048, &mut HashSet::new(), workspace);
+    let message = ProviderMessage {
+        role: ProviderRole::Tool,
+        content: first,
+        tool_call_id: Some("call-a".to_owned()),
+        tool_name: Some("read_file".to_owned()),
+        tool_calls: Vec::new(),
+        metadata: Default::default(),
+    };
+    let mut seen = HashSet::new();
+    seed_seen_read_facts_from_plan(std::slice::from_ref(&message), &mut seen, workspace);
+
+    let repeated = model_visible_tool_result_for_active_plan(&report, 2_048, &mut seen, workspace);
+    assert!(!repeated.contains("body"));
+    assert!(repeated.contains("sha256:one"));
+    assert!(repeated.contains("next_offset"));
+}
+
+#[test]
+fn repeated_read_projection_does_not_seed_from_a_compacted_body() {
+    let workspace = Path::new("/workspace");
+    let report = read_fact_report("src/lib.rs", "sha256:one", 0, 200, "body");
+    let mut current_seen = HashSet::new();
+    let _ = model_visible_tool_result_for_active_plan(&report, 2_048, &mut current_seen, workspace);
+    let compacted =
+        model_visible_tool_result_for_active_plan(&report, 2_048, &mut current_seen, workspace);
+    let message = ProviderMessage {
+        role: ProviderRole::Tool,
+        content: compacted,
+        tool_call_id: Some("call-a".to_owned()),
+        tool_name: Some("read_file".to_owned()),
+        tool_calls: Vec::new(),
+        metadata: Default::default(),
+    };
+    let mut seen = HashSet::new();
+    seed_seen_read_facts_from_plan(std::slice::from_ref(&message), &mut seen, workspace);
+    assert!(seen.is_empty());
+
+    let repeated = model_visible_tool_result_for_active_plan(&report, 2_048, &mut seen, workspace);
+    assert!(repeated.contains("body"));
+}
+
+#[test]
 fn repeated_read_projection_reopens_body_after_tight_budget_clipping() {
     let workspace = Path::new("/workspace");
     let body = "complete file body\n".repeat(200);
@@ -6155,7 +6202,7 @@ fn parallel_read_candidate_enforces_the_active_tool_profile() {
             .iter()
             .any(|tool| tool.tool_name == "external_hidden_read")
     );
-    assert_eq!(coding_tools.len(), 5);
+    assert_eq!(coding_tools.len(), 8);
 
     let none_tools = provider_tools_for_turn(
         &executor
@@ -6173,7 +6220,7 @@ fn parallel_read_candidate_enforces_the_active_tool_profile() {
 }
 
 #[test]
-fn coding_tool_surface_adds_optional_capabilities_only_when_requested() {
+fn coding_tool_surface_is_stable_across_objectives() {
     let workspace = tempdir().expect("workspace");
     let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
     let all_tools = executor
@@ -6183,12 +6230,15 @@ fn coding_tool_surface_adds_optional_capabilities_only_when_requested() {
         .cloned()
         .collect::<Vec<_>>();
     let contract = TaskContract::conversational(Vec::new());
-    let core = vec![
-        "apply_patch",
-        "edit_file",
+    let expected = vec![
         "read_file",
         "shell",
+        "edit_file",
         "write_file",
+        "apply_patch",
+        "shell_session",
+        "web_search",
+        "subagent",
     ];
     let selected = provider_tools_for_turn(
         &all_tools,
@@ -6202,22 +6252,30 @@ fn coding_tool_surface_adds_optional_capabilities_only_when_requested() {
             .iter()
             .map(|tool| tool.tool_name.as_str())
             .collect::<Vec<_>>(),
-        core
+        expected
+    );
+    let selected_digest = provider_tool_snapshot(&selected).2;
+    let mut reversed = selected.clone();
+    reversed.reverse();
+    assert_ne!(
+        provider_tool_snapshot(&reversed).2,
+        selected_digest,
+        "provider wire digest must include the stable tool order",
     );
 
-    let optional = provider_tools_for_turn(
+    let next_objective = provider_tools_for_turn(
         &all_tools,
         &contract,
         AgentToolProfile::Coding,
         executor.registry(),
         "search the web and delegate a check in a background process session",
     );
-    assert!(optional.iter().any(|tool| tool.tool_name == "web_search"));
-    assert!(optional.iter().any(|tool| tool.tool_name == "subagent"));
-    assert!(
-        optional
+    assert_eq!(
+        next_objective
             .iter()
-            .any(|tool| tool.tool_name == "shell_session")
+            .map(|tool| tool.tool_name.as_str())
+            .collect::<Vec<_>>(),
+        expected
     );
 
     let full = provider_tools_for_turn(
@@ -6233,7 +6291,7 @@ fn coding_tool_surface_adds_optional_capabilities_only_when_requested() {
 }
 
 #[test]
-fn coding_tool_surface_adds_background_capability_only_when_requested() {
+fn coding_tool_surface_retains_declared_capabilities_without_keyword_matching() {
     let workspace = tempdir().expect("workspace");
     let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).expect("policy"));
     let all_tools = executor
@@ -6251,9 +6309,7 @@ fn coding_tool_surface_adds_background_capability_only_when_requested() {
         executor.registry(),
         "implement the task and keep the code maintainable",
     );
-    assert!(!generic.iter().any(|tool| tool.tool_name == "web_search"));
-    assert!(!generic.iter().any(|tool| tool.tool_name == "subagent"));
-    assert!(!generic.iter().any(|tool| tool.tool_name == "shell_session"));
+    assert_eq!(generic.len(), 8);
 
     let long_task = provider_tools_for_turn(
         &all_tools,
@@ -6262,11 +6318,7 @@ fn coding_tool_surface_adds_background_capability_only_when_requested() {
         executor.registry(),
         "complete this long-running task and keep the code maintainable",
     );
-    assert!(
-        !long_task
-            .iter()
-            .any(|tool| tool.tool_name == "shell_session")
-    );
+    assert_eq!(long_task.len(), 8);
 
     let explicit = provider_tools_for_turn(
         &all_tools,
@@ -6275,11 +6327,7 @@ fn coding_tool_surface_adds_background_capability_only_when_requested() {
         executor.registry(),
         "run the test suite as a background process and wait for the process state",
     );
-    assert!(
-        explicit
-            .iter()
-            .any(|tool| tool.tool_name == "shell_session")
-    );
+    assert_eq!(explicit.len(), 8);
 
     let server = provider_tools_for_turn(
         &all_tools,
@@ -6288,7 +6336,7 @@ fn coding_tool_surface_adds_background_capability_only_when_requested() {
         executor.registry(),
         "start a long-running server and wait for the process state",
     );
-    assert!(server.iter().any(|tool| tool.tool_name == "shell_session"));
+    assert_eq!(server.len(), 8);
 
     let read_only = provider_tools_for_turn(
         &all_tools,
@@ -6300,11 +6348,8 @@ fn coding_tool_surface_adds_background_capability_only_when_requested() {
         executor.registry(),
         "inspect the workspace without changing it",
     );
-    assert!(
-        !read_only
-            .iter()
-            .any(|tool| tool.tool_name == "shell_session")
-    );
+    assert_eq!(read_only.len(), 1);
+    assert_eq!(read_only[0].tool_name, "read_file");
 }
 
 #[test]
@@ -6326,7 +6371,7 @@ fn stable_tool_surface_expands_once_and_does_not_shrink_with_objective_text() {
         executor.registry(),
         "update the ledger files",
     );
-    assert_eq!(initial.len(), 5);
+    assert_eq!(initial.len(), 8);
 
     let expanded_candidate = provider_tools_for_turn(
         &all_tools,
@@ -7149,7 +7194,7 @@ async fn queued_turn_applies_its_own_tool_profile() {
         *process_tool_visibility
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
-        vec![false, true]
+        vec![true, true]
     );
     assert_eq!(outcome.final_turn_id, queued_turn_id);
     assert_eq!(
@@ -7219,7 +7264,7 @@ async fn appended_turn_uses_the_default_coding_surface() {
         *process_tool_visibility
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
-        vec![false, false]
+        vec![true, true]
     );
     assert_eq!(outcome.final_turn_id, queued_turn_id);
     assert!(trace.iter().any(|event| matches!(
@@ -7396,7 +7441,7 @@ async fn configured_pending_turn_without_a_mode_uses_the_default_surface() {
         *process_tool_visibility
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
-        vec![true, false]
+        vec![true, true]
     );
     assert_eq!(outcome.final_turn_id, queued_turn_id);
     assert_eq!(
@@ -7471,7 +7516,7 @@ async fn configured_pending_turn_explicit_surface_overrides_the_active_surface()
         *process_tool_visibility
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
-        vec![true, false]
+        vec![true, true]
     );
     assert_eq!(outcome.final_turn_id, queued_turn_id);
     assert_eq!(

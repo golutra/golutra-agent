@@ -6,7 +6,7 @@ use futures_util::StreamExt;
 use genai::{
     Client, Headers, ModelIden, ServiceTarget, WebConfig,
     adapter::AdapterKind,
-    chat::{ChatOptions, ChatStreamEvent, StreamEnd, ToolCall, ToolChoice},
+    chat::{ChatOptions, ChatStreamEvent, StreamEnd, ToolCall, ToolChoice, Verbosity},
     resolver::{AuthData, Endpoint},
 };
 use golutra_auth::{CredentialProvider, FixedCredentialProvider};
@@ -38,8 +38,8 @@ use super::{
 const CHATGPT_ACCOUNT_ID_HEADER: &str = "ChatGPT-Account-Id";
 const DEFAULT_PROVIDER_ID: &str = "openai-chatgpt";
 
-/// SSE 首帧通常很小，压缩会让代理等待更多字节后才刷新。Responses 使用
-/// 独立的无压缩 client，并保留 TCP_NODELAY、连接池和 HTTP/2 keep-alive。
+/// SSE 首帧通常很小；无压缩可避免代理等待压缩块再刷新。Responses 使用
+/// 独立的无压缩 client，同时保留 TCP_NODELAY、连接池和 HTTP/2 keep-alive。
 fn responses_web_config() -> WebConfig {
     let mut default_headers = HeaderMap::new();
     default_headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
@@ -139,7 +139,10 @@ impl OpenAiResponsesProvider {
             credential,
             config,
             cache_profile,
-            client: Client::builder().with_web_config(web_config).build(),
+            client: Client::builder()
+                .with_web_config(web_config)
+                .build()
+                .expect("static genai client configuration is valid"),
             probe_client: provider_http_client(),
         }
     }
@@ -326,6 +329,12 @@ impl OpenAiResponsesProvider {
             self.cache_profile,
         )?
         .with_extra_headers(self.request_headers(request, account_id));
+        // GPT-5 Responses 使用原生客户端的低 verbosity 默认值。该设置只减少
+        // 解释性文本 token，不改变 reasoning effort 或工具能力，并且仅发送
+        // 给明确支持 Responses `text.verbosity` 字段的模型系列。
+        if responses_model_supports_text_verbosity(&self.config.model_id) {
+            options = options.with_verbosity(Verbosity::Low);
+        }
         let mut reasoning = json!({"summary": "auto"});
         if let Some(effort) = options
             .reasoning_effort
@@ -336,6 +345,8 @@ impl OpenAiResponsesProvider {
         }
         let mut extra_body = json!({"reasoning": reasoning});
         if !request.tools.is_empty() {
+            // 兼容网关可能使用串行/隐式默认值；显式声明与原生客户端一致，
+            // 让模型在一次响应中返回彼此独立的工具调用，同时保留 auto 决策。
             options = options.with_tool_choice(ToolChoice::Auto);
             extra_body["parallel_tool_calls"] = Value::Bool(true);
         }
@@ -433,7 +444,9 @@ impl OpenAiResponsesProvider {
                         retry_with_refresh = true;
                         break;
                     }
-                    Err(error) => return Err(map_responses_genai_error(error)),
+                    Err(error) => {
+                        return Err(map_responses_genai_error(error));
+                    }
                 };
                 match event {
                     ChatStreamEvent::Start | ChatStreamEvent::Heartbeat => {}
@@ -503,12 +516,20 @@ impl OpenAiResponsesProvider {
                 force_refresh = true;
                 continue;
             }
-            let end = stream_end.ok_or_else(|| ProviderError::Unavailable {
-                message: "responses stream ended before a terminal event".to_owned(),
-            })?;
-            return responses_provider_response(end, &model_id, &self.config.provider_id);
+            let Some(end) = stream_end else {
+                return Err(ProviderError::Unavailable {
+                    message: "responses stream ended before a terminal event".to_owned(),
+                });
+            };
+            let response = responses_provider_response(end, &model_id, &self.config.provider_id)?;
+            return Ok(response);
         }
     }
+}
+
+fn responses_model_supports_text_verbosity(model_id: &str) -> bool {
+    let model_id = model_id.trim().to_ascii_lowercase();
+    model_id == "gpt-5" || model_id.starts_with("gpt-5-") || model_id.starts_with("gpt-5.")
 }
 
 #[async_trait]
@@ -763,7 +784,6 @@ fn chatgpt_account_id(access_token: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn response_failed_stream_event_is_not_replayed() {
         let parser_error =
@@ -815,6 +835,15 @@ mod tests {
             Some(std::time::Duration::from_secs(10))
         );
         assert_eq!(config.timeout, Some(std::time::Duration::from_secs(3_600)));
+    }
+
+    #[test]
+    fn gpt5_responses_use_low_text_verbosity_without_affecting_other_models() {
+        assert!(responses_model_supports_text_verbosity("gpt-5"));
+        assert!(responses_model_supports_text_verbosity("gpt-5.5"));
+        assert!(responses_model_supports_text_verbosity("GPT-5-Codex"));
+        assert!(!responses_model_supports_text_verbosity("gpt-4.1"));
+        assert!(!responses_model_supports_text_verbosity("grok-4.5"));
     }
 
     #[test]

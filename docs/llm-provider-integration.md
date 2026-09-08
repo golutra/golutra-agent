@@ -105,10 +105,10 @@ Golutra 不直接复制 qwen-code 的配置文件形状。Golutra 的核心仍�
 
 | 协议/路由 | 请求字段 | 亲和 header | 默认行为 |
 | --- | --- | --- | --- |
-| 通用 `openai-responses` | `prompt_cache_key`；声明长期能力时才发送 `prompt_cache_retention` | `session_id`、`x-client-request-id` | Responses preset |
+| 通用 `openai-responses` | 默认只发 `prompt_cache_key`；显式 `Long` 且声明长期能力时才发 `prompt_cache_retention` | `session_id`、`x-client-request-id` | 上游默认短期窗口 |
 | ChatGPT/Codex Responses | `prompt_cache_key`；不假定长期 retention 或 `cache_control` | `session-id`、`x-client-request-id` | Codex preset |
 | `anthropic` | 仅按声明发送 `cache_control`（5m/1h） | 默认无；明确声明后才发送 `x-session-affinity` | Anthropic preset |
-| 已登记的 OpenAI-compatible（如 `golutra`） | 按显式声明发送 key/retention | 按显式声明发送 | compatible preset |
+| 已登记的 OpenAI-compatible（如 `golutra`） | 默认只发 key；显式 `Long` 时按声明发送 retention | 按显式声明发送 | 上游默认短期窗口 |
 | 未登记的 OpenAI-compatible | 不发送缓存字段或亲和 header | 无 | 保守 disabled |
 
 `prompt_cache_key`、retention、`cache_control` 和 affinity header 是相互独立的能力
