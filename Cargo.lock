@@ -1233,7 +1233,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-app-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -1263,7 +1263,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-auth"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1285,7 +1285,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "clap",
@@ -1313,7 +1313,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1353,7 +1353,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-code-intelligence"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "fs2",
@@ -1372,7 +1372,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-config"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fs2",
  "golutra-auth",
@@ -1388,7 +1388,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-context"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "golutra-core",
@@ -1401,7 +1401,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "schemars 1.2.1",
@@ -1413,7 +1413,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-eval"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "fs2",
@@ -1430,7 +1430,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-eval-model"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "golutra-core",
@@ -1442,7 +1442,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-eval-worker"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "clap",
@@ -1457,14 +1457,14 @@ dependencies = [
 
 [[package]]
 name = "golutra-event"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "golutra-protocol",
 ]
 
 [[package]]
 name = "golutra-evolution"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "fs2",
@@ -1481,7 +1481,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-file-search"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "golutra-core",
  "golutra-policy",
@@ -1496,7 +1496,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-governor"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "golutra-core",
  "schemars 1.2.1",
@@ -1505,7 +1505,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-llm"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1527,7 +1527,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "golutra-core",
@@ -1545,7 +1545,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-memory"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "fs2",
@@ -1560,7 +1560,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-plugin"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "fs2",
@@ -1577,7 +1577,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-policy"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "golutra-core",
  "shlex 1.3.0",
@@ -1589,7 +1589,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-project-service"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1607,7 +1607,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "golutra-core",
@@ -1620,7 +1620,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-protocol-fixtures"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "golutra-core",
@@ -1636,7 +1636,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-release"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "fs2",
@@ -1655,7 +1655,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-runtime"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1688,7 +1688,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-sandbox"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "tempfile",
@@ -1697,7 +1697,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "fs2",
@@ -1715,7 +1715,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-supervisor"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1741,7 +1741,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-test-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "golutra-client",
@@ -1755,7 +1755,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-tools"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1781,7 +1781,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-tui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -1817,7 +1817,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-verify"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "golutra-core",
@@ -1825,7 +1825,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-vis"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "clap",

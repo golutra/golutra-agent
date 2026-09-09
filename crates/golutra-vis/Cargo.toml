@@ -15,10 +15,10 @@ categories.workspace = true
 [dependencies]
 chrono.workspace = true
 clap.workspace = true
-golutra-client = { path = "../golutra-client", version = "0.1.0" }
+golutra-client = { path = "../golutra-client", version = "0.2.0" }
 golutra-core.workspace = true
 golutra-protocol.workspace = true
-golutra-tools = { path = "../golutra-tools", version = "0.1.0" }
+golutra-tools = { path = "../golutra-tools", version = "0.2.0" }
 miette.workspace = true
 schemars.workspace = true
 serde.workspace = true

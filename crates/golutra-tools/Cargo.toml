@@ -17,8 +17,8 @@ async-trait.workspace = true
 futures-util.workspace = true
 chrono.workspace = true
 golutra-core.workspace = true
-golutra-code-intelligence = { path = "../golutra-code-intelligence", version = "0.1.0" }
-golutra-policy = { path = "../golutra-policy", version = "0.1.0" }
+golutra-code-intelligence = { path = "../golutra-code-intelligence", version = "0.2.0" }
+golutra-policy = { path = "../golutra-policy", version = "0.2.0" }
 golutra-sandbox.workspace = true
 jsonschema.workspace = true
 regex.workspace = true

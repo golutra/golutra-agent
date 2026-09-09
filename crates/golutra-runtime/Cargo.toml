@@ -16,14 +16,14 @@ categories.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
-golutra-context = { path = "../golutra-context", version = "0.1.0" }
+golutra-context = { path = "../golutra-context", version = "0.2.0" }
 golutra-core.workspace = true
-golutra-governor = { path = "../golutra-governor", version = "0.1.0" }
-golutra-llm = { path = "../golutra-llm", version = "0.1.0" }
-golutra-policy = { path = "../golutra-policy", version = "0.1.0" }
+golutra-governor = { path = "../golutra-governor", version = "0.2.0" }
+golutra-llm = { path = "../golutra-llm", version = "0.2.0" }
+golutra-policy = { path = "../golutra-policy", version = "0.2.0" }
 golutra-protocol.workspace = true
-golutra-tools = { path = "../golutra-tools", version = "0.1.0" }
-golutra-verify = { path = "../golutra-verify", version = "0.1.0" }
+golutra-tools = { path = "../golutra-tools", version = "0.2.0" }
+golutra-verify = { path = "../golutra-verify", version = "0.2.0" }
 ignore.workspace = true
 jsonschema.workspace = true
 regex.workspace = true

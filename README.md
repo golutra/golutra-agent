@@ -37,7 +37,7 @@ than the model's own claim. The same facts can then drive the user interface,
 debugging, replay, evaluation, and controlled improvement without mixing those
 concerns into the conversation.
 
-> Status: `0.1.0` is an early, actively evolving release. Runtime and protocol
+> Status: `0.2.0` is an early, actively evolving release. Runtime and protocol
 > APIs may change before a stable compatibility policy is published.
 
 ## English
@@ -374,7 +374,7 @@ TUI 的非敏感默认配置按 `$GOLUTRA_HOME/runtime.json` →
 - 安全策略：[SECURITY.md](SECURITY.md)
 - 变更记录：[CHANGELOG.md](CHANGELOG.md)
 
-项目当前处于 `0.1.0` 早期阶段，协议和运行时边界仍可能演进。欢迎提交代码、
+项目当前处于 `0.2.0` 早期阶段，协议和运行时边界仍可能演进。欢迎提交代码、
 测试、文档和可复现的 issue；涉及凭据、沙箱、网络或数据泄露的问题请按安全策略
 私下报告。
 

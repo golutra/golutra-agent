@@ -10,7 +10,7 @@ and [Code of Conduct](CODE_OF_CONDUCT.md). Do not open a public issue for a
 security vulnerability or include credentials, provider responses, private
 workspace data, or unredacted runtime artifacts in a report.
 
-The repository is an early `0.1.0` release. The public source repository is
+The repository is an early `0.2.0` release. The public source repository is
 open for contribution, but the runtime protocol and internal crate APIs are
 still evolving. Check an existing issue before starting a large change and
 open a design issue when the change affects protocol, storage, policy,
