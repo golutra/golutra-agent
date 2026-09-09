@@ -49,7 +49,7 @@ mod mcp_server;
 #[derive(Debug, Parser)]
 #[command(name = "golutra")]
 #[command(version)]
-#[command(about = "Golutra coding agent runtime CLI")]
+#[command(about = "Simple coding agent for local, observable workspace tasks")]
 struct Cli {
     #[arg(long, global = true)]
     cwd: Option<std::path::PathBuf>,

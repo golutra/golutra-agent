@@ -136,7 +136,7 @@ pub(crate) use transcript_widget::*;
 #[derive(Debug, Parser)]
 #[command(name = "golutra-tui")]
 #[command(version)]
-#[command(about = "Golutra terminal chat UI")]
+#[command(about = "Simple interactive coding agent with reliable background work")]
 struct Args {
     #[arg(long, global = true)]
     cwd: Option<std::path::PathBuf>,
