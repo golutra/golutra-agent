@@ -121,6 +121,11 @@ Responses 的现代 GPT-5.6+ `prompt_cache_options` 由 `rust-genai` 按原生 e
 改变 reasoning、工具或失败语义。能力声明仍以 provider 实际文档/探测结果为准，不能
 把一次命中率或同一 base URL 当作永久能力证明。
 
+Responses 流还会在 `ProviderCompleted` 事件中提供有界的
+`transport_diagnostics`：流句柄建立、首个解析事件、首个业务事件、终态事件、
+尝试次数和认证刷新标记。基准只投影这些非敏感字段；provider 或其他引擎未提供
+对应观测时保持 `unknown`，不以零值或外层进程时间替代。
+
 ## 目标架构
 
 LLM 接入链路收敛为：

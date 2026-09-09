@@ -716,6 +716,113 @@ pub struct ProviderResponse {
     pub raw_metadata: Value,
 }
 
+/// 可安全投影到运行时观测中的 provider 流时序。
+///
+/// 字段是从单次请求开始计算的持续时间，不是墙上时钟时间戳。使用有界的
+/// 类型化投影后，基准可以区分本地流初始化与 provider 首帧，同时不会复制
+/// 原始 header、URL 或响应正文。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderTransportDiagnostics {
+    pub transport: String,
+    pub attempt_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_handle_ready_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_stream_event_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_business_event_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_event_ms: Option<u64>,
+    #[serde(default)]
+    pub credential_refresh_attempted: bool,
+}
+
+impl ProviderTransportDiagnostics {
+    /// 适配器使用的元数据键。它与 provider 响应正文分离，避免原始字段被
+    /// 意外投影到普通运行时事件。
+    pub const KEY: &'static str = "transport_diagnostics";
+
+    const MAX_TRANSPORT_BYTES: usize = 64;
+    const MAX_DURATION_MS: u64 = 86_400_000;
+    const MAX_ATTEMPTS: u32 = 32;
+
+    /// 将诊断转换为 provider 响应元数据值。
+    #[must_use]
+    pub fn to_value(&self) -> Value {
+        serde_json::to_value(self).expect("transport diagnostics are serializable")
+    }
+
+    /// 仅从不可信原始元数据读取获准的诊断字段。
+    ///
+    /// 运行时事件使用这个投影而不是克隆 `raw_metadata`；格式错误或超限值
+    /// 会被省略，不会向外暴露。
+    #[must_use]
+    pub fn from_raw_metadata(raw_metadata: &Value) -> Option<Self> {
+        let object = raw_metadata.get(Self::KEY)?.as_object()?;
+        let transport = object.get("transport")?.as_str()?;
+        if !Self::is_safe_transport_label(transport) {
+            return None;
+        }
+        let attempt_count = object.get("attempt_count")?.as_u64()?;
+        let attempt_count = u32::try_from(attempt_count).ok()?;
+        if attempt_count == 0 || attempt_count > Self::MAX_ATTEMPTS {
+            return None;
+        }
+        let duration = |key: &str| {
+            object
+                .get(key)
+                .and_then(Value::as_u64)
+                .filter(|value| *value <= Self::MAX_DURATION_MS)
+        };
+        let credential_refresh_attempted = object
+            .get("credential_refresh_attempted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let stream_handle_ready_ms = duration("stream_handle_ready_ms");
+        let first_stream_event_ms = duration("first_stream_event_ms");
+        let first_business_event_ms = duration("first_business_event_ms");
+        let terminal_event_ms = duration("terminal_event_ms");
+        let durations = [
+            stream_handle_ready_ms,
+            first_stream_event_ms,
+            first_business_event_ms,
+            terminal_event_ms,
+        ];
+        if !Self::durations_are_monotonic(&durations) {
+            return None;
+        }
+        Some(Self {
+            transport: transport.to_owned(),
+            attempt_count,
+            stream_handle_ready_ms,
+            first_stream_event_ms,
+            first_business_event_ms,
+            terminal_event_ms,
+            credential_refresh_attempted,
+        })
+    }
+
+    fn is_safe_transport_label(value: &str) -> bool {
+        !value.is_empty()
+            && value.len() <= Self::MAX_TRANSPORT_BYTES
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    }
+
+    fn durations_are_monotonic(values: &[Option<u64>]) -> bool {
+        let mut previous = None;
+        for value in values.iter().flatten() {
+            if previous.is_some_and(|previous| *value < previous) {
+                return false;
+            }
+            previous = Some(*value);
+        }
+        true
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderToolCall {
     pub tool_call_id: String,

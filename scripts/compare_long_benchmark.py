@@ -899,17 +899,69 @@ def aggregate_turns(turns: list[dict[str, Any]]) -> dict[str, Any]:
         summary[f"long_request_{target}_samples"] = len(timings) if provider_requests else None
         summary[f"long_request_{target}_p50_ms"] = quantile(timings, 0.5)
         summary[f"long_request_{target}_p95_ms"] = quantile(timings, 0.95)
+
+    # Responses adapter 的分段时延来自 provider 完成事件中的安全诊断。
+    # 缺失诊断保持 unknown，不能用外层事件时间猜测 HTTP 首字节。
+    transport_fields = (
+        ("stream_handle_ready_ms", "stream_handle_ready"),
+        ("first_stream_event_ms", "first_stream"),
+        ("first_business_event_ms", "first_business"),
+        ("terminal_event_ms", "terminal_event"),
+    )
     diagnosed_requests = [
+        request
+        for request in provider_requests
+        if isinstance(request.get("transport_diagnostics"), dict)
+    ]
+    summary["transport_diagnostic_requests"] = (
+        len(diagnosed_requests) if provider_requests else None
+    )
+    attempt_values = [
+        request["attempt_count"]
+        for request in diagnosed_requests
+        if isinstance(request.get("attempt_count"), int)
+        and not isinstance(request.get("attempt_count"), bool)
+    ]
+    summary["transport_attempts_total"] = sum(attempt_values) if provider_requests else None
+    summary["transport_retry_requests"] = (
+        sum(value > 1 for value in attempt_values) if provider_requests else None
+    )
+    for field, target in transport_fields:
+        timings = [
+            float(request[field])
+            for request in diagnosed_requests
+            if isinstance(request.get(field), (int, float))
+            and not isinstance(request.get(field), bool)
+        ]
+        summary[f"transport_{target}_samples"] = (
+            len(timings) if provider_requests else None
+        )
+        summary[f"transport_{target}_p50_ms"] = quantile(timings, 0.5)
+        summary[f"transport_{target}_p95_ms"] = quantile(timings, 0.95)
+        summary[f"transport_{target}_max_ms"] = max(timings, default=None)
+        long_timings = [
+            float(request[field])
+            for request in long_requests
+            if isinstance(request.get("transport_diagnostics"), dict)
+            and isinstance(request.get(field), (int, float))
+            and not isinstance(request.get(field), bool)
+        ]
+        summary[f"long_request_{target}_samples"] = (
+            len(long_timings) if provider_requests else None
+        )
+        summary[f"long_request_{target}_p50_ms"] = quantile(long_timings, 0.5)
+        summary[f"long_request_{target}_p95_ms"] = quantile(long_timings, 0.95)
+    cache_diagnosed_requests = [
         request
         for request in provider_requests
         if isinstance(request.get("cache_diagnostics"), dict)
     ]
-    if diagnosed_requests:
+    if cache_diagnosed_requests:
         prefix_relations: dict[str, int] = {}
         outcome_reasons: dict[str, int] = {}
         stable_miss_uncached = 0
         stable_miss_uncached_complete = True
-        for request in diagnosed_requests:
+        for request in cache_diagnosed_requests:
             relation = str(request.get("cache_prefix_relation") or "unknown")
             outcome = str(request.get("cache_outcome_reason") or "unknown")
             prefix_relations[relation] = prefix_relations.get(relation, 0) + 1
@@ -921,7 +973,7 @@ def aggregate_turns(turns: list[dict[str, Any]]) -> dict[str, Any]:
                 else:
                     stable_miss_uncached_complete = False
         stable_misses = outcome_reasons.get("provider_miss_on_stable_prefix", 0)
-        summary["cache_diagnostic_requests"] = len(diagnosed_requests)
+        summary["cache_diagnostic_requests"] = len(cache_diagnosed_requests)
         summary["cache_prefix_relations"] = prefix_relations
         summary["cache_outcome_reasons"] = outcome_reasons
         summary["stable_prefix_miss_requests"] = stable_misses
@@ -1927,10 +1979,25 @@ def markdown_report(report: dict[str, Any]) -> str:
         ("End-to-end P50", "elapsed_p50_ms"),
         ("First observable P50", "first_observable_p50_ms"),
         ("Provider TTFT P50", "provider_ttft_p50_ms"),
+        ("Transport diagnostics", "transport_diagnostic_requests"),
+        ("Transport attempts", "transport_attempts_total"),
+        ("Transport retries", "transport_retry_requests"),
+        ("Stream handle ready P50", "transport_stream_handle_ready_p50_ms"),
+        ("First stream event P50", "transport_first_stream_p50_ms"),
+        ("First business event P50", "transport_first_business_p50_ms"),
+        ("Transport terminal event P50", "transport_terminal_event_p50_ms"),
         ("Long-input requests (>=16K)", "long_request_count"),
         ("Long-input TTFT samples", "long_request_ttft_samples"),
         ("Long-input TTFT P50", "long_request_ttft_p50_ms"),
         ("Long-input TTFT P95", "long_request_ttft_p95_ms"),
+        ("Long-input stream handle samples", "long_request_stream_handle_ready_samples"),
+        ("Long-input stream handle P95", "long_request_stream_handle_ready_p95_ms"),
+        ("Long-input first stream samples", "long_request_first_stream_samples"),
+        ("Long-input first stream P95", "long_request_first_stream_p95_ms"),
+        ("Long-input first business samples", "long_request_first_business_samples"),
+        ("Long-input first business P95", "long_request_first_business_p95_ms"),
+        ("Long-input terminal event samples", "long_request_terminal_event_samples"),
+        ("Long-input terminal event P95", "long_request_terminal_event_p95_ms"),
         ("Long-input terminal samples", "long_request_terminal_samples"),
         ("Long-input terminal P95", "long_request_terminal_p95_ms"),
     )

@@ -182,6 +182,53 @@ class CompareLongBenchmarkTest(unittest.TestCase):
         self.assertIsNone(unknown["long_request_count"])
         self.assertIsNone(unknown["long_request_ttft_p95_ms"])
 
+    def test_transport_diagnostics_report_samples_and_keep_unknowns(self) -> None:
+        requests = [
+            {
+                "prompt_tokens": 20_000,
+                "transport_diagnostics": {
+                    "transport": "responses_sse",
+                    "attempt_count": 1,
+                    "stream_handle_ready_ms": 60,
+                    "first_stream_event_ms": 100,
+                    "first_business_event_ms": 140,
+                    "terminal_event_ms": 500,
+                },
+                "attempt_count": 1,
+                "stream_handle_ready_ms": 60,
+                "first_stream_event_ms": 100,
+                "first_business_event_ms": 140,
+                "terminal_event_ms": 500,
+            },
+            {
+                "prompt_tokens": 22_000,
+                "transport_diagnostics": {
+                    "transport": "responses_sse",
+                    "attempt_count": 2,
+                    "stream_handle_ready_ms": 180,
+                    "first_stream_event_ms": 300,
+                    "first_business_event_ms": 350,
+                    "terminal_event_ms": 900,
+                },
+                "attempt_count": 2,
+                "stream_handle_ready_ms": 180,
+                "first_stream_event_ms": 300,
+                "first_business_event_ms": 350,
+                "terminal_event_ms": 900,
+            },
+            {"prompt_tokens": 18_000},
+        ]
+        summary = benchmark.aggregate_turns([{"metrics": {"provider_requests": requests}}])
+        self.assertEqual(summary["transport_diagnostic_requests"], 2)
+        self.assertEqual(summary["transport_attempts_total"], 3)
+        self.assertEqual(summary["transport_retry_requests"], 1)
+        self.assertEqual(summary["transport_stream_handle_ready_p95_ms"], 180)
+        self.assertEqual(summary["transport_first_stream_p95_ms"], 300)
+        self.assertEqual(summary["long_request_stream_handle_ready_samples"], 2)
+        self.assertEqual(summary["long_request_first_business_samples"], 2)
+        self.assertEqual(summary["long_request_first_business_p95_ms"], 350)
+        self.assertEqual(summary["long_request_terminal_event_p95_ms"], 900)
+
     def test_timing_breakdown_separates_startup_and_preserves_unknown(self) -> None:
         rows = benchmark.timing_breakdown({"stages": [{
             "stage": 1,

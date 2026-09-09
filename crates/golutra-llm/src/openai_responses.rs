@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::{collections::HashMap, fmt, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -27,12 +27,12 @@ use super::{
     ProviderCacheProfile, ProviderError, ProviderErrorMetadata, ProviderFinishReason,
     ProviderGenerationConfig, ProviderHttpHeaders, ProviderMessage, ProviderMessageMetadata,
     ProviderProbeResult, ProviderProtocol, ProviderRequest, ProviderResponse, ProviderRole,
-    ProviderStreamEvent, ProviderUsage, RESERVED_AFFINITY_HEADERS, cache_capabilities_from_reader,
-    configured_or_first_env, custom_headers_from_reader, env_mapping, first_env,
-    generation_config_from_reader, missing_env_error, protocol_capabilities,
-    provider_credential_error, provider_http_client, provider_http_error_with_headers,
-    provider_transport_error, response_json_or_error, sanitize_provider_error,
-    validate_native_base_url,
+    ProviderStreamEvent, ProviderTransportDiagnostics, ProviderUsage, RESERVED_AFFINITY_HEADERS,
+    cache_capabilities_from_reader, configured_or_first_env, custom_headers_from_reader,
+    env_mapping, first_env, generation_config_from_reader, missing_env_error,
+    protocol_capabilities, provider_credential_error, provider_http_client,
+    provider_http_error_with_headers, provider_transport_error, response_json_or_error,
+    sanitize_provider_error, validate_native_base_url,
 };
 
 const CHATGPT_ACCOUNT_ID_HEADER: &str = "ChatGPT-Account-Id";
@@ -397,12 +397,21 @@ impl OpenAiResponsesProvider {
         request: &ProviderRequest,
         on_event: &mut (dyn FnMut(ProviderStreamEvent) + Send),
     ) -> Result<ProviderResponse, ProviderError> {
+        let request_started = Instant::now();
         // The request shape and cache options do not depend on credentials.
         // Reuse them across a 401 refresh so retries spend their time on the
         // network instead of rebuilding the full message/tool projection.
         let chat_request = genai_chat_request(request, ProviderProtocol::OpenAiResponses)?;
         let mut force_refresh = false;
+        let mut attempt_count = 0_u32;
+        let mut credential_refresh_attempted = false;
+        // 这些时间点跨认证重试累计，才能把一次逻辑请求的首事件与重试开销分开。
+        let mut stream_handle_ready_ms = None;
+        let mut first_stream_event_ms = None;
+        let mut first_business_event_ms = None;
+        let mut terminal_event_ms = None;
         loop {
+            attempt_count = attempt_count.saturating_add(1);
             let (token, account_id) = self.resolve_credential(force_refresh).await?;
             let options = self.chat_options(request, account_id.as_deref())?;
             let response = match self
@@ -419,6 +428,7 @@ impl OpenAiResponsesProvider {
                     if !force_refresh && genai_stream_error_requires_auth_refresh(&error) =>
                 {
                     force_refresh = true;
+                    credential_refresh_attempted = true;
                     continue;
                 }
                 Err(error) => return Err(map_responses_genai_error(error)),
@@ -426,6 +436,9 @@ impl OpenAiResponsesProvider {
 
             let model_id = response.model_iden.to_string();
             let mut stream = response.stream;
+            if stream_handle_ready_ms.is_none() {
+                stream_handle_ready_ms = Some(elapsed_millis(request_started));
+            }
             let mut stream_end = None;
             let mut retry_with_refresh = false;
             let mut business_event_seen = false;
@@ -434,6 +447,9 @@ impl OpenAiResponsesProvider {
             let mut tool_calls = HashMap::<String, StreamedToolCall>::new();
 
             while let Some(event) = stream.next().await {
+                if first_stream_event_ms.is_none() {
+                    first_stream_event_ms = Some(elapsed_millis(request_started));
+                }
                 let event = match event {
                     Ok(event) => event,
                     Err(error)
@@ -458,6 +474,9 @@ impl OpenAiResponsesProvider {
                             add_stream_bytes(&mut captured_response_bytes, chunk.content.len())?;
                             add_message_bytes(&mut captured_text_bytes, chunk.content.len())?;
                             business_event_seen = true;
+                            if first_business_event_ms.is_none() {
+                                first_business_event_ms = Some(elapsed_millis(request_started));
+                            }
                             on_event(ProviderStreamEvent::TextDelta {
                                 text: chunk.content,
                             });
@@ -467,6 +486,9 @@ impl OpenAiResponsesProvider {
                         if !chunk.content.is_empty() {
                             add_stream_bytes(&mut captured_response_bytes, chunk.content.len())?;
                             business_event_seen = true;
+                            if first_business_event_ms.is_none() {
+                                first_business_event_ms = Some(elapsed_millis(request_started));
+                            }
                             on_event(ProviderStreamEvent::ReasoningDelta {
                                 text: chunk.content,
                             });
@@ -476,6 +498,9 @@ impl OpenAiResponsesProvider {
                         let call = &chunk.tool_call;
                         let argument_bytes = validate_streamed_tool_call(call)?;
                         business_event_seen = true;
+                        if first_business_event_ms.is_none() {
+                            first_business_event_ms = Some(elapsed_millis(request_started));
+                        }
                         let next_index = tool_calls.len();
                         let state =
                             tool_calls
@@ -506,6 +531,7 @@ impl OpenAiResponsesProvider {
                         }
                     }
                     ChatStreamEvent::End(end) => {
+                        terminal_event_ms = Some(elapsed_millis(request_started));
                         stream_end = Some(end);
                         break;
                     }
@@ -514,6 +540,7 @@ impl OpenAiResponsesProvider {
 
             if retry_with_refresh {
                 force_refresh = true;
+                credential_refresh_attempted = true;
                 continue;
             }
             let Some(end) = stream_end else {
@@ -521,7 +548,17 @@ impl OpenAiResponsesProvider {
                     message: "responses stream ended before a terminal event".to_owned(),
                 });
             };
-            let response = responses_provider_response(end, &model_id, &self.config.provider_id)?;
+            let diagnostics = ProviderTransportDiagnostics {
+                transport: "responses_sse".to_owned(),
+                attempt_count,
+                stream_handle_ready_ms,
+                first_stream_event_ms,
+                first_business_event_ms,
+                terminal_event_ms,
+                credential_refresh_attempted,
+            };
+            let response =
+                responses_provider_response(end, &model_id, &self.config.provider_id, diagnostics)?;
             return Ok(response);
         }
     }
@@ -635,6 +672,7 @@ fn responses_provider_response(
     end: StreamEnd,
     model_id: &str,
     provider_id: &str,
+    diagnostics: ProviderTransportDiagnostics,
 ) -> Result<ProviderResponse, ProviderError> {
     let response_id = end
         .captured_response_id
@@ -696,8 +734,13 @@ fn responses_provider_response(
         "stop_reason": stop_reason,
         "streamed": true,
         "usage": response.usage.raw,
+        "transport_diagnostics": diagnostics.to_value(),
     });
     Ok(response)
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 fn apply_responses_cache_semantics(usage: &mut ProviderUsage) {
@@ -835,6 +878,61 @@ mod tests {
             Some(std::time::Duration::from_secs(10))
         );
         assert_eq!(config.timeout, Some(std::time::Duration::from_secs(3_600)));
+    }
+
+    #[test]
+    fn transport_diagnostics_are_bounded_and_round_trip() {
+        let diagnostics = ProviderTransportDiagnostics {
+            transport: "responses_sse".to_owned(),
+            attempt_count: 2,
+            stream_handle_ready_ms: Some(3),
+            first_stream_event_ms: Some(1_200),
+            first_business_event_ms: Some(1_250),
+            terminal_event_ms: Some(2_000),
+            credential_refresh_attempted: true,
+        };
+        let raw = json!({
+            "provider": "responses",
+            "transport_diagnostics": diagnostics.to_value(),
+            "authorization": "must-not-be-projected"
+        });
+        assert_eq!(
+            ProviderTransportDiagnostics::from_raw_metadata(&raw),
+            Some(diagnostics)
+        );
+
+        let invalid = json!({
+            "transport_diagnostics": {
+                "transport": "responses_sse",
+                "attempt_count": 1,
+                "first_stream_event_ms": 86_400_001,
+                "unexpected": "ignored"
+            }
+        });
+        let projected = ProviderTransportDiagnostics::from_raw_metadata(&invalid)
+            .expect("valid required diagnostic fields");
+        assert_eq!(projected.first_stream_event_ms, None);
+        assert_eq!(projected.attempt_count, 1);
+
+        for transport in ["responses sse", "响应流", "responses\nstream"] {
+            let invalid = json!({
+                "transport_diagnostics": {
+                    "transport": transport,
+                    "attempt_count": 1,
+                }
+            });
+            assert!(ProviderTransportDiagnostics::from_raw_metadata(&invalid).is_none());
+        }
+
+        let invalid_order = json!({
+            "transport_diagnostics": {
+                "transport": "responses_sse",
+                "attempt_count": 1,
+                "first_stream_event_ms": 20,
+                "first_business_event_ms": 10,
+            }
+        });
+        assert!(ProviderTransportDiagnostics::from_raw_metadata(&invalid_order).is_none());
     }
 
     #[test]

@@ -8,7 +8,9 @@ use golutra_core::{
     Actor, ActorKind, ArtifactId, ArtifactRecord, CommandId, ContextSnapshot, EventId, LoopAction,
     RedactionStatus, SessionId, TaskContract, TaskId, TaskStatus, ThreadId, TurnId,
 };
-use golutra_llm::{ProviderRequest, ProviderResponse, ProviderStreamEvent};
+use golutra_llm::{
+    ProviderRequest, ProviderResponse, ProviderStreamEvent, ProviderTransportDiagnostics,
+};
 use golutra_protocol::{EventFilter, RuntimeEvent, RuntimeEventSource, RuntimeEventType};
 use golutra_runtime::{
     AgentLoopTraceEvent, PendingAgentTurn, PendingTurnExecutionOptions, RuntimeObservation,
@@ -973,6 +975,9 @@ pub(crate) fn trace_event_payload(
             model_id,
             response,
         } => {
+            let transport_diagnostics =
+                ProviderTransportDiagnostics::from_raw_metadata(&response.raw_metadata)
+                    .map(|diagnostics| diagnostics.to_value());
             let provider_tool_calls = response
                 .tool_calls
                 .into_iter()
@@ -983,20 +988,24 @@ pub(crate) fn trace_event_payload(
                     })
                 })
                 .collect::<Vec<_>>();
+            let mut payload = json!({
+                "summary": "provider request completed",
+                "provider_request_id": request_id,
+                "provider_response_id": response.response_id,
+                "provider_id": provider_id,
+                "model_id": model_id,
+                "finish_reason": response.finish_reason,
+                "tool_call_count": provider_tool_calls.len(),
+                "provider_tool_calls": provider_tool_calls,
+                "usage": response.usage,
+            });
+            if let Some(transport_diagnostics) = transport_diagnostics {
+                payload[ProviderTransportDiagnostics::KEY] = transport_diagnostics;
+            }
             Some((
                 RuntimeEventType::ProviderCompleted,
                 RuntimeEventSource::Provider,
-                json!({
-                    "summary": "provider request completed",
-                    "provider_request_id": request_id,
-                    "provider_response_id": response.response_id,
-                    "provider_id": provider_id,
-                    "model_id": model_id,
-                    "finish_reason": response.finish_reason,
-                    "tool_call_count": provider_tool_calls.len(),
-                    "provider_tool_calls": provider_tool_calls,
-                    "usage": response.usage,
-                }),
+                payload,
             ))
         }
         AgentLoopTraceEvent::ProviderFailed {
@@ -1658,6 +1667,56 @@ mod tests {
             second_diagnostics["tool_digest"],
             changed_diagnostics["tool_digest"]
         );
+    }
+
+    #[test]
+    fn provider_completed_projects_only_bounded_transport_diagnostics() {
+        let response = ProviderResponse {
+            response_id: golutra_core::ProviderResponseId::new(),
+            message: None,
+            tool_calls: Vec::new(),
+            usage: golutra_llm::ProviderUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(2),
+                reasoning_tokens: None,
+                cached_input_tokens: Some(8),
+                total_tokens: Some(12),
+                usage_source: golutra_core::UsageSource::Provider,
+                raw: json!({"input_tokens": 10}),
+            },
+            finish_reason: golutra_llm::ProviderFinishReason::Stop,
+            raw_metadata: json!({
+                "transport_diagnostics": {
+                    "transport": "responses_sse",
+                    "attempt_count": 1,
+                    "first_stream_event_ms": 120,
+                    "first_business_event_ms": 160,
+                    "terminal_event_ms": 400,
+                    "credential_refresh_attempted": false,
+                    "secret": "must-not-escape"
+                },
+                "authorization": "must-not-escape"
+            }),
+        };
+        let (_, _, payload) = trace_event_payload(AgentLoopTraceEvent::ProviderCompleted {
+            request_id: golutra_core::ProviderRequestId::new(),
+            provider_id: "responses".to_owned(),
+            model_id: "gpt-test".to_owned(),
+            response,
+        })
+        .expect("provider completion event");
+
+        assert_eq!(
+            payload[ProviderTransportDiagnostics::KEY]["first_stream_event_ms"],
+            120
+        );
+        assert!(
+            payload[ProviderTransportDiagnostics::KEY]
+                .get("secret")
+                .is_none()
+        );
+        let encoded = payload.to_string();
+        assert!(!encoded.contains("must-not-escape"));
     }
 
     #[test]

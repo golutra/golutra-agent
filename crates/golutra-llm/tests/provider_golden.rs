@@ -11,7 +11,7 @@ use golutra_llm::{
     OpenAiCompatibleProviderConfig, OpenAiResponsesProvider, OpenAiResponsesProviderConfig,
     ProviderCacheCapabilities, ProviderError, ProviderFinishReason, ProviderGenerationConfig,
     ProviderMessage, ProviderProtocol, ProviderReasoningEffort, ProviderRequest, ProviderRole,
-    ProviderStreamEvent, ProviderToolCall, UsageSource,
+    ProviderStreamEvent, ProviderToolCall, ProviderTransportDiagnostics, UsageSource,
 };
 use secrecy::SecretString;
 use serde::Deserialize;
@@ -671,6 +671,17 @@ async fn openai_responses_provider_matches_sse_goldens_and_auth_headers() {
     assert_eq!(response.usage.reasoning_tokens, Some(1));
     assert_eq!(response.usage.total_tokens, Some(15));
     assert_eq!(response.raw_metadata["response_id"], "resp_golden_text");
+    let diagnostics = ProviderTransportDiagnostics::from_raw_metadata(&response.raw_metadata)
+        .expect("Responses stream diagnostics");
+    assert_eq!(diagnostics.transport, "responses_sse");
+    assert_eq!(diagnostics.attempt_count, 1);
+    assert!(diagnostics.stream_handle_ready_ms.is_some());
+    assert!(diagnostics.first_stream_event_ms.is_some());
+    assert!(diagnostics.first_business_event_ms.is_some());
+    assert!(diagnostics.terminal_event_ms.is_some());
+    assert!(diagnostics.stream_handle_ready_ms <= diagnostics.first_stream_event_ms);
+    assert!(diagnostics.first_stream_event_ms <= diagnostics.first_business_event_ms);
+    assert!(diagnostics.first_business_event_ms <= diagnostics.terminal_event_ms);
 
     let (base_url, _captured) = spawn_provider_sequence(vec![TestProviderResponse::sse(
         200,

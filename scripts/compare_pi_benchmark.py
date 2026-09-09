@@ -893,6 +893,61 @@ def elapsed_between(end: float | None, start: float | None) -> float | None:
     return round(max(0.0, end - start), 1)
 
 
+TRANSPORT_DIAGNOSTIC_DURATION_FIELDS = (
+    "stream_handle_ready_ms",
+    "first_stream_event_ms",
+    "first_business_event_ms",
+    "terminal_event_ms",
+)
+
+
+def transport_diagnostics_from_observation(
+    observation: dict[str, Any],
+) -> dict[str, Any] | None:
+    """投影 provider 的有界传输诊断，不复制原始响应元数据。"""
+    raw = observation.get("transport_diagnostics")
+    if not isinstance(raw, dict):
+        return None
+    transport = raw.get("transport")
+    if (
+        not isinstance(transport, str)
+        or not transport
+        or len(transport) > 64
+        or not transport.isascii()
+        or not all(
+            character.isalnum() or character in "_-."
+            for character in transport
+        )
+    ):
+        return None
+    attempt_count = raw.get("attempt_count")
+    if (
+        not isinstance(attempt_count, int)
+        or isinstance(attempt_count, bool)
+        or attempt_count < 1
+        or attempt_count > 32
+    ):
+        return None
+    projected: dict[str, Any] = {
+        "transport": transport,
+        "attempt_count": attempt_count,
+        "credential_refresh_attempted": raw.get("credential_refresh_attempted") is True,
+    }
+    previous_duration: int | None = None
+    for field in TRANSPORT_DIAGNOSTIC_DURATION_FIELDS:
+        value = raw.get(field)
+        if (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and 0 <= value <= 86_400_000
+        ):
+            if previous_duration is not None and value < previous_duration:
+                return None
+            projected[field] = value
+            previous_duration = value
+    return projected
+
+
 def provider_request_metrics(
     request_id: str,
     request_index: int,
@@ -939,6 +994,19 @@ def provider_request_metrics(
         partial = metrics.get(f"{field}_partial")
         if partial is not None:
             projection[f"{field}_partial"] = partial
+    transport_diagnostics = transport_diagnostics_from_observation(observation)
+    if transport_diagnostics is not None:
+        projection["transport_diagnostics"] = transport_diagnostics
+        for key in (
+            "stream_handle_ready_ms",
+            "first_stream_event_ms",
+            "first_business_event_ms",
+            "terminal_event_ms",
+            "attempt_count",
+            "credential_refresh_attempted",
+        ):
+            if key in transport_diagnostics:
+                projection[key] = transport_diagnostics[key]
     projection.update(
         provider_cache_round_diagnostics(
             cache_context,
@@ -1222,6 +1290,11 @@ def parse_golutra(
                 request_order.append(request_id)
             observation = request_observations.setdefault(request_id, {})
             observation["completed_ms"] = event_time
+            transport_diagnostics = transport_diagnostics_from_observation(
+                {"transport_diagnostics": payload.get("transport_diagnostics")}
+            )
+            if transport_diagnostics is not None:
+                observation["transport_diagnostics"] = transport_diagnostics
             if request_id and isinstance(payload.get("usage"), dict):
                 fallback_record = normalize_golutra_usage(
                     usage_record_from_provider_completed(event, payload)

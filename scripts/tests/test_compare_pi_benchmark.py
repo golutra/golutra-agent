@@ -111,6 +111,16 @@ class CompareBenchmarkTest(unittest.TestCase):
                 json.dumps(item("provider_streamed", "stream-1", 1010, {"delta": {"kind": "text_delta", "text": "ok"}})),
                 json.dumps(item("tool_started", "tool-start", 1020, {"payload": {}, "tool_name": "shell"})),
                 json.dumps(item("tool_completed", "tool-end", 1030, {"tool_name": "shell"})),
+                json.dumps(item("provider_completed", "provider-end", 1035, {
+                    "provider_request_id": "request-1",
+                    "transport_diagnostics": {
+                        "transport": "responses_sse",
+                        "attempt_count": 1,
+                        "first_stream_event_ms": 8,
+                        "first_business_event_ms": 15,
+                        "terminal_event_ms": 30,
+                    },
+                })),
                 json.dumps(item("token_usage_recorded", "usage-1", 1040, {"record": {
                     "request_event_id": "request-1",
                     "input_tokens": 20,
@@ -129,7 +139,7 @@ class CompareBenchmarkTest(unittest.TestCase):
                 50.0,
                 0,
                 Path(directory),
-                [2.0, 10.0, 25.0, 30.0, 35.0, 40.0, 50.0],
+                [2.0, 10.0, 25.0, 30.0, 35.0, 40.0, 42.0, 50.0],
             )
         self.assertEqual(metrics["request_count"], 1)
         self.assertEqual(metrics["tool_call_count"], 1)
@@ -154,6 +164,102 @@ class CompareBenchmarkTest(unittest.TestCase):
         self.assertEqual(request["cache_hit_ratio"], 0.4)
         self.assertEqual(request["ttft_ms"], 15.0)
         self.assertEqual(request["terminal_latency_ms"], 30.0)
+        self.assertEqual(request["first_stream_event_ms"], 8)
+        self.assertEqual(request["first_business_event_ms"], 15)
+        self.assertEqual(request["terminal_event_ms"], 30)
+
+    def test_provider_request_metrics_projects_transport_diagnostics(self) -> None:
+        usage = benchmark.normalize_golutra_usage(
+            {
+                "input_tokens": 4_096,
+                "non_cached_input_tokens": 128,
+                "cache_read_tokens": 3_968,
+                "output_tokens": 12,
+                "provider_total_tokens": 4_108,
+                "usage_source": "provider",
+            }
+        )
+        request = benchmark.provider_request_metrics(
+            "request-1",
+            0,
+            {
+                "started_ms": 10.0,
+                "completed_ms": 450.0,
+                "transport_diagnostics": {
+                    "transport": "responses_sse",
+                    "attempt_count": 2,
+                    "stream_handle_ready_ms": 4,
+                    "first_stream_event_ms": 120,
+                    "first_business_event_ms": 160,
+                    "terminal_event_ms": 440,
+                    "credential_refresh_attempted": True,
+                    "secret": "must-not-be-reported",
+                },
+            },
+            usage,
+        )
+        self.assertEqual(request["first_stream_event_ms"], 120)
+        self.assertEqual(request["first_business_event_ms"], 160)
+        self.assertEqual(request["terminal_event_ms"], 440)
+        self.assertEqual(request["attempt_count"], 2)
+        self.assertTrue(request["credential_refresh_attempted"])
+        self.assertNotIn("secret", request["transport_diagnostics"])
+
+        minimal = benchmark.provider_request_metrics(
+            "request-minimal",
+            2,
+            {
+                "transport_diagnostics": {
+                    "transport": "responses_sse",
+                    "attempt_count": 1,
+                }
+            },
+            usage,
+        )
+        self.assertNotIn("first_stream_event_ms", minimal)
+        self.assertFalse(minimal["credential_refresh_attempted"])
+
+        invalid = benchmark.provider_request_metrics(
+            "request-2",
+            1,
+            {
+                "transport_diagnostics": {
+                    "transport": "responses_sse",
+                    "attempt_count": 0,
+                    "first_stream_event_ms": 1,
+                }
+            },
+            usage,
+        )
+        self.assertNotIn("transport_diagnostics", invalid)
+
+        invalid_label = benchmark.provider_request_metrics(
+            "request-label",
+            3,
+            {
+                "transport_diagnostics": {
+                    "transport": "responses sse",
+                    "attempt_count": 1,
+                }
+            },
+            usage,
+        )
+        self.assertNotIn("transport_diagnostics", invalid_label)
+
+        invalid_order = benchmark.provider_request_metrics(
+            "request-order",
+            4,
+            {
+                "transport_diagnostics": {
+                    "transport": "responses_sse",
+                    "attempt_count": 1,
+                    "first_stream_event_ms": 20,
+                    "first_business_event_ms": 10,
+                }
+            },
+            usage,
+        )
+        self.assertNotIn("transport_diagnostics", invalid_order)
 
     def test_golutra_parser_excludes_caller_verifier_from_model_tools(self) -> None:
         stdout = json.dumps(
