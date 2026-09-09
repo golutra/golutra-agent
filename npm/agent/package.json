@@ -1,7 +1,7 @@
 {
   "name": "@golutra/agent",
   "version": "0.0.0-dev",
-  "description": "Golutra coding agent runtime for local development",
+  "description": "Simple local coding agent with background work and full observability",
   "license": "Apache-2.0",
   "bin": {
     "golutra": "bin/golutra.js",

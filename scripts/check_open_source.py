@@ -16,8 +16,10 @@ REQUIRED_FILES = (
     "LICENSE",
     "NOTICE",
     "README.md",
+    "README_CN.md",
     "assets/readme/golutra-logo.png",
-    "assets/readme/golutra-concept-hero.png",
+    "assets/readme/publicity_EN.png",
+    "assets/readme/publicity_CN.png",
     "Cargo.lock",
     "rust-toolchain.toml",
     ".gitattributes",
@@ -307,12 +309,30 @@ def check_repository(root: Path) -> list[str]:
             "CONTRIBUTING.md",
             "SECURITY.md",
             "docs/README.md",
+            "README_CN.md",
             "assets/readme/golutra-logo.png",
-            "assets/readme/golutra-concept-hero.png",
+            "assets/readme/publicity_EN.png",
             "npm install -g @golutra/agent",
         ):
             if link not in readme_text:
                 errors.append(f"README.md does not link to {link}")
+
+        if "## 中文" in readme_text:
+            errors.append("README.md must keep Chinese content in README_CN.md")
+
+    readme_cn = root / "README_CN.md"
+    if readme_cn.is_file():
+        readme_cn_text = readme_cn.read_text(encoding="utf-8")
+        for link in (
+            "README.md",
+            "assets/readme/golutra-logo.png",
+            "assets/readme/publicity_CN.png",
+            "npm install -g @golutra/agent",
+        ):
+            if link not in readme_cn_text:
+                errors.append(f"README_CN.md does not link to {link}")
+        if "## 中文" not in readme_cn_text:
+            errors.append("README_CN.md is missing the Chinese section heading")
 
     return errors
 
