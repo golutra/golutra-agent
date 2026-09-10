@@ -65,7 +65,7 @@ eventsource-stream = "0.2.3"
 ignore = "0.4"
 jsonschema = { version = "0.47", default-features = false }
 miette = { version = "7.6", features = ["fancy"] }
-nix = { version = "0.30", default-features = false, features = ["process", "signal"] }
+nix = { version = "0.31", default-features = false, features = ["process", "signal"] }
 oauth2 = { version = "5.0", default-features = false, features = ["reqwest", "rustls-tls"] }
 pulldown-cmark = "0.13"
 ratatui = "0.28"
