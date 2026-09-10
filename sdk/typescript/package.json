@@ -15,7 +15,7 @@
   "homepage": "https://github.com/golutra/golutra-agent/tree/main/sdk/typescript",
   "keywords": ["golutra", "agent", "coding-agent", "runtime", "sdk"],
   "overrides": {
-    "js-yaml": "4.3.1"
+    "js-yaml": "4.3.2"
   },
   "type": "module",
   "exports": {
