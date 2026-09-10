@@ -4,6 +4,22 @@
 安全和支持入口位于仓库根目录的 `CONTRIBUTING.md`、`CODE_OF_CONDUCT.md`、
 `SECURITY.md` 和 `SUPPORT.md`。
 
+## 先从目标开始
+
+普通用户不需要先阅读整套架构文档：安装 npm 包后运行 `golutra`，直接用自然语言描述目标；
+脚本和 CI 使用 `golutra exec`。默认 TUI 只展示进度和结果，遇到问题时再按需打开 JSON、debug
+或 run-bundle 观测面。
+
+按需要选择入口：
+
+- 想了解日常使用、后台任务和配置：先看根目录 [README](../README.md)；中文用户可看
+  [中文 README](../README_CN.md)，再按需阅读[运行入口](runtime-entrypoints.md)。
+- 想接入 SDK、provider 或自定义客户端：看 [LLM provider 集成](llm-provider-integration.md)、
+  [扩展与 SDK 交付](extensions-sdk-delivery.md) 和 [运行入口](runtime-entrypoints.md)。
+- 想排查任务、token、缓存或验证结果：看 [观测与评估](evaluation-observability.md)、
+  [运行时契约](runtime-contracts.md) 和 [外部验证](external-verification.md)。
+- 想维护或贡献代码：从下面的架构、契约和实现文档开始，并运行仓库质量检查。
+
 ## 推荐阅读顺序
 
 1. `ARCHITECTURE.md`：主架构规格，作为实现时的架构真相。

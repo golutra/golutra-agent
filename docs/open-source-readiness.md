@@ -8,8 +8,9 @@ only a GitHub administrator can apply.
 
 - `LICENSE` contains the unmodified Apache License 2.0 text.
 - `NOTICE` identifies the project and explains third-party notice handling.
-- `README.md` provides the public product entry point, quick start, links,
-  status, architecture boundaries, and verification commands.
+- `README.md` provides the English public product entry point, quick start,
+  links, status, architecture boundaries, and verification commands; the
+  localized entry point is `README_CN.md`.
 - README visual assets are tracked in `assets/readme/` with their display
   permission and trademark boundary recorded in `NOTICE`.
 - `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SECURITY.md`, `GOVERNANCE.md`, and

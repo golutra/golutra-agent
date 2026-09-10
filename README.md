@@ -1,7 +1,7 @@
 <div align="center">
   <img src="assets/readme/golutra-logo.png" alt="Golutra logo" width="128" />
   <h1>Golutra Agent</h1>
-  <p><strong>A governable agent harness for coding.</strong><br />面向 Coding Agent 的可治理执行框架。</p>
+  <p><strong>Simple coding agent. Reliable background work. Full observability.</strong></p>
 
   <p>
     <a href="https://github.com/golutra/golutra-agent/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/golutra/golutra-agent/ci.yml?branch=main&label=CI" alt="CI status" /></a>
@@ -11,8 +11,8 @@
   </p>
 
   <p>
-    <a href="#english">English</a> ·
-    <a href="#中文">中文</a> ·
+    <a href="README.md">English</a> ·
+    <a href="README_CN.md">中文</a> ·
     <a href="docs/README.md">Docs</a> ·
     <a href="CONTRIBUTING.md">Contributing</a> ·
     <a href="SECURITY.md">Security</a> ·
@@ -22,48 +22,67 @@
 </div>
 
 <p align="center">
-  <img src="assets/readme/golutra-concept-hero.png" alt="Golutra Agent coding workspace" width="898" />
+  <img src="assets/readme/publicity_EN.png" alt="Golutra Agent coding workspace" width="898" />
 </p>
 
-Golutra Agent is a Rust-first, local-first agent harness for coding. An LLM
-generates tokens; Golutra turns those tokens into a durable, typed execution
-loop that can use tools, survive interruption, prove outcomes, and expose the
-right level of detail to each consumer.
+Golutra Agent is a simple, local-first coding agent for moving from intent to
+working code. Install it, run `golutra`, and describe the result you want; the
+agent inspects the current workspace, changes files, runs checks, and reports
+what actually happened. You do not need to learn a command catalog before
+getting useful work done.
 
-The design goal is a **governable Runtime OS**: every meaningful execution step
-becomes a `RuntimeEvent`, model input crosses an explicit `ModelInputEnvelope`
-boundary, and task completion is decided from a `VerificationRecord` rather
-than the model's own claim. The same facts can then drive the user interface,
-debugging, replay, evaluation, and controlled improvement without mixing those
-concerns into the conversation.
+It keeps the path simple for people and the context focused for models: state
+the goal once, let the agent choose the necessary actions, and receive a clear
+result backed by real workspace evidence.
 
-> Status: `0.1.0` is an early, actively evolving release. Runtime and protocol
+The everyday path is deliberately short:
+
+- **Two primary entry points:** `golutra` opens the interactive TUI; `golutra exec`
+  is the headless path for scripts and CI.
+- **Less repeated context:** the default coding profile exposes a compact tool
+  surface, bounded context, and stable provider prefixes, reducing unnecessary
+  round trips so the model can spend its budget on the task.
+- **Work that keeps running:** background shell sessions and independent
+  sessions can continue in parallel, subject to the host's resource and policy
+  limits; a single session still keeps an ordered task lane.
+- **Observable without clutter:** the normal UI shows progress and results;
+  explicit debug, JSON, and run-bundle surfaces expose the detailed events,
+  token usage, tool outcomes, and verification facts when they are needed.
+- **Model-led execution:** the agent can inspect real turn, background-process,
+  checkpoint, and verification state, then choose and adapt its next action.
+  Runtime safeguards preserve failures and never invent a successful result or
+  skip a necessary check.
+
+Under that simple surface, Golutra provides a durable typed execution loop. An
+LLM generates tokens; Golutra turns them into `RuntimeEvent` facts, routes them
+through an explicit `ModelInputEnvelope`, and determines completion from a
+`VerificationRecord` rather than the model's own claim. The same facts can drive
+the UI, debugging, replay, evaluation, and controlled improvement without
+polluting the conversation with internal governance data.
+
+> Status: `0.2.0` is an early, actively evolving release. Runtime and protocol
 > APIs may change before a stable compatibility policy is published.
 
 ## English
 
-### Why an Agent Harness
+### Why Golutra
 
-A capable model is only one part of a coding agent. The harness determines what
-the model sees, which actions it may take, when the loop stops, how failures are
-recovered, what the user sees, and what can be proved afterward. Those runtime
-choices often decide whether the same model behaves like a chatbot or a useful
-engineering agent.
+A capable model is only one part of a useful coding agent. Golutra pairs an
+open-ended model with a small, dependable execution loop so users get the
+speed of a conversation without giving up evidence, recovery, or control.
 
-Golutra keeps the model's problem solving open-ended while making the execution
-boundary dependable:
+The result is a focused workflow:
 
-- **Durable execution:** sessions, commands, events, checkpoints, cancellation,
-  recovery, and replay share one lifecycle across processes and clients.
-- **Governed tools:** shell, files, code intelligence, MCP, delegation, and
-  managed processes pass through explicit policy and result contracts.
-- **Provider independence:** adapters normalize streaming, authentication,
-  fallback, tool calls, and usage without changing the runtime loop.
-- **Evidence-backed completion:** tool evidence, objective assertions, and
-  policy results determine whether a workspace task passed, partially
-  completed, failed, or remains unknown.
-- **Typed public surfaces:** the TUI, CLI, app-server, Rust host, Python SDK,
-  TypeScript SDK, and external drivers use one generated protocol contract.
+- **Say what you want:** the model owns planning and tool choice instead of
+  forcing users through a command checklist.
+- **Spend tokens on the task:** compact tools, bounded context, and stable
+  prefixes reduce repeated input while preserving the model's reasoning.
+- **Keep work moving:** background processes and independent sessions can run
+  alongside the interactive task, with explicit lifecycle and cancellation.
+- **Know what happened:** progress stays readable, while detailed token usage,
+  tool outcomes, events, and verification facts remain available on demand.
+- **Finish on evidence:** files, commands, checks, and failures are recorded so
+  a completed task means more than a confident final sentence.
 
 ### Runtime Model
 
@@ -112,14 +131,46 @@ cannot publish a new stable runtime by itself.
 
 ### Quick Start
 
-Prerequisites:
+#### Everyday use
 
-- Rust `1.93` or newer
-- Python `3.11` or newer for release checks and the Python SDK
-- Node.js `18` or newer for the npm launcher; Node.js `22` or newer for the TypeScript SDK
-- A configured provider (the TUI can guide first-time setup)
+For the published launcher, Node.js `18` or newer is enough; no Rust toolchain
+is required. Install once, then use the same two commands for interactive work
+or automation:
 
-Run the TUI from a checkout:
+```bash
+npm install -g @golutra/agent
+golutra
+golutra exec "inspect this workspace and run the checks"
+```
+
+`golutra` with no arguments opens the TUI. Describe the goal in plain language;
+the agent decides which reads, edits, commands, and checks are needed. A
+background shell session can keep running while the agent continues other work,
+and the TUI reports its real state when it finishes. Use `golutra exec` when a
+caller needs a non-interactive turn or JSON output:
+
+```bash
+golutra exec --json "summarize the current changes"
+```
+
+The default interactive `coding` profile keeps the model-facing tool surface
+small and the context bounded. Select `--tool-profile full` only when a task
+needs low-frequency extensions; this does not change the model's reasoning
+settings. Progress and final results stay simple in the normal UI, while
+explicit JSON/debug/run-bundle views provide detailed token, tool, event, and
+verification facts for troubleshooting or automation.
+
+The TUI can guide first-time provider setup. Non-secret defaults may be kept in
+`$GOLUTRA_HOME/runtime.json` (global) or `<workspace>/.golutra/runtime.json`
+(project); project values override global values, session controls are in
+memory, and explicit `--execution-mode`/`--tool-profile` flags win. Credentials
+stay in the owner-only credential store or environment references.
+
+#### Build from source
+
+Source builds require Rust `1.93` or newer. Python `3.11` or newer is needed for
+release checks and the Python SDK; Node.js `22` or newer is needed for the
+TypeScript SDK.
 
 ```bash
 git clone https://github.com/golutra/golutra-agent.git
@@ -127,7 +178,7 @@ cd golutra-agent
 cargo run -p golutra-tui
 ```
 
-Run a one-shot command or the local app-server:
+For a one-shot source build or the local app-server:
 
 ```bash
 cargo run -p golutra-cli -- chat "inspect this workspace"
@@ -135,33 +186,21 @@ cargo run -p golutra-cli -- --cwd "$PWD" exec "run the checks"
 cargo run -p golutra-app-server -- --addr 127.0.0.1:47831
 ```
 
-#### Install the CLI and TUI with npm
-
-The published npm package is a lightweight launcher. npm resolves the matching
-native package for the host platform, so no Rust toolchain or install-time
-network download script is required:
+If you pass TUI flags through Cargo, put the separator before the program
+arguments:
 
 ```bash
-npm install -g @golutra/agent
-golutra
-golutra --help
+cargo run -p golutra-tui -- --yolo
 ```
 
-`golutra` opens the interactive TUI when no arguments are supplied. Use
-`golutra exec "..."` for a headless turn in scripts or CI; `golutra-tui` remains
-available as an explicit TUI alias.
+`cargo run -p golutra-tui --yolo` is parsed by Cargo itself and fails with
+`unexpected argument '--yolo'`.
 
-TUI defaults can be kept without storing secrets in either
-`$GOLUTRA_HOME/runtime.json` (global) or `<workspace>/.golutra/runtime.json`
-(project). Project values override global values, session controls are
-in-memory, and explicit `--execution-mode`/`--tool-profile` flags win over the
-files. The accepted non-secret fields are `provider_profile`, `model`,
-`execution_mode`, `verify_on_change`, `tool_profile`, and `reasoning_effort`.
-New interactive turns expose the compact `coding` tool surface and keep
-verification-on-change disabled unless enabled explicitly; pass
-`--tool-profile full` when a task needs low-frequency extensions. Unknown
-fields and secret-shaped values are rejected; credentials stay in the
-owner-only credential store or environment references.
+#### Maintainer package work
+
+The published npm package is a lightweight launcher. npm resolves the matching
+native package for the host platform, and installation does not run a network
+download script. `golutra-tui` remains available as an explicit TUI alias.
 
 The current release workflow publishes Linux x64/arm64, macOS x64/arm64, and
 Windows x64/arm64 native packages. The npm distribution contains the
@@ -177,14 +216,6 @@ python3 scripts/package_npm.py --package platform \
   --binary-dir target/aarch64-apple-darwin/release
 python3 scripts/package_npm.py --package root \
   --targets aarch64-apple-darwin
-```
-
-Cargo consumes its own options before forwarding arguments to the binary. Use
-the separator when passing TUI flags; `cargo run -p golutra-tui --yolo` is a
-Cargo argument error, while this is correct:
-
-```bash
-cargo run -p golutra-tui -- --yolo
 ```
 
 Provider setup and credential storage are documented in
@@ -267,115 +298,3 @@ Golutra Agent is distributed under the [Apache License 2.0](LICENSE).
 Contributions are accepted under the same license as described in Section 5;
 there is no separate CLA requirement in this repository at present. See
 [NOTICE](NOTICE) for dependency and README asset notices.
-
-## 中文
-
-Golutra Agent 是一个 Rust-first、local-first 的 Coding Agent Harness。模型负责开放式
-思考与生成，Golutra 负责把这些 token 变成可执行、可恢复、可验证的工程任务。
-
-### 为什么是 Agent Harness
-
-模型本身只会生成 token。一个真正可用的 Coding Agent 还需要回答：模型每轮看到什么、
-可以做什么、循环何时停止、失败如何恢复、用户看到什么，以及事后能够证明什么。同一个
-模型在不同 Harness 中会表现出明显差异，因为上下文纪律、工具契约和完成判定同样决定
-Agent 的能力上限。
-
-Golutra 的目标不是把更多控制逻辑写进 Prompt，而是提供一个**可治理的 Runtime OS**：
-
-- **持久执行**：session、command、event、checkpoint、取消、恢复和 replay 使用同一套生命周期；
-- **受治理工具**：shell、文件、代码索引、MCP、子代理和托管进程经过统一 policy 与结果契约；
-- **Provider 解耦**：流式输出、认证、fallback、tool call 和 token usage 在适配层归一化；
-- **证据判定完成**：工作区任务由工具证据、目标断言和策略结果共同判定，不采信模型自述；
-- **统一协议**：TUI、CLI、app-server、Rust host、Python SDK、TypeScript SDK 和外部驱动共享
-  command/query/event 契约。
-
-### 可治理观测链路
-
-```text
-用户输入
-  -> Session Command Protocol
-  -> RuntimeEvent 事实账本 + StateProjection
-  -> Runtime OS control loop
-  -> ModelInputEnvelope
-  -> Provider / Tool loop
-  -> VerificationRecord + LoopDecision
-  -> User / Debug / Context 审计 / Evaluation 投影
-```
-
-这条链路把三类责任硬分离：Runtime control plane 管 session、turn、工具、副作用、
-预算和终态；model boundary 只允许经过审批的消息与工具定义进入 provider request；
-observation/governance plane 保存事实、artifact 和完整性结果，再按用途生成不同投影。
-
-因此，对话 transcript 只是持久事实的一种用户视图。Debug 与治理信息不会因为“文本可读”
-就自动回灌给模型；普通用户也不需要承受完整审计链路的噪声。需要排查时，系统仍能回答
-模型当时看到了什么、工具实际做了什么、证据是否完整，以及任务为什么被判定为当前终态。
-
-### 从事实到受治理改进
-
-```text
-任务执行
-  -> RuntimeEvent 与 Evidence
-  -> VerificationRecord
-  -> 持久化任务后复盘
-  -> ImprovementCandidate
-  -> baseline/candidate 配对回归
-  -> PromotionDecision
-```
-
-改进候选必须携带证据、风险、验证计划和回滚信息。缺失完整 trace 或配对执行时，结果保持
-`NeedsReview`，不会把“没测到”解释为通过。runtime code、policy、sandbox 和兼容性等高风险
-变更必须经过人工审查；普通 Runtime 无权自行发布新的 stable runtime。
-
-### 快速运行
-
-```bash
-git clone https://github.com/golutra/golutra-agent.git
-cd golutra-agent
-cargo run -p golutra-tui
-```
-
-如果要传递 TUI 参数，必须使用 Cargo 与程序参数之间的分隔符：
-
-```bash
-cargo run -p golutra-tui -- --yolo
-```
-
-`cargo run -p golutra-tui --yolo` 会被 Cargo 自己解析，因此会报
-`unexpected argument '--yolo'`。
-
-也可以直接通过 npm 安装 CLI 和 TUI。根包只负责选择当前平台的原生包，安装过程不运行
-联网下载脚本：
-
-```bash
-npm install -g @golutra/agent
-golutra
-golutra --help
-```
-
-无参数执行 `golutra` 会进入交互式 TUI；脚本和 CI 使用
-`golutra exec "..."` 保持无界面执行，`golutra-tui` 仍作为显式 TUI 别名保留。
-
-TUI 的非敏感默认配置按 `$GOLUTRA_HOME/runtime.json` →
-`<workspace>/.golutra/runtime.json` → 当前 session 内存覆盖合并；显式
-`--execution-mode` 和 `--tool-profile` 参数优先级最高。配置文件不允许未知
-字段或 secret，key/token 仍只通过 credentials 文件或环境引用提供。
-
-当前 release workflow 发布 Linux x64/arm64、macOS x64/arm64 和 Windows x64/arm64。app-server、
-观测、supervisor 与 evaluation 入口仍随下面的完整平台归档分发。
-
-### 代码、文档与贡献
-
-- 架构总览：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-- 观测与评估：[docs/evaluation-observability.md](docs/evaluation-observability.md)
-- 改进闭环：[docs/agent-improvement-loop.md](docs/agent-improvement-loop.md)
-- 文档索引：[docs/README.md](docs/README.md)
-- 运行入口：[docs/runtime-entrypoints.md](docs/runtime-entrypoints.md)
-- 贡献指南：[CONTRIBUTING.md](CONTRIBUTING.md)
-- 安全策略：[SECURITY.md](SECURITY.md)
-- 变更记录：[CHANGELOG.md](CHANGELOG.md)
-
-项目当前处于 `0.1.0` 早期阶段，协议和运行时边界仍可能演进。欢迎提交代码、
-测试、文档和可复现的 issue；涉及凭据、沙箱、网络或数据泄露的问题请按安全策略
-私下报告。
-
-本项目采用 [Apache License 2.0](LICENSE)。
