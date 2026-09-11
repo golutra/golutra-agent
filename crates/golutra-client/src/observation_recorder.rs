@@ -239,11 +239,44 @@ impl ObservationSender {
             .iter()
             .position(|pending| pending.key == key)
         {
+            let stream_kind_changed = state.pending_live.get(index).is_some_and(|pending| {
+                provider_stream_kinds_differ(&pending.observation, &observation)
+            });
+            if stream_kind_changed {
+                if !fits_limits(state, 1, observation_bytes) {
+                    return Err(ObservationSendError::Overloaded);
+                }
+                let pending = state
+                    .pending_live
+                    .remove(index)
+                    .expect("live observation index must remain valid");
+                state.pending_live_bytes = state.pending_live_bytes.saturating_sub(pending.bytes);
+                self.enqueue_live(state, pending);
+                state.pending_live.push_back(PendingLive {
+                    key,
+                    observation,
+                    coalescing: CoalescingSummary::default(),
+                    bytes: observation_bytes,
+                });
+                state.pending_live_bytes =
+                    state.pending_live_bytes.saturating_add(observation_bytes);
+                return Ok(());
+            }
             let current_bytes = state
                 .pending_live
                 .get(index)
                 .map_or(0, |pending| pending.bytes);
-            if !fits_limits(state, 0, observation_bytes.saturating_sub(current_bytes)) {
+            let lossless_stream_merge = state.pending_live.get(index).is_some_and(|pending| {
+                provider_stream_deltas_can_merge(&pending.observation, &observation)
+            });
+            let next_bytes = if lossless_stream_merge {
+                current_bytes.saturating_add(
+                    usize::try_from(live_event_bytes(&observation)).unwrap_or(usize::MAX),
+                )
+            } else {
+                observation_bytes
+            };
+            if !fits_limits(state, 0, next_bytes.saturating_sub(current_bytes)) {
                 return Err(ObservationSendError::Overloaded);
             }
             // A replacement is a new ingress event. Move it to the back so a
@@ -253,18 +286,22 @@ impl ObservationSender {
                 .pending_live
                 .remove(index)
                 .expect("live observation index must remain valid");
-            let omitted_bytes = live_event_bytes(&pending.observation);
             pending.coalescing.omitted_events = pending.coalescing.omitted_events.saturating_add(1);
-            pending.coalescing.omitted_bytes = pending
-                .coalescing
-                .omitted_bytes
-                .saturating_add(omitted_bytes);
-            pending.observation = observation;
+            if lossless_stream_merge {
+                merge_provider_stream_deltas(&mut pending.observation, *observation);
+            } else {
+                let omitted_bytes = live_event_bytes(&pending.observation);
+                pending.coalescing.omitted_bytes = pending
+                    .coalescing
+                    .omitted_bytes
+                    .saturating_add(omitted_bytes);
+                pending.observation = observation;
+            }
             state.pending_live_bytes = state
                 .pending_live_bytes
                 .saturating_sub(current_bytes)
-                .saturating_add(observation_bytes);
-            pending.bytes = observation_bytes;
+                .saturating_add(next_bytes);
+            pending.bytes = next_bytes;
             state.pending_live.push_back(pending);
             return Ok(());
         }
@@ -322,6 +359,79 @@ impl ObservationSender {
     fn close_state(&self, state: &mut QueueState) {
         state.closed = true;
         self.flush_pending_live(state);
+    }
+}
+
+fn provider_stream_kinds_differ(current: &RuntimeObservation, next: &RuntimeObservation) -> bool {
+    let stream_kind = |observation: &RuntimeObservation| match observation {
+        RuntimeObservation::ProviderStreamed {
+            event: ProviderStreamEvent::TextDelta { .. },
+            ..
+        } => Some(0_u8),
+        RuntimeObservation::ProviderStreamed {
+            event: ProviderStreamEvent::ReasoningDelta { .. },
+            ..
+        } => Some(1_u8),
+        RuntimeObservation::ProviderStreamed {
+            event: ProviderStreamEvent::ToolCallDelta { .. },
+            ..
+        } => Some(2_u8),
+        _ => None,
+    };
+    matches!((stream_kind(current), stream_kind(next)), (Some(a), Some(b)) if a != b)
+}
+
+fn provider_stream_deltas_can_merge(
+    current: &RuntimeObservation,
+    next: &RuntimeObservation,
+) -> bool {
+    matches!(
+        (current, next),
+        (
+            RuntimeObservation::ProviderStreamed {
+                event: ProviderStreamEvent::TextDelta { .. },
+                ..
+            },
+            RuntimeObservation::ProviderStreamed {
+                event: ProviderStreamEvent::TextDelta { .. },
+                ..
+            }
+        ) | (
+            RuntimeObservation::ProviderStreamed {
+                event: ProviderStreamEvent::ReasoningDelta { .. },
+                ..
+            },
+            RuntimeObservation::ProviderStreamed {
+                event: ProviderStreamEvent::ReasoningDelta { .. },
+                ..
+            }
+        )
+    )
+}
+
+fn merge_provider_stream_deltas(current: &mut RuntimeObservation, next: RuntimeObservation) {
+    match (current, next) {
+        (
+            RuntimeObservation::ProviderStreamed {
+                event: ProviderStreamEvent::TextDelta { text: current },
+                ..
+            },
+            RuntimeObservation::ProviderStreamed {
+                event: ProviderStreamEvent::TextDelta { text: next },
+                ..
+            },
+        )
+        | (
+            RuntimeObservation::ProviderStreamed {
+                event: ProviderStreamEvent::ReasoningDelta { text: current },
+                ..
+            },
+            RuntimeObservation::ProviderStreamed {
+                event: ProviderStreamEvent::ReasoningDelta { text: next },
+                ..
+            },
+        ) => current.push_str(&next),
+        _ => unreachable!("provider stream merge variants were checked before merging"),
     }
 }
 
@@ -870,7 +980,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_provider_request_coalesces_to_latest_delta() {
+    async fn same_provider_request_coalesces_text_deltas_without_losing_content() {
         let (sender, receiver) = channel();
         let request_id = ProviderRequestId::new();
         sender
@@ -894,11 +1004,69 @@ mod tests {
             RuntimeObservation::ProviderStreamed {
                 event: ProviderStreamEvent::TextDelta { ref text },
                 ..
-            } if text == "second"
+            } if text == "firstsecond"
         ));
         assert_eq!(coalescing.omitted_events, 1);
-        assert_eq!(coalescing.omitted_bytes, 5);
+        assert_eq!(coalescing.omitted_bytes, 0);
         assert!(receiver.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn same_provider_request_preserves_chinese_delta_order() {
+        let (sender, receiver) = channel();
+        let request_id = ProviderRequestId::new();
+        for text in ["当前", "项目", "是一个", "编程代理"] {
+            sender
+                .send(streamed_with_request(request_id, text))
+                .expect("text delta");
+        }
+        sender.close().expect("close");
+
+        let Some(ObservationCommand::Event { observation, .. }) = receiver.next().await else {
+            panic!("coalesced event");
+        };
+        assert!(matches!(
+            *observation,
+            RuntimeObservation::ProviderStreamed {
+                event: ProviderStreamEvent::TextDelta { ref text },
+                ..
+            } if text == "当前项目是一个编程代理"
+        ));
+    }
+
+    #[tokio::test]
+    async fn provider_stream_kind_changes_do_not_overwrite_text_deltas() {
+        let (sender, receiver) = channel();
+        let request_id = ProviderRequestId::new();
+        sender
+            .send(streamed_with_request(request_id, "正文一"))
+            .expect("first text");
+        sender
+            .send(RuntimeObservation::ProviderStreamed {
+                request_id,
+                provider_id: "provider".to_owned(),
+                model_id: "model".to_owned(),
+                event: ProviderStreamEvent::ReasoningDelta {
+                    text: "internal".to_owned(),
+                },
+            })
+            .expect("reasoning");
+        sender
+            .send(streamed_with_request(request_id, "正文二"))
+            .expect("second text");
+        sender.close().expect("close");
+
+        let mut text = String::new();
+        while let Some(ObservationCommand::Event { observation, .. }) = receiver.next().await {
+            if let RuntimeObservation::ProviderStreamed {
+                event: ProviderStreamEvent::TextDelta { text: delta },
+                ..
+            } = *observation
+            {
+                text.push_str(&delta);
+            }
+        }
+        assert_eq!(text, "正文一正文二");
     }
 
     #[tokio::test]
@@ -1259,7 +1427,7 @@ mod tests {
                 request_id,
                 event: ProviderStreamEvent::TextDelta { ref text },
                 ..
-            } if request_id == first_request && text == "first-b"
+            } if request_id == first_request && text == "first-afirst-b"
         ));
         assert!(receiver.next().await.is_none());
     }
