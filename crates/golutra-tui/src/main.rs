@@ -70,6 +70,7 @@ const TUI_EVENT_HISTORY_BYTE_LIMIT: usize = 512 * 1024;
 const TUI_EVENT_HISTORY_TRIM_BATCH: usize = 256;
 const TUI_EVENT_PAYLOAD_LIMIT: usize = 64 * 1024;
 const TUI_EVENT_PAYLOAD_PREVIEW_LIMIT: usize = 4 * 1024;
+const TUI_MESSAGE_PAYLOAD_LIMIT: usize = 4 * 1024 * 1024;
 
 mod activity_view;
 mod activity_widget;
@@ -518,6 +519,26 @@ fn bound_event_payload(event: &mut RuntimeEvent) {
     };
     if serialized.len() <= TUI_EVENT_PAYLOAD_LIMIT {
         return;
+    }
+    // Message bodies are user-visible durable history. Keep them intact while
+    // dropping only bulky provider metadata; otherwise /resume would replay a
+    // permanently truncated assistant response.
+    if let Some(object) = event.payload.as_object() {
+        let mut preserved = serde_json::Map::new();
+        if let Some(content) = object.get("content").and_then(Value::as_str) {
+            preserved.insert("content".to_owned(), Value::String(content.to_owned()));
+        }
+        if let Some(payload) = object.get("payload").and_then(Value::as_object)
+            && let Some(prompt) = payload.get("prompt").and_then(Value::as_str)
+        {
+            preserved.insert("payload".to_owned(), json!({"prompt": prompt}));
+        }
+        if !preserved.is_empty() && serialized.len() <= TUI_MESSAGE_PAYLOAD_LIMIT {
+            preserved.insert("_metadata_truncated".to_owned(), json!(true));
+            preserved.insert("original_bytes".to_owned(), json!(serialized.len()));
+            event.payload = Value::Object(preserved);
+            return;
+        }
     }
     let preview_end = serialized.len().min(TUI_EVENT_PAYLOAD_PREVIEW_LIMIT);
     let preview = String::from_utf8_lossy(&serialized[..preview_end]);

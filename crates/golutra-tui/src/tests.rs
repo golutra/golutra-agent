@@ -256,6 +256,36 @@ fn tui_history_bounds_a_single_oversized_event_payload() {
     assert_eq!(app.events[0].sequence_no, 1);
 }
 
+#[test]
+fn tui_history_preserves_oversized_assistant_content_for_resume() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(task_id),
+        true,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    let content = "中文段落。".repeat(5_000);
+    let event = transcript_event(
+        1,
+        session_id,
+        task_id,
+        RuntimeEventType::AssistantMessage,
+        json!({"content": content}),
+    );
+
+    app.append_event_to_history(event);
+
+    assert_eq!(
+        app.events[0].payload["content"].as_str(),
+        Some(content.as_str())
+    );
+    assert_eq!(app.events[0].payload["_metadata_truncated"], json!(true));
+}
+
 #[tokio::test]
 async fn remote_transport_attaches_to_the_real_app_server_and_resolves_a_session() {
     let _guard = env_lock_guard().await;

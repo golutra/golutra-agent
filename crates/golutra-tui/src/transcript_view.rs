@@ -290,12 +290,6 @@ fn transcript_operation_projections_after(
         if include_result_card && let Some(result_card) = result_card_projection(app) {
             items.push(result_card);
         }
-    } else {
-        items.push(notice_projection(TranscriptItem {
-            role: TranscriptRole::System,
-            title: "Connecting".to_owned(),
-            body: vec!["loading runtime state".to_owned()],
-        }));
     }
     items
 }
@@ -2684,7 +2678,11 @@ mod tests {
         ];
         let item = event_transcript_items(&events)[0].clone();
         assert_eq!(item.title, "ran");
-        assert!(item.body.iter().any(|line| line == "  └ git status --short"));
+        assert!(
+            item.body
+                .iter()
+                .any(|line| line == "  └ git status --short")
+        );
     }
 
     #[test]
