@@ -66,6 +66,7 @@ pub enum RuntimeEventType {
     ProviderFailed,
     TokenUsageRecorded,
     AssistantMessage,
+    UserStep,
     ToolStarted,
     ToolProgress,
     ToolCompleted,
@@ -252,6 +253,7 @@ impl RuntimeEventType {
             | Self::ProviderFailed
             | Self::TokenUsageRecorded
             | Self::AssistantMessage
+            | Self::UserStep
             | Self::ToolStarted
             | Self::ToolProgress
             | Self::ToolCompleted
@@ -329,6 +331,7 @@ impl RuntimeEventType {
                 | Self::ProviderAuthCancelled
                 | Self::ProviderRateLimited
                 | Self::AssistantMessage
+                | Self::UserStep
                 | Self::ToolStarted
                 | Self::ToolProgress
                 | Self::ToolCompleted
@@ -491,6 +494,8 @@ mod tests {
             RuntimeEventClass::Governance
         );
         assert!(RuntimeEventType::AssistantMessage.is_model_history_fact());
+        assert!(!RuntimeEventType::UserStep.is_model_history_fact());
+        assert!(RuntimeEventType::UserStep.is_user_projection_fact());
         assert!(!RuntimeEventType::EvaluationCompleted.is_model_history_fact());
         assert!(!RuntimeEventType::PromotionDecided.is_user_projection_fact());
     }

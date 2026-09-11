@@ -8,7 +8,7 @@ use golutra_context::ContextCompactionRecord;
 use golutra_core::{
     ApprovalRequest, ApprovalResolution, ContextSnapshot, CorrectionEnvelope, ProviderRequestId,
     ToolCallId, ToolProgress, ToolRecoveryPolicy, TurnId, UserQuestionRequest,
-    UserQuestionResolution, VerificationAssertion, VerificationPlan, VerificationPlanId,
+    UserQuestionResolution, UserStep, VerificationAssertion, VerificationPlan, VerificationPlanId,
     VerificationRecord,
 };
 use golutra_governor::RuntimeGovernorDecision;
@@ -128,6 +128,7 @@ pub enum AgentLoopTraceEvent {
         turn_id: TurnId,
         content: String,
     },
+    UserStep(UserStep),
 }
 
 /// A typed execution fact emitted by `AgentLoop` before it is translated into

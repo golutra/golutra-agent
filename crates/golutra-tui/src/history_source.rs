@@ -19,7 +19,7 @@ pub(crate) struct LoadedEventHistory {
 const COMPLETE_HISTORY_EVENT_LIMIT: usize = 32_768;
 const COMPLETE_HISTORY_BYTE_LIMIT: usize = 32 * 1024 * 1024;
 
-/// 首屏只读取最近一页；更早事件由 TUI 在用户向上滚动时按游标加载。
+/// 默认仍可只读最近一页。会话恢复优先走完整历史；超预算时才退回这一页。
 pub(crate) async fn load_recent_event_history(
     transport: &RuntimeTransport,
     session_id: SessionId,

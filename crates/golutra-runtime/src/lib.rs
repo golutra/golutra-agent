@@ -23,9 +23,10 @@ use golutra_core::{
     ProviderRequestId, SessionId, SideEffectType, TaskContract, TaskId, TokenBudgetSnapshotId,
     TokenUsageRecord, ToolContract, ToolExecutionMetrics, ToolProgress, ToolProgressPhase,
     ToolRecoveryPolicy, ToolResultEnvelope, ToolResultStatus, TurnId, TurnState,
-    UserQuestionPrompt, UserQuestionRequest, UserQuestionResolution, VerificationCheck,
-    VerificationCheckKind, VerificationPlan, VerificationRecord, VerificationResult,
-    WorkspaceChangeRequirement,
+    UserQuestionPrompt, UserQuestionRequest, UserQuestionResolution, UserStep, UserStepId,
+    UserStepKind, VerificationCheck, VerificationCheckKind, VerificationPlan, VerificationRecord,
+    VerificationResult, WorkspaceChangeRequirement, summarize_user_tool_batch,
+    user_step_tool_from_envelope,
 };
 #[cfg(test)]
 use golutra_core::{
@@ -59,6 +60,49 @@ fn append_plan_message(
     message_token_total: &mut u64,
 ) {
     *message_token_total = message_token_total.saturating_add(plan.append_message(message, source));
+}
+
+fn emit_assistant_user_step<F>(turn_id: TurnId, content: &str, trace: &mut F)
+where
+    F: FnMut(AgentLoopTraceEvent) + Send,
+{
+    let text = content.trim();
+    if text.is_empty() {
+        return;
+    }
+    trace(AgentLoopTraceEvent::UserStep(UserStep {
+        step_id: UserStepId::new(),
+        turn_id,
+        kind: UserStepKind::AssistantText {
+            text: text.to_owned(),
+        },
+    }));
+}
+
+fn emit_tool_batch_user_step<F>(turn_id: TurnId, reports: &[ToolExecutionReport], trace: &mut F)
+where
+    F: FnMut(AgentLoopTraceEvent) + Send,
+{
+    if reports.is_empty() {
+        return;
+    }
+    let tools = reports
+        .iter()
+        .map(|report| {
+            user_step_tool_from_envelope(
+                report.envelope.tool_call_id,
+                report.envelope.tool_name.clone(),
+                report.envelope.status,
+                &report.envelope.structured_facts,
+            )
+        })
+        .collect::<Vec<_>>();
+    let summary = summarize_user_tool_batch(&tools);
+    trace(AgentLoopTraceEvent::UserStep(UserStep {
+        step_id: UserStepId::new(),
+        turn_id,
+        kind: UserStepKind::ToolBatch { summary, tools },
+    }));
 }
 
 /// Provider input reported for the last successful request. As in Pi, this is
@@ -2099,6 +2143,7 @@ where
                         turn_id: current_turn_id,
                         content: content.clone(),
                     });
+                    emit_assistant_user_step(current_turn_id, &content, &mut trace);
                     last_emitted_assistant_message = Some((current_turn_id, content));
                 }
 
@@ -3061,6 +3106,11 @@ where
                         break;
                     }
                 }
+                emit_tool_batch_user_step(
+                    current_turn_id,
+                    &tool_reports[tool_reports_before_step..],
+                    &mut trace,
+                );
                 if stop_after_parallel_batch {
                     finish_runtime_step(
                         &mut step_machine,

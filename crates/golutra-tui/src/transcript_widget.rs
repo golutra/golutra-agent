@@ -352,18 +352,17 @@ fn render_item_rows(
     item: TranscriptItem,
     operation_id: Option<OperationId>,
     toggle: bool,
-    expanded: bool,
+    _expanded: bool,
     projection_index: usize,
     width: u16,
 ) -> Vec<TranscriptRenderRow> {
     let palette = app.palette();
     let color = role_color(app, &item.role);
-    let marker = if toggle {
-        match (app.preferences.screen_reader, expanded) {
-            (true, true) => "v ",
-            (true, false) => "> ",
-            (false, true) => "▾ ",
-            (false, false) => "▸ ",
+    let marker = if item.title.starts_with("Interacted with") {
+        if app.preferences.screen_reader {
+            "> "
+        } else {
+            "↳ "
         }
     } else {
         role_marker(app, &item.role)

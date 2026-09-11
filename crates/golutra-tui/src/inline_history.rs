@@ -236,11 +236,8 @@ impl InlineHistoryState {
             self.rebuild_after_replay = false;
         }
 
-        // Retain enough event rows to fill the largest possible live body. A larger bottom pane
-        // may clip the oldest retained row, but it cannot expose padding between scrollback and
-        // the live tail when the composer shrinks again.
         let live_row_capacity = viewport_height
-            .saturating_sub(MIN_INLINE_BOTTOM_ROWS)
+            .saturating_sub(bottom_pane_height_for_width(app, width).max(MIN_INLINE_BOTTOM_ROWS))
             .max(1);
         let committable_entries = rendered_history_entries(app, width, live_row_capacity, mode);
         let committable_ids = committable_entries

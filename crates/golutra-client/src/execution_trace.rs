@@ -195,6 +195,7 @@ impl RuntimeHost {
                 Some(configured.turn.turn_id)
             }
             AgentLoopTraceEvent::AssistantMessage { turn_id, .. } => Some(*turn_id),
+            AgentLoopTraceEvent::UserStep(step) => Some(step.turn_id),
             AgentLoopTraceEvent::ApprovalRequested(approval) => Some(approval.turn_id),
             AgentLoopTraceEvent::UserQuestionRequested(request) => Some(request.turn_id),
             AgentLoopTraceEvent::TokenUsageRecorded(record) => Some(record.turn_id),

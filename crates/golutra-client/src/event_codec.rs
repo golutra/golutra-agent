@@ -726,6 +726,11 @@ pub(crate) fn observation_descriptor(observation: &RuntimeObservation) -> Observ
             RuntimeEventSource::Runtime,
             ObservationIntegrityClass::Supporting,
         ),
+        RuntimeObservation::UserStep(_) => (
+            RuntimeEventType::UserStep,
+            RuntimeEventSource::Runtime,
+            ObservationIntegrityClass::Supporting,
+        ),
     };
     ObservationDescriptor {
         event_type,
@@ -1192,6 +1197,17 @@ pub(crate) fn trace_event_payload(
             json!({
                 "summary": compact_event_summary(&content),
                 "content": content,
+            }),
+        )),
+        AgentLoopTraceEvent::UserStep(step) => Some((
+            RuntimeEventType::UserStep,
+            RuntimeEventSource::Runtime,
+            json!({
+                "summary": match &step.kind {
+                    golutra_core::UserStepKind::AssistantText { text } => compact_event_summary(text),
+                    golutra_core::UserStepKind::ToolBatch { summary, .. } => summary.clone(),
+                },
+                "step": step,
             }),
         )),
     };

@@ -4,7 +4,8 @@ use std::collections::{HashMap, HashSet};
 
 use golutra_core::{
     EventId, FileChangeKind, FileChangeSummary, TaskId, TaskStatus, ToolResultStatus, TurnId,
-    VerificationIndependence, VerificationRecord, VerificationResult, VerificationSource,
+    UserStep, UserStepKind, VerificationIndependence, VerificationRecord, VerificationResult,
+    VerificationSource,
 };
 use golutra_protocol::{RuntimeEvent, RuntimeEventType, UserProjection, VisibleStep};
 use serde_json::Value;
@@ -192,9 +193,12 @@ impl OperationProjection {
             }
         };
         let mut item = item.clone();
-        if expanded {
-            item.body.extend(details.clone());
-        }
+        let preview = if expanded {
+            details.clone()
+        } else {
+            default_tool_preview(details)
+        };
+        item.body.extend(preview);
         item
     }
 
@@ -205,6 +209,23 @@ impl OperationProjection {
             | Self::FileChange { item, .. }
             | Self::Notice { item } => item,
         }
+    }
+
+    fn is_assistant_message(&self) -> bool {
+        matches!(self, Self::Message { item } if item.role == TranscriptRole::Assistant)
+    }
+
+    fn is_completed_tool(&self) -> bool {
+        match self {
+            Self::ToolActivity { item, .. } | Self::FileChange { item, .. } => {
+                !matches!(item.role, TranscriptRole::Activity)
+            }
+            Self::Message { .. } | Self::Notice { .. } => false,
+        }
+    }
+
+    fn is_successful_completed_tool(&self) -> bool {
+        self.is_completed_tool() && self.item(false).role == TranscriptRole::Success
     }
 }
 
@@ -295,24 +316,17 @@ fn result_card_projection(app: &TuiApp) -> Option<OperationProjection> {
         .and_then(|debug| debug.verification.clone())
         .or_else(|| latest_verification(&app.events, projection.task_id));
     let independently_verified = verification.as_ref().is_some_and(is_independently_verified);
-    let state = if projection.status == TaskStatus::Failed
-        || projection.status == TaskStatus::Cancelled
-        || projection.status == TaskStatus::Blocked
-        || verification
-            .as_ref()
-            .is_some_and(|record| record.result == VerificationResult::Fail)
-    {
-        "Failed"
+    let state = if independently_verified {
+        "Verified"
     } else if projection.status == TaskStatus::Partial
         || verification
             .as_ref()
             .is_some_and(|record| record.result == VerificationResult::Partial)
     {
         "Partial"
-    } else if independently_verified {
-        "Verified"
     } else {
-        "Completed · Unverified"
+        // Completed / Failed / Blocked 都不再打 Result 卡；失败原因已在工具行或助手回复里。
+        return None;
     };
     let role = match state {
         "Verified" => TranscriptRole::Success,
@@ -447,14 +461,65 @@ impl EventOperationEntry {
     }
 }
 
+#[derive(Debug, Default)]
+struct ProjectionIndexes {
+    visible_user_turns: HashMap<TurnId, usize>,
+    streamed_assistant_items: HashMap<TurnId, usize>,
+    active_tools: HashMap<OperationId, usize>,
+}
+
+fn user_step_projection(step: &UserStep) -> Option<OperationProjection> {
+    match &step.kind {
+        UserStepKind::AssistantText { text } => {
+            let text = text.trim();
+            if text.is_empty() {
+                return None;
+            }
+            Some(message_projection(TranscriptItem {
+                role: TranscriptRole::Assistant,
+                title: "Golutra".to_owned(),
+                body: vec![text.to_owned()],
+            }))
+        }
+        UserStepKind::ToolBatch { summary, tools } => {
+            let failed = tools
+                .iter()
+                .filter(|tool| tool.status != ToolResultStatus::Ok)
+                .collect::<Vec<_>>();
+            let title = if summary.trim().is_empty() {
+                "ran".to_owned()
+            } else {
+                summary.clone()
+            };
+            let details = tools
+                .iter()
+                .filter_map(|tool| tool.object.clone())
+                .collect::<Vec<_>>();
+            Some(OperationProjection::ToolActivity {
+                id: OperationId(step.step_id.to_string()),
+                item: TranscriptItem {
+                    role: if failed.is_empty() {
+                        TranscriptRole::Success
+                    } else {
+                        TranscriptRole::Error
+                    },
+                    title,
+                    body: Vec::new(),
+                },
+                details,
+            })
+        }
+    }
+}
+
 pub(crate) fn event_operation_entries(events: &[RuntimeEvent]) -> Vec<EventOperationEntry> {
     let mut typed_events = events.iter().collect::<Vec<_>>();
     typed_events.sort_by_key(|event| event.sequence_no);
 
     let mut items: Vec<EventOperationEntry> = Vec::new();
-    let mut visible_user_turns = HashMap::<TurnId, usize>::new();
-    let mut streamed_assistant_items: HashMap<TurnId, usize> = HashMap::new();
-    let mut active_tools = HashMap::<OperationId, usize>::new();
+    let mut indexes = ProjectionIndexes::default();
+    let mut turns_with_user_steps = HashSet::<TurnId>::new();
+    let mut covered_user_step_tools = HashSet::<OperationId>::new();
     for event in typed_events {
         if event.event_type.is_task_terminal() {
             for record in &mut items {
@@ -471,10 +536,10 @@ pub(crate) fn event_operation_entries(events: &[RuntimeEvent]) -> Vec<EventOpera
             RuntimeEventType::TaskCreated => {
                 let is_new_turn = event
                     .turn_id
-                    .is_none_or(|turn_id| !visible_user_turns.contains_key(&turn_id));
+                    .is_none_or(|turn_id| !indexes.visible_user_turns.contains_key(&turn_id));
                 if is_new_turn && let Some(item) = user_event_transcript_item(event) {
                     if let Some(turn_id) = event.turn_id {
-                        visible_user_turns.insert(turn_id, items.len());
+                        indexes.visible_user_turns.insert(turn_id, items.len());
                     }
                     items.push(EventOperationEntry::new(
                         event,
@@ -486,10 +551,10 @@ pub(crate) fn event_operation_entries(events: &[RuntimeEvent]) -> Vec<EventOpera
             RuntimeEventType::TurnQueued => {
                 let is_new_turn = event
                     .turn_id
-                    .is_none_or(|turn_id| !visible_user_turns.contains_key(&turn_id));
+                    .is_none_or(|turn_id| !indexes.visible_user_turns.contains_key(&turn_id));
                 if is_new_turn && let Some(item) = user_event_transcript_item(event) {
                     if let Some(turn_id) = event.turn_id {
-                        visible_user_turns.insert(turn_id, items.len());
+                        indexes.visible_user_turns.insert(turn_id, items.len());
                     }
                     items.push(EventOperationEntry::new(
                         event,
@@ -501,7 +566,7 @@ pub(crate) fn event_operation_entries(events: &[RuntimeEvent]) -> Vec<EventOpera
             RuntimeEventType::TurnStarted => {
                 if let Some(index) = event
                     .turn_id
-                    .and_then(|turn_id| visible_user_turns.get(&turn_id).copied())
+                    .and_then(|turn_id| indexes.visible_user_turns.get(&turn_id).copied())
                     && let Some(record) = items.get_mut(index)
                 {
                     record.task_id = event.task_id.or(record.task_id);
@@ -511,7 +576,7 @@ pub(crate) fn event_operation_entries(events: &[RuntimeEvent]) -> Vec<EventOpera
             RuntimeEventType::TurnUpdated => {
                 if let Some(index) = event
                     .turn_id
-                    .and_then(|turn_id| visible_user_turns.get(&turn_id).copied())
+                    .and_then(|turn_id| indexes.visible_user_turns.get(&turn_id).copied())
                     && let Some(item) = user_event_transcript_item(event)
                 {
                     items[index].projection = message_projection(item);
@@ -520,26 +585,11 @@ pub(crate) fn event_operation_entries(events: &[RuntimeEvent]) -> Vec<EventOpera
             RuntimeEventType::TurnCancelled => {
                 let Some(index) = event
                     .turn_id
-                    .and_then(|turn_id| visible_user_turns.remove(&turn_id))
+                    .and_then(|turn_id| indexes.visible_user_turns.remove(&turn_id))
                 else {
                     continue;
                 };
-                items.remove(index);
-                for position in visible_user_turns.values_mut() {
-                    if *position > index {
-                        *position = position.saturating_sub(1);
-                    }
-                }
-                for position in streamed_assistant_items.values_mut() {
-                    if *position > index {
-                        *position = position.saturating_sub(1);
-                    }
-                }
-                for position in active_tools.values_mut() {
-                    if *position > index {
-                        *position = position.saturating_sub(1);
-                    }
-                }
+                remove_projected_item(index, &mut items, &mut indexes);
             }
             RuntimeEventType::ProviderStreamed => {
                 let Some(delta) = provider_stream_text_delta(event) else {
@@ -548,7 +598,7 @@ pub(crate) fn event_operation_entries(events: &[RuntimeEvent]) -> Vec<EventOpera
                 let Some(turn_id) = event.turn_id else {
                     continue;
                 };
-                if let Some(index) = streamed_assistant_items.get(&turn_id).copied() {
+                if let Some(index) = indexes.streamed_assistant_items.get(&turn_id).copied() {
                     if let Some(record) = items.get_mut(index)
                         && let Some(body) = record.projection.item_mut().body.first_mut()
                     {
@@ -565,21 +615,43 @@ pub(crate) fn event_operation_entries(events: &[RuntimeEvent]) -> Vec<EventOpera
                         }),
                         false,
                     ));
-                    streamed_assistant_items.insert(turn_id, index);
+                    indexes.streamed_assistant_items.insert(turn_id, index);
                 }
             }
             RuntimeEventType::AssistantMessage => {
+                // UserStep 已经按回合冻结了可见短句。整段 AssistantMessage 是模型历史，
+                // 不能再覆盖或追加到用户 transcript。
+                let sealed_by_user_steps = event.turn_id.is_some_and(|turn_id| {
+                    turns_with_user_steps.contains(&turn_id)
+                        && assistant_turn_already_split_by_tools(&items, turn_id)
+                });
+                if sealed_by_user_steps {
+                    if let Some(index) = event
+                        .turn_id
+                        .and_then(|turn_id| indexes.streamed_assistant_items.remove(&turn_id))
+                        && let Some(record) = items.get_mut(index)
+                    {
+                        record.stable = true;
+                    }
+                    continue;
+                }
+                // 只有在工具已经把同一 turn 切成多段之后，才拒绝用整段 content 覆盖。
+                // 单纯的流式收口（Hello → Hello world.）仍应替换当前这一条。
+                let sealed_split = event
+                    .turn_id
+                    .is_some_and(|turn_id| assistant_turn_already_split_by_tools(&items, turn_id));
                 let streamed = event
                     .turn_id
-                    .and_then(|turn_id| streamed_assistant_items.remove(&turn_id));
+                    .and_then(|turn_id| indexes.streamed_assistant_items.remove(&turn_id));
                 if let Some(index) = streamed {
                     if let Some(record) = items.get_mut(index) {
-                        if let Some(item) = assistant_event_transcript_item(event) {
+                        if !sealed_split && let Some(item) = assistant_event_transcript_item(event)
+                        {
                             record.projection = message_projection(item);
                         }
                         record.stable = true;
                     }
-                } else if let Some(item) = assistant_event_transcript_item(event) {
+                } else if !sealed_split && let Some(item) = assistant_event_transcript_item(event) {
                     items.push(EventOperationEntry::new(
                         event,
                         message_projection(item),
@@ -588,26 +660,45 @@ pub(crate) fn event_operation_entries(events: &[RuntimeEvent]) -> Vec<EventOpera
                 }
             }
             RuntimeEventType::ToolStarted => {
+                // 工具批次开始后，同一 turn 的后续模型文本必须另起一条，
+                // 否则步间短句会被拼进同一条助手消息。
+                if let Some(turn_id) = event.turn_id
+                    && let Some(index) = indexes.streamed_assistant_items.remove(&turn_id)
+                    && let Some(record) = items.get_mut(index)
+                {
+                    record.stable = true;
+                }
+                if operation_id_from_event(event)
+                    .is_some_and(|id| covered_user_step_tools.contains(&id))
+                {
+                    continue;
+                }
                 if let Some(projection) = tool_started_projection(event) {
                     let index = items.len();
                     if let Some(id) = projection.id().cloned() {
-                        active_tools.insert(id, index);
+                        indexes.active_tools.insert(id, index);
                     }
                     items.push(EventOperationEntry::new(event, projection, false));
                 }
             }
             RuntimeEventType::ToolProgress => {
                 if let Some(id) = operation_id_from_event(event)
-                    && let Some(index) = active_tools.get(&id).copied()
+                    && let Some(index) = indexes.active_tools.get(&id).copied()
                     && let Some(record) = items.get_mut(index)
                 {
                     update_tool_progress(&mut record.projection, event);
                 }
             }
             RuntimeEventType::ToolCompleted => {
+                if let Some(id) = operation_id_from_event(event)
+                    && covered_user_step_tools.contains(&id)
+                {
+                    indexes.active_tools.remove(&id);
+                    continue;
+                }
                 if let Some(projection) = tool_operation_projection(event) {
                     if let Some(id) = projection.id().cloned()
-                        && let Some(index) = active_tools.remove(&id)
+                        && let Some(index) = indexes.active_tools.remove(&id)
                     {
                         items[index].projection = projection;
                         items[index].stable = true;
@@ -615,6 +706,21 @@ pub(crate) fn event_operation_entries(events: &[RuntimeEvent]) -> Vec<EventOpera
                         items.push(EventOperationEntry::new(event, projection, true));
                     }
                 }
+            }
+            RuntimeEventType::UserStep => {
+                let Some(step) = user_step_from_event(event) else {
+                    continue;
+                };
+                let turn_id = event.turn_id.unwrap_or(step.turn_id);
+                turns_with_user_steps.insert(turn_id);
+                apply_user_step(
+                    event,
+                    &step,
+                    turn_id,
+                    &mut items,
+                    &mut indexes,
+                    &mut covered_user_step_tools,
+                );
             }
             _ => {
                 if let Some(item) = status_event_transcript_item(event) {
@@ -627,7 +733,7 @@ pub(crate) fn event_operation_entries(events: &[RuntimeEvent]) -> Vec<EventOpera
             }
         }
     }
-    items
+    coalesce_completed_tool_batches(items)
 }
 
 fn plain_projection(item: TranscriptItem) -> OperationProjection {
@@ -645,6 +751,165 @@ fn notice_projection(item: TranscriptItem) -> OperationProjection {
     OperationProjection::Notice { item }
 }
 
+fn user_step_from_event(event: &RuntimeEvent) -> Option<UserStep> {
+    event
+        .payload
+        .get("step")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
+fn assistant_turn_already_split_by_tools(items: &[EventOperationEntry], turn_id: TurnId) -> bool {
+    let mut saw_assistant = false;
+    let mut saw_tool_after_assistant = false;
+    for record in items {
+        if record.turn_id != Some(turn_id) {
+            continue;
+        }
+        if record.projection.is_assistant_message() {
+            saw_assistant = true;
+        } else if saw_assistant
+            && matches!(
+                record.projection,
+                OperationProjection::ToolActivity { .. } | OperationProjection::FileChange { .. }
+            )
+        {
+            saw_tool_after_assistant = true;
+        }
+    }
+    saw_assistant && saw_tool_after_assistant
+}
+
+fn remove_projected_item(
+    index: usize,
+    items: &mut Vec<EventOperationEntry>,
+    indexes: &mut ProjectionIndexes,
+) {
+    items.remove(index);
+    for position in indexes.visible_user_turns.values_mut() {
+        if *position > index {
+            *position = position.saturating_sub(1);
+        }
+    }
+    for position in indexes.streamed_assistant_items.values_mut() {
+        if *position > index {
+            *position = position.saturating_sub(1);
+        }
+    }
+    for position in indexes.active_tools.values_mut() {
+        if *position > index {
+            *position = position.saturating_sub(1);
+        }
+    }
+}
+
+fn apply_user_step(
+    event: &RuntimeEvent,
+    step: &UserStep,
+    turn_id: TurnId,
+    items: &mut Vec<EventOperationEntry>,
+    indexes: &mut ProjectionIndexes,
+    covered_user_step_tools: &mut HashSet<OperationId>,
+) {
+    match &step.kind {
+        UserStepKind::AssistantText { .. } => {
+            let Some(projection) = user_step_projection(step) else {
+                return;
+            };
+            if let Some(index) = indexes.streamed_assistant_items.remove(&turn_id) {
+                if let Some(record) = items.get_mut(index) {
+                    record.projection = projection;
+                    record.stable = true;
+                }
+                return;
+            }
+            // AssistantMessage / 流式文本可能先于 UserStep 到达；收口同一回合尚未被工具切开的助手行。
+            if let Some(index) = trailing_assistant_index(items, turn_id)
+                && let Some(record) = items.get_mut(index)
+            {
+                record.projection = projection;
+                record.stable = true;
+                return;
+            }
+            if assistant_text_already_visible(items, turn_id, &projection) {
+                return;
+            }
+            items.push(EventOperationEntry::new(event, projection, true));
+        }
+        UserStepKind::ToolBatch { tools, .. } => {
+            let Some(projection) = user_step_projection(step) else {
+                return;
+            };
+            let mut replace_at = None;
+            for tool in tools {
+                let id = OperationId(tool.tool_call_id.to_string());
+                covered_user_step_tools.insert(id.clone());
+                let index = indexes.active_tools.remove(&id).or_else(|| {
+                    items
+                        .iter()
+                        .position(|record| record.projection.id() == Some(&id))
+                });
+                if let Some(index) = index {
+                    replace_at =
+                        Some(replace_at.map_or(index, |current: usize| current.min(index)));
+                }
+            }
+            let Some(first_index) = replace_at else {
+                items.push(EventOperationEntry::new(event, projection, true));
+                return;
+            };
+            if let Some(record) = items.get_mut(first_index) {
+                record.projection = projection;
+                record.stable = true;
+            }
+            let mut remove = tools
+                .iter()
+                .filter_map(|tool| {
+                    let id = OperationId(tool.tool_call_id.to_string());
+                    items
+                        .iter()
+                        .position(|record| record.projection.id() == Some(&id))
+                })
+                .filter(|index| *index != first_index)
+                .collect::<Vec<_>>();
+            remove.sort_unstable();
+            remove.dedup();
+            for index in remove.into_iter().rev() {
+                remove_projected_item(index, items, indexes);
+            }
+        }
+    }
+}
+
+fn assistant_text_already_visible(
+    items: &[EventOperationEntry],
+    turn_id: TurnId,
+    projection: &OperationProjection,
+) -> bool {
+    let OperationProjection::Message { item } = projection else {
+        return false;
+    };
+    items.iter().any(|record| {
+        record.turn_id == Some(turn_id)
+            && record.projection.is_assistant_message()
+            && record.projection.item(false).body == item.body
+    })
+}
+
+fn trailing_assistant_index(items: &[EventOperationEntry], turn_id: TurnId) -> Option<usize> {
+    let index = items.iter().rposition(|record| {
+        record.turn_id == Some(turn_id) && record.projection.is_assistant_message()
+    })?;
+    let has_tool_after = items[index + 1..].iter().any(|record| {
+        record.turn_id == Some(turn_id)
+            && matches!(
+                record.projection,
+                OperationProjection::ToolActivity { .. } | OperationProjection::FileChange { .. }
+            )
+    });
+    (!has_tool_after).then_some(index)
+}
+
 fn operation_id_from_event(event: &RuntimeEvent) -> Option<OperationId> {
     event
         .payload
@@ -660,6 +925,9 @@ fn tool_started_projection(event: &RuntimeEvent) -> Option<OperationProjection> 
     let arguments = event.payload.get("arguments");
     let invocation = tool_invocation(tool_name, arguments);
     let mut details = Vec::new();
+    if !invocation.is_empty() {
+        details.push(invocation.clone());
+    }
     if let Some(arguments) = arguments {
         details.push("Arguments".to_owned());
         details.extend(pretty_json_lines(arguments, 20));
@@ -668,11 +936,24 @@ fn tool_started_projection(event: &RuntimeEvent) -> Option<OperationProjection> 
         id,
         item: TranscriptItem {
             role: TranscriptRole::Activity,
-            title: running_tool_title(tool_name),
-            body: (!invocation.is_empty())
-                .then_some(invocation)
-                .into_iter()
-                .collect(),
+            title: if invocation.is_empty()
+                || matches!(
+                    tool_name,
+                    "shell" | "shell_session" | "subagent" | "delegate_task"
+                ) {
+                running_tool_title(tool_name)
+            } else {
+                format!(
+                    "{} {}",
+                    running_tool_title(tool_name),
+                    if matches!(tool_name, "read_file" | "write_file" | "edit_file") {
+                        display_file_name(&invocation)
+                    } else {
+                        invocation.clone()
+                    }
+                )
+            },
+            body: Vec::new(),
         },
         details,
     })
@@ -701,23 +982,29 @@ fn update_tool_progress(projection: &mut OperationProjection, event: &RuntimeEve
         .get("detail")
         .and_then(Value::as_str)
         .unwrap_or("output");
-    let item = projection.item_mut();
-    item.body.truncate(1);
-    item.body.push(format!(
+    let progress_line = format!(
         "{stream} · {} · {} · {}",
         plural_count(output_lines, "line", "lines"),
         format_bytes(output_bytes),
         format_millis(elapsed_ms)
-    ));
-    if let Some(excerpt) = progress.get("output_excerpt").and_then(Value::as_str) {
-        let lines = excerpt.lines().filter(|line| !line.trim().is_empty());
-        let mut lines = lines.rev().take(6).collect::<Vec<_>>();
-        lines.reverse();
-        item.body.extend(
-            lines
-                .into_iter()
-                .map(|line| format!("│ {}", bounded_text(line, 320))),
-        );
+    );
+    match projection {
+        OperationProjection::ToolActivity { details, .. }
+        | OperationProjection::FileChange { details, .. } => {
+            details.retain(|line| !line.starts_with("stdout ·") && !line.starts_with("│ "));
+            details.push(progress_line);
+            if let Some(excerpt) = progress.get("output_excerpt").and_then(Value::as_str) {
+                let lines = excerpt.lines().filter(|line| !line.trim().is_empty());
+                let mut lines = lines.rev().take(6).collect::<Vec<_>>();
+                lines.reverse();
+                details.extend(
+                    lines
+                        .into_iter()
+                        .map(|line| format!("│ {}", bounded_text(line, 320))),
+                );
+            }
+        }
+        OperationProjection::Message { .. } | OperationProjection::Notice { .. } => {}
     }
 }
 
@@ -740,19 +1027,25 @@ fn tool_operation_projection(event: &RuntimeEvent) -> Option<OperationProjection
         .or_else(|| event.payload.get("summary").and_then(Value::as_str))
         .unwrap_or("tool completed");
     let metrics = event.payload.get("metrics");
+    let title = completed_tool_title_with_object(
+        tool_name,
+        status,
+        (!invocation.is_empty()).then_some(invocation.as_str()),
+    );
     let mut body = Vec::new();
+    let mut details = Vec::new();
     if !invocation.is_empty() {
-        body.push(invocation);
+        details.push(invocation);
     }
     if let Some(line) = tool_metrics_line(metrics, facts) {
-        body.push(line);
+        details.push(line);
     }
     if facts
         .and_then(|value| value.get("workspace_changes_known"))
         .and_then(Value::as_bool)
         == Some(false)
     {
-        body.push("workspace changes unknown".to_owned());
+        details.push("workspace changes unknown".to_owned());
     }
     if status != ToolResultStatus::Ok && !summary.trim().is_empty() {
         body.push(summary.to_owned());
@@ -768,8 +1061,6 @@ fn tool_operation_projection(event: &RuntimeEvent) -> Option<OperationProjection
         let mut item = file_change_item(&changes, status);
         body.append(&mut item.body);
         item.body = body;
-
-        let mut details = Vec::new();
         if !output_lines.is_empty() {
             details.push("Output".to_owned());
             details.extend(output_lines);
@@ -778,7 +1069,6 @@ fn tool_operation_projection(event: &RuntimeEvent) -> Option<OperationProjection
         return Some(OperationProjection::FileChange { id, item, details });
     }
 
-    let mut details = Vec::new();
     if !output_lines.is_empty() {
         details.push("Output".to_owned());
         details.extend(output_lines);
@@ -787,7 +1077,7 @@ fn tool_operation_projection(event: &RuntimeEvent) -> Option<OperationProjection
         id,
         item: TranscriptItem {
             role: tool_status_role(status),
-            title: completed_tool_title(tool_name, status),
+            title,
             body,
         },
         details,
@@ -797,15 +1087,63 @@ fn tool_operation_projection(event: &RuntimeEvent) -> Option<OperationProjection
 fn running_tool_title(tool_name: &str) -> String {
     match tool_name {
         "shell" => "Running".to_owned(),
-        "read_file" | "list_dir" | "rg_search" | "symbol_search" | "find_references" => {
-            "Exploring".to_owned()
-        }
+        "shell_session" => "Waited for background terminal".to_owned(),
+        "subagent" | "delegate_task" => "Running subagent".to_owned(),
+        "read_file" => "Reading".to_owned(),
+        "list_dir" => "Listing".to_owned(),
+        "rg_search" | "symbol_search" | "find_references" => "Searching".to_owned(),
         "write_file" | "edit_file" => "Editing".to_owned(),
         other => format!("Calling {other}"),
     }
 }
 
+const DEFAULT_TOOL_PREVIEW_LINES: usize = 5;
+
+fn default_tool_preview(details: &[String]) -> Vec<String> {
+    let preview = details
+        .iter()
+        .filter(|line| {
+            let line = line.as_str();
+            line != "Arguments"
+                && line != "Output"
+                && line != "Facts"
+                && !line.starts_with('{')
+                && !line.starts_with("exit ")
+                && !line.contains(" · ")
+                && !line.starts_with("    \"")
+                && !line.starts_with("    }")
+                && line != "}"
+                && line != "]"
+                && line != "{"
+                && line != "["
+        })
+        .take(DEFAULT_TOOL_PREVIEW_LINES)
+        .cloned()
+        .collect::<Vec<_>>();
+    preview
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| {
+            if line.starts_with("  └ ") || line.starts_with("    ") || line.starts_with("│ ") {
+                line
+            } else if index == 0 {
+                format!("  └ {line}")
+            } else {
+                format!("    {line}")
+            }
+        })
+        .collect()
+}
+
 fn completed_tool_title(tool_name: &str, status: ToolResultStatus) -> String {
+    completed_tool_title_with_object(tool_name, status, None)
+}
+
+fn completed_tool_title_with_object(
+    tool_name: &str,
+    status: ToolResultStatus,
+    object: Option<&str>,
+) -> String {
     match status {
         ToolResultStatus::Blocked => return "Blocked".to_owned(),
         ToolResultStatus::Cancelled => return "Cancelled".to_owned(),
@@ -813,14 +1151,237 @@ fn completed_tool_title(tool_name: &str, status: ToolResultStatus) -> String {
         ToolResultStatus::Error => return "Failed".to_owned(),
         ToolResultStatus::Ok => {}
     }
-    match tool_name {
-        "shell" => "Ran".to_owned(),
-        "read_file" | "list_dir" | "rg_search" | "symbol_search" | "find_references" => {
-            "Explored".to_owned()
-        }
-        "write_file" | "edit_file" => "Edited".to_owned(),
-        _ => "Tool Completed".to_owned(),
+    if matches!(tool_name, "shell_session") {
+        return if object.is_some_and(|value| value.contains('\n')) {
+            "Interacted with background terminal".to_owned()
+        } else {
+            "Waited for background terminal".to_owned()
+        };
     }
+    if matches!(tool_name, "subagent" | "delegate_task") {
+        return "subagent".to_owned();
+    }
+    let kind = ToolSummaryKind::from_tool_name(tool_name);
+    match object.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(object) => {
+            let object = match kind {
+                ToolSummaryKind::Read | ToolSummaryKind::Edited => display_file_name(object),
+                ToolSummaryKind::Ran => String::new(),
+                _ => object.to_owned(),
+            };
+            if object.is_empty() {
+                kind.label().to_owned()
+            } else {
+                format!("{} {object}", kind.label())
+            }
+        }
+        None if kind == ToolSummaryKind::Other => "Tool Completed".to_owned(),
+        None => kind.label().to_owned(),
+    }
+}
+
+fn display_file_name(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(path)
+        .to_owned()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolSummaryKind {
+    Read,
+    Listed,
+    Searched,
+    Edited,
+    Ran,
+    Other,
+}
+
+impl ToolSummaryKind {
+    fn from_tool_name(tool_name: &str) -> Self {
+        match tool_name {
+            "read_file" => Self::Read,
+            "list_dir" => Self::Listed,
+            "rg_search" | "symbol_search" | "find_references" => Self::Searched,
+            "write_file" | "edit_file" => Self::Edited,
+            "shell" | "shell_session" => Self::Ran,
+            _ => Self::Other,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Listed => "listed",
+            Self::Searched => "searched",
+            Self::Edited => "edited",
+            Self::Ran => "ran",
+            Self::Other => "used",
+        }
+    }
+
+    fn noun(self, count: usize) -> &'static str {
+        match (self, count) {
+            (Self::Read, 1) => "file",
+            (Self::Read, _) => "files",
+            (Self::Listed, 1) => "directory",
+            (Self::Listed, _) => "directories",
+            (Self::Searched, 1) => "pattern",
+            (Self::Searched, _) => "patterns",
+            (Self::Edited, 1) => "file",
+            (Self::Edited, _) => "files",
+            (Self::Ran, 1) => "shell command",
+            (Self::Ran, _) => "shell commands",
+            (Self::Other, 1) => "other tool",
+            (Self::Other, _) => "other tools",
+        }
+    }
+}
+
+fn tool_activity_object(projection: &OperationProjection) -> Option<String> {
+    let (item, details) = match projection {
+        OperationProjection::ToolActivity { item, details, .. }
+        | OperationProjection::FileChange { item, details, .. } => (item, details.as_slice()),
+        OperationProjection::Message { .. } | OperationProjection::Notice { .. } => return None,
+    };
+    if let Some(object) = item.title.split_once(' ').map(|(_, rest)| rest.trim())
+        && !object.is_empty()
+        && !object.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+    {
+        return Some(object.to_owned());
+    }
+    details
+        .iter()
+        .find(|line| {
+            !line.is_empty()
+                && *line != "Arguments"
+                && *line != "Output"
+                && !line.starts_with('{')
+                && !line.starts_with("exit ")
+                && !line.contains(" · ")
+        })
+        .cloned()
+}
+
+fn summarize_successful_tool_batch(entries: &[EventOperationEntry]) -> Option<EventOperationEntry> {
+    if entries.len() < 2
+        || !entries
+            .iter()
+            .all(|entry| entry.stable && entry.projection.is_successful_completed_tool())
+    {
+        return None;
+    }
+
+    let mut counts = [
+        (ToolSummaryKind::Read, Vec::new()),
+        (ToolSummaryKind::Listed, Vec::new()),
+        (ToolSummaryKind::Searched, Vec::new()),
+        (ToolSummaryKind::Edited, Vec::new()),
+        (ToolSummaryKind::Ran, Vec::new()),
+        (ToolSummaryKind::Other, Vec::new()),
+    ];
+    let mut details = Vec::new();
+    for entry in entries {
+        let item = entry.projection.item(false);
+        let object = tool_activity_object(&entry.projection).unwrap_or_default();
+        let kind = match item.title.as_str() {
+            title if title == "read" || title.starts_with("read ") => ToolSummaryKind::Read,
+            title if title == "listed" || title.starts_with("listed ") => ToolSummaryKind::Listed,
+            title if title == "searched" || title.starts_with("searched ") => {
+                ToolSummaryKind::Searched
+            }
+            title if title == "edited" || title.starts_with("edited ") => ToolSummaryKind::Edited,
+            title if title == "ran" || title.starts_with("ran ") => ToolSummaryKind::Ran,
+            _ => ToolSummaryKind::Other,
+        };
+        if let Some((_, objects)) = counts.iter_mut().find(|(candidate, _)| *candidate == kind) {
+            if !object.is_empty() {
+                objects.push(object.to_owned());
+            } else {
+                objects.push(String::new());
+            }
+        }
+        if !object.is_empty() {
+            details.push(object.to_owned());
+        }
+        if let OperationProjection::ToolActivity { details: extra, .. }
+        | OperationProjection::FileChange { details: extra, .. } = &entry.projection
+        {
+            details.extend(extra.iter().cloned());
+        }
+    }
+
+    let parts = counts
+        .iter()
+        .filter(|(_, objects)| !objects.is_empty())
+        .map(|(kind, objects)| {
+            if objects.len() == 1 && !objects[0].is_empty() {
+                let object = match kind {
+                    ToolSummaryKind::Read | ToolSummaryKind::Edited => {
+                        display_file_name(&objects[0])
+                    }
+                    ToolSummaryKind::Ran => String::new(),
+                    _ => objects[0].clone(),
+                };
+                if object.is_empty() {
+                    format!("{} {}", kind.label(), kind.noun(objects.len()))
+                } else {
+                    format!("{} {object}", kind.label())
+                }
+            } else {
+                format!(
+                    "{} {} {}",
+                    kind.label(),
+                    objects.len(),
+                    kind.noun(objects.len())
+                )
+            }
+        })
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return None;
+    }
+
+    let mut first = entries[0].clone();
+    first.projection = OperationProjection::ToolActivity {
+        id: OperationId(format!("batch:{}", first.id)),
+        item: TranscriptItem {
+            role: TranscriptRole::Success,
+            title: parts.join(", "),
+            body: Vec::new(),
+        },
+        details,
+    };
+    first.stable = true;
+    Some(first)
+}
+
+fn coalesce_completed_tool_batches(items: Vec<EventOperationEntry>) -> Vec<EventOperationEntry> {
+    let mut coalesced = Vec::with_capacity(items.len());
+    let mut index = 0;
+    while index < items.len() {
+        if items[index].stable && items[index].projection.is_successful_completed_tool() {
+            let mut end = index + 1;
+            while end < items.len()
+                && items[end].stable
+                && items[end].projection.is_successful_completed_tool()
+                && items[end].turn_id.is_some()
+                && items[end].turn_id == items[index].turn_id
+            {
+                end += 1;
+            }
+            if let Some(summary) = summarize_successful_tool_batch(&items[index..end]) {
+                coalesced.push(summary);
+                index = end;
+                continue;
+            }
+        }
+        coalesced.push(items[index].clone());
+        index += 1;
+    }
+    coalesced
 }
 
 fn tool_status_role(status: ToolResultStatus) -> TranscriptRole {
@@ -839,6 +1400,23 @@ fn tool_invocation(tool_name: &str, values: Option<&Value>) -> String {
     let string = |key: &str| values.get(key).and_then(Value::as_str);
     match tool_name {
         "shell" => string("command").unwrap_or_default().to_owned(),
+        "shell_session" => {
+            let command = string("command").unwrap_or_default();
+            let stdin = string("stdin")
+                .or_else(|| string("input"))
+                .unwrap_or_default();
+            if stdin.trim().is_empty() {
+                command.to_owned()
+            } else if command.trim().is_empty() {
+                stdin.to_owned()
+            } else {
+                format!("{command}\n{stdin}")
+            }
+        }
+        "subagent" | "delegate_task" => string("task")
+            .or_else(|| string("child_status"))
+            .unwrap_or_default()
+            .to_owned(),
         "read_file" | "write_file" | "edit_file" | "list_dir" => {
             string("path").unwrap_or_default().to_owned()
         }
@@ -1050,24 +1628,8 @@ pub(crate) fn assistant_event_transcript_item(event: &RuntimeEvent) -> Option<Tr
 
 pub(crate) fn status_event_transcript_item(event: &RuntimeEvent) -> Option<TranscriptItem> {
     if event.event_type == RuntimeEventType::ApprovalRequested {
-        let request = event.payload.get("request")?;
-        let tool_name = request
-            .get("tool_name")
-            .and_then(Value::as_str)
-            .unwrap_or("tool");
-        let resource = request
-            .get("resource")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown resource");
-        let reason = request
-            .get("reason")
-            .and_then(Value::as_str)
-            .unwrap_or("explicit approval is required");
-        return Some(TranscriptItem {
-            role: TranscriptRole::Status,
-            title: "Approval required".to_owned(),
-            body: vec![format!("{tool_name}: {resource}"), reason.to_owned()],
-        });
+        // 审批走独立对话框，不在 transcript 再铺一张卡。
+        return None;
     }
     if event.event_type == RuntimeEventType::ToolCompleted {
         return tool_event_transcript_item(event);
@@ -1111,22 +1673,27 @@ fn tool_event_transcript_item(event: &RuntimeEvent) -> Option<TranscriptItem> {
         .and_then(Value::as_str);
     let facts = envelope.and_then(|value| value.get("structured_facts"));
     match tool_name {
-        Some("shell") => Some(TranscriptItem {
-            role: tool_status_role(status),
-            title: completed_tool_title("shell", status),
-            body: vec![
-                facts
-                    .and_then(|value| value.get("command"))
-                    .and_then(Value::as_str)
-                    .unwrap_or(&summary)
-                    .to_owned(),
-            ],
-        }),
-        Some("read_file" | "list_dir" | "rg_search" | "symbol_search" | "find_references") => {
+        Some("shell") => {
+            let command = facts
+                .and_then(|value| value.get("command"))
+                .and_then(Value::as_str)
+                .unwrap_or(&summary);
             Some(TranscriptItem {
                 role: tool_status_role(status),
-                title: completed_tool_title(tool_name.unwrap_or("tool"), status),
-                body: vec![tool_resource(facts).unwrap_or(summary)],
+                title: completed_tool_title_with_object("shell", status, Some(command)),
+                body: vec![command.to_owned()],
+            })
+        }
+        Some("read_file" | "list_dir" | "rg_search" | "symbol_search" | "find_references") => {
+            let resource = tool_resource(facts).unwrap_or(summary);
+            Some(TranscriptItem {
+                role: tool_status_role(status),
+                title: completed_tool_title_with_object(
+                    tool_name.unwrap_or("tool"),
+                    status,
+                    Some(&resource),
+                ),
+                body: vec![resource],
             })
         }
         _ => Some(TranscriptItem {
@@ -1333,8 +1900,9 @@ pub(crate) fn readable_step_label(label: &str) -> String {
 mod tests {
     use chrono::Utc;
     use golutra_core::{
-        EventId, EvidenceId, SessionId, TaskId, ToolCallId, VerificationCheck,
-        VerificationCheckKind, VerificationId, VerificationIndependence, VerificationSource,
+        EventId, EvidenceId, SessionId, TaskId, ToolCallId, UserStep, UserStepId, UserStepKind,
+        UserStepTool, VerificationCheck, VerificationCheckKind, VerificationId,
+        VerificationIndependence, VerificationSource,
     };
     use golutra_protocol::RuntimeEventSource;
     use serde_json::json;
@@ -1426,12 +1994,10 @@ mod tests {
             durable: true,
         };
         app.events.push(event.clone());
-        let OperationProjection::Notice { item } =
-            result_card_projection(&app).expect("terminal result card")
-        else {
-            panic!("result card must be a notice");
-        };
-        assert_eq!(item.title, "Result · Completed · Unverified");
+        assert!(
+            result_card_projection(&app).is_none(),
+            "successful unverified tasks should not show a result card"
+        );
 
         event.task_id = Some(current_task);
         event.payload = json!({"record": verification_for(current_task)});
@@ -1442,9 +2008,29 @@ mod tests {
             panic!("result card must be a notice");
         };
         assert_eq!(item.title, "Result · Verified");
+        assert!(
+            !item.title.contains("Unverified"),
+            "unverified wording must not appear on the verified card"
+        );
+
+        app.events.clear();
+        app.projection.as_mut().expect("projection").status = TaskStatus::Failed;
+        assert!(
+            result_card_projection(&app).is_none(),
+            "failed tasks should not show a result card in the user transcript"
+        );
     }
 
     fn tool_event(sequence_no: u64, event_type: RuntimeEventType, payload: Value) -> RuntimeEvent {
+        tool_event_on_turn(sequence_no, None, event_type, payload)
+    }
+
+    fn tool_event_on_turn(
+        sequence_no: u64,
+        turn_id: Option<TurnId>,
+        event_type: RuntimeEventType,
+        payload: Value,
+    ) -> RuntimeEvent {
         RuntimeEvent {
             schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
             causal_context: Default::default(),
@@ -1452,7 +2038,7 @@ mod tests {
             id: EventId::new(),
             sequence_no,
             session_id: SessionId::new(),
-            turn_id: None,
+            turn_id,
             task_id: Some(TaskId::new()),
             parent_event_id: None,
             event_type,
@@ -1580,15 +2166,22 @@ mod tests {
         ];
 
         let running = event_operation_projections(&events[..2]);
-        let OperationProjection::ToolActivity { item, .. } = &running[0] else {
+        let OperationProjection::ToolActivity { .. } = &running[0] else {
             panic!("running tool projection");
         };
+        let running_expanded = running[0].item(true);
         assert!(
-            item.body
+            running_expanded
+                .body
                 .iter()
                 .any(|line| line.contains("stdout · 3 lines"))
         );
-        assert!(item.body.iter().any(|line| line == "│ running test two"));
+        assert!(
+            running_expanded
+                .body
+                .iter()
+                .any(|line| line == "│ running test two")
+        );
 
         let projections = event_operation_projections(&events);
 
@@ -1596,18 +2189,29 @@ mod tests {
         let OperationProjection::ToolActivity { item, details, .. } = &projections[0] else {
             panic!("tool lifecycle should remain a tool operation");
         };
-        assert_eq!(item.title, "Ran");
+        assert_eq!(item.title, "ran");
         assert_eq!(item.role, TranscriptRole::Success);
-        assert!(item.body.iter().any(|line| line == "cargo test"));
-        assert!(item.body.iter().any(|line| line.contains("exit 0")));
+        let collapsed = projections[0].item(false);
+        assert!(collapsed.body.iter().any(|line| line == "  └ cargo test"));
+        assert!(collapsed.body.iter().any(|line| line == "    one"));
+        assert!(details.iter().any(|line| line == "cargo test"));
+        assert!(details.iter().any(|line| line.contains("exit 0")));
         assert!(details.iter().all(|line| line != "Facts"));
         assert!(details.iter().any(|line| line == "four"));
+        assert_eq!(running[0].item(false).title, "Running");
+        assert!(
+            running[0]
+                .item(false)
+                .body
+                .iter()
+                .any(|line| line.contains("running test two"))
+        );
     }
 
     #[test]
     fn terminal_tool_statuses_have_distinct_user_visible_roles() {
         let cases = [
-            ("ok", "Ran", TranscriptRole::Success),
+            ("ok", "ran", TranscriptRole::Success),
             ("error", "Failed", TranscriptRole::Error),
             ("timeout", "Timed out", TranscriptRole::Warning),
             ("blocked", "Blocked", TranscriptRole::Warning),
@@ -1666,7 +2270,12 @@ mod tests {
         let collapsed = projection.item(false);
         let expanded = projection.item(true);
 
-        assert!(collapsed.body.iter().all(|line| !line.contains("-old")));
+        assert!(
+            collapsed
+                .body
+                .iter()
+                .any(|line| line.contains("src/lib.rs"))
+        );
         assert!(expanded.body.iter().any(|line| line == "-old"));
         assert!(expanded.body.iter().any(|line| line == "+new"));
     }
@@ -1717,14 +2326,14 @@ mod tests {
 
         assert_eq!(item.role, TranscriptRole::Error);
         assert_eq!(item.title, "Failed · Edited 1 file (+1 -0)");
+        assert!(item.body.iter().any(|line| line == "shell command failed"));
+        assert!(item.body.iter().any(|line| line == "src/lib.rs  +1 -0"));
         assert!(
-            item.body
+            details
                 .iter()
                 .any(|line| line == "printf new > src/lib.rs; false")
         );
-        assert!(item.body.iter().any(|line| line.contains("exit 1")));
-        assert!(item.body.iter().any(|line| line == "shell command failed"));
-        assert!(item.body.iter().any(|line| line == "src/lib.rs  +1 -0"));
+        assert!(details.iter().any(|line| line.contains("exit 1")));
         assert!(details.iter().any(|line| line == "Output"));
         assert!(details.iter().any(|line| line == "command failure output"));
         assert!(details.iter().all(|line| line != "Facts"));
@@ -1790,12 +2399,510 @@ mod tests {
             }),
         )])[0]
             .clone();
-        let item = projection.item(false);
+        let collapsed = projection.item(false);
+        let expanded = projection.item(true);
 
         assert!(
-            item.body
+            collapsed
+                .body
+                .iter()
+                .any(|line| line.contains("workspace changes unknown"))
+        );
+        assert!(
+            expanded
+                .body
                 .iter()
                 .any(|line| line == "workspace changes unknown")
+        );
+    }
+
+    fn assistant_delta(sequence_no: u64, turn_id: TurnId, text: &str) -> RuntimeEvent {
+        tool_event_on_turn(
+            sequence_no,
+            Some(turn_id),
+            RuntimeEventType::ProviderStreamed,
+            json!({"delta": {"kind": "text_delta", "text": text}}),
+        )
+    }
+
+    fn completed_read(sequence_no: u64, turn_id: TurnId, path: &str) -> Vec<RuntimeEvent> {
+        completed_read_with_id(sequence_no, turn_id, ToolCallId::new(), path)
+    }
+
+    fn completed_read_with_id(
+        sequence_no: u64,
+        turn_id: TurnId,
+        tool_call_id: ToolCallId,
+        path: &str,
+    ) -> Vec<RuntimeEvent> {
+        vec![
+            tool_event_on_turn(
+                sequence_no,
+                Some(turn_id),
+                RuntimeEventType::ToolStarted,
+                json!({
+                    "tool_call_id": tool_call_id,
+                    "tool_name": "read_file",
+                    "arguments": {"path": path}
+                }),
+            ),
+            tool_event_on_turn(
+                sequence_no + 1,
+                Some(turn_id),
+                RuntimeEventType::ToolCompleted,
+                json!({
+                    "envelope": {
+                        "tool_call_id": tool_call_id,
+                        "tool_name": "read_file",
+                        "status": "ok",
+                        "summary": "file read",
+                        "structured_facts": {"path": path}
+                    }
+                }),
+            ),
+        ]
+    }
+
+    #[test]
+    fn assistant_text_between_tool_batches_stays_as_separate_model_narration() {
+        let turn_id = TurnId::new();
+        let mut events = vec![assistant_delta(1, turn_id, "先摸清仓库结构。")];
+        events.extend(completed_read(2, turn_id, "README.md"));
+        events.extend(completed_read(4, turn_id, "Cargo.toml"));
+        events.push(assistant_delta(6, turn_id, "再补架构信息。"));
+        events.push(tool_event_on_turn(
+            7,
+            Some(turn_id),
+            RuntimeEventType::AssistantMessage,
+            json!({"content": "先摸清仓库结构。再补架构信息。最终回复"}),
+        ));
+        let projections = event_operation_projections(&events);
+        let titles_and_bodies = projections
+            .iter()
+            .map(|projection| {
+                let item = projection.item(false);
+                (item.title, item.body)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            titles_and_bodies[0],
+            ("Golutra".to_owned(), vec!["先摸清仓库结构。".to_owned()])
+        );
+        assert_eq!(titles_and_bodies[1].0, "read 2 files");
+        assert!(
+            titles_and_bodies[1]
+                .1
+                .iter()
+                .any(|line| line.contains("README.md"))
+        );
+        assert_eq!(
+            titles_and_bodies[2],
+            ("Golutra".to_owned(), vec!["再补架构信息。".to_owned()])
+        );
+        assert_eq!(titles_and_bodies.len(), 3);
+    }
+
+    #[test]
+    fn single_successful_read_keeps_the_file_name_instead_of_a_count() {
+        let projections =
+            event_operation_projections(&completed_read(1, TurnId::new(), "README.md"));
+        let item = projections[0].item(false);
+        assert_eq!(item.title, "read README.md");
+    }
+
+    #[test]
+    fn failed_shell_stays_outside_the_successful_tool_summary() {
+        let turn_id = TurnId::new();
+        let mut events = completed_read(1, turn_id, "README.md");
+        events.extend(completed_read(3, turn_id, "Cargo.toml"));
+        events.push(tool_event_on_turn(
+            5,
+            Some(turn_id),
+            RuntimeEventType::ToolCompleted,
+            json!({
+                "envelope": {
+                    "tool_call_id": ToolCallId::new(),
+                    "tool_name": "shell",
+                    "status": "error",
+                    "summary": "command failed",
+                    "structured_facts": {"command": "false"}
+                }
+            }),
+        ));
+        let projections = event_operation_projections(&events);
+        assert_eq!(projections.len(), 2);
+        assert_eq!(projections[0].item(false).title, "read 2 files");
+        assert_eq!(projections[1].item(false).title, "Failed");
+    }
+
+    #[test]
+    fn in_progress_read_is_not_folded_into_completed_summary() {
+        let turn_id = TurnId::new();
+        let mut events = completed_read(1, turn_id, "README.md");
+        events.extend(completed_read(3, turn_id, "Cargo.toml"));
+        events.push(tool_event_on_turn(
+            5,
+            Some(turn_id),
+            RuntimeEventType::ToolStarted,
+            json!({
+                "tool_call_id": ToolCallId::new(),
+                "tool_name": "read_file",
+                "arguments": {"path": "docs/ARCHITECTURE.md"}
+            }),
+        ));
+        let projections = event_operation_projections(&events);
+        assert_eq!(projections.len(), 2);
+        assert_eq!(projections[0].item(false).title, "read 2 files");
+        assert_eq!(projections[1].item(false).title, "Reading ARCHITECTURE.md");
+    }
+
+    #[test]
+    fn mixed_batch_prints_user_visible_titles() {
+        let turn_id = TurnId::new();
+        let list_id = ToolCallId::new();
+        let shell_id = ToolCallId::new();
+        let mut events = vec![assistant_delta(1, turn_id, "先摸清仓库结构。")];
+        events.extend(completed_read(2, turn_id, "README.md"));
+        events.extend(completed_read(4, turn_id, "Cargo.toml"));
+        events.push(tool_event_on_turn(
+            6,
+            Some(turn_id),
+            RuntimeEventType::ToolStarted,
+            json!({
+                "tool_call_id": list_id,
+                "tool_name": "list_dir",
+                "arguments": {"path": "crates"}
+            }),
+        ));
+        events.push(tool_event_on_turn(
+            7,
+            Some(turn_id),
+            RuntimeEventType::ToolCompleted,
+            json!({
+                "envelope": {
+                    "tool_call_id": list_id,
+                    "tool_name": "list_dir",
+                    "status": "ok",
+                    "summary": "listed",
+                    "structured_facts": {"path": "crates"}
+                }
+            }),
+        ));
+        events.push(assistant_delta(8, turn_id, "再核对入口后跑检查。"));
+        events.push(tool_event_on_turn(
+            9,
+            Some(turn_id),
+            RuntimeEventType::ToolStarted,
+            json!({
+                "tool_call_id": shell_id,
+                "tool_name": "shell",
+                "arguments": {"command": "cargo test -p golutra-tui"}
+            }),
+        ));
+        events.push(tool_event_on_turn(
+            10,
+            Some(turn_id),
+            RuntimeEventType::ToolCompleted,
+            json!({
+                "envelope": {
+                    "tool_call_id": shell_id,
+                    "tool_name": "shell",
+                    "status": "ok",
+                    "summary": "ok",
+                    "structured_facts": {"command": "cargo test -p golutra-tui"}
+                }
+            }),
+        ));
+        events.push(tool_event_on_turn(
+            11,
+            Some(turn_id),
+            RuntimeEventType::AssistantMessage,
+            json!({"content": "先摸清仓库结构。再核对入口后跑检查。最终回复不应覆盖步间短句。"}),
+        ));
+
+        let items = event_transcript_items(&events);
+        let rendered = items
+            .iter()
+            .map(|item| {
+                if item.body.is_empty() {
+                    item.title.clone()
+                } else {
+                    format!("{} | {}", item.title, item.body.join(" / "))
+                }
+            })
+            .collect::<Vec<_>>();
+        for line in &rendered {
+            println!("VISIBLE {line}");
+        }
+        assert_eq!(rendered[0], "Golutra | 先摸清仓库结构。");
+        assert!(rendered[1].starts_with("read 2 files, listed crates"));
+        assert_eq!(rendered[2], "Golutra | 再核对入口后跑检查。");
+        assert!(rendered[3].starts_with("ran"));
+        assert!(rendered[3].contains("cargo test -p golutra-tui"));
+        assert_eq!(rendered.len(), 4);
+    }
+
+    #[test]
+    fn user_step_shell_batch_keeps_the_command_preview() {
+        let turn_id = TurnId::new();
+        let tool_call_id = ToolCallId::new();
+        let events = vec![
+            tool_event_on_turn(
+                1,
+                Some(turn_id),
+                RuntimeEventType::ToolCompleted,
+                json!({
+                    "envelope": {
+                        "tool_call_id": tool_call_id,
+                        "tool_name": "shell",
+                        "status": "ok",
+                        "summary": "ok",
+                        "structured_facts": {"command": "git status --short"}
+                    }
+                }),
+            ),
+            tool_event_on_turn(
+                2,
+                Some(turn_id),
+                RuntimeEventType::UserStep,
+                json!({
+                    "step": UserStep {
+                        step_id: UserStepId::new(),
+                        turn_id,
+                        kind: UserStepKind::ToolBatch {
+                            summary: "ran".to_owned(),
+                            tools: vec![golutra_core::user_step_tool_from_envelope(
+                                tool_call_id,
+                                "shell".to_owned(),
+                                ToolResultStatus::Ok,
+                                &json!({"command": "git status --short"}),
+                            )],
+                        },
+                    }
+                }),
+            ),
+        ];
+        let item = event_transcript_items(&events)[0].clone();
+        assert_eq!(item.title, "ran");
+        assert!(item.body.iter().any(|line| line == "  └ git status --short"));
+    }
+
+    #[test]
+    fn user_step_events_render_visible_text_and_tool_batches() {
+        let turn_id = TurnId::new();
+        let events = vec![
+            tool_event_on_turn(
+                1,
+                Some(turn_id),
+                RuntimeEventType::UserStep,
+                json!({
+                    "step": UserStep {
+                        step_id: UserStepId::new(),
+                        turn_id,
+                        kind: UserStepKind::AssistantText {
+                            text: "先看仓库结构。".to_owned(),
+                        },
+                    }
+                }),
+            ),
+            tool_event_on_turn(
+                2,
+                Some(turn_id),
+                RuntimeEventType::UserStep,
+                json!({
+                    "step": UserStep {
+                        step_id: UserStepId::new(),
+                        turn_id,
+                        kind: UserStepKind::ToolBatch {
+                            summary: "read 2 files, listed crates".to_owned(),
+                            tools: vec![
+                                UserStepTool {
+                                    tool_call_id: ToolCallId::new(),
+                                    tool_name: "read_file".to_owned(),
+                                    status: ToolResultStatus::Ok,
+                                    object: Some("README.md".to_owned()),
+                                },
+                                UserStepTool {
+                                    tool_call_id: ToolCallId::new(),
+                                    tool_name: "read_file".to_owned(),
+                                    status: ToolResultStatus::Ok,
+                                    object: Some("Cargo.toml".to_owned()),
+                                },
+                                UserStepTool {
+                                    tool_call_id: ToolCallId::new(),
+                                    tool_name: "list_dir".to_owned(),
+                                    status: ToolResultStatus::Ok,
+                                    object: Some("crates".to_owned()),
+                                },
+                            ],
+                        },
+                    }
+                }),
+            ),
+            tool_event_on_turn(
+                3,
+                Some(turn_id),
+                RuntimeEventType::AssistantMessage,
+                json!({"content": "最终整段回复不应覆盖 UserStep 短句。"}),
+            ),
+        ];
+        let items = event_transcript_items(&events);
+        assert_eq!(items[0].title, "Golutra");
+        assert_eq!(items[0].body, vec!["先看仓库结构。".to_owned()]);
+        assert_eq!(items[1].title, "read 2 files, listed crates");
+        assert!(items.iter().all(|item| {
+            item.body
+                .iter()
+                .all(|line| line != "最终整段回复不应覆盖 UserStep 短句。")
+        }));
+    }
+
+    #[test]
+    fn user_step_path_keeps_user_prompt_and_interleaves_live_tools() {
+        let turn_id = TurnId::new();
+        let read_id = ToolCallId::new();
+        let mut events = vec![tool_event_on_turn(
+            1,
+            Some(turn_id),
+            RuntimeEventType::TaskCreated,
+            json!({"payload": {"prompt": "看仓库结构"}}),
+        )];
+        events.push(assistant_delta(2, turn_id, "先看仓库结构。"));
+        events.extend(completed_read_with_id(3, turn_id, read_id, "README.md"));
+        events.push(tool_event_on_turn(
+            5,
+            Some(turn_id),
+            RuntimeEventType::UserStep,
+            json!({
+                "step": UserStep {
+                    step_id: UserStepId::new(),
+                    turn_id,
+                    kind: UserStepKind::AssistantText {
+                        text: "先看仓库结构。".to_owned(),
+                    },
+                }
+            }),
+        ));
+        events.push(tool_event_on_turn(
+            6,
+            Some(turn_id),
+            RuntimeEventType::UserStep,
+            json!({
+                "step": UserStep {
+                    step_id: UserStepId::new(),
+                    turn_id,
+                    kind: UserStepKind::ToolBatch {
+                        summary: "read README.md".to_owned(),
+                        tools: vec![UserStepTool {
+                            tool_call_id: read_id,
+                            tool_name: "read_file".to_owned(),
+                            status: ToolResultStatus::Ok,
+                            object: Some("README.md".to_owned()),
+                        }],
+                    },
+                }
+            }),
+        ));
+        events.push(tool_event_on_turn(
+            7,
+            Some(turn_id),
+            RuntimeEventType::ToolStarted,
+            json!({
+                "tool_call_id": ToolCallId::new(),
+                "tool_name": "list_dir",
+                "arguments": {"path": "crates"}
+            }),
+        ));
+        events.push(tool_event_on_turn(
+            8,
+            Some(turn_id),
+            RuntimeEventType::AssistantMessage,
+            json!({"content": "先看仓库结构。最终整段回复不应覆盖短句。"}),
+        ));
+
+        let items = event_transcript_items(&events);
+        let rendered = items
+            .iter()
+            .map(|item| {
+                if item.body.is_empty() {
+                    item.title.clone()
+                } else {
+                    format!("{} | {}", item.title, item.body.join(" / "))
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rendered[0], "You | 看仓库结构");
+        assert_eq!(rendered[1], "Golutra | 先看仓库结构。");
+        assert!(rendered[2].starts_with("read README.md"));
+        assert!(rendered[3].starts_with("Listing crates"));
+        assert_eq!(rendered.len(), 4);
+    }
+
+    #[test]
+    fn background_session_and_subagent_follow_codex_titles() {
+        let waited = event_operation_projections(&[tool_event(
+            1,
+            RuntimeEventType::ToolCompleted,
+            json!({
+                "envelope": {
+                    "tool_call_id": ToolCallId::new(),
+                    "tool_name": "shell_session",
+                    "status": "ok",
+                    "summary": "still running",
+                    "structured_facts": {"command": "cargo test"}
+                }
+            }),
+        )]);
+        assert_eq!(
+            waited[0].item(false).title,
+            "Waited for background terminal"
+        );
+        assert!(
+            waited[0]
+                .item(false)
+                .body
+                .iter()
+                .any(|line| line == "  └ cargo test")
+        );
+
+        let interacted = event_operation_projections(&[tool_event(
+            1,
+            RuntimeEventType::ToolCompleted,
+            json!({
+                "envelope": {
+                    "tool_call_id": ToolCallId::new(),
+                    "tool_name": "shell_session",
+                    "status": "ok",
+                    "summary": "sent input",
+                    "structured_facts": {"command": "python", "stdin": "print(1)\n"}
+                }
+            }),
+        )]);
+        assert_eq!(
+            interacted[0].item(false).title,
+            "Interacted with background terminal"
+        );
+
+        let child = event_operation_projections(&[tool_event(
+            1,
+            RuntimeEventType::ToolCompleted,
+            json!({
+                "envelope": {
+                    "tool_call_id": ToolCallId::new(),
+                    "tool_name": "subagent",
+                    "status": "ok",
+                    "summary": "child completed",
+                    "structured_facts": {"child_status": "completed"}
+                }
+            }),
+        )]);
+        assert_eq!(child[0].item(false).title, "subagent");
+        assert!(
+            child[0]
+                .item(false)
+                .body
+                .iter()
+                .any(|line| line.contains("completed"))
         );
     }
 }

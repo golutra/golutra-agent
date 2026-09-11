@@ -1028,6 +1028,7 @@ pub(crate) fn system_prompt() -> String {
         "Trust successful mutation status, changed paths, digest, count, and preview. Do not reread your own successful mutation unless external changes, truncated evidence, or failed validation require it.",
         "Finish guarded changes before release or wait; never change them after terminal. Background starts return; one bounded wait for terminal state.",
         "Follow project conventions; verify by risk; report blockers concisely; ask on consequential ambiguity.",
+        "Before each tool batch, write one short visible sentence; do not hide it in reasoning.",
     ]
     .join("\n")
 }
@@ -1311,7 +1312,8 @@ mod tests {
         assert!(prompt.contains("one bounded wait for terminal state"));
         assert!(prompt.contains("blockers concisely"));
         assert!(prompt.contains("consequential ambiguity"));
-        assert!(prompt.chars().count() < 1_000);
+        assert!(prompt.contains("Before each tool batch, write one short visible sentence"));
+        assert!(prompt.chars().count() < 1_100);
         for tool_detail in [
             "read_file",
             "write_file",
@@ -1354,6 +1356,41 @@ mod tests {
         };
 
         assert_eq!(conversation_history_line(&event), None);
+    }
+
+    #[test]
+    fn user_step_events_are_user_projection_not_model_history() {
+        let event = RuntimeEvent {
+            schema_version: RUNTIME_EVENT_SCHEMA_VERSION,
+            causal_context: Default::default(),
+            causal_links: Vec::new(),
+            id: EventId::new(),
+            sequence_no: 1,
+            session_id: SessionId::new(),
+            turn_id: Some(TurnId::new()),
+            task_id: Some(TaskId::new()),
+            parent_event_id: None,
+            event_type: RuntimeEventType::UserStep,
+            timestamp: Utc::now(),
+            source: RuntimeEventSource::Runtime,
+            payload: serde_json::json!({
+                "summary": "read README.md",
+                "step": {
+                    "step_id": "01HUSERSTEP000000000000000",
+                    "turn_id": "01HTURN0000000000000000000",
+                    "kind": {"type": "assistant_text", "text": "先看仓库结构。"}
+                }
+            }),
+            payload_ref: None,
+            durable: true,
+        };
+
+        assert!(!event.event_type.is_model_history_fact());
+        assert!(event.event_type.is_user_projection_fact());
+        assert_eq!(conversation_history_line(&event), None);
+        assert!(conversation_history_contributor(&event).is_none());
+        assert!(!is_history_cache_event(&event));
+        assert!(effective_model_history_events([&event]).is_empty());
     }
 
     #[test]

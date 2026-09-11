@@ -559,6 +559,7 @@ fn estimate_observation_bytes(observation: &RuntimeObservation) -> usize {
         RuntimeObservation::AssistantMessage { turn_id, content } => {
             structured_bytes(&(turn_id, content))
         }
+        RuntimeObservation::UserStep(step) => structured_bytes(step),
     };
     size_of::<RuntimeObservation>().saturating_add(dynamic_bytes)
 }

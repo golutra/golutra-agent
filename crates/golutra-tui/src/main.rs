@@ -996,9 +996,27 @@ impl TuiApp {
     }
 
     async fn load_recent_history(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
-        let history = load_recent_event_history(transport, self.session_id, self.task_id)
-            .await
-            .map_err(|error| miette::miette!("{error}"))?;
+        // 会话恢复和首次附着都要把可回放的完整历史灌进 transcript。
+        // 只读最近一页会让 --resume / /resume 后终端只剩尾部几轮。
+        self.load_session_history(transport).await
+    }
+
+    async fn load_session_history(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
+        let history =
+            match load_complete_event_history(transport, self.session_id, self.task_id).await {
+                Ok(history) => history,
+                Err(error) => {
+                    // 超预算时退回最近一页，并保留 has_more_before，让触顶继续分页。
+                    let mut history =
+                        load_recent_event_history(transport, self.session_id, self.task_id)
+                            .await
+                            .map_err(|fallback| miette::miette!("{fallback}"))?;
+                    history.has_more_before = true;
+                    self.status_message =
+                        format!("loaded recent history; earlier pages remain: {error}");
+                    history
+                }
+            };
         self.apply_loaded_history(history);
         Ok(())
     }
@@ -1007,12 +1025,11 @@ impl TuiApp {
         &mut self,
         transport: &RuntimeTransport,
     ) -> miette::Result<()> {
-        let history = load_recent_event_history(transport, self.session_id, self.task_id)
-            .await
-            .map_err(|error| miette::miette!("{error}"))?;
         self.begin_history_replay();
-        self.apply_loaded_history(history);
-        self.status_message = "transcript history reloaded".to_owned();
+        self.load_session_history(transport).await?;
+        if !self.status_message.starts_with("loaded recent history") {
+            self.status_message = "transcript history reloaded".to_owned();
+        }
         Ok(())
     }
 
@@ -1052,6 +1069,10 @@ impl TuiApp {
         }
         self.invalidate_transcript_layout();
         self.rebuild_event_projections();
+        if self.transcript.history.enabled {
+            // 新页插到已提交滚动区前面，必须重建，否则终端只保留原来的尾部。
+            self.request_history_rebuild();
+        }
         let current_rows = self.current_transcript_row_count();
         if let Some(top_row) = self.transcript.top_row_override {
             let prepended_rows = current_rows.saturating_sub(self.transcript.scroll.row_count);
@@ -1919,6 +1940,25 @@ impl TuiApp {
         self.transcript.enable_inline_history();
     }
 
+    fn transcript_is_scrolled_to_oldest(&self, visible_rows: usize) -> bool {
+        self.transcript.top_row_override.map_or_else(
+            || {
+                self.transcript.scroll.offset_from_bottom
+                    == self.max_transcript_scroll_offset(visible_rows)
+            },
+            |top_row| top_row == 0,
+        )
+    }
+
+    fn request_older_inline_history_if_needed(&mut self, visible_rows: usize) {
+        if self.history_has_more_before
+            && self.transcript.history.enabled
+            && self.transcript_is_scrolled_to_oldest(visible_rows)
+        {
+            self.history_load_requested = true;
+        }
+    }
+
     fn begin_history_replay(&mut self) {
         self.transcript.begin_history_replay();
     }
@@ -2054,21 +2094,14 @@ impl TuiApp {
                 | TranscriptScrollAction::Bottom
         ) {
             self.history_load_requested = false;
-        } else if !self.transcript.history.enabled
-            && self.history_has_more_before
+        } else if self.history_has_more_before
             && matches!(
                 action,
                 TranscriptScrollAction::LineUp
                     | TranscriptScrollAction::PageUp
                     | TranscriptScrollAction::Top
             )
-            && self.transcript.top_row_override.map_or_else(
-                || {
-                    self.transcript.scroll.offset_from_bottom
-                        == self.max_transcript_scroll_offset(visible_rows)
-                },
-                |top_row| top_row == 0,
-            )
+            && self.transcript_is_scrolled_to_oldest(visible_rows)
         {
             self.history_load_requested = true;
         }
@@ -4055,6 +4088,8 @@ fn draw_interactive_frame(
     terminal
         .draw(|frame| draw_ui(frame, app))
         .map_err(|error| miette::miette!("{error}"))?;
+    let visible_rows = app.layout.transcript.height.saturating_sub(1) as usize;
+    app.request_older_inline_history_if_needed(visible_rows);
     Ok(())
 }
 

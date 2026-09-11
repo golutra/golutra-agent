@@ -1314,18 +1314,20 @@ fn completed_history_keeps_latest_response_next_to_composer() {
         .iter()
         .position(|row| row.contains("latest completed response"))
         .expect("latest response row");
-    let result_row = rows
-        .iter()
-        .position(|row| row.contains("Result · Completed · Unverified"))
-        .expect("result card row");
     let composer_row = rows
         .iter()
         .position(|row| row.contains("Ask Golutra to change code or inspect the workspace"))
         .expect("composer row");
 
     assert!(
-        response_row < result_row && composer_row.saturating_sub(result_row) <= 6,
-        "latest response and result card must stay above the composer: {rows:#?}"
+        !rows
+            .iter()
+            .any(|row| row.contains("Result · Completed · Unverified")),
+        "successful unverified result card must stay hidden: {rows:#?}"
+    );
+    assert!(
+        response_row < composer_row && composer_row.saturating_sub(response_row) <= 6,
+        "latest response must stay above the composer: {rows:#?}"
     );
 }
 
@@ -1529,21 +1531,23 @@ fn resume_keeps_an_oversized_latest_response_above_the_composer() {
         .iter()
         .position(|row| row.contains("resumed response row 40"))
         .expect("latest resumed response row must remain live");
-    let result_row = rows
-        .iter()
-        .position(|row| row.contains("Result · Completed · Unverified"))
-        .expect("result card row");
     let composer_row = rows
         .iter()
         .position(|row| row.contains("Ask Golutra to change code or inspect the workspace"))
         .expect("composer row");
-    let blank_rows = rows[result_row.saturating_add(1)..composer_row]
+    let blank_rows = rows[response_row.saturating_add(1)..composer_row]
         .iter()
         .filter(|row| row.trim().is_empty())
         .count();
     assert!(
-        response_row < result_row && blank_rows <= 1,
-        "resume result card left a gap before the composer: {rows:#?}"
+        !rows
+            .iter()
+            .any(|row| row.contains("Result · Completed · Unverified")),
+        "successful unverified result card must stay hidden: {rows:#?}"
+    );
+    assert!(
+        response_row < composer_row && blank_rows <= 1,
+        "resume response left a gap before the composer: {rows:#?}"
     );
 }
 
@@ -1704,21 +1708,23 @@ fn oversized_non_tail_response_can_be_archived_atomically() {
         .iter()
         .position(|row| row.contains("latest response"))
         .expect("latest turn remains live");
-    let result_row = rows
-        .iter()
-        .position(|row| row.contains("Result · Completed · Unverified"))
-        .expect("result card row");
     let composer_row = rows
         .iter()
         .position(|row| row.contains("Ask Golutra to change code or inspect the workspace"))
         .expect("composer row");
-    let blank_rows = rows[result_row.saturating_add(1)..composer_row]
+    let blank_rows = rows[latest_row.saturating_add(1)..composer_row]
         .iter()
         .filter(|row| row.trim().is_empty())
         .count();
     assert!(
-        latest_row < result_row && blank_rows <= 1,
-        "latest result card should stay next to composer: {rows:#?}"
+        !rows
+            .iter()
+            .any(|row| row.contains("Result · Completed · Unverified")),
+        "successful unverified result card must stay hidden: {rows:#?}"
+    );
+    assert!(
+        latest_row < composer_row && blank_rows <= 1,
+        "latest response should stay next to composer: {rows:#?}"
     );
 }
 
@@ -1938,21 +1944,23 @@ fn replay_rebuild_clears_provisional_frame_before_committing_history() {
         .iter()
         .position(|row| row.contains("resumed response 30"))
         .expect("latest resumed response row");
-    let result_row = rows
-        .iter()
-        .position(|row| row.contains("Result · Completed · Unverified"))
-        .expect("result card row");
     let composer_row = rows
         .iter()
         .position(|row| row.contains("Ask Golutra to change code or inspect the workspace"))
         .expect("composer row");
-    let blank_rows = rows[result_row.saturating_add(1)..composer_row]
+    let blank_rows = rows[latest_row.saturating_add(1)..composer_row]
         .iter()
         .filter(|row| row.trim().is_empty())
         .count();
     assert!(
-        latest_row < result_row && blank_rows <= 1,
-        "replay result card left a gap before the composer: {rows:#?}"
+        !rows
+            .iter()
+            .any(|row| row.contains("Result · Completed · Unverified")),
+        "successful unverified result card must stay hidden: {rows:#?}"
+    );
+    assert!(
+        latest_row < composer_row && blank_rows <= 1,
+        "replay response left a gap before the composer: {rows:#?}"
     );
 }
 
@@ -5405,7 +5413,7 @@ fn failed_loop_decision_is_visible_in_transcript() {
 }
 
 #[test]
-fn approval_transcript_shows_tool_resource_and_reason() {
+fn approval_transcript_does_not_repeat_the_approval_dialog() {
     let event = transcript_event(
         1,
         SessionId::new(),
@@ -5422,11 +5430,7 @@ fn approval_transcript_shows_tool_resource_and_reason() {
     );
 
     let items = event_transcript_items(&[event]);
-
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0].title, "Approval required");
-    assert_eq!(items[0].body[0], "shell: cargo test --workspace");
-    assert!(items[0].body[1].contains("explicit user approval"));
+    assert!(items.is_empty());
 }
 
 #[test]
@@ -6558,6 +6562,25 @@ fn transcript_visible_window_pages_from_bottom_and_round_trips() {
     app.scroll_transcript(TranscriptScrollAction::Bottom, 10);
     assert_eq!(app.transcript.scroll.offset_from_bottom, 0);
     assert!(!app.history_load_requested);
+}
+
+#[test]
+fn inline_history_requests_older_pages_when_scrolled_to_the_oldest_row() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.enable_inline_history();
+    app.history_has_more_before = true;
+    app.transcript.scroll.row_count = 50;
+    app.transcript.scroll.follow_tail = true;
+
+    app.scroll_transcript(TranscriptScrollAction::Top, 10);
+    assert!(app.history_load_requested);
 }
 
 #[test]

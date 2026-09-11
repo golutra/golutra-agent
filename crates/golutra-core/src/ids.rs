@@ -84,6 +84,7 @@ define_id!(VerificationAssertionId);
 define_id!(RegressionCampaignId);
 define_id!(RegressionExecutionId);
 define_id!(MemoryCandidateId);
+define_id!(UserStepId);
 
 impl From<TaskId> for RunId {
     fn from(value: TaskId) -> Self {

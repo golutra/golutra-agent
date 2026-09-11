@@ -3343,6 +3343,14 @@ async fn zero_iteration_budget_disables_the_legacy_fixed_round_cap() {
         AgentLoopTraceEvent::AssistantMessage { content, .. }
             if content == "completed without fixed cap"
     )));
+    assert!(trace.iter().any(|event| matches!(
+        event,
+        AgentLoopTraceEvent::UserStep(step)
+            if matches!(
+                &step.kind,
+                golutra_core::UserStepKind::AssistantText { text } if text == "completed without fixed cap"
+            )
+    )));
     assert!(!trace.iter().any(|event| matches!(
         event,
         AgentLoopTraceEvent::GovernorDecided(decision)
@@ -3390,6 +3398,17 @@ async fn agent_loop_can_complete_more_than_four_provider_tool_rounds() {
         AgentLoopTraceEvent::AssistantMessage { content, .. }
             if content == "finished six rounds"
     )));
+    assert!(
+        trace
+            .iter()
+            .filter(|event| matches!(
+                event,
+                AgentLoopTraceEvent::UserStep(step)
+                    if matches!(step.kind, golutra_core::UserStepKind::ToolBatch { .. })
+            ))
+            .count()
+            >= 6
+    );
     assert_eq!(
         trace
             .iter()
