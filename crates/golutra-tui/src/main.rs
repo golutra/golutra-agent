@@ -2245,7 +2245,7 @@ impl TuiApp {
     }
 
     fn scroll_active_pane(&mut self, action: TranscriptScrollAction) {
-        if self.debug_mode {
+        if self.debug_mode || self.transcript.history.enabled {
             return;
         }
         let rows = self.layout.transcript.height.max(1) as usize;

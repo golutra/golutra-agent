@@ -1061,6 +1061,35 @@ fn session_history_logo_is_responsive_and_screen_reader_safe() {
 }
 
 #[test]
+fn inline_viewport_height_stays_near_the_composer() {
+    let app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    )
+    .with_footer_context("/workspace", "gpt-test");
+    let width = 80;
+    let screen_height = 40;
+    let bottom = bottom_pane_height_for_width(&app, width);
+    let viewport = inline_viewport_height(&app, width, screen_height);
+    assert_eq!(viewport, bottom.saturating_add(8));
+    assert!(
+        viewport < screen_height / 2,
+        "viewport={viewport} screen={screen_height}"
+    );
+    let layout = ui_layout(Rect::new(0, 0, width, viewport), &app);
+    assert_eq!(layout.bottom.height, bottom);
+    assert!(layout.transcript.height >= 8);
+    assert_eq!(
+        layout.bottom.y.saturating_add(layout.bottom.height),
+        viewport
+    );
+}
+
+#[test]
 fn inline_session_history_is_inserted_only_once() {
     let mut app = TuiApp::new(
         ThreadId::new(),
@@ -6616,6 +6645,39 @@ fn debug_mouse_wheel_leaves_history_scrolling_to_the_terminal() {
 }
 
 #[test]
+fn inline_history_mouse_wheel_leaves_history_scrolling_to_the_terminal() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.enable_inline_history();
+    app.transcript.scroll.row_count = 50;
+    app.transcript.scroll.follow_tail = true;
+    let mut terminal = Terminal::new(TestBackend::new(120, 30)).expect("terminal");
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw");
+    let transcript = app.layout.transcript;
+
+    handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: transcript.x + 1,
+            row: transcript.y + 1,
+            modifiers: KeyModifiers::NONE,
+        },
+        &mut app,
+    );
+    assert_eq!(app.transcript.scroll.offset_from_bottom, 0);
+    app.scroll_active_pane(TranscriptScrollAction::PageUp);
+    assert_eq!(app.transcript.scroll.offset_from_bottom, 0);
+}
+
+#[test]
 fn overlay_mouse_clicks_select_every_interactive_surface() {
     let mut app = TuiApp::new(
         ThreadId::new(),
@@ -7026,7 +7088,12 @@ fn help_scrolling_clamps_to_the_wrapped_content_height() {
     handle_help_dialog_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE), &mut app);
     assert_eq!(app.help_dialog.as_ref().expect("help").scroll, 0);
     handle_help_dialog_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE), &mut app);
-    assert_eq!(app.help_dialog.as_ref().expect("help").scroll, max_scroll);
+    let drawn_max = help_scroll_max(
+        app.help_dialog.as_ref().expect("help"),
+        &app,
+        app.layout.transcript,
+    );
+    assert_eq!(app.help_dialog.as_ref().expect("help").scroll, drawn_max);
 }
 
 #[test]

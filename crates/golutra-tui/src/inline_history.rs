@@ -865,12 +865,8 @@ fn clear_history_terminal<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<
 }
 
 pub(crate) fn inline_viewport_height(app: &TuiApp, width: u16, screen_height: u16) -> u16 {
-    let history_rows = u16::try_from(session_history_lines(app, width).len()).unwrap_or(u16::MAX);
-    let minimum = bottom_pane_height_for_width(app, width).saturating_add(1);
-    screen_height
-        .saturating_sub(history_rows)
-        .max(minimum.min(screen_height))
-        .max(1)
+    let bottom = bottom_pane_height_for_width(app, width).max(MIN_INLINE_BOTTOM_ROWS);
+    bottom.saturating_add(8).min(screen_height).max(1)
 }
 
 pub(crate) fn session_history_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {

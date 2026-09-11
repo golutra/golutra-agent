@@ -98,14 +98,14 @@ pub(crate) fn help_lines(topic: HelpTopic, keymap: KeymapMode, context: &str) ->
         ],
         HelpTopic::Composer => composer_help_lines(keymap),
         HelpTopic::Navigation => vec![
-            "PageUp/PageDown  scroll transcript views".to_owned(),
+            "PageUp/PageDown  scroll terminal history".to_owned(),
             "Home/End         oldest or latest visible content".to_owned(),
             "Ctrl+T           switch full transcript/split observations".to_owned(),
             "Ctrl+F           search transcript".to_owned(),
             "Alt+C            copy transcript through OSC52".to_owned(),
             "Alt+R            rich/raw transcript".to_owned(),
             "Ctrl+O           expand operation details".to_owned(),
-            "Mouse wheel      scroll transcript views".to_owned(),
+            "Mouse wheel      scroll terminal history".to_owned(),
             "Mouse click      select visible choices".to_owned(),
         ],
         HelpTopic::Runtime => vec![
