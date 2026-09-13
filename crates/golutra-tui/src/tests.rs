@@ -3,7 +3,7 @@ use golutra_config::ProviderSettings;
 use golutra_llm::ProviderReasoningEffort;
 use golutra_protocol::{RuntimeEventType, VisibleStep};
 use ratatui::backend::TestBackend;
-use ratatui::layout::{Position, Rect};
+use ratatui::layout::{Position, Rect, Size};
 use ratatui::style::Color;
 use ratatui::text::Line;
 use tokio::{
@@ -1105,18 +1105,270 @@ fn inline_viewport_height_stays_near_the_composer() {
     let screen_height = 40;
     let bottom = bottom_pane_height_for_width(&app, width);
     let viewport = inline_viewport_height(&app, width, screen_height);
-    assert_eq!(viewport, bottom.saturating_add(8));
+    assert_eq!(viewport, bottom);
     assert!(
         viewport < screen_height / 2,
         "viewport={viewport} screen={screen_height}"
     );
     let layout = ui_layout(Rect::new(0, 0, width, viewport), &app);
     assert_eq!(layout.bottom.height, bottom);
-    assert!(layout.transcript.height >= 8);
+    assert_eq!(layout.transcript.height, 0);
     assert_eq!(
         layout.bottom.y.saturating_add(layout.bottom.height),
         viewport
     );
+}
+
+#[test]
+fn typing_a_slash_prefix_does_not_resize_the_inline_viewport() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    )
+    .with_footer_context("/workspace", "gpt-test");
+    let width = 80;
+    let screen_height = 40;
+    let idle = inline_viewport_height(&app, width, screen_height);
+    app.input.set_text("/");
+    let with_slash = inline_viewport_height(&app, width, screen_height);
+    app.input.set_text("/re");
+    let with_prefix = inline_viewport_height(&app, width, screen_height);
+    assert_eq!(idle, with_slash);
+    assert_eq!(idle, with_prefix);
+    assert!(bottom_pane_height_for_width(&app, width) > idle);
+}
+
+#[test]
+fn slash_overlays_use_the_full_terminal_instead_of_the_inline_live_viewport() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    )
+    .with_footer_context("/workspace", "gpt-test");
+    let width = 80;
+    let screen_height = 40;
+    let inline_height = inline_viewport_height(&app, width, screen_height);
+    app.resume_picker = Some(ResumePickerState::new(vec![resume_item("resume target")]));
+
+    let inline_layout = ui_layout(Rect::new(0, 0, width, inline_height), &app);
+    let fullscreen_layout = ui_layout(Rect::new(0, 0, width, screen_height), &app);
+    assert!(fullscreen_layout.transcript.height > inline_layout.transcript.height);
+    assert_eq!(
+        fullscreen_layout
+            .body
+            .height
+            .saturating_add(fullscreen_layout.bottom.height),
+        screen_height
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(width, screen_height)).expect("terminal");
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw fullscreen resume overlay");
+    let rendered = terminal_buffer_text(&terminal);
+    assert!(rendered.contains("Resume session"));
+    assert!(rendered.contains("resume target"));
+    assert_eq!(
+        app.layout.transcript.height,
+        fullscreen_layout.transcript.height
+    );
+}
+
+#[test]
+fn leaving_a_slash_overlay_keeps_the_original_inline_viewport() {
+    let screen = Size {
+        width: 80,
+        height: 24,
+    };
+    let restored = restored_inline_viewport(Some(Rect::new(0, 13, 80, 11)), screen);
+    assert_eq!(restored, Rect::new(0, 13, 80, 11));
+
+    let restored = restored_inline_viewport(Some(Rect::new(0, 20, 80, 11)), screen);
+    assert_eq!(restored, Rect::new(0, 13, 80, 11));
+
+    let restored = restored_inline_viewport(
+        Some(Rect::new(0, 0, 40, 8)),
+        Size {
+            width: 120,
+            height: 40,
+        },
+    );
+    assert_eq!(restored, Rect::new(0, 0, 40, 8));
+}
+
+#[test]
+fn flushing_slash_commands_archives_them_out_of_the_live_viewport() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    )
+    .with_footer_context("/workspace", "gpt-test");
+    app.enable_inline_history();
+    app.command_messages.push(TranscriptItem {
+        role: TranscriptRole::User,
+        title: "You".to_owned(),
+        body: vec!["/resume".to_owned()],
+    });
+    let mut terminal = Terminal::with_options(
+        TestBackend::new(80, 24),
+        TerminalOptions {
+            viewport: Viewport::Inline(12),
+        },
+    )
+    .expect("inline terminal");
+    let mut history = InlineHistoryState::new(app.session_id);
+
+    assert!(history.flush(&mut terminal, &mut app).expect("archive slash"));
+    assert!(app.command_messages.is_empty());
+    assert_eq!(
+        inline_viewport_height(&app, 80, 24),
+        bottom_pane_height_for_width(&app, 80)
+    );
+    let archived = terminal_buffer_text(&terminal);
+    assert!(
+        archived.contains("/resume"),
+        "slash command must be inserted before the live viewport: {archived}"
+    );
+    assert!(
+        !history
+            .flush(&mut terminal, &mut app)
+            .expect("second slash flush")
+    );
+}
+
+#[tokio::test]
+async fn cancelling_resume_keeps_the_submitted_slash_command_in_transcript() {
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.input.set_text("/re");
+    app.slash_selected = app
+        .slash_candidates()
+        .iter()
+        .position(|candidate| candidate.command == "/resume")
+        .expect("resume candidate");
+
+    assert!(
+        app.accept_slash_candidate(&transport)
+            .await
+            .expect("submit /resume")
+    );
+    assert!(app.input.is_empty());
+    app.command_messages
+        .retain(|item| item.role == TranscriptRole::User);
+    assert_eq!(
+        app.command_messages
+            .iter()
+            .map(|item| (item.role.clone(), item.body.clone()))
+            .collect::<Vec<_>>(),
+        vec![(TranscriptRole::User, vec!["/resume".to_owned()])]
+    );
+
+    app.resume_picker = Some(ResumePickerState::new(vec![resume_item("resume target")]));
+    handle_key(
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("cancel resume picker");
+    assert!(app.resume_picker.is_none());
+    assert_eq!(app.status_message, "Resume cancelled");
+    assert_eq!(app.input.text(), "");
+    assert_eq!(
+        app.command_messages
+            .iter()
+            .map(|item| (item.role.clone(), item.body.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (TranscriptRole::User, vec!["/resume".to_owned()]),
+            (
+                TranscriptRole::CommandResult,
+                vec!["Resume cancelled".to_owned()]
+            )
+        ]
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("terminal");
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw cancelled resume");
+    let rendered = terminal_buffer_text(&terminal);
+    assert!(rendered.contains("› /resume"));
+    assert!(rendered.contains("Resume cancelled"));
+    assert!(!rendered.contains("/re/resume"));
+    assert!(
+        !rendered
+            .lines()
+            .any(|line| line.trim() == "› /re" || line.contains("› /re─")),
+        "cancelled resume must not leave a leftover composer prefix: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn resume_without_sessions_reports_the_empty_result_under_the_slash_command() {
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.input.set_text("/resume");
+    app.slash_selected = app
+        .slash_candidates()
+        .iter()
+        .position(|candidate| candidate.command == "/resume")
+        .expect("resume candidate");
+
+    assert!(
+        app.accept_slash_candidate(&transport)
+            .await
+            .expect("submit /resume")
+    );
+    assert!(app.resume_picker.is_none());
+    assert_eq!(app.status_message, "No sessions in this cwd yet");
+    assert_eq!(
+        app.command_messages
+            .iter()
+            .map(|item| (item.role.clone(), item.body.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (TranscriptRole::User, vec!["/resume".to_owned()]),
+            (
+                TranscriptRole::CommandResult,
+                vec!["No sessions in this cwd yet".to_owned()]
+            )
+        ]
+    );
+
+    let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("terminal");
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw empty resume result");
+    let rendered = terminal_buffer_text(&terminal);
+    assert!(rendered.contains("› /resume"));
+    assert!(rendered.contains("No sessions in this cwd yet"));
 }
 
 #[test]
@@ -1301,8 +1553,12 @@ fn history_replay_resizes_before_committing_new_content() {
         .map(|row| row.line.to_string())
         .collect::<Vec<_>>();
     assert!(
-        live_rows.iter().any(|row| row.contains("RESIZE_TAIL")),
-        "the resized response must remain in the live transcript: visible={visible}; scrollback={scrollback}; live={live_rows:#?}"
+        !live_rows.iter().any(|row| row.contains("RESIZE_TAIL")),
+        "the resized completed response must leave the live composer viewport: live={live_rows:#?}"
+    );
+    assert!(
+        !app.transcript.history.committed_event_ids.is_empty(),
+        "the resized completed response must be archived: visible={visible}; scrollback={scrollback}"
     );
 }
 
@@ -1361,37 +1617,27 @@ fn completed_history_keeps_latest_response_next_to_composer() {
         .draw(|frame| draw_ui(frame, &mut app))
         .expect("draw completed frame");
 
-    let rows = (0..24)
-        .map(|row| {
-            (0..80)
-                .filter_map(|column| terminal.backend().buffer().cell((column, row)))
-                .map(|cell| cell.symbol())
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>();
-    let response_row = rows
-        .iter()
-        .position(|row| row.contains("latest completed response"))
-        .expect("latest response row");
-    let composer_row = rows
-        .iter()
-        .position(|row| row.contains("Ask Golutra to change code or inspect the workspace"))
-        .expect("composer row");
-
     assert!(
-        !rows
-            .iter()
-            .any(|row| row.contains("Result · Completed · Unverified")),
-        "successful unverified result card must stay hidden: {rows:#?}"
+        !app.transcript.history.committed_event_ids.is_empty(),
+        "completed responses must be archived out of the live composer viewport"
+    );
+    let live = transcript_render_rows(&app)
+        .into_iter()
+        .map(|row| row.line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !live.contains("latest completed response"),
+        "archived responses must leave the live composer viewport"
     );
     assert!(
-        response_row < composer_row && composer_row.saturating_sub(response_row) <= 6,
-        "latest response must stay above the composer: {rows:#?}"
+        !live.contains("Result · Completed · Unverified"),
+        "successful unverified result card must stay hidden"
     );
 }
 
 #[test]
-fn completed_response_taller_than_the_live_viewport_stays_live_for_tail_alignment() {
+fn completed_response_taller_than_the_live_viewport_is_archived_to_scrollback() {
     let session_id = SessionId::new();
     let task_id = TaskId::new();
     let turn_id = TurnId::new();
@@ -1458,18 +1704,119 @@ fn completed_response_taller_than_the_live_viewport_stays_live_for_tail_alignmen
         .expect("render tall completed response");
 
     assert!(
-        !app.transcript
+        app.transcript
             .history
             .committed_event_ids
             .contains(&assistant_event_id),
-        "an oversized latest response must remain live for tail alignment"
+        "an oversized completed response must be archived into terminal scrollback"
     );
     let live = transcript_render_rows(&app)
         .into_iter()
         .map(|row| row.line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(live.contains("long response row"));
+    assert!(
+        !live.contains("long response row"),
+        "archived long content must leave the live composer viewport"
+    );
+}
+
+#[test]
+fn streaming_assistant_commits_completed_lines_and_keeps_the_live_tail() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let turn_id = TurnId::new();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(task_id),
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    )
+    .with_footer_context("/workspace", "gpt-test");
+    let mut created = transcript_event(
+        1,
+        session_id,
+        task_id,
+        RuntimeEventType::TaskCreated,
+        json!({"payload": {"prompt": "stream a long answer"}}),
+    );
+    created.turn_id = Some(turn_id);
+    let mut streamed = transcript_event(
+        2,
+        session_id,
+        task_id,
+        RuntimeEventType::ProviderStreamed,
+        json!({
+            "delta": {
+                "kind": "text_delta",
+                "text": "first completed line\n\nsecond completed line\n\ncurrent tail"
+            }
+        }),
+    );
+    streamed.turn_id = Some(turn_id);
+    let streamed_id = streamed.id;
+    app.events = vec![created, streamed];
+    app.projection = Some(UserProjection {
+        session_id,
+        task_id: Some(task_id),
+        status: golutra_core::TaskStatus::Running,
+        visible_steps: Vec::new(),
+        pending_approval: None,
+        final_message: None,
+        residual_risks: Vec::new(),
+    });
+    app.enable_inline_history();
+    let mut terminal = Terminal::with_options(
+        TestBackend::new(80, 24),
+        TerminalOptions {
+            viewport: Viewport::Inline(12),
+        },
+    )
+    .expect("inline terminal");
+    let mut history = InlineHistoryState::new(session_id);
+
+    history
+        .flush(&mut terminal, &mut app)
+        .expect("commit streaming prefix");
+
+    assert!(
+        !app.transcript
+            .history
+            .committed_event_ids
+            .contains(&streamed_id),
+        "the in-flight stream must stay live until it finalizes"
+    );
+    assert!(
+        app.transcript
+            .history
+            .committed_stream_lines
+            .get(&streamed_id)
+            .copied()
+            .unwrap_or(0)
+            >= 1,
+        "completed stream lines must be pushed into scrollback"
+    );
+    let live = transcript_render_rows(&app)
+        .into_iter()
+        .map(|row| row.line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        live.contains("current tail"),
+        "the current stream tail must remain in the live composer viewport: {live}"
+    );
+    assert!(
+        !live.contains("first completed line"),
+        "completed stream lines must leave the live composer viewport: {live}"
+    );
+    let bottom = bottom_pane_height_for_width(&app, 80);
+    let viewport = inline_viewport_height(&app, 80, 24);
+    assert!(
+        viewport <= bottom.saturating_add(8),
+        "streaming live viewport must stay near the composer, not the full stream: viewport={viewport} bottom={bottom}"
+    );
 }
 
 #[test]
@@ -1586,27 +1933,22 @@ fn resume_keeps_an_oversized_latest_response_above_the_composer() {
         !rows.iter().any(|row| row.contains("Resume session")),
         "resume picker frame survived replay: {rows:#?}"
     );
-    let response_row = rows
-        .iter()
-        .position(|row| row.contains("resumed response row 40"))
-        .expect("latest resumed response row must remain live");
-    let composer_row = rows
-        .iter()
-        .position(|row| row.contains("Ask Golutra to change code or inspect the workspace"))
-        .expect("composer row");
-    let blank_rows = rows[response_row.saturating_add(1)..composer_row]
-        .iter()
-        .filter(|row| row.trim().is_empty())
-        .count();
     assert!(
-        !rows
-            .iter()
-            .any(|row| row.contains("Result · Completed · Unverified")),
-        "successful unverified result card must stay hidden: {rows:#?}"
+        !app.transcript.history.committed_event_ids.is_empty(),
+        "resumed long content must be archived out of the live composer viewport"
+    );
+    let live = transcript_render_rows(&app)
+        .into_iter()
+        .map(|row| row.line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !live.contains("resumed response row 40"),
+        "archived resumed content must leave the live composer viewport"
     );
     assert!(
-        response_row < composer_row && blank_rows <= 1,
-        "resume response left a gap before the composer: {rows:#?}"
+        !live.contains("Result · Completed · Unverified"),
+        "successful unverified result card must stay hidden"
     );
 }
 
@@ -1699,11 +2041,11 @@ fn oversized_non_tail_response_can_be_archived_atomically() {
     draw_inline_test_frame(&mut terminal, &mut app);
 
     assert!(
-        !app.transcript
+        app.transcript
             .history
             .committed_event_ids
             .contains(&first_streamed_id),
-        "the oversized latest response should initially remain live"
+        "an oversized completed response must be archived as soon as it is stable"
     );
     let initial_scrollback = terminal
         .backend()
@@ -1712,7 +2054,7 @@ fn oversized_non_tail_response_can_be_archived_atomically() {
         .iter()
         .map(|cell| cell.symbol())
         .collect::<String>();
-    assert!(!initial_scrollback.contains(archive_marker));
+    assert!(initial_scrollback.contains(archive_marker));
 
     app.task_id = Some(second_task);
     app.events.extend([second_created, second_completed]);
@@ -1762,28 +2104,18 @@ fn oversized_non_tail_response_can_be_archived_atomically() {
         .collect::<String>();
     assert_eq!(archived_after_repeat.matches(archive_marker).count(), 1);
 
-    let rows = terminal_buffer_rows(&terminal);
-    let latest_row = rows
-        .iter()
-        .position(|row| row.contains("latest response"))
-        .expect("latest turn remains live");
-    let composer_row = rows
-        .iter()
-        .position(|row| row.contains("Ask Golutra to change code or inspect the workspace"))
-        .expect("composer row");
-    let blank_rows = rows[latest_row.saturating_add(1)..composer_row]
-        .iter()
-        .filter(|row| row.trim().is_empty())
-        .count();
+    let live = transcript_render_rows(&app)
+        .into_iter()
+        .map(|row| row.line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        !rows
-            .iter()
-            .any(|row| row.contains("Result · Completed · Unverified")),
-        "successful unverified result card must stay hidden: {rows:#?}"
+        !live.contains("latest response"),
+        "the latest completed turn must also leave the live composer viewport"
     );
     assert!(
-        latest_row < composer_row && blank_rows <= 1,
-        "latest response should stay next to composer: {rows:#?}"
+        !live.contains("Result · Completed · Unverified"),
+        "successful unverified result card must stay hidden"
     );
 }
 
@@ -1999,27 +2331,22 @@ fn replay_rebuild_clears_provisional_frame_before_committing_history() {
         !scrollback.contains("provisional resume projection"),
         "the provisional loading frame leaked into terminal scrollback: {scrollback:?}"
     );
-    let latest_row = rows
-        .iter()
-        .position(|row| row.contains("resumed response 30"))
-        .expect("latest resumed response row");
-    let composer_row = rows
-        .iter()
-        .position(|row| row.contains("Ask Golutra to change code or inspect the workspace"))
-        .expect("composer row");
-    let blank_rows = rows[latest_row.saturating_add(1)..composer_row]
-        .iter()
-        .filter(|row| row.trim().is_empty())
-        .count();
     assert!(
-        !rows
-            .iter()
-            .any(|row| row.contains("Result · Completed · Unverified")),
-        "successful unverified result card must stay hidden: {rows:#?}"
+        !app.transcript.history.committed_event_ids.is_empty(),
+        "replayed long content must be archived out of the live composer viewport"
+    );
+    let live = transcript_render_rows(&app)
+        .into_iter()
+        .map(|row| row.line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !live.contains("resumed response 30"),
+        "archived replay content must leave the live composer viewport"
     );
     assert!(
-        latest_row < composer_row && blank_rows <= 1,
-        "replay response left a gap before the composer: {rows:#?}"
+        !live.contains("Result · Completed · Unverified"),
+        "successful unverified result card must stay hidden"
     );
 }
 
@@ -3662,6 +3989,7 @@ fn transcript_role_markers_follow_codex_symbols() {
     assert_eq!(role_marker(&app, &TranscriptRole::Assistant), "• ");
     assert_eq!(role_marker(&app, &TranscriptRole::Status), "• ");
     assert_eq!(role_marker(&app, &TranscriptRole::System), "• ");
+    assert_eq!(role_marker(&app, &TranscriptRole::CommandResult), "  ⎿  ");
 }
 
 #[test]
@@ -3700,6 +4028,69 @@ fn user_and_assistant_messages_start_on_the_marker_line() {
     assert!(lines.iter().any(|line| line == "• 直接回答"));
     assert!(!lines.iter().any(|line| line.contains("You")));
     assert!(!lines.iter().any(|line| line.contains("Golutra")));
+}
+
+#[test]
+fn consecutive_transcript_items_do_not_insert_blank_rows() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(task_id),
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.events = vec![
+        transcript_event(
+            1,
+            session_id,
+            task_id,
+            RuntimeEventType::AssistantMessage,
+            json!({"content": "第一句"}),
+        ),
+        transcript_event(
+            2,
+            session_id,
+            task_id,
+            RuntimeEventType::AssistantMessage,
+            json!({"content": "第二句"}),
+        ),
+    ];
+
+    let lines = full_transcript_layout(&app, Rect::new(0, 0, 80, 12)).plain_lines();
+    let first = lines
+        .iter()
+        .position(|line| line == "• 第一句")
+        .expect("first assistant row");
+    let second = lines
+        .iter()
+        .position(|line| line == "• 第二句")
+        .expect("second assistant row");
+    assert_eq!(second, first + 1, "consecutive markers: {lines:?}");
+}
+
+#[test]
+fn inline_history_does_not_pad_live_transcript_to_the_viewport() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.enable_inline_history();
+    app.command_messages.push(TranscriptItem {
+        role: TranscriptRole::System,
+        title: "Status".to_owned(),
+        body: vec!["thread demo".to_owned()],
+    });
+    let area = Rect::new(0, 0, 80, 24);
+    let layout = transcript_layout(&app, area);
+    assert!(layout.row_count < usize::from(area.height));
+    assert_eq!(transcript_top_padding(&app, &layout, area), 0);
 }
 
 #[test]
@@ -4812,7 +5203,7 @@ fn transcript_search_finds_logical_rows_and_moves_the_viewport() {
     app.rebuild_transcript_search();
     let search = app.transcript.search.as_ref().expect("search");
     assert_eq!(search.matches.len(), 2);
-    assert_eq!(search.current_line(), Some(10));
+    assert_eq!(search.current_line(), Some(7));
     assert!(app.transcript.scroll.offset_from_bottom > 0);
     let first_offset = app.transcript.scroll.offset_from_bottom;
 
@@ -5258,7 +5649,7 @@ fn transcript_wraps_long_body_lines_to_the_available_width() {
     assert!(terminal_buffer_text(&terminal).contains(marker));
     assert!(app.transcript.scroll.row_count > transcript_render_rows(&app).len());
 
-    let visible_rows = app.layout.transcript.height.saturating_sub(1) as usize;
+    let visible_rows = app.layout.body.height.max(1) as usize;
     app.scroll_transcript(TranscriptScrollAction::Top, visible_rows);
     terminal
         .draw(|frame| draw_ui(frame, &mut app))
@@ -5856,7 +6247,7 @@ fn transcript_detail_reflow_keeps_the_first_visible_projection() {
     terminal
         .draw(|frame| draw_ui(frame, &mut app))
         .expect("draw collapsed transcript");
-    let visible_rows = app.layout.transcript.height.saturating_sub(1) as usize;
+    let visible_rows = app.layout.body.height.max(1) as usize;
     app.scroll_transcript(TranscriptScrollAction::PageUp, visible_rows);
     let anchor = app
         .first_visible_transcript_projection()
@@ -5906,9 +6297,9 @@ fn transcript_width_reflow_keeps_the_first_visible_projection() {
                 sequence_no,
                 session_id,
                 task_id,
-                RuntimeEventType::StepCompleted,
+                RuntimeEventType::AssistantMessage,
                 json!({
-                    "summary": format!(
+                    "content": format!(
                         "event {sequence_no} {}",
                         "has enough content to wrap when the transcript narrows ".repeat(3)
                     )
@@ -5919,10 +6310,10 @@ fn transcript_width_reflow_keeps_the_first_visible_projection() {
     let mut wide = Terminal::new(TestBackend::new(100, 20)).expect("wide terminal");
     wide.draw(|frame| draw_ui(frame, &mut app))
         .expect("draw wide transcript");
-    let visible_rows = app.layout.transcript.height.saturating_sub(1) as usize;
+    let visible_rows = app.layout.body.height.max(1) as usize;
     app.scroll_transcript(TranscriptScrollAction::PageUp, visible_rows);
     let anchor = app
-        .first_visible_transcript_projection()
+        .first_visible_transcript_anchor()
         .expect("wide anchor");
 
     let mut narrow = Terminal::new(TestBackend::new(54, 20)).expect("narrow terminal");
@@ -5930,7 +6321,10 @@ fn transcript_width_reflow_keeps_the_first_visible_projection() {
         .draw(|frame| draw_ui(frame, &mut app))
         .expect("draw narrow transcript");
 
-    assert_eq!(app.first_visible_transcript_projection(), Some(anchor));
+    let resized = app
+        .first_visible_transcript_anchor()
+        .expect("narrow anchor");
+    assert_eq!(resized.projection, anchor.projection);
 }
 
 #[test]
@@ -5951,15 +6345,15 @@ fn transcript_height_reflow_keeps_the_first_visible_logical_row() {
                 sequence_no,
                 session_id,
                 task_id,
-                RuntimeEventType::StepCompleted,
-                json!({"summary": format!("stable logical row {sequence_no}")}),
+                RuntimeEventType::AssistantMessage,
+                json!({"content": format!("stable logical row {sequence_no}")}),
             )
         })
         .collect();
     let mut tall = Terminal::new(TestBackend::new(80, 28)).expect("tall terminal");
     tall.draw(|frame| draw_ui(frame, &mut app))
         .expect("draw tall transcript");
-    let visible_rows = app.layout.transcript.height.saturating_sub(1) as usize;
+    let visible_rows = app.layout.body.height.max(1) as usize;
     app.scroll_transcript(TranscriptScrollAction::PageUp, visible_rows);
     let anchor = app
         .first_visible_transcript_anchor()
@@ -6025,7 +6419,7 @@ fn cancelling_an_earlier_turn_keeps_the_visible_projection_anchored() {
     let top_row = layout
         .visual_start_for_projection(8)
         .expect("anchor projection row");
-    let visible_rows = app.layout.transcript.height.saturating_sub(1) as usize;
+    let visible_rows = app.layout.body.height.max(1) as usize;
     app.transcript.scroll.row_count = layout.row_count;
     app.set_transcript_top_row(&layout, top_row, visible_rows);
     let anchor = app
@@ -7663,11 +8057,29 @@ async fn resume_thread_clears_previous_visible_transcript_state() {
     app.transcript.scroll.row_count = 30;
     app.transcript.scroll.follow_tail = false;
 
-    app.resume_thread(&transport, target_thread_id)
+    app.resume_thread_from_command(&transport, target_thread_id)
         .await
         .expect("resume");
 
-    assert!(app.command_messages.is_empty());
+    assert_eq!(
+        app.command_messages
+            .iter()
+            .map(|item| item.role.clone())
+            .collect::<Vec<_>>(),
+        vec![TranscriptRole::User, TranscriptRole::CommandResult]
+    );
+    assert_eq!(
+        app.command_messages[0].body,
+        vec!["/resume".to_owned()]
+    );
+    assert!(
+        app.command_messages[1]
+            .body
+            .iter()
+            .any(|line| line.starts_with("Resumed ")),
+        "resume success must leave a command result: {:?}",
+        app.command_messages[1].body
+    );
     assert!(app.events.is_empty());
     assert!(app.input.is_empty());
     assert_eq!(app.slash_selected, 0);

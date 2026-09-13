@@ -92,28 +92,6 @@ impl TranscriptLayout {
         Some(start..end)
     }
 
-    pub(crate) fn first_visible_row_anchor(
-        &self,
-        visual: std::ops::Range<usize>,
-    ) -> Option<(usize, usize)> {
-        self.rows
-            .iter()
-            .enumerate()
-            .find(|(_, row)| row.end > visual.start)
-            .map(|(row_index, row)| (row_index, visual.start.saturating_sub(row.start)))
-    }
-
-    pub(crate) fn visual_row_for_row_anchor(
-        &self,
-        row_index: usize,
-        offset: usize,
-    ) -> Option<usize> {
-        self.rows.get(row_index).map(|row| {
-            row.start
-                .saturating_add(offset.min(row.end.saturating_sub(row.start).saturating_sub(1)))
-        })
-    }
-
     pub(crate) fn plain_lines(&self) -> Vec<String> {
         self.lines
             .iter()
@@ -165,7 +143,12 @@ pub(crate) fn transcript_layout(app: &TuiApp, area: Rect) -> TranscriptLayout {
 
 pub(crate) fn full_transcript_layout(app: &TuiApp, area: Rect) -> TranscriptLayout {
     transcript_layout_from_rows(
-        render_operation_projections(app, transcript_operation_projections(app), area.width),
+        render_operation_projections(
+            app,
+            transcript_operation_projections(app),
+            area.width,
+            false,
+        ),
         area,
     )
 }
@@ -202,22 +185,23 @@ pub(crate) fn transcript_render_rows(app: &TuiApp) -> Vec<TranscriptRenderRow> {
 }
 
 fn transcript_render_rows_at_width(app: &TuiApp, width: u16) -> Vec<TranscriptRenderRow> {
-    render_operation_projections(app, rendered_transcript_operation_projections(app), width)
+    render_operation_projections(
+        app,
+        rendered_transcript_operation_projections(app),
+        width,
+        true,
+    )
+}
+
+pub(crate) fn live_transcript_render_rows(app: &TuiApp, width: u16) -> Vec<TranscriptRenderRow> {
+    transcript_render_rows_at_width(app, width)
 }
 
 pub(crate) fn transcript_top_padding(app: &TuiApp, layout: &TranscriptLayout, area: Rect) -> u16 {
-    if !app.transcript.history.enabled
-        || !app.transcript.scroll.follow_tail
-        || app.transcript.top_row_override.is_some()
-        || app.transcript.search.is_some()
-    {
-        return 0;
-    }
-    area.height.saturating_sub(
-        u16::try_from(layout.row_count)
-            .unwrap_or(u16::MAX)
-            .min(area.height),
-    )
+    // 对照 Codex：不要把 live transcript 垫到 viewport 底部。
+    // history 开启时再垫，会在上方 scrollback 和 › /status 之间留出一块空洞。
+    let _ = (app, layout, area);
+    0
 }
 
 pub(crate) fn render_operation_projection_lines(
@@ -225,22 +209,8 @@ pub(crate) fn render_operation_projection_lines(
     projections: Vec<super::OperationProjection>,
     width: u16,
 ) -> Vec<Line<'static>> {
-    projections
+    render_operation_projections(app, projections, width, false)
         .into_iter()
-        .enumerate()
-        .flat_map(|(projection_index, projection)| {
-            let operation_id = projection.id().cloned();
-            let toggle = projection.is_expandable();
-            render_item_rows(
-                app,
-                projection.item(false),
-                operation_id,
-                toggle,
-                false,
-                projection_index,
-                width,
-            )
-        })
         .map(|row| row.line)
         .collect()
 }
@@ -249,7 +219,13 @@ fn render_operation_projections(
     app: &TuiApp,
     projections: Vec<super::OperationProjection>,
     width: u16,
+    skip_committed_stream_lines: bool,
 ) -> Vec<TranscriptRenderRow> {
+    let skips = if skip_committed_stream_lines {
+        live_stream_line_skips(app, projections.len())
+    } else {
+        vec![0; projections.len()]
+    };
     projections
         .into_iter()
         .enumerate()
@@ -269,9 +245,29 @@ fn render_operation_projections(
                 expanded,
                 projection_index,
                 width,
+                skips.get(projection_index).copied().unwrap_or(0),
             )
         })
         .collect()
+}
+
+fn live_stream_line_skips(app: &TuiApp, projection_count: usize) -> Vec<usize> {
+    let committed = (app.transcript.history.enabled && app.transcript.search.is_none())
+        .then_some(&app.transcript.history.committed_event_ids);
+    let mut skips = super::event_operation_entries(&app.events)
+        .into_iter()
+        .filter(|entry| committed.is_none_or(|ids| !ids.contains(&entry.id)))
+        .map(|entry| {
+            app.transcript
+                .history
+                .committed_stream_lines
+                .get(&entry.id)
+                .copied()
+                .unwrap_or(0)
+        })
+        .collect::<Vec<_>>();
+    skips.resize(projection_count, 0);
+    skips
 }
 
 pub(crate) fn transcript_toggle_at(
@@ -355,6 +351,7 @@ fn render_item_rows(
     _expanded: bool,
     projection_index: usize,
     width: u16,
+    skip_lines: usize,
 ) -> Vec<TranscriptRenderRow> {
     let palette = app.palette();
     let color = role_color(app, &item.role);
@@ -373,7 +370,10 @@ fn render_item_rows(
     } else {
         (marker, marker_width)
     };
-    let inline_body = matches!(item.role, TranscriptRole::User | TranscriptRole::Assistant);
+    let inline_body = matches!(
+        item.role,
+        TranscriptRole::User | TranscriptRole::Assistant | TranscriptRole::CommandResult
+    );
     let mut body_lines = match item.role {
         TranscriptRole::Assistant => markdown_lines(
             &item.body.join("\n"),
@@ -396,12 +396,30 @@ fn render_item_rows(
                     .collect::<Vec<_>>()
             })
             .collect(),
+        TranscriptRole::CommandResult => {
+            let text = if item.body.is_empty() {
+                item.title.clone()
+            } else {
+                item.body.join("\n")
+            };
+            vec![Line::from(Span::styled(
+                text,
+                Style::default().fg(color),
+            ))]
+        }
         _ => item
             .body
             .into_iter()
             .flat_map(|value| value.split('\n').map(detail_line).collect::<Vec<_>>())
             .collect(),
     };
+    // 对照 Codex：已推进上方 scrollback 的流式前缀不再画进 live 区。
+    if skip_lines > 0 && matches!(item.role, TranscriptRole::Assistant) {
+        let keep_from = skip_lines.min(body_lines.len().saturating_sub(1));
+        if keep_from > 0 {
+            body_lines.drain(..keep_from);
+        }
+    }
     for line in &mut body_lines {
         for span in &mut line.spans {
             if let Some(color) = span.style.fg {
@@ -462,12 +480,6 @@ fn render_item_rows(
             }
         }));
     }
-    rows.push(TranscriptRenderRow {
-        line: Line::from(""),
-        operation_id: None,
-        toggle: false,
-        projection_index,
-    });
     rows
 }
 
@@ -485,6 +497,9 @@ pub(crate) fn role_marker(app: &TuiApp, role: &TranscriptRole) -> &'static str {
     match role {
         TranscriptRole::User if app.preferences.screen_reader => "> ",
         TranscriptRole::User => "› ",
+        TranscriptRole::CommandResult if app.preferences.screen_reader => "* ",
+        // 对照 Claude Code：slash 结果缩进在命令行下面，用 ⎿ 标明成功或取消。
+        TranscriptRole::CommandResult => "  ⎿  ",
         TranscriptRole::Assistant
         | TranscriptRole::Status
         | TranscriptRole::Activity
@@ -516,7 +531,7 @@ fn role_color(app: &TuiApp, role: &TranscriptRole) -> Color {
         TranscriptRole::Success => palette.success,
         TranscriptRole::Warning => palette.warning,
         TranscriptRole::Error => palette.error,
-        TranscriptRole::System => palette.muted,
+        TranscriptRole::System | TranscriptRole::CommandResult => palette.muted,
     }
 }
 

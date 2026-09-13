@@ -80,9 +80,15 @@ fn rect_contains(area: Rect, x: u16, y: u16) -> bool {
 
 pub(crate) fn ui_layout(area: Rect, app: &TuiApp) -> UiLayoutSnapshot {
     let bottom_height = bottom_pane_height_for_width(app, area.width);
+    // 对照 Codex：inline live 区只留 composer。overlay 才需要上方内容区占满屏幕。
+    let body_constraint = if app.overlay_surface().is_some() {
+        Constraint::Min(8)
+    } else {
+        Constraint::Min(0)
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(8), Constraint::Length(bottom_height)])
+        .constraints([body_constraint, Constraint::Length(bottom_height)])
         .split(area);
     let overlay_visible = app.overlay_surface().is_some();
     let body_mode = if overlay_visible || !app.debug_mode {
@@ -152,17 +158,25 @@ pub(crate) fn bottom_pane_height(app: &TuiApp) -> u16 {
 }
 
 pub(crate) fn bottom_pane_height_for_width(app: &TuiApp, width: u16) -> u16 {
+    bottom_pane_height_parts(app, width, true)
+}
+
+pub(crate) fn bottom_pane_height_for_width_without_popups(app: &TuiApp, width: u16) -> u16 {
+    bottom_pane_height_parts(app, width, false)
+}
+
+fn bottom_pane_height_parts(app: &TuiApp, width: u16, include_popups: bool) -> u16 {
     let composer_suppressed = app.overlay_surface().is_some()
         || app.transcript.search.is_some()
         || app.history_search.is_some();
-    let mention_rows = if composer_suppressed {
+    let mention_rows = if !include_popups || composer_suppressed {
         0
     } else {
         app.mention_completion
             .as_ref()
             .map_or(0, |completion| completion.candidates.len().min(6)) as u16
     };
-    let slash_rows = if mention_rows > 0 {
+    let slash_rows = if !include_popups || mention_rows > 0 {
         0
     } else {
         app.slash_candidates().len() as u16

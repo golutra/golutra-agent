@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     future::pending,
     io::{self, Stdout},
     path::{Path, PathBuf},
@@ -18,7 +18,7 @@ use crossterm::{
         KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
-    terminal::{LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use futures_util::StreamExt;
 use golutra_auth::{
@@ -55,7 +55,10 @@ use golutra_tui::{
     SlashCommandCandidate, SlashDebugCommand, SlashInput, TranscriptScrollAction,
     parse_slash_input, ratatui_vertical_scroll, slash_command_candidates,
 };
-use ratatui::{Terminal, TerminalOptions, Viewport};
+use ratatui::{
+    Terminal, TerminalOptions, Viewport,
+    layout::Rect,
+};
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -1371,8 +1374,7 @@ impl TuiApp {
         match parse_slash_input(&input) {
             SlashInput::Prompt(prompt) => self.send_runtime_prompt(transport, prompt).await,
             SlashInput::Command(command) => {
-                self.input.clear();
-                self.execute_slash_command(transport, command).await
+                self.submit_slash_command(transport, &input, command).await
             }
             SlashInput::Empty => {
                 self.status_message = "prompt is empty".to_owned();
@@ -1402,8 +1404,15 @@ impl TuiApp {
             return Ok(false);
         }
         if candidate.execute_on_select {
-            self.input.set_text(candidate.command);
-            self.send_prompt(transport).await?;
+            let SlashInput::Command(command) = parse_slash_input(&candidate.command) else {
+                return Err(miette::miette!(
+                    "slash candidate {} did not parse as a command",
+                    candidate.command
+                ));
+            };
+            // 直接提交完整命令，避免把 /resume 写回仍显示 /re 的 composer。
+            self.submit_slash_command(transport, &candidate.command, command)
+                .await?;
         } else {
             self.input.set_text(format!("{} ", candidate.command));
             self.slash_selected = 0;
@@ -1881,7 +1890,15 @@ impl TuiApp {
         anchor: Option<TranscriptProjectionAnchor>,
         previous_row_count: usize,
     ) {
-        let area = self.layout.transcript;
+        self.reflow_transcript_with_anchor_in(self.layout.transcript, anchor, previous_row_count);
+    }
+
+    fn reflow_transcript_with_anchor_in(
+        &mut self,
+        area: ratatui::layout::Rect,
+        anchor: Option<TranscriptProjectionAnchor>,
+        previous_row_count: usize,
+    ) {
         let layout = transcript_layout(self, area);
         let projections = rendered_transcript_operation_projections(self);
         if let Some(top_row) = anchor.and_then(|anchor| {
@@ -1992,6 +2009,10 @@ impl TuiApp {
         self.transcript.set_committed_event_ids(ids);
     }
 
+    fn set_inline_history_committed_stream_lines(&mut self, lines: HashMap<EventId, usize>) {
+        self.transcript.set_committed_stream_lines(lines);
+    }
+
     fn ensure_transcript_layout(&mut self, area: ratatui::layout::Rect) {
         let stale = self.transcript.layout_cache.as_ref().is_none_or(|cache| {
             cache.revision != self.transcript.revision
@@ -2005,32 +2026,22 @@ impl TuiApp {
                     && cache.height > 0
                     && (!self.transcript.scroll.follow_tail
                         || self.transcript.top_row_override.is_some()))
-                .then(|| {
-                    let window = cache.layout.visible_window(
-                        cache.height as usize,
-                        self.transcript.scroll.offset_from_bottom,
-                        self.transcript.top_row_override,
-                    );
-                    cache.layout.first_visible_row_anchor(window)
-                })
+                .then(|| self.first_visible_transcript_anchor())
                 .flatten()
             });
             let previous_row_count = self.transcript.scroll.row_count;
-            let layout = transcript_layout(self, area);
-            if let Some(top_row) = resize_anchor
-                .and_then(|(row_index, offset)| layout.visual_row_for_row_anchor(row_index, offset))
-            {
-                self.transcript.scroll.row_count = layout.row_count;
-                self.set_transcript_top_row(&layout, top_row, area.height as usize);
+            if resize_anchor.is_some() {
+                self.reflow_transcript_with_anchor_in(area, resize_anchor, previous_row_count);
             } else {
+                let layout = transcript_layout(self, area);
                 self.sync_transcript_row_count_to(previous_row_count, layout.row_count);
+                self.transcript.layout_cache = Some(TranscriptLayoutCache {
+                    revision: self.transcript.revision,
+                    width: area.width,
+                    height: area.height,
+                    layout,
+                });
             }
-            self.transcript.layout_cache = Some(TranscriptLayoutCache {
-                revision: self.transcript.revision,
-                width: area.width,
-                height: area.height,
-                layout,
-            });
         }
     }
 
@@ -2453,7 +2464,7 @@ impl TuiApp {
             }
             SlashCommand::Resume { thread_id } => {
                 if let Some(thread_id) = thread_id {
-                    self.resume_thread(transport, parse_thread_id(&thread_id)?)
+                    self.resume_thread_from_command(transport, parse_thread_id(&thread_id)?)
                         .await?;
                 } else {
                     self.open_resume_picker(transport).await?;
@@ -2824,11 +2835,11 @@ impl TuiApp {
         }
 
         if items.is_empty() {
-            self.push_system_message("Resume", vec!["no sessions in this cwd yet".to_owned()]);
+            // 对照 Claude Code：没有可恢复会话时，在 › /resume 下面给出结果，不打开空 picker。
+            self.push_command_result("No sessions in this cwd yet");
             return Ok(());
         }
 
-        self.input.clear();
         self.queue_picker = None;
         self.editing_queued_turn = None;
         self.resume_picker = Some(ResumePickerState::new(items));
@@ -3063,9 +3074,21 @@ impl TuiApp {
         self.question_dialog = None;
         self.dashboard = None;
         self.editing_queued_turn = None;
-        self.status_message = format!("resumed {}", short_id(&thread.thread_id.to_string()));
         self.reset_transcript_view();
         self.refresh(transport).await
+    }
+
+    async fn resume_thread_from_command(
+        &mut self,
+        transport: &RuntimeTransport,
+        thread_id: ThreadId,
+    ) -> miette::Result<()> {
+        self.resume_thread(transport, thread_id).await?;
+        // 对照 Claude Code：slash / picker 成功后新会话留下 › /resume 和结果行。
+        // retry fork 走 resume_thread，不能把 /resume 记进新会话。
+        self.record_slash_command("/resume");
+        self.push_command_result(format!("Resumed {}", short_id(&self.thread_id.to_string())));
+        Ok(())
     }
 
     async fn resume_selected_thread(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
@@ -3076,7 +3099,7 @@ impl TuiApp {
         else {
             return Ok(());
         };
-        self.resume_thread(transport, thread_id).await
+        self.resume_thread_from_command(transport, thread_id).await
     }
 
     async fn apply_session_picker_action(
@@ -3209,7 +3232,58 @@ impl TuiApp {
 
     fn close_resume_picker(&mut self) {
         self.resume_picker = None;
-        self.status_message = "resume cancelled".to_owned();
+        // 对照 Claude Code：取消 picker 后留下 › /resume，下面再跟 ⎿ Resume cancelled。
+        // 提交时已经 reset 过 composer；这里再清一次，避免退出全屏后把 › /re 叠在分隔线上。
+        self.input.reset();
+        self.push_command_result("Resume cancelled");
+    }
+
+    fn push_command_result(&mut self, result: impl Into<String>) {
+        let result = result.into();
+        self.status_message = result.clone();
+        self.command_messages.push(TranscriptItem {
+            role: TranscriptRole::CommandResult,
+            title: result.clone(),
+            body: vec![result],
+        });
+        if self.command_messages.len() > 12 {
+            self.command_messages
+                .drain(0..self.command_messages.len().saturating_sub(12));
+        }
+        self.invalidate_transcript_layout();
+        self.sync_transcript_row_count(self.transcript.scroll.row_count);
+        self.clamp_transcript_scroll();
+    }
+
+    async fn submit_slash_command(
+        &mut self,
+        transport: &RuntimeTransport,
+        command_text: &str,
+        command: SlashCommand,
+    ) -> miette::Result<()> {
+        self.record_slash_command(command_text);
+        self.input.reset();
+        self.execute_slash_command(transport, command).await
+    }
+
+    fn record_slash_command(&mut self, command: &str) {
+        let command = command.trim();
+        if command.is_empty() {
+            return;
+        }
+        self.prompt_history.record(command);
+        self.command_messages.push(TranscriptItem {
+            role: TranscriptRole::User,
+            title: "You".to_owned(),
+            body: vec![command.to_owned()],
+        });
+        if self.command_messages.len() > 12 {
+            self.command_messages
+                .drain(0..self.command_messages.len().saturating_sub(12));
+        }
+        self.invalidate_transcript_layout();
+        self.sync_transcript_row_count(self.transcript.scroll.row_count);
+        self.clamp_transcript_scroll();
     }
 
     fn open_auth_dialog(&mut self) {
@@ -3939,7 +4013,11 @@ impl TerminalRestoreCoordinator {
         if self.restored.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        let result = restore_terminal(output, self.use_alternate_screen);
+        // overlay 会在运行中进入 alt-screen；退出或 panic 时必须按当前实际状态离开。
+        let result = restore_terminal(
+            output,
+            alternate_screen_active() || self.use_alternate_screen,
+        );
         if result.is_err() {
             self.restored.store(false, Ordering::Release);
         }
@@ -4004,13 +4082,14 @@ async fn run_app(
     activity_status.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     activity_status.tick().await;
     let mut inline_history = InlineHistoryState::new(app.session_id);
+    let mut overlay_screen = OverlayScreenState::new();
     let parent_watch = ParentDeathWatch::new();
     let parent_watch_enabled = parent_watch.enabled();
     let parent_watch_future = parent_watch.wait();
     tokio::pin!(parent_watch_future);
 
     let result: miette::Result<()> = async {
-        draw_interactive_frame(terminal, &mut app, &mut inline_history)?;
+        draw_interactive_frame(terminal, &mut overlay_screen, &mut app, &mut inline_history)?;
         app.render_metrics.mark_drawn_at(Instant::now());
 
         while !app.should_quit {
@@ -4020,7 +4099,7 @@ async fn run_app(
             .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
         tokio::select! {
             _ = tokio::time::sleep_until(frame_deadline.into()), if app.render_metrics.deadline().is_some() => {
-                draw_interactive_frame(terminal, &mut app, &mut inline_history)?;
+                draw_interactive_frame(terminal, &mut overlay_screen, &mut app, &mut inline_history)?;
                 app.render_metrics.mark_drawn_at(Instant::now());
             }
             runtime_event = controller.recv() => {
@@ -4098,20 +4177,116 @@ async fn run_app(
     result.and(shutdown)
 }
 
+struct OverlayScreenState {
+    active: bool,
+    saved_inline: Option<Rect>,
+}
+
+impl OverlayScreenState {
+    fn new() -> Self {
+        Self {
+            active: false,
+            saved_inline: None,
+        }
+    }
+}
+
 fn draw_interactive_frame(
     terminal: &mut InteractiveTerminal,
+    overlay_screen: &mut OverlayScreenState,
     app: &mut TuiApp,
     inline_history: &mut InlineHistoryState,
 ) -> miette::Result<()> {
-    inline_history
-        .flush_interactive(terminal, app)
-        .map_err(|error| miette::miette!("write terminal history: {error}"))?;
+    let overlay_visible = app.overlay_surface().is_some();
+    // 进入 overlay 前先在 Inline 上归档 slash 行。同一帧 sync_overlay 会切 Fixed，insert_before 会失效。
+    // 这里不能 sync 高度：overlay 已打开时 composer 被压成 1 行，保存进去的 viewport 会偏矮。
+    if overlay_visible != overlay_screen.active && overlay_visible {
+        inline_history
+            .flush_interactive(terminal, app)
+            .map_err(|error| miette::miette!("write terminal history: {error}"))?;
+    }
+    sync_overlay_screen(terminal, overlay_screen, overlay_visible)?;
+    if !overlay_screen.active {
+        inline_history
+            .flush_interactive(terminal, app)
+            .map_err(|error| miette::miette!("write terminal history: {error}"))?;
+        sync_inline_viewport_height(terminal, app)
+            .map_err(|error| miette::miette!("resize inline viewport: {error}"))?;
+    }
     terminal
         .draw(|frame| draw_ui(frame, app))
         .map_err(|error| miette::miette!("{error}"))?;
-    let visible_rows = app.layout.transcript.height.saturating_sub(1) as usize;
-    app.request_older_inline_history_if_needed(visible_rows);
+    if overlay_screen.active {
+        overlay_screen
+            .saved_inline
+            .get_or_insert(terminal.current_buffer_mut().area);
+    } else {
+        overlay_screen.saved_inline = Some(terminal.current_buffer_mut().area);
+        let visible_rows = app.layout.transcript.height.saturating_sub(1) as usize;
+        app.request_older_inline_history_if_needed(visible_rows);
+    }
     Ok(())
+}
+
+fn sync_overlay_screen(
+    terminal: &mut InteractiveTerminal,
+    overlay_screen: &mut OverlayScreenState,
+    overlay_visible: bool,
+) -> miette::Result<()> {
+    if overlay_visible == overlay_screen.active {
+        return Ok(());
+    }
+    if overlay_visible {
+        enter_overlay_screen(terminal, overlay_screen)?;
+    } else {
+        leave_overlay_screen(terminal, overlay_screen)?;
+    }
+    overlay_screen.active = overlay_visible;
+    Ok(())
+}
+
+fn enter_overlay_screen(
+    terminal: &mut InteractiveTerminal,
+    overlay_screen: &mut OverlayScreenState,
+) -> miette::Result<()> {
+    overlay_screen.saved_inline = Some(terminal.current_buffer_mut().area);
+    execute!(terminal.backend_mut(), EnterAlternateScreen)
+        .map_err(|error| miette::miette!("enter overlay screen: {error}"))?;
+    set_alternate_screen_active(true);
+    let size = terminal
+        .size()
+        .map_err(|error| miette::miette!("read overlay screen size: {error}"))?;
+    // 对照 Codex：进入 alt-screen 后扩大到全屏，但不按当前光标重建 Inline viewport。
+    // Inline 重建会在光标后再追加 live 区高度，宽屏/窄屏底栏不同，退出后错位程度也就不同。
+    match switch_terminal_viewport(
+        terminal,
+        Viewport::Fixed(Rect::new(0, 0, size.width, size.height)),
+    ) {
+        Ok(()) => terminal
+            .clear()
+            .map_err(|error| miette::miette!("clear overlay screen: {error}")),
+        Err(error) => {
+            let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+            set_alternate_screen_active(false);
+            Err(miette::miette!("expand overlay viewport: {error}"))
+        }
+    }
+}
+
+fn leave_overlay_screen(
+    terminal: &mut InteractiveTerminal,
+    overlay_screen: &mut OverlayScreenState,
+) -> miette::Result<()> {
+    let size = terminal
+        .size()
+        .map_err(|error| miette::miette!("read restored screen size: {error}"))?;
+    let restored = restored_inline_viewport(overlay_screen.saved_inline, size);
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)
+        .map_err(|error| miette::miette!("leave overlay screen: {error}"))?;
+    set_alternate_screen_active(false);
+    // 对照 Codex：离开 alt-screen 只恢复进入前的 viewport，不按 CSI 6n 再 append_lines。
+    restore_inline_viewport(terminal, restored)
+        .map_err(|error| miette::miette!("restore inline viewport: {error}"))
 }
 
 fn provider_stream_event_is_meaningful(payload: &Value) -> bool {

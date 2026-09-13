@@ -25,6 +25,8 @@ pub(crate) enum TranscriptRole {
     Warning,
     Error,
     System,
+    // 对照 Claude Code：slash 命令结果画在 › /resume 下面，用 ⎿ 收口成功或取消。
+    CommandResult,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +49,7 @@ impl OperationId {
 pub(crate) struct TranscriptHistoryState {
     pub(crate) enabled: bool,
     pub(crate) committed_event_ids: HashSet<EventId>,
+    pub(crate) committed_stream_lines: HashMap<EventId, usize>,
     pub(crate) replay_generation: u64,
     pub(crate) replay_ready: bool,
 }
@@ -56,6 +59,7 @@ impl Default for TranscriptHistoryState {
         Self {
             enabled: false,
             committed_event_ids: HashSet::new(),
+            committed_stream_lines: HashMap::new(),
             replay_generation: 0,
             replay_ready: true,
         }
@@ -133,16 +137,28 @@ impl TranscriptState {
         self.history.replay_generation = self.history.replay_generation.wrapping_add(1);
         self.history.replay_ready = false;
         self.set_committed_event_ids(HashSet::new());
+        self.set_committed_stream_lines(HashMap::new());
     }
 
     pub(crate) fn request_history_rebuild(&mut self) {
         self.history.replay_generation = self.history.replay_generation.wrapping_add(1);
         self.set_committed_event_ids(HashSet::new());
+        self.set_committed_stream_lines(HashMap::new());
     }
 
     pub(crate) fn set_committed_event_ids(&mut self, ids: HashSet<EventId>) {
         if self.history.committed_event_ids != ids {
             self.history.committed_event_ids = ids;
+            self.history
+                .committed_stream_lines
+                .retain(|event_id, _| !self.history.committed_event_ids.contains(event_id));
+            self.invalidate_layout();
+        }
+    }
+
+    pub(crate) fn set_committed_stream_lines(&mut self, lines: HashMap<EventId, usize>) {
+        if self.history.committed_stream_lines != lines {
+            self.history.committed_stream_lines = lines;
             self.invalidate_layout();
         }
     }
@@ -732,16 +748,18 @@ pub(crate) fn event_operation_entries(events: &[RuntimeEvent]) -> Vec<EventOpera
 
 fn plain_projection(item: TranscriptItem) -> OperationProjection {
     match item.role {
-        TranscriptRole::User | TranscriptRole::Assistant => message_projection(item),
+        TranscriptRole::User | TranscriptRole::Assistant | TranscriptRole::CommandResult => {
+            message_projection(item)
+        }
         _ => notice_projection(item),
     }
 }
 
-fn message_projection(item: TranscriptItem) -> OperationProjection {
+pub(crate) fn message_projection(item: TranscriptItem) -> OperationProjection {
     OperationProjection::Message { item }
 }
 
-fn notice_projection(item: TranscriptItem) -> OperationProjection {
+pub(crate) fn notice_projection(item: TranscriptItem) -> OperationProjection {
     OperationProjection::Notice { item }
 }
 

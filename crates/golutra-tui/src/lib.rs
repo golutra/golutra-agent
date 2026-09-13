@@ -350,7 +350,7 @@ const SEARCHABLE_SLASH_HINTS: &[SlashCommandHint] = &[
     },
     SlashCommandHint {
         command: "/resume",
-        description: "open sessions",
+        description: "open the full-screen session picker",
         selection: SlashCommandSelection::Execute,
     },
     SlashCommandHint {
@@ -1573,7 +1573,7 @@ mod tests {
                 "/help - open contextual keyboard reference".to_owned(),
                 "/whats-new - show release notes for this version".to_owned(),
                 "/new - start a new session".to_owned(),
-                "/resume - open sessions".to_owned(),
+                "/resume - open the full-screen session picker".to_owned(),
                 "/export - export session history and runtime facts".to_owned(),
             ]
         );
@@ -1584,7 +1584,7 @@ mod tests {
         assert_eq!(
             slash_command_suggestions("/r"),
             vec![
-                "/resume - open sessions".to_owned(),
+                "/resume - open the full-screen session picker".to_owned(),
                 "/retry - rerun the last task in a fork with an optional model".to_owned(),
             ]
         );

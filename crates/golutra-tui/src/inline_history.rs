@@ -108,6 +108,8 @@ impl InlineHistoryMode {
 struct RenderedHistoryEntry {
     event_ids: Vec<EventId>,
     lines: Vec<Line<'static>>,
+    stable_line_count: usize,
+    commit_event: bool,
 }
 
 impl RenderedHistoryEntry {
@@ -131,6 +133,7 @@ pub(crate) struct InlineHistoryState {
     header_emitted: bool,
     rebuild_after_replay: bool,
     committed_event_ids: HashSet<EventId>,
+    committed_stream_lines: HashMap<EventId, usize>,
 }
 
 impl InlineHistoryState {
@@ -145,6 +148,7 @@ impl InlineHistoryState {
             header_emitted: false,
             rebuild_after_replay: false,
             committed_event_ids: HashSet::new(),
+            committed_stream_lines: HashMap::new(),
         }
     }
 
@@ -189,31 +193,33 @@ impl InlineHistoryState {
         let buffer_area = terminal.current_buffer_mut().area;
         let width = buffer_area.width.max(1);
         let viewport_height = buffer_area.height.max(1);
-        let target_changed = self.initialized
+        // 对照 Codex：viewport 高度变化（slash 弹层、overlay 进出、流式尾巴）不能重建 scrollback。
+        let identity_changed = self.initialized
             && (self.session_id != app.session_id
                 || self.generation != app.transcript.history.replay_generation
                 || self.mode != mode
-                || self.rendered_width != width
-                || self.rendered_height != viewport_height);
+                || self.rendered_width != width);
         let clear_previous_history =
-            target_changed && (self.header_emitted || !self.committed_event_ids.is_empty());
+            identity_changed && (self.header_emitted || !self.committed_event_ids.is_empty());
 
         let mut history_cleared = false;
         if clear_previous_history {
             rebuild_terminal(terminal)?;
             history_cleared = true;
         }
-        if !self.initialized || target_changed {
+        if !self.initialized || identity_changed {
             self.session_id = app.session_id;
             self.generation = app.transcript.history.replay_generation;
             self.mode = mode;
             self.rendered_width = width;
-            self.rendered_height = viewport_height;
             self.initialized = true;
             self.header_emitted = false;
             self.committed_event_ids.clear();
+            self.committed_stream_lines.clear();
             app.set_inline_history_committed_event_ids(HashSet::new());
+            app.set_inline_history_committed_stream_lines(HashMap::new());
         }
+        self.rendered_height = viewport_height;
 
         let source_ready = app.transcript.history.replay_ready
             && (!matches!(
@@ -239,14 +245,14 @@ impl InlineHistoryState {
         let live_row_capacity = viewport_height
             .saturating_sub(bottom_pane_height_for_width(app, width).max(MIN_INLINE_BOTTOM_ROWS))
             .max(1);
-        let committable_entries = rendered_history_entries(app, width, live_row_capacity, mode);
-        let committable_ids = committable_entries
+        let history_entries = rendered_history_entries(app, width, live_row_capacity, mode);
+        let committable_ids = history_entries
             .iter()
             .flat_map(|entry| entry.event_ids.iter().copied())
             .collect::<HashSet<_>>();
-        let grouping_changed = committable_entries
-            .iter()
-            .any(|entry| entry.is_partially_committed(&self.committed_event_ids));
+        let grouping_changed = history_entries.iter().any(|entry| {
+            entry.commit_event && entry.is_partially_committed(&self.committed_event_ids)
+        });
         if !self.committed_event_ids.is_subset(&committable_ids) || grouping_changed {
             if !history_cleared {
                 rebuild_terminal(terminal)?;
@@ -254,13 +260,10 @@ impl InlineHistoryState {
             }
             self.header_emitted = false;
             self.committed_event_ids.clear();
+            self.committed_stream_lines.clear();
             app.set_inline_history_committed_event_ids(HashSet::new());
+            app.set_inline_history_committed_stream_lines(HashMap::new());
         }
-        let stable_entries = committable_entries
-            .iter()
-            .filter(|entry| !entry.is_committed(&self.committed_event_ids))
-            .cloned()
-            .collect::<Vec<_>>();
         let mut lines = Vec::new();
         let emit_header = !self.header_emitted;
         if emit_header {
@@ -285,20 +288,81 @@ impl InlineHistoryState {
             }
         }
 
-        if !stable_entries.is_empty() {
-            lines.extend(stable_entries.iter().flat_map(|entry| entry.lines.clone()));
+        let mut inserted = false;
+        for entry in history_entries {
+            if entry.commit_event && entry.is_committed(&self.committed_event_ids) {
+                continue;
+            }
+            let already = entry
+                .event_ids
+                .first()
+                .and_then(|id| self.committed_stream_lines.get(id).copied())
+                .unwrap_or(0);
+            let commit_from = if entry.commit_event {
+                already.min(entry.lines.len())
+            } else {
+                already.min(entry.stable_line_count)
+            };
+            let commit_until = if entry.commit_event {
+                entry.lines.len()
+            } else {
+                entry.stable_line_count
+            };
+            if commit_until > commit_from {
+                lines.extend(entry.lines[commit_from..commit_until].iter().cloned());
+                inserted = true;
+            }
+            if let Some(event_id) = entry.event_ids.first().copied() {
+                if entry.commit_event {
+                    self.committed_event_ids.insert(event_id);
+                    self.committed_stream_lines.remove(&event_id);
+                } else if commit_until > already {
+                    self.committed_stream_lines.insert(event_id, commit_until);
+                }
+            }
+        }
+
+        if !app.command_messages.is_empty() {
+            // slash 命令没有 RuntimeEvent。推进 scrollback 后从 live 区拿掉，避免每次进出 overlay 再画一遍。
+            let archived = app
+                .command_messages
+                .iter()
+                .cloned()
+                .map(|item| {
+                    if matches!(
+                        item.role,
+                        TranscriptRole::User
+                            | TranscriptRole::Assistant
+                            | TranscriptRole::CommandResult
+                    ) {
+                        message_projection(item)
+                    } else {
+                        notice_projection(item)
+                    }
+                })
+                .collect::<Vec<_>>();
+            let archived_lines = render_operation_projection_lines(app, archived, width);
+            if !archived_lines.is_empty() {
+                lines.extend(archived_lines);
+                inserted = true;
+            }
+            app.command_messages.clear();
+            app.invalidate_transcript_layout();
         }
 
         if lines.is_empty() {
+            if inserted {
+                app.set_inline_history_committed_event_ids(self.committed_event_ids.clone());
+                app.set_inline_history_committed_stream_lines(self.committed_stream_lines.clone());
+            }
             return Ok(history_cleared);
         }
 
         insert_history_lines(terminal, lines, width)?;
 
         self.header_emitted = true;
-        self.committed_event_ids
-            .extend(stable_entries.into_iter().flat_map(|entry| entry.event_ids));
         app.set_inline_history_committed_event_ids(self.committed_event_ids.clone());
+        app.set_inline_history_committed_stream_lines(self.committed_stream_lines.clone());
         Ok(true)
     }
 }
@@ -306,87 +370,80 @@ impl InlineHistoryState {
 fn rendered_history_entries(
     app: &TuiApp,
     width: u16,
-    live_row_capacity: u16,
+    _live_row_capacity: u16,
     mode: InlineHistoryMode,
 ) -> Vec<RenderedHistoryEntry> {
     match mode {
-        InlineHistoryMode::Transcript => {
-            let entries = event_operation_entries(&app.events);
-            let stable_count = entries.iter().take_while(|entry| entry.stable).count();
-            let rendered = entries
-                .into_iter()
-                .map(|entry| RenderedHistoryEntry {
-                    event_ids: vec![entry.id],
-                    lines: render_operation_projection_lines(app, vec![entry.projection], width),
-                })
-                .collect::<Vec<_>>();
-            let committed_count = committed_prefix_len(
-                &rendered,
-                stable_count,
-                width,
-                usize::from(live_row_capacity),
-            );
-            rendered.into_iter().take(committed_count).collect()
-        }
+        InlineHistoryMode::Transcript => event_operation_entries(&app.events)
+            .into_iter()
+            .map(|entry| {
+                history_entry_from_projection(
+                    app,
+                    vec![entry.id],
+                    entry.projection,
+                    entry.stable,
+                    width,
+                )
+            })
+            .collect(),
         InlineHistoryMode::Developer { expanded } => {
             let mut events = app.events.iter().collect::<Vec<_>>();
             events.sort_by_key(|event| event.sequence_no);
-            let projected = developer_event_projections(events);
-            let stable_count = projected.len().saturating_sub(usize::from(
-                projected
-                    .last()
-                    .is_some_and(DeveloperEventProjection::is_open_provider_stream),
-            ));
-            let rendered = projected
+            developer_event_projections(events)
                 .into_iter()
-                .map(|event| RenderedHistoryEntry {
-                    event_ids: event.event_ids.clone(),
-                    lines: developer_event_history_lines(&event, width, expanded, app.palette()),
+                .map(|event| {
+                    let lines =
+                        developer_event_history_lines(&event, width, expanded, app.palette());
+                    let commit_event = !event.is_open_provider_stream();
+                    RenderedHistoryEntry {
+                        event_ids: event.event_ids,
+                        stable_line_count: if commit_event {
+                            lines.len()
+                        } else {
+                            lines.len().saturating_sub(1)
+                        },
+                        commit_event,
+                        lines,
+                    }
                 })
-                .collect::<Vec<_>>();
-            let committed_count = committed_prefix_len(
-                &rendered,
-                stable_count,
-                width,
-                usize::from(live_row_capacity),
-            );
-            rendered.into_iter().take(committed_count).collect()
+                .collect()
         }
         InlineHistoryMode::DebugSplit { expanded } => {
-            debug_split_history_entries(app, width, live_row_capacity, expanded)
+            debug_split_history_entries(app, width, expanded)
         }
+    }
+}
+
+fn history_entry_from_projection(
+    app: &TuiApp,
+    event_ids: Vec<EventId>,
+    projection: OperationProjection,
+    stable: bool,
+    width: u16,
+) -> RenderedHistoryEntry {
+    let lines = render_operation_projection_lines(app, vec![projection], width);
+    RenderedHistoryEntry {
+        event_ids,
+        // 进行中的工具/流式尾巴必须留在 live 区。以前靠尾部空行占位；空行去掉后，
+        // 未稳定条目不能把最后一行提交进 scrollback。
+        stable_line_count: if stable {
+            lines.len()
+        } else {
+            lines.len().saturating_sub(1)
+        },
+        commit_event: stable,
+        lines,
     }
 }
 
 fn debug_split_history_entries(
     app: &TuiApp,
     width: u16,
-    live_row_capacity: u16,
     expanded: bool,
 ) -> Vec<RenderedHistoryEntry> {
-    let operation_entries = event_operation_entries(&app.events);
-    // A streaming message or running tool can still rewrite its earlier transcript row. Keep
-    // that event and every later observation live until the operation reaches a stable state.
-    let first_unstable_id = operation_entries
-        .iter()
-        .find(|entry| !entry.stable)
-        .map(|entry| entry.id);
     let mut events = app.events.iter().collect::<Vec<_>>();
     events.sort_by_key(|event| event.sequence_no);
-    let rendered = debug_split_event_entries(app, events, width, expanded);
-    let stable_count = first_unstable_id.map_or(rendered.len(), |id| {
-        rendered
-            .iter()
-            .position(|entry| entry.event_ids.contains(&id))
-            .unwrap_or_default()
-    });
-    let committed_count = committed_prefix_len(
-        &rendered,
-        stable_count,
-        width,
-        usize::from(live_row_capacity),
-    );
-    rendered.into_iter().take(committed_count).collect()
+    debug_split_event_entries(app, events, width, expanded)
 }
 
 fn debug_source_events(app: &TuiApp) -> Vec<&golutra_protocol::RuntimeEvent> {
@@ -410,28 +467,45 @@ fn debug_split_event_entries(
 ) -> Vec<RenderedHistoryEntry> {
     let mut operations = event_operation_entries(&app.events)
         .into_iter()
-        .map(|entry| (entry.id, entry.projection))
+        .map(|entry| (entry.id, (entry.projection, entry.stable)))
         .collect::<HashMap<_, _>>();
     let (transcript_width, developer_width) = debug_pane_widths(width);
-    developer_event_projections(events)
-        .into_iter()
-        .map(|event| {
-            let transcript = event
-                .event_ids
-                .iter()
-                .find_map(|event_id| operations.remove(event_id))
-                .map(|projection| {
-                    render_operation_projection_lines(app, vec![projection], transcript_width)
-                })
-                .unwrap_or_default();
-            let developer =
-                developer_event_history_lines(&event, developer_width, expanded, app.palette());
-            RenderedHistoryEntry {
-                event_ids: event.event_ids,
-                lines: debug_split_history_lines(transcript, developer, width),
-            }
-        })
-        .collect()
+    let mut blocked = false;
+    let mut entries = Vec::new();
+    for event in developer_event_projections(events) {
+        let open_or_unstable = event.is_open_provider_stream()
+            || event.event_ids.iter().any(|event_id| {
+                operations
+                    .get(event_id)
+                    .is_some_and(|(_, stable)| !*stable)
+            });
+        if open_or_unstable {
+            blocked = true;
+        }
+        let commit_event = !blocked;
+        let transcript = event
+            .event_ids
+            .iter()
+            .find_map(|event_id| operations.remove(event_id))
+            .map(|(projection, _)| {
+                render_operation_projection_lines(app, vec![projection], transcript_width)
+            })
+            .unwrap_or_default();
+        let developer =
+            developer_event_history_lines(&event, developer_width, expanded, app.palette());
+        let lines = debug_split_history_lines(transcript, developer, width);
+        entries.push(RenderedHistoryEntry {
+            event_ids: event.event_ids,
+            stable_line_count: if commit_event {
+                lines.len()
+            } else {
+                lines.len().saturating_sub(1)
+            },
+            commit_event,
+            lines,
+        });
+    }
+    entries
 }
 
 pub(crate) fn debug_split_live_lines(
@@ -817,41 +891,6 @@ fn styled_buffer_row(buffer: &Buffer, row: u16, width: u16) -> Vec<Span<'static>
     spans
 }
 
-fn committed_prefix_len(
-    entries: &[RenderedHistoryEntry],
-    stable_count: usize,
-    width: u16,
-    live_row_capacity: usize,
-) -> usize {
-    let stable_count = stable_count.min(entries.len());
-    let mut committed_count = stable_count;
-    let mut live_rows = entries[stable_count..]
-        .iter()
-        .map(|entry| history_lines_height(&entry.lines, width))
-        .sum::<usize>();
-
-    while committed_count > 0 && live_rows < live_row_capacity {
-        let candidate = committed_count.saturating_sub(1);
-        let candidate_rows = history_lines_height(&entries[candidate].lines, width);
-        // A whole operation is the smallest stable scrollback unit. A stable operation taller than
-        // the live body cannot be committed without leaving an empty live transcript, so keep it
-        // in the live tail and let the transcript pane show its final rows. Shorter operations can
-        // still be moved to scrollback as a complete unit.
-        if candidate_rows > live_row_capacity {
-            // Once a later operation exists, it supplies the live tail and the oversized
-            // operation can be archived atomically. Only the latest operation must stay live.
-            if candidate.saturating_add(1) == entries.len() {
-                committed_count = candidate;
-            }
-            break;
-        }
-        committed_count = candidate;
-        live_rows = live_rows.saturating_add(candidate_rows);
-    }
-
-    committed_count
-}
-
 #[cfg(test)]
 fn clear_history_terminal<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
     let size = terminal.size()?;
@@ -865,8 +904,53 @@ fn clear_history_terminal<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<
 }
 
 pub(crate) fn inline_viewport_height(app: &TuiApp, width: u16, screen_height: u16) -> u16 {
-    let bottom = bottom_pane_height_for_width(app, width).max(MIN_INLINE_BOTTOM_ROWS);
-    bottom.saturating_add(8).min(screen_height).max(1)
+    // 对照 Codex：slash/mention 弹层画在 composer 内部，不改变 inline viewport。
+    // 否则每敲一个 `/` 都会重建 Terminal，整屏闪一下。
+    let bottom =
+        bottom_pane_height_for_width_without_popups(app, width).max(MIN_INLINE_BOTTOM_ROWS);
+    let live = live_transcript_body_rows(app, width);
+    bottom.saturating_add(live).min(screen_height).max(1)
+}
+
+fn live_transcript_body_rows(app: &TuiApp, width: u16) -> u16 {
+    // 高度必须按 live 渲染行计算，已经推进 scrollback 的流式前缀不能再把 composer 撑高。
+    let lines = live_transcript_render_rows(app, width)
+        .into_iter()
+        .map(|row| row.line)
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return 0;
+    }
+    u16::try_from(history_lines_height(&lines, width)).unwrap_or(u16::MAX)
+}
+
+pub(crate) fn sync_inline_viewport_height(
+    terminal: &mut InteractiveTerminal,
+    app: &TuiApp,
+) -> io::Result<()> {
+    let size = terminal.size()?;
+    let desired = inline_viewport_height(app, size.width.max(1), size.height.max(1));
+    let current = terminal.current_buffer_mut().area;
+    let new_y = size.height.saturating_sub(desired);
+    if current.height == desired && current.width == size.width && current.y == new_y {
+        return Ok(());
+    }
+    if desired < current.height {
+        // 缩小时清掉多出来的 live 行，避免已归档长内容在屏幕上重复。
+        terminal.set_cursor_position(ratatui::layout::Position { x: 0, y: current.y })?;
+        let backend = terminal.backend_mut();
+        std::io::Write::write_all(backend, b"\x1b[J")?;
+        std::io::Write::flush(backend)?;
+    }
+    restore_inline_viewport(
+        terminal,
+        ratatui::layout::Rect {
+            x: 0,
+            y: new_y,
+            width: size.width.max(1),
+            height: desired.max(1),
+        },
+    )
 }
 
 pub(crate) fn session_history_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {

@@ -19,9 +19,10 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
+    Terminal, TerminalOptions, Viewport,
     backend::{Backend, ClearType, CrosstermBackend, WindowSize},
     buffer::Cell,
-    layout::{Position, Size},
+    layout::{Position, Rect, Size},
     style::{Color, Modifier},
 };
 use unicode_width::UnicodeWidthStr;
@@ -232,6 +233,8 @@ pub(crate) struct CursorFallbackBackend<B> {
     inner: B,
     last_known_cursor_position: Position,
     cursor_queries_supported: bool,
+    // 对照 Codex：离开 alt-screen 只恢复原来的 viewport，不能按 CSI 6n 再 append_lines。
+    restoring_inline_viewport: bool,
 }
 
 impl<B> CursorFallbackBackend<B> {
@@ -240,7 +243,17 @@ impl<B> CursorFallbackBackend<B> {
             inner,
             last_known_cursor_position: Position::ORIGIN,
             cursor_queries_supported: true,
+            restoring_inline_viewport: false,
         }
+    }
+
+    pub(crate) fn begin_inline_restore(&mut self, position: Position) {
+        self.last_known_cursor_position = position;
+        self.restoring_inline_viewport = true;
+    }
+
+    pub(crate) fn end_inline_restore(&mut self) {
+        self.restoring_inline_viewport = false;
     }
 
     fn resolve_cursor_position(&mut self, result: io::Result<Position>) -> Position {
@@ -271,6 +284,9 @@ impl<B: Backend> Backend for CursorFallbackBackend<B> {
     }
 
     fn append_lines(&mut self, count: u16) -> io::Result<()> {
+        if self.restoring_inline_viewport {
+            return Ok(());
+        }
         self.inner.append_lines(count)
     }
 
@@ -283,7 +299,7 @@ impl<B: Backend> Backend for CursorFallbackBackend<B> {
     }
 
     fn get_cursor_position(&mut self) -> io::Result<Position> {
-        if !self.cursor_queries_supported {
+        if self.restoring_inline_viewport || !self.cursor_queries_supported {
             return Ok(self.last_known_cursor_position);
         }
         let result = self.inner.get_cursor_position();
@@ -320,6 +336,51 @@ impl<B: Backend> Backend for CursorFallbackBackend<B> {
 
 pub(crate) fn set_alternate_screen_active(active: bool) {
     ALTERNATE_SCREEN_ACTIVE.store(active, Ordering::Relaxed);
+}
+
+pub(crate) fn alternate_screen_active() -> bool {
+    ALTERNATE_SCREEN_ACTIVE.load(Ordering::Relaxed)
+}
+
+pub(crate) fn switch_terminal_viewport(
+    terminal: &mut InteractiveTerminal,
+    viewport: Viewport,
+) -> io::Result<()> {
+    // ratatui 不允许移出 backend。先换成占位 stdout，再把真正的 backend 交给新 Terminal。
+    let backend = std::mem::replace(
+        terminal.backend_mut(),
+        CursorFallbackBackend::new(ContiguousCrosstermBackend::new(io::stdout())),
+    );
+    match Terminal::with_options(backend, TerminalOptions { viewport }) {
+        Ok(next) => {
+            *terminal = next;
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn restore_inline_viewport(
+    terminal: &mut InteractiveTerminal,
+    area: Rect,
+) -> io::Result<()> {
+    let position = Position {
+        x: area.x,
+        y: area.y,
+    };
+    terminal.set_cursor_position(position)?;
+    terminal.backend_mut().begin_inline_restore(position);
+    let result = switch_terminal_viewport(terminal, Viewport::Inline(area.height.max(1)));
+    terminal.backend_mut().end_inline_restore();
+    result
+}
+
+pub(crate) fn restored_inline_viewport(saved: Option<Rect>, size: Size) -> Rect {
+    let saved = saved.unwrap_or(Rect::new(0, 0, size.width, size.height.max(1)));
+    let width = saved.width.min(size.width).max(1);
+    let height = saved.height.min(size.height).max(1);
+    let max_y = size.height.saturating_sub(height);
+    Rect::new(0, saved.y.min(max_y), width, height)
 }
 
 pub(crate) fn clear_inline_scrollback(terminal: &mut InteractiveTerminal) -> io::Result<()> {
@@ -521,6 +582,7 @@ fn bounded_utf8_prefix(value: &str, max_bytes: usize) -> (&str, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
 
     #[test]
     fn adjacent_cjk_cells_are_written_as_contiguous_text() {
@@ -556,7 +618,21 @@ mod tests {
             "continuation cell was addressed: {output:?}"
         );
     }
-    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn restoring_inline_viewport_does_not_append_blank_lines() {
+        let mut backend = CursorFallbackBackend::new(TestBackend::new(80, 24));
+        let pinned = Position { x: 0, y: 13 };
+        backend.begin_inline_restore(pinned);
+        backend
+            .append_lines(10)
+            .expect("restore must not grow the screen");
+        assert_eq!(
+            backend.get_cursor_position().expect("pinned cursor"),
+            pinned
+        );
+        backend.end_inline_restore();
+    }
 
     #[test]
     fn osc52_payload_is_base64_encoded() {
