@@ -46,6 +46,7 @@
 22. `runtime-entrypoints.md`：exec、App Server、Python/TypeScript SDK、MCP 和 Remote TUI 的进程模型、协议边界和验收方式。
 23. `runtime-stability.md`：长任务执行、provider/process 监督、崩溃恢复、任务对账和 restart soak 验收。
 24. `external-verification.md`：调用方声明的客观验证器、证据链和自动修复驱动。
+25. [tui-rendering.md](tui-rendering.md)：终端历史、流式显示、输入区锚点、工具卡片与真实 PTY 验收。
 
 ## 文档分工
 

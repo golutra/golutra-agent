@@ -375,6 +375,36 @@ pub(crate) fn restore_inline_viewport(
     result
 }
 
+/// 活动区只从原锚点向下增长；不足的空间通过真实滚屏获得，不能覆盖上方历史。
+pub(crate) fn resize_inline_surface(
+    terminal: &mut InteractiveTerminal,
+    height: u16,
+    size: Size,
+) -> io::Result<()> {
+    let old = terminal.current_buffer_mut().area;
+    let height = height.max(1).min(size.height.max(1));
+    let top = old.y.min(size.height.saturating_sub(1));
+    let scroll = top.saturating_add(height).saturating_sub(size.height);
+    let writer = terminal.backend_mut();
+    // 只清除活动区；先清后滚，防止旧输入框被当成历史推入 scrollback。
+    queue!(
+        writer,
+        MoveTo(0, top),
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown)
+    )?;
+    if scroll > 0 {
+        queue!(writer, MoveTo(0, size.height.saturating_sub(1)))?;
+        for _ in 0..scroll {
+            writer.write_all(b"\r\n")?;
+        }
+    }
+    Write::flush(writer)?;
+    restore_inline_viewport(
+        terminal,
+        Rect::new(0, top.saturating_sub(scroll), size.width.max(1), height),
+    )
+}
+
 pub(crate) fn restored_inline_viewport(saved: Option<Rect>, size: Size) -> Rect {
     let saved = saved.unwrap_or(Rect::new(0, 0, size.width, size.height.max(1)));
     let width = saved.width.min(size.width).max(1);

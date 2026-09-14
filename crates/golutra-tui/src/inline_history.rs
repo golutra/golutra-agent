@@ -3,6 +3,7 @@
 use std::{
     collections::{HashMap, HashSet},
     io,
+    sync::Arc,
 };
 
 use golutra_core::{EventId, SessionId};
@@ -110,6 +111,35 @@ struct RenderedHistoryEntry {
     lines: Vec<Line<'static>>,
     stable_line_count: usize,
     commit_event: bool,
+    source_prefix: Option<String>,
+}
+
+/// 本地命令没有 runtime 事件；保留语义内容和归档锚点，窗口重排时不能丢掉 /status。
+#[derive(Debug, Clone)]
+struct LocalHistoryEntry {
+    anchor: Option<EventId>,
+    source_prefix: Option<String>,
+    items: Vec<TranscriptItem>,
+    emitted: bool,
+}
+
+impl LocalHistoryEntry {
+    fn offset_in(&self, app: &TuiApp, entry: &RenderedHistoryEntry, width: u16) -> usize {
+        self.source_prefix
+            .as_ref()
+            .map_or(entry.lines.len(), |prefix| {
+                let rendered = render_operation_projection_lines(
+                    app,
+                    vec![message_projection(TranscriptItem {
+                        role: TranscriptRole::Assistant,
+                        title: "Golutra".to_owned(),
+                        body: vec![prefix.clone()],
+                    })],
+                    width,
+                );
+                super::stream_commit::stable_rendered_prefix(&entry.lines, &rendered)
+            })
+    }
 }
 
 impl RenderedHistoryEntry {
@@ -122,18 +152,23 @@ impl RenderedHistoryEntry {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct InlineHistoryState {
     session_id: SessionId,
     generation: u64,
     mode: InlineHistoryMode,
     rendered_width: u16,
-    rendered_height: u16,
     initialized: bool,
     header_emitted: bool,
     rebuild_after_replay: bool,
     committed_event_ids: HashSet<EventId>,
     committed_stream_lines: HashMap<EventId, usize>,
+    // 只保留活动流已写入的渲染前缀；最终正文或后置 Markdown 定义可能修订它。
+    committed_stream_prefixes: HashMap<EventId, Arc<[Line<'static>]>>,
+    local_entries: Vec<LocalHistoryEntry>,
+    last_anchor: Option<EventId>,
+    last_source_prefix: Option<String>,
+    tail: super::transcript_spacing::TranscriptTail,
 }
 
 impl InlineHistoryState {
@@ -143,12 +178,16 @@ impl InlineHistoryState {
             generation: 0,
             mode: InlineHistoryMode::Transcript,
             rendered_width: 0,
-            rendered_height: 0,
             initialized: false,
             header_emitted: false,
             rebuild_after_replay: false,
             committed_event_ids: HashSet::new(),
             committed_stream_lines: HashMap::new(),
+            committed_stream_prefixes: HashMap::new(),
+            local_entries: Vec::new(),
+            last_anchor: None,
+            last_source_prefix: None,
+            tail: super::transcript_spacing::TranscriptTail::default(),
         }
     }
 
@@ -183,6 +222,30 @@ impl InlineHistoryState {
         &mut self,
         terminal: &mut Terminal<B>,
         app: &mut TuiApp,
+        rebuild_terminal: impl FnMut(&mut Terminal<B>) -> io::Result<()>,
+    ) -> io::Result<bool> {
+        // 归档标记与本地命令只有在终端写入成功后才能提交；失败不能吞掉待显示内容。
+        let mut next = self.clone();
+        let previous_history = app.transcript.history.clone();
+        let previous_commands = app.command_messages.clone();
+        match next.flush_prepared(terminal, app, rebuild_terminal) {
+            Ok(changed) => {
+                *self = next;
+                Ok(changed)
+            }
+            Err(error) => {
+                app.transcript.history = previous_history;
+                app.command_messages = previous_commands;
+                app.invalidate_transcript_layout();
+                Err(error)
+            }
+        }
+    }
+
+    fn flush_prepared<B: Backend>(
+        &mut self,
+        terminal: &mut Terminal<B>,
+        app: &mut TuiApp,
         mut rebuild_terminal: impl FnMut(&mut Terminal<B>) -> io::Result<()>,
     ) -> io::Result<bool> {
         // History is inserted before the normal frame draw, while ratatui normally performs its
@@ -192,7 +255,6 @@ impl InlineHistoryState {
         let mode = InlineHistoryMode::from_app(app);
         let buffer_area = terminal.current_buffer_mut().area;
         let width = buffer_area.width.max(1);
-        let viewport_height = buffer_area.height.max(1);
         // 对照 Codex：viewport 高度变化（slash 弹层、overlay 进出、流式尾巴）不能重建 scrollback。
         let identity_changed = self.initialized
             && (self.session_id != app.session_id
@@ -208,6 +270,15 @@ impl InlineHistoryState {
             history_cleared = true;
         }
         if !self.initialized || identity_changed {
+            self.tail = super::transcript_spacing::TranscriptTail::default();
+            if self.session_id != app.session_id {
+                self.local_entries.clear();
+            }
+            for entry in &mut self.local_entries {
+                entry.emitted = false;
+            }
+            self.last_anchor = None;
+            self.last_source_prefix = None;
             self.session_id = app.session_id;
             self.generation = app.transcript.history.replay_generation;
             self.mode = mode;
@@ -216,10 +287,10 @@ impl InlineHistoryState {
             self.header_emitted = false;
             self.committed_event_ids.clear();
             self.committed_stream_lines.clear();
+            self.committed_stream_prefixes.clear();
             app.set_inline_history_committed_event_ids(HashSet::new());
             app.set_inline_history_committed_stream_lines(HashMap::new());
         }
-        self.rendered_height = viewport_height;
 
         let source_ready = app.transcript.history.replay_ready
             && (!matches!(
@@ -242,28 +313,53 @@ impl InlineHistoryState {
             self.rebuild_after_replay = false;
         }
 
-        let live_row_capacity = viewport_height
-            .saturating_sub(bottom_pane_height_for_width(app, width).max(MIN_INLINE_BOTTOM_ROWS))
-            .max(1);
-        let history_entries = rendered_history_entries(app, width, live_row_capacity, mode);
+        app.transcript.history.command_anchors = self
+            .local_entries
+            .iter()
+            .filter_map(|entry| entry.anchor)
+            .collect();
+        let mut history_entries = rendered_history_entries(app, width, mode);
         let committable_ids = history_entries
             .iter()
             .flat_map(|entry| entry.event_ids.iter().copied())
             .collect::<HashSet<_>>();
-        let grouping_changed = history_entries.iter().any(|entry| {
-            entry.commit_event && entry.is_partially_committed(&self.committed_event_ids)
+        let grouping_changed = !matches!(mode, InlineHistoryMode::Transcript)
+            && history_entries.iter().any(|entry| {
+                entry.commit_event && entry.is_partially_committed(&self.committed_event_ids)
+            });
+        let stream_prefix_changed = history_entries.iter().any(|entry| {
+            entry.event_ids.iter().any(|id| {
+                self.committed_stream_prefixes
+                    .get(id)
+                    .is_some_and(|prefix| !entry.lines.starts_with(prefix))
+            })
         });
-        if !self.committed_event_ids.is_subset(&committable_ids) || grouping_changed {
+        if (!matches!(mode, InlineHistoryMode::Transcript)
+            && !self.committed_event_ids.is_subset(&committable_ids))
+            || grouping_changed
+            || stream_prefix_changed
+        {
             if !history_cleared {
                 rebuild_terminal(terminal)?;
                 history_cleared = true;
             }
             self.header_emitted = false;
+            for entry in &mut self.local_entries {
+                entry.emitted = false;
+            }
+            self.tail = super::transcript_spacing::TranscriptTail::default();
+            self.last_anchor = None;
+            self.last_source_prefix = None;
             self.committed_event_ids.clear();
             self.committed_stream_lines.clear();
+            self.committed_stream_prefixes.clear();
             app.set_inline_history_committed_event_ids(HashSet::new());
             app.set_inline_history_committed_stream_lines(HashMap::new());
+            // 取消旧提交边界后重新投影，不能沿用受旧分组边界影响的条目。
+            history_entries = rendered_history_entries(app, width, mode);
         }
+        self.committed_stream_prefixes
+            .retain(|id, _| committable_ids.contains(id));
         let mut lines = Vec::new();
         let emit_header = !self.header_emitted;
         if emit_header {
@@ -286,10 +382,46 @@ impl InlineHistoryState {
                 lines.extend(fact_lines);
                 lines.push(Line::default());
             }
+            if let Some(last) = lines.last() {
+                self.tail.observe(last, None);
+            }
         }
 
-        let mut inserted = false;
-        for entry in history_entries {
+        self.append_event_lines(app, history_entries, width, &mut lines);
+        self.append_local_messages(app, width, &mut lines);
+
+        let changed = !lines.is_empty();
+        if changed {
+            insert_history_lines(terminal, lines, width)?;
+            self.header_emitted = true;
+        }
+        app.set_inline_history_committed_event_ids(self.committed_event_ids.clone());
+        app.set_inline_history_committed_stream_lines(self.committed_stream_lines.clone());
+        if app.transcript.history.tail != self.tail {
+            app.transcript.history.tail = self.tail.clone();
+            app.invalidate_transcript_layout();
+        }
+        Ok(changed || history_cleared)
+    }
+
+    fn append_event_lines(
+        &mut self,
+        app: &TuiApp,
+        entries: Vec<RenderedHistoryEntry>,
+        width: u16,
+        lines: &mut Vec<Line<'static>>,
+    ) {
+        for entry in self
+            .local_entries
+            .iter_mut()
+            .filter(|entry| entry.anchor.is_none() && !entry.emitted)
+        {
+            self.tail
+                .append(lines, &local_entry_lines(app, &entry.items, width), None);
+            entry.emitted = true;
+        }
+        for entry in entries {
+            let event_id = entry.event_ids.first().copied();
             if entry.commit_event && entry.is_committed(&self.committed_event_ids) {
                 continue;
             }
@@ -309,83 +441,109 @@ impl InlineHistoryState {
                 entry.stable_line_count
             };
             if commit_until > commit_from {
-                lines.extend(entry.lines[commit_from..commit_until].iter().cloned());
-                inserted = true;
-            }
-            if let Some(event_id) = entry.event_ids.first().copied() {
-                if entry.commit_event {
-                    self.committed_event_ids.insert(event_id);
-                    self.committed_stream_lines.remove(&event_id);
-                } else if commit_until > already {
-                    self.committed_stream_lines.insert(event_id, commit_until);
+                let mut cursor = commit_from;
+                for local in self.local_entries.iter_mut().filter(|local| {
+                    !local.emitted && local.anchor.is_some_and(|id| entry.event_ids.contains(&id))
+                }) {
+                    let offset = local.offset_in(app, &entry, width);
+                    if offset > commit_until {
+                        continue;
+                    }
+                    let offset = offset.max(cursor);
+                    self.tail
+                        .append(lines, &entry.lines[cursor..offset], event_id);
+                    self.tail
+                        .append(lines, &local_entry_lines(app, &local.items, width), None);
+                    cursor = offset;
+                    local.emitted = true;
                 }
+                self.tail
+                    .append(lines, &entry.lines[cursor..commit_until], event_id);
+                self.last_anchor = entry.event_ids.last().copied();
+                self.last_source_prefix = entry.source_prefix.clone();
+            }
+            if entry.commit_event {
+                for event_id in &entry.event_ids {
+                    self.committed_event_ids.insert(*event_id);
+                    self.committed_stream_lines.remove(event_id);
+                    self.committed_stream_prefixes.remove(event_id);
+                }
+            } else if commit_until > already
+                && let Some(event_id) = entry.event_ids.first().copied()
+            {
+                self.committed_stream_lines.insert(event_id, commit_until);
+                self.committed_stream_prefixes
+                    .insert(event_id, Arc::from(&entry.lines[..commit_until]));
+            }
+            // 后完成的工具不得越过尚未完成的前一个单元进入不可变历史。
+            if !entry.commit_event {
+                break;
             }
         }
+    }
 
+    fn append_local_messages(
+        &mut self,
+        app: &mut TuiApp,
+        width: u16,
+        lines: &mut Vec<Line<'static>>,
+    ) {
         if !app.command_messages.is_empty() {
             // slash 命令没有 RuntimeEvent。推进 scrollback 后从 live 区拿掉，避免每次进出 overlay 再画一遍。
-            let archived = app
-                .command_messages
-                .iter()
-                .cloned()
-                .map(|item| {
-                    if matches!(
-                        item.role,
-                        TranscriptRole::User
-                            | TranscriptRole::Assistant
-                            | TranscriptRole::CommandResult
-                    ) {
-                        message_projection(item)
-                    } else {
-                        notice_projection(item)
-                    }
-                })
-                .collect::<Vec<_>>();
-            let archived_lines = render_operation_projection_lines(app, archived, width);
+            let archived_lines = local_entry_lines(app, &app.command_messages, width);
             if !archived_lines.is_empty() {
-                lines.extend(archived_lines);
-                inserted = true;
+                self.tail.append(lines, &archived_lines, None);
             }
-            app.command_messages.clear();
+            self.local_entries.push(LocalHistoryEntry {
+                anchor: self.last_anchor,
+                source_prefix: self.last_source_prefix.clone(),
+                items: std::mem::take(&mut app.command_messages),
+                emitted: true,
+            });
             app.invalidate_transcript_layout();
         }
-
-        if lines.is_empty() {
-            if inserted {
-                app.set_inline_history_committed_event_ids(self.committed_event_ids.clone());
-                app.set_inline_history_committed_stream_lines(self.committed_stream_lines.clone());
-            }
-            return Ok(history_cleared);
-        }
-
-        insert_history_lines(terminal, lines, width)?;
-
-        self.header_emitted = true;
-        app.set_inline_history_committed_event_ids(self.committed_event_ids.clone());
-        app.set_inline_history_committed_stream_lines(self.committed_stream_lines.clone());
-        Ok(true)
     }
+}
+
+fn local_entry_lines(app: &TuiApp, items: &[TranscriptItem], width: u16) -> Vec<Line<'static>> {
+    let projections = items
+        .iter()
+        .cloned()
+        .map(|item| {
+            if matches!(
+                item.role,
+                TranscriptRole::User | TranscriptRole::Assistant | TranscriptRole::CommandResult
+            ) {
+                message_projection(item)
+            } else {
+                notice_projection(item)
+            }
+        })
+        .collect();
+    render_operation_projection_lines(app, projections, width)
 }
 
 fn rendered_history_entries(
     app: &TuiApp,
     width: u16,
-    _live_row_capacity: u16,
     mode: InlineHistoryMode,
 ) -> Vec<RenderedHistoryEntry> {
     match mode {
-        InlineHistoryMode::Transcript => event_operation_entries(&app.events)
-            .into_iter()
-            .map(|entry| {
-                history_entry_from_projection(
-                    app,
-                    vec![entry.id],
-                    entry.projection,
-                    entry.stable,
-                    width,
-                )
-            })
-            .collect(),
+        InlineHistoryMode::Transcript => {
+            let entries = history_event_operations(app);
+            entries
+                .into_iter()
+                .map(|entry| {
+                    history_entry_from_projection(
+                        app,
+                        entry.event_ids,
+                        entry.projection,
+                        entry.stable,
+                        width,
+                    )
+                })
+                .collect()
+        }
         InlineHistoryMode::Developer { expanded } => {
             let mut events = app.events.iter().collect::<Vec<_>>();
             events.sort_by_key(|event| event.sequence_no);
@@ -404,6 +562,7 @@ fn rendered_history_entries(
                         },
                         commit_event,
                         lines,
+                        source_prefix: None,
                     }
                 })
                 .collect()
@@ -421,18 +580,31 @@ fn history_entry_from_projection(
     stable: bool,
     width: u16,
 ) -> RenderedHistoryEntry {
+    let source_prefix = (!stable && projection.is_assistant_message()).then(|| {
+        let source = projection.item(false).body.join("\n");
+        source[..super::stream_commit::stable_source_end(&source)].to_owned()
+    });
+    let stable_source = source_prefix
+        .as_ref()
+        .filter(|prefix| !prefix.is_empty())
+        .map(|prefix| {
+            let mut item = projection.item(false);
+            item.body = vec![prefix.clone()];
+            render_operation_projection_lines(app, vec![message_projection(item)], width)
+        });
     let lines = render_operation_projection_lines(app, vec![projection], width);
     RenderedHistoryEntry {
         event_ids,
-        // 进行中的工具/流式尾巴必须留在 live 区。以前靠尾部空行占位；空行去掉后，
-        // 未稳定条目不能把最后一行提交进 scrollback。
         stable_line_count: if stable {
             lines.len()
         } else {
-            lines.len().saturating_sub(1)
+            stable_source.as_ref().map_or(0, |prefix| {
+                super::stream_commit::stable_rendered_prefix(&lines, prefix)
+            })
         },
         commit_event: stable,
         lines,
+        source_prefix,
     }
 }
 
@@ -467,18 +639,23 @@ fn debug_split_event_entries(
 ) -> Vec<RenderedHistoryEntry> {
     let mut operations = event_operation_entries(&app.events)
         .into_iter()
-        .map(|entry| (entry.id, (entry.projection, entry.stable)))
+        .flat_map(|entry| {
+            let value = (entry.projection, entry.stable);
+            entry
+                .event_ids
+                .into_iter()
+                .map(move |event_id| (event_id, value.clone()))
+        })
         .collect::<HashMap<_, _>>();
     let (transcript_width, developer_width) = debug_pane_widths(width);
     let mut blocked = false;
     let mut entries = Vec::new();
     for event in developer_event_projections(events) {
         let open_or_unstable = event.is_open_provider_stream()
-            || event.event_ids.iter().any(|event_id| {
-                operations
-                    .get(event_id)
-                    .is_some_and(|(_, stable)| !*stable)
-            });
+            || event
+                .event_ids
+                .iter()
+                .any(|event_id| operations.get(event_id).is_some_and(|(_, stable)| !*stable));
         if open_or_unstable {
             blocked = true;
         }
@@ -503,6 +680,7 @@ fn debug_split_event_entries(
             },
             commit_event,
             lines,
+            source_prefix: None,
         });
     }
     entries
@@ -538,10 +716,12 @@ pub(crate) fn debug_split_live_lines(
     let live_event_operation_count = event_operation_entries(&app.events)
         .into_iter()
         .filter(|entry| {
-            !app.transcript
-                .history
-                .committed_event_ids
-                .contains(&entry.id)
+            !entry.event_ids.iter().any(|event_id| {
+                app.transcript
+                    .history
+                    .committed_event_ids
+                    .contains(event_id)
+            })
         })
         .count();
     let transcript_only = rendered_transcript_operation_projections(app)
@@ -931,26 +1111,10 @@ pub(crate) fn sync_inline_viewport_height(
     let size = terminal.size()?;
     let desired = inline_viewport_height(app, size.width.max(1), size.height.max(1));
     let current = terminal.current_buffer_mut().area;
-    let new_y = size.height.saturating_sub(desired);
-    if current.height == desired && current.width == size.width && current.y == new_y {
+    if current.height == desired && current.width == size.width && current.bottom() <= size.height {
         return Ok(());
     }
-    if desired < current.height {
-        // 缩小时清掉多出来的 live 行，避免已归档长内容在屏幕上重复。
-        terminal.set_cursor_position(ratatui::layout::Position { x: 0, y: current.y })?;
-        let backend = terminal.backend_mut();
-        std::io::Write::write_all(backend, b"\x1b[J")?;
-        std::io::Write::flush(backend)?;
-    }
-    restore_inline_viewport(
-        terminal,
-        ratatui::layout::Rect {
-            x: 0,
-            y: new_y,
-            width: size.width.max(1),
-            height: desired.max(1),
-        },
-    )
+    resize_inline_surface(terminal, desired, size)
 }
 
 pub(crate) fn session_history_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
@@ -1021,6 +1185,7 @@ pub(crate) fn session_history_lines(app: &TuiApp, width: u16) -> Vec<Line<'stati
             Style::default().fg(palette.muted),
         ),
     ]));
+    // 页首提示与第一条消息共用一行分隔，后续提交不能再叠加留白。
     lines.push(Line::default());
     lines
 }

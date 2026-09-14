@@ -19,6 +19,9 @@ use unicode_width::UnicodeWidthChar;
 
 const ANSI_ESC: u8 = 0x1b;
 
+#[path = "support/pty_scrollback.rs"]
+mod scrollback;
+
 struct PtyHarness {
     master: Box<dyn portable_pty::MasterPty + Send>,
     writer: Box<dyn Write + Send>,
@@ -35,6 +38,21 @@ impl Drop for PtyHarness {
 
 impl PtyHarness {
     fn spawn(home: &Path, cwd: &Path, width: u16, height: u16) -> Self {
+        Self::spawn_configured(home, cwd, width, height, false)
+    }
+
+    fn spawn_configured(home: &Path, cwd: &Path, width: u16, height: u16, live: bool) -> Self {
+        Self::spawn_with_resume(home, cwd, width, height, live, None)
+    }
+
+    fn spawn_with_resume(
+        home: &Path,
+        cwd: &Path,
+        width: u16,
+        height: u16,
+        live: bool,
+        resume: Option<&str>,
+    ) -> Self {
         let system = native_pty_system();
         let pair = system
             .openpty(PtySize {
@@ -47,8 +65,17 @@ impl PtyHarness {
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_golutra-tui"));
         command.arg("--cwd");
         command.arg(cwd);
+        if let Some(resume) = resume {
+            command.arg("--resume");
+            command.arg(resume);
+        }
         command.env("GOLUTRA_HOME", home);
-        command.env("GOLUTRA_PROVIDER_MODE", "mock");
+        if live {
+            command.env("GOLUTRA_PROVIDER_MODE", "live");
+            command.env("GOLUTRA_PTY_TEST_KEY", "isolated-pty-test-key");
+        } else {
+            command.env("GOLUTRA_PROVIDER_MODE", "mock");
+        }
         command.env("TERM", "xterm-256color");
         let child = pair.slave.spawn_command(command).expect("spawn TUI binary");
         drop(pair.slave);

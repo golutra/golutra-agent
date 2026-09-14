@@ -221,53 +221,95 @@ fn render_operation_projections(
     width: u16,
     skip_committed_stream_lines: bool,
 ) -> Vec<TranscriptRenderRow> {
-    let skips = if skip_committed_stream_lines {
+    let (skips, continues_history) = if skip_committed_stream_lines {
         live_stream_line_skips(app, projections.len())
     } else {
-        vec![0; projections.len()]
+        (vec![0; projections.len()], false)
     };
-    projections
-        .into_iter()
-        .enumerate()
-        .flat_map(|(projection_index, projection)| {
-            let expanded = app.transcript.details_expanded
-                || projection
-                    .id()
-                    .is_some_and(|id| app.transcript.expanded_operations.contains(id));
-            let operation_id = projection.id().cloned();
-            let toggle = projection.is_expandable();
-            let item = projection.item(expanded);
-            render_item_rows(
-                app,
-                item,
-                operation_id,
-                toggle,
-                expanded,
-                projection_index,
-                width,
-                skips.get(projection_index).copied().unwrap_or(0),
-            )
-        })
-        .collect()
+    let mut tail = if skip_committed_stream_lines
+        && app.transcript.history.enabled
+        && app.transcript.search.is_none()
+    {
+        app.transcript.history.tail.clone()
+    } else {
+        super::transcript_spacing::TranscriptTail::default()
+    };
+    let mut result = Vec::new();
+    for (projection_index, projection) in projections.into_iter().enumerate() {
+        let expanded = app.transcript.details_expanded
+            || projection
+                .id()
+                .is_some_and(|id| app.transcript.expanded_operations.contains(id));
+        let operation_id = projection.id().cloned();
+        let toggle = projection.is_expandable();
+        let item = projection.item(expanded);
+        let rows = render_item_rows(
+            app,
+            item,
+            operation_id,
+            toggle,
+            projection_index,
+            width,
+            skips.get(projection_index).copied().unwrap_or(0),
+        );
+        if let (Some(first), Some(last)) = (rows.first(), rows.last()) {
+            if tail.needs_separator(&first.line, projection_index == 0 && continues_history) {
+                result.push(TranscriptRenderRow {
+                    line: Line::default(),
+                    operation_id: None,
+                    toggle: false,
+                    projection_index,
+                });
+            }
+            tail.observe(&last.line, None);
+            result.extend(rows);
+        }
+    }
+    result
 }
 
-fn live_stream_line_skips(app: &TuiApp, projection_count: usize) -> Vec<usize> {
+fn live_stream_line_skips(app: &TuiApp, projection_count: usize) -> (Vec<usize>, bool) {
+    if !app.transcript.history.enabled || app.transcript.search.is_some() {
+        return (vec![0; projection_count], false);
+    }
     let committed = (app.transcript.history.enabled && app.transcript.search.is_none())
         .then_some(&app.transcript.history.committed_event_ids);
-    let mut skips = super::event_operation_entries(&app.events)
+    let entries = super::history_event_operations(app)
         .into_iter()
-        .filter(|entry| committed.is_none_or(|ids| !ids.contains(&entry.id)))
+        .filter(|entry| {
+            committed.is_none_or(|ids| {
+                !entry
+                    .event_ids
+                    .iter()
+                    .all(|event_id| ids.contains(event_id))
+            })
+        })
+        .collect::<Vec<_>>();
+    let continues_history = entries.first().is_some_and(|entry| {
+        app.transcript
+            .history
+            .tail
+            .event_id
+            .is_some_and(|id| entry.event_ids.contains(&id))
+    });
+    let mut skips = entries
+        .into_iter()
         .map(|entry| {
-            app.transcript
-                .history
-                .committed_stream_lines
-                .get(&entry.id)
-                .copied()
+            entry
+                .event_ids
+                .iter()
+                .find_map(|event_id| {
+                    app.transcript
+                        .history
+                        .committed_stream_lines
+                        .get(event_id)
+                        .copied()
+                })
                 .unwrap_or(0)
         })
         .collect::<Vec<_>>();
     skips.resize(projection_count, 0);
-    skips
+    (skips, continues_history)
 }
 
 pub(crate) fn transcript_toggle_at(
@@ -348,7 +390,6 @@ fn render_item_rows(
     item: TranscriptItem,
     operation_id: Option<OperationId>,
     toggle: bool,
-    _expanded: bool,
     projection_index: usize,
     width: u16,
     skip_lines: usize,
@@ -402,10 +443,9 @@ fn render_item_rows(
             } else {
                 item.body.join("\n")
             };
-            vec![Line::from(Span::styled(
-                text,
-                Style::default().fg(color),
-            ))]
+            text.split('\n')
+                .map(|line| Line::from(Span::styled(line.to_owned(), Style::default().fg(color))))
+                .collect()
         }
         _ => item
             .body
@@ -415,7 +455,7 @@ fn render_item_rows(
     };
     // 对照 Codex：已推进上方 scrollback 的流式前缀不再画进 live 区。
     if skip_lines > 0 && matches!(item.role, TranscriptRole::Assistant) {
-        let keep_from = skip_lines.min(body_lines.len().saturating_sub(1));
+        let keep_from = skip_lines.min(body_lines.len());
         if keep_from > 0 {
             body_lines.drain(..keep_from);
         }
@@ -430,7 +470,7 @@ fn render_item_rows(
 
     let mut rows = Vec::new();
     if inline_body {
-        if body_lines.is_empty() {
+        if body_lines.is_empty() && skip_lines == 0 {
             rows.push(TranscriptRenderRow {
                 line: Line::from(Span::styled(marker, Style::default().fg(color))),
                 operation_id: operation_id.clone(),
@@ -439,7 +479,7 @@ fn render_item_rows(
             });
         } else {
             for (index, mut line) in body_lines.into_iter().enumerate() {
-                if index == 0 {
+                if index == 0 && skip_lines == 0 {
                     line.spans
                         .insert(0, Span::styled(marker, Style::default().fg(color)));
                 } else if !line.spans.is_empty() {

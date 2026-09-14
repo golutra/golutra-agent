@@ -55,10 +55,7 @@ use golutra_tui::{
     SlashCommandCandidate, SlashDebugCommand, SlashInput, TranscriptScrollAction,
     parse_slash_input, ratatui_vertical_scroll, slash_command_candidates,
 };
-use ratatui::{
-    Terminal, TerminalOptions, Viewport,
-    layout::Rect,
-};
+use ratatui::{Terminal, TerminalOptions, Viewport, layout::Rect};
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -68,8 +65,9 @@ use uuid::Uuid;
 static TUI_ACTOR_ID: LazyLock<String> =
     LazyLock::new(|| format!("golutra-tui-{}-{}", std::process::id(), Uuid::now_v7()));
 const TUI_HISTORY_PAGE_SIZE: u32 = 256;
-const TUI_EVENT_HISTORY_LIMIT: usize = 4_096;
-const TUI_EVENT_HISTORY_BYTE_LIMIT: usize = 512 * 1024;
+// 恢复页与交互窗口使用同一预算，避免刚加载的完整会话立即被裁成最近几百 KB。
+const TUI_EVENT_HISTORY_LIMIT: usize = history_source::COMPLETE_HISTORY_EVENT_LIMIT;
+const TUI_EVENT_HISTORY_BYTE_LIMIT: usize = history_source::COMPLETE_HISTORY_BYTE_LIMIT;
 const TUI_EVENT_HISTORY_TRIM_BATCH: usize = 256;
 const TUI_EVENT_PAYLOAD_LIMIT: usize = 64 * 1024;
 const TUI_EVENT_PAYLOAD_PREVIEW_LIMIT: usize = 4 * 1024;
@@ -103,7 +101,9 @@ mod rich_text;
 mod runtime_controller;
 mod session;
 mod settings;
+mod stream_commit;
 mod terminal_integration;
+mod transcript_spacing;
 mod transcript_view;
 mod transcript_widget;
 pub(crate) use activity_view::*;
@@ -1833,6 +1833,10 @@ impl TuiApp {
         let anchor = self.first_visible_transcript_anchor();
         let previous_row_count = self.transcript.scroll.row_count;
         let expanded = self.transcript.toggle_details();
+        if self.transcript.history.enabled {
+            // 已归档的工具不在活动区；显式展开必须从语义事件重排，否则 Ctrl+O 看不到详情。
+            self.request_history_rebuild();
+        }
         self.reflow_transcript_with_anchor(anchor, previous_row_count);
         self.status_message = if expanded {
             "transcript details expanded"
@@ -4197,9 +4201,29 @@ fn draw_interactive_frame(
     app: &mut TuiApp,
     inline_history: &mut InlineHistoryState,
 ) -> miette::Result<()> {
+    // 归档、滚屏与活动区重画是一帧；支持同步更新的终端不应展示它们之间的半成品。
+    execute!(
+        terminal.backend_mut(),
+        crossterm::terminal::BeginSynchronizedUpdate
+    )
+    .map_err(|error| miette::miette!("begin terminal update: {error}"))?;
+    let result = draw_interactive_frame_inner(terminal, overlay_screen, app, inline_history);
+    let end = execute!(
+        terminal.backend_mut(),
+        crossterm::terminal::EndSynchronizedUpdate
+    );
+    result?;
+    end.map_err(|error| miette::miette!("finish terminal update: {error}"))
+}
+
+fn draw_interactive_frame_inner(
+    terminal: &mut InteractiveTerminal,
+    overlay_screen: &mut OverlayScreenState,
+    app: &mut TuiApp,
+    inline_history: &mut InlineHistoryState,
+) -> miette::Result<()> {
     let overlay_visible = app.overlay_surface().is_some();
-    // 进入 overlay 前先在 Inline 上归档 slash 行。同一帧 sync_overlay 会切 Fixed，insert_before 会失效。
-    // 这里不能 sync 高度：overlay 已打开时 composer 被压成 1 行，保存进去的 viewport 会偏矮。
+    // 历史先写入原活动区上方，再按剩余尾部调整输入区；顺序反转会擦掉尚未归档的行。
     if overlay_visible != overlay_screen.active && overlay_visible {
         inline_history
             .flush_interactive(terminal, app)

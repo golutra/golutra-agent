@@ -14,6 +14,12 @@ mod wrap;
 
 use ratatui::text::Line;
 
+// 渲染与流式冻结必须使用同一组 Markdown 扩展，否则两者可能认定不同的块边界。
+pub(crate) fn markdown_options() -> pulldown_cmark::Options {
+    use pulldown_cmark::Options;
+    Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS
+}
+
 pub(crate) fn markdown_lines(markdown: &str, width: u16) -> Vec<Line<'static>> {
     let document = markdown::parse_markdown(markdown);
     layout::render_markdown_document(&document, usize::from(width.max(1)))

@@ -14,6 +14,9 @@ use tokio::{
 
 use super::*;
 
+#[path = "history_test_backend.rs"]
+mod history_test_backend;
+
 #[test]
 fn remote_subcommand_is_an_explicit_app_server_transport() {
     let args = Args::try_parse_from([
@@ -245,13 +248,13 @@ fn tui_history_bounds_a_single_oversized_event_payload() {
         session_id,
         task_id,
         RuntimeEventType::ProviderStreamed,
-        json!({"delta": "x".repeat(TUI_EVENT_HISTORY_BYTE_LIMIT * 2)}),
+        json!({"delta": "x".repeat(TUI_EVENT_PAYLOAD_LIMIT * 2)}),
     );
 
     app.append_event_to_history(oversized);
 
     assert_eq!(app.events.len(), 1);
-    assert!(app.retained_event_bytes() <= TUI_EVENT_HISTORY_BYTE_LIMIT);
+    assert!(app.retained_event_bytes() <= TUI_EVENT_PAYLOAD_LIMIT);
     assert_eq!(app.events[0].payload["_truncated"], json!(true));
     assert_eq!(app.events[0].sequence_no, 1);
 }
@@ -1027,6 +1030,14 @@ fn session_history_card_uses_golutra_brand_and_operational_fields() {
     assert!(!text.contains("new in"));
     assert!(!text.contains("F1 help"));
     assert!(!text.contains("/settings"));
+    let tip = lines
+        .iter()
+        .position(|line| line.to_string().contains("Tip:"))
+        .expect("tip row");
+    assert!(
+        lines[tip + 1].to_string().trim().is_empty() && lines.len() == tip + 2,
+        "Tip must leave exactly one blank row before the first message: {text}"
+    );
 }
 
 #[test]
@@ -1230,7 +1241,11 @@ fn flushing_slash_commands_archives_them_out_of_the_live_viewport() {
     .expect("inline terminal");
     let mut history = InlineHistoryState::new(app.session_id);
 
-    assert!(history.flush(&mut terminal, &mut app).expect("archive slash"));
+    assert!(
+        history
+            .flush(&mut terminal, &mut app)
+            .expect("archive slash")
+    );
     assert!(app.command_messages.is_empty());
     assert_eq!(
         inline_viewport_height(&app, 80, 24),
@@ -1245,6 +1260,308 @@ fn flushing_slash_commands_archives_them_out_of_the_live_viewport() {
         !history
             .flush(&mut terminal, &mut app)
             .expect("second slash flush")
+    );
+}
+
+#[test]
+fn sending_a_prompt_archives_it_before_the_reply_is_ready() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let mut created = transcript_event(
+        1,
+        session_id,
+        task_id,
+        RuntimeEventType::TaskCreated,
+        json!({"payload": {"prompt": "你好"}}),
+    );
+    created.turn_id = Some(TurnId::new());
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(task_id),
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    )
+    .with_footer_context("/workspace", "gpt-test");
+    app.enable_inline_history();
+    let mut terminal = Terminal::with_options(
+        TestBackend::new(80, 24),
+        TerminalOptions {
+            viewport: Viewport::Inline(12),
+        },
+    )
+    .expect("inline terminal");
+    let mut history = InlineHistoryState::new(session_id);
+    history
+        .flush(&mut terminal, &mut app)
+        .expect("flush header");
+    app.events = vec![created.clone()];
+    app.projection = Some(UserProjection {
+        session_id,
+        task_id: Some(task_id),
+        status: golutra_core::TaskStatus::Running,
+        visible_steps: Vec::new(),
+        pending_approval: None,
+        final_message: None,
+        residual_risks: Vec::new(),
+    });
+    let desired = inline_viewport_height(&app, 80, 24);
+    terminal
+        .resize(Rect::new(0, 24_u16.saturating_sub(desired), 80, desired))
+        .expect("pin live viewport to the bottom");
+    let after_header = terminal.current_buffer_mut().area.y;
+    history.flush(&mut terminal, &mut app).expect("flush send");
+    let after_prompt = terminal.current_buffer_mut().area.y;
+    assert!(
+        after_prompt >= after_header,
+        "insert_before must push the startup logo and Tip up: header_y={after_header} prompt_y={after_prompt}"
+    );
+    assert!(
+        app.transcript
+            .history
+            .committed_event_ids
+            .contains(&created.id),
+        "submitted prompts must be committed independently of provider progress"
+    );
+    let live = transcript_render_rows(&app)
+        .into_iter()
+        .map(|row| row.line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !live.contains("› 你好"),
+        "the archived prompt must not also be redrawn inside the composer viewport: {live}"
+    );
+
+    let mut reply = transcript_event(
+        2,
+        session_id,
+        task_id,
+        RuntimeEventType::AssistantMessage,
+        json!({"content": "你好，我是 Golutra"}),
+    );
+    reply.turn_id = created.turn_id;
+    app.events.push(reply);
+    app.projection = Some(UserProjection {
+        session_id,
+        task_id: Some(task_id),
+        status: golutra_core::TaskStatus::Completed,
+        visible_steps: Vec::new(),
+        pending_approval: None,
+        final_message: None,
+        residual_risks: Vec::new(),
+    });
+    history.flush(&mut terminal, &mut app).expect("flush reply");
+    assert!(
+        app.transcript
+            .history
+            .committed_event_ids
+            .contains(&created.id),
+        "the prompt must archive with the completed reply"
+    );
+    let live = transcript_render_rows(&app)
+        .into_iter()
+        .map(|row| row.line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !live.contains("› 你好") && !live.contains("你好，我是 Golutra"),
+        "completed prompt and reply belong in scrollback: {live}"
+    );
+}
+
+#[test]
+fn coalescing_completed_tools_does_not_rebuild_archived_conversation() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let first_turn = TurnId::new();
+    let second_turn = TurnId::new();
+    let first_read = golutra_core::ToolCallId::new();
+    let second_read = golutra_core::ToolCallId::new();
+    let mut greeting_created = transcript_event(
+        1,
+        session_id,
+        task_id,
+        RuntimeEventType::TaskCreated,
+        json!({"payload": {"prompt": "你好"}}),
+    );
+    greeting_created.turn_id = Some(first_turn);
+    let mut greeting = transcript_event(
+        2,
+        session_id,
+        task_id,
+        RuntimeEventType::AssistantMessage,
+        json!({"content": "你好，我是 Golutra"}),
+    );
+    greeting.turn_id = Some(first_turn);
+    let mut inspect_created = transcript_event(
+        3,
+        session_id,
+        task_id,
+        RuntimeEventType::TaskCreated,
+        json!({"payload": {"prompt": "你看看整个项目"}}),
+    );
+    inspect_created.turn_id = Some(second_turn);
+    let mut inspect_narration = transcript_event(
+        4,
+        session_id,
+        task_id,
+        RuntimeEventType::AssistantMessage,
+        json!({"content": "先从工作区根目录看整体结构。"}),
+    );
+    inspect_narration.turn_id = Some(second_turn);
+    let mut first_started = transcript_event(
+        5,
+        session_id,
+        task_id,
+        RuntimeEventType::ToolStarted,
+        json!({
+            "tool_call_id": first_read,
+            "tool_name": "read_file",
+            "arguments": {"path": "README.md"}
+        }),
+    );
+    first_started.turn_id = Some(second_turn);
+    let mut first_completed = transcript_event(
+        6,
+        session_id,
+        task_id,
+        RuntimeEventType::ToolCompleted,
+        json!({
+            "envelope": {
+                "tool_call_id": first_read,
+                "tool_name": "read_file",
+                "status": "ok",
+                "summary": "file read",
+                "structured_facts": {"path": "README.md"}
+            }
+        }),
+    );
+    first_completed.turn_id = Some(second_turn);
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        Some(task_id),
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    )
+    .with_footer_context("/workspace", "gpt-test");
+    app.events = vec![
+        greeting_created.clone(),
+        greeting,
+        inspect_created,
+        inspect_narration.clone(),
+        first_started.clone(),
+        first_completed.clone(),
+    ];
+    let greeting_created_id = greeting_created.id;
+    let inspect_narration_id = inspect_narration.id;
+    let first_started_id = first_started.id;
+    app.projection = Some(UserProjection {
+        session_id,
+        task_id: Some(task_id),
+        status: golutra_core::TaskStatus::Running,
+        visible_steps: Vec::new(),
+        pending_approval: None,
+        final_message: None,
+        residual_risks: Vec::new(),
+    });
+    app.enable_inline_history();
+    let mut terminal = Terminal::with_options(
+        TestBackend::new(80, 48),
+        TerminalOptions {
+            viewport: Viewport::Inline(12),
+        },
+    )
+    .expect("inline terminal");
+    let mut history = InlineHistoryState::new(session_id);
+    history
+        .flush(&mut terminal, &mut app)
+        .expect("archive greeting and first tool");
+    let archived_before = app.transcript.history.committed_event_ids.clone();
+    assert!(archived_before.contains(&greeting_created_id));
+    assert!(archived_before.contains(&inspect_narration_id));
+    assert!(archived_before.contains(&first_started_id));
+    let live_before = transcript_render_rows(&app)
+        .into_iter()
+        .map(|row| row.line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !live_before.contains("› 你好") && !live_before.contains("先从工作区根目录看整体结构。"),
+        "greeting and tool narration must already be archived: {live_before}"
+    );
+
+    let mut second_started = transcript_event(
+        7,
+        session_id,
+        task_id,
+        RuntimeEventType::ToolStarted,
+        json!({
+            "tool_call_id": second_read,
+            "tool_name": "read_file",
+            "arguments": {"path": "Cargo.toml"}
+        }),
+    );
+    second_started.turn_id = Some(second_turn);
+    let mut second_completed = transcript_event(
+        8,
+        session_id,
+        task_id,
+        RuntimeEventType::ToolCompleted,
+        json!({
+            "envelope": {
+                "tool_call_id": second_read,
+                "tool_name": "read_file",
+                "status": "ok",
+                "summary": "file read",
+                "structured_facts": {"path": "Cargo.toml"}
+            }
+        }),
+    );
+    second_completed.turn_id = Some(second_turn);
+    app.events.extend([second_started, second_completed]);
+    let pending = history_event_operations(&app)
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .event_ids
+                .iter()
+                .any(|id| !app.transcript.history.committed_event_ids.contains(id))
+        })
+        .map(|entry| entry.projection.item(false))
+        .collect::<Vec<_>>();
+    assert!(
+        pending
+            .iter()
+            .any(|item| item.body.iter().any(|line| line.contains("Cargo.toml"))),
+        "a later tool completion must survive the archived batch boundary: {pending:?}"
+    );
+    history
+        .flush(&mut terminal, &mut app)
+        .expect("coalesce completed tools");
+
+    let titles = event_operation_entries(&app.events)
+        .into_iter()
+        .map(|entry| entry.projection.item(false).title)
+        .collect::<Vec<_>>();
+    assert!(titles.iter().any(|title| title == "You"));
+    assert!(titles.iter().any(|title| title == "Golutra"));
+    assert!(titles.iter().any(|title| title == "read 2 files"));
+    assert!(
+        archived_before.is_subset(&app.transcript.history.committed_event_ids),
+        "coalescing tools must keep already archived conversation ids"
+    );
+    let live = transcript_render_rows(&app)
+        .into_iter()
+        .map(|row| row.line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !live.contains("› 你好") && !live.contains("先从工作区根目录看整体结构。"),
+        "greeting and tool narration belong in scrollback, not the live composer: {live}"
     );
 }
 
@@ -1817,6 +2134,207 @@ fn streaming_assistant_commits_completed_lines_and_keeps_the_live_tail() {
         viewport <= bottom.saturating_add(8),
         "streaming live viewport must stay near the composer, not the full stream: viewport={viewport} bottom={bottom}"
     );
+}
+
+#[test]
+fn final_message_that_revises_archived_stream_prefix_rebuilds_history() {
+    let session = SessionId::new();
+    let task = TaskId::new();
+    let turn = TurnId::new();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session,
+        Some(task),
+        false,
+        "ready".into(),
+        None,
+    );
+    app.enable_inline_history();
+    let mut streamed = transcript_event(
+        1,
+        session,
+        task,
+        RuntimeEventType::ProviderStreamed,
+        json!({"delta":{"kind":"text_delta","text":"旧的第一段。\n\n旧的第二段。\n\n活动尾部"}}),
+    );
+    streamed.turn_id = Some(turn);
+    let stream_id = streamed.id;
+    app.events.push(streamed);
+    let mut terminal = Terminal::with_options(
+        TestBackend::new(80, 24),
+        TerminalOptions {
+            viewport: Viewport::Inline(4),
+        },
+    )
+    .unwrap();
+    let mut history = InlineHistoryState::new(session);
+    history.flush(&mut terminal, &mut app).unwrap();
+    assert!(app.transcript.history.committed_stream_lines[&stream_id] > 0);
+    let mut continued = transcript_event(
+        2,
+        session,
+        task,
+        RuntimeEventType::ProviderStreamed,
+        json!({"delta":{"kind":"text_delta","text":"\n\n最后一段"}}),
+    );
+    continued.turn_id = Some(turn);
+    app.events.push(continued);
+    app.invalidate_transcript_layout();
+    history
+        .flush_with_rebuild_for_test(&mut terminal, &mut app, |_| {
+            panic!("ordinary appended text must not rebuild history")
+        })
+        .unwrap();
+    let mut final_message = transcript_event(
+        3,
+        session,
+        task,
+        RuntimeEventType::AssistantMessage,
+        json!({"content":"更正后的完整回复。"}),
+    );
+    final_message.turn_id = Some(turn);
+    app.events.push(final_message);
+    app.invalidate_transcript_layout();
+    let mut rebuilt = false;
+    history
+        .flush_with_rebuild_for_test(&mut terminal, &mut app, |terminal| {
+            rebuilt = true;
+            ratatui::backend::Backend::clear(terminal.backend_mut())?;
+            terminal.clear()
+        })
+        .unwrap();
+    assert!(
+        rebuilt,
+        "changed final prefix must not be skipped by the old stream line count"
+    );
+    assert!(
+        app.transcript
+            .history
+            .committed_event_ids
+            .contains(&stream_id)
+    );
+    assert!(app.transcript.history.committed_stream_lines.is_empty());
+    let visible = terminal_buffer_display_rows(&terminal).join("\n");
+    assert!(visible.contains("更正后的完整回复。"), "{visible}");
+    assert!(!visible.contains("旧的第一段"), "{visible}");
+}
+
+#[test]
+fn replay_retains_the_same_budget_as_the_complete_history_loader() {
+    let session = SessionId::new();
+    let task = TaskId::new();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session,
+        Some(task),
+        false,
+        "ready".into(),
+        None,
+    );
+    let events = (1..=1024)
+        .map(|n| {
+            transcript_event(
+                n,
+                session,
+                task,
+                RuntimeEventType::AssistantMessage,
+                json!({"content": format!("{n}:{}", "正文".repeat(200))}),
+            )
+        })
+        .collect();
+    app.replace_event_history(events, false);
+    assert_eq!(app.events.len(), 1024);
+    assert!(!app.history_has_more_before);
+    assert!(app.retained_event_bytes() > 512 * 1024);
+}
+
+#[test]
+fn local_status_anchor_prevents_tool_recoalescing_during_reflow() {
+    let session = SessionId::new();
+    let task = TaskId::new();
+    let turn = TurnId::new();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session,
+        Some(task),
+        false,
+        "ready".into(),
+        None,
+    );
+    for (n, path) in [(1, "first.txt"), (2, "second.txt")] {
+        let mut event = transcript_event(
+            n,
+            session,
+            task,
+            RuntimeEventType::ToolCompleted,
+            json!({
+                "envelope": {"tool_call_id": golutra_core::ToolCallId::new(), "tool_name":"read_file",
+                "status":"ok", "summary":"read", "structured_facts":{"path":path}}
+            }),
+        );
+        event.turn_id = Some(turn);
+        app.events.push(event);
+    }
+    assert_eq!(
+        history_event_operations(&app).len(),
+        1,
+        "adjacent reads normally coalesce"
+    );
+    app.transcript
+        .history
+        .command_anchors
+        .insert(app.events[0].id);
+    let entries = history_event_operations(&app);
+    assert_eq!(
+        entries.len(),
+        2,
+        "replay cannot move /status past the second read"
+    );
+    assert!(
+        entries[0]
+            .projection
+            .item(false)
+            .title
+            .contains("first.txt")
+    );
+    assert!(
+        entries[1]
+            .projection
+            .item(false)
+            .title
+            .contains("second.txt")
+    );
+}
+
+#[test]
+fn failed_history_write_does_not_acknowledge_pending_commands() {
+    let session = SessionId::new();
+    let mut app = TuiApp::new(ThreadId::new(), session, None, false, "ready".into(), None);
+    app.enable_inline_history();
+    let mut terminal = Terminal::with_options(
+        history_test_backend::HistoryTestBackend::new(80, 24),
+        TerminalOptions {
+            viewport: Viewport::Inline(4),
+        },
+    )
+    .unwrap();
+    let mut history = InlineHistoryState::new(session);
+    history.flush(&mut terminal, &mut app).unwrap();
+    app.command_messages.push(TranscriptItem {
+        role: TranscriptRole::Status,
+        title: "Status".into(),
+        body: vec!["pending status".into()],
+    });
+    terminal.backend_mut().fail_draw = true;
+    let commands = app.command_messages.clone();
+    let ids = app.transcript.history.committed_event_ids.clone();
+    let error = history.flush(&mut terminal, &mut app).unwrap_err();
+    assert!(error.to_string().contains("injected"));
+    assert_eq!(app.command_messages, commands);
+    assert_eq!(app.transcript.history.committed_event_ids, ids);
+    terminal.backend_mut().fail_draw = false;
+    history.flush(&mut terminal, &mut app).unwrap();
+    assert!(app.command_messages.is_empty());
 }
 
 #[test]
@@ -4031,7 +4549,97 @@ fn user_and_assistant_messages_start_on_the_marker_line() {
 }
 
 #[test]
-fn consecutive_transcript_items_do_not_insert_blank_rows() {
+fn independent_messages_have_one_blank_row_for_every_role_pair() {
+    for first_role in [TranscriptRole::User, TranscriptRole::Assistant] {
+        for second_role in [TranscriptRole::User, TranscriptRole::Assistant] {
+            let mut app = TuiApp::new(
+                ThreadId::new(),
+                SessionId::new(),
+                None,
+                false,
+                "ready (mock)".to_owned(),
+                None,
+            );
+            app.command_messages = vec![
+                TranscriptItem {
+                    role: first_role.clone(),
+                    title: String::new(),
+                    body: vec!["第一句".to_owned()],
+                },
+                TranscriptItem {
+                    role: second_role,
+                    title: String::new(),
+                    body: vec!["第二句".to_owned()],
+                },
+            ];
+            let lines = full_transcript_layout(&app, Rect::new(0, 0, 80, 12)).plain_lines();
+            assert_eq!(lines.len(), 3, "independent messages: {lines:?}");
+            assert!(lines[0].ends_with("第一句"), "{lines:?}");
+            assert_eq!(lines[1], "", "one boundary separator: {lines:?}");
+            assert!(lines[2].ends_with("第二句"), "{lines:?}");
+        }
+    }
+}
+
+#[test]
+fn archived_and_replayed_messages_have_one_blank_for_every_role_pair() {
+    for first_user in [true, false] {
+        for second_user in [true, false] {
+            let session = SessionId::new();
+            let mut app = TuiApp::new(ThreadId::new(), session, None, false, "ready".into(), None);
+            app.enable_inline_history();
+            let mut terminal = Terminal::with_options(
+                TestBackend::new(80, 24),
+                TerminalOptions {
+                    viewport: Viewport::Inline(4),
+                },
+            )
+            .unwrap();
+            let mut history = InlineHistoryState::new(session);
+            for (n, user, text) in [(1, first_user, "第一句"), (2, second_user, "第二句")] {
+                app.events.push(transcript_event(
+                    n,
+                    session,
+                    TaskId::new(),
+                    if user {
+                        RuntimeEventType::TaskCreated
+                    } else {
+                        RuntimeEventType::AssistantMessage
+                    },
+                    if user {
+                        json!({"payload":{"prompt":text}})
+                    } else {
+                        json!({"content":text})
+                    },
+                ));
+                app.invalidate_transcript_layout();
+                history.flush(&mut terminal, &mut app).unwrap();
+            }
+            let expected = format!(
+                "{} 第一句\n\n{} 第二句",
+                if first_user { "›" } else { "•" },
+                if second_user { "›" } else { "•" }
+            );
+            let rows = terminal_buffer_display_rows(&terminal)
+                .into_iter()
+                .map(|row| row.trim_end().to_owned())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(rows.contains(&expected), "incremental archive: {rows}");
+            app.request_history_rebuild();
+            history.flush(&mut terminal, &mut app).unwrap();
+            let rows = terminal_buffer_display_rows(&terminal)
+                .into_iter()
+                .map(|row| row.trim_end().to_owned())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(rows.contains(&expected), "history replay: {rows}");
+        }
+    }
+}
+
+#[test]
+fn consecutive_assistant_events_have_one_blank_row() {
     let session_id = SessionId::new();
     let task_id = TaskId::new();
     let mut app = TuiApp::new(
@@ -4068,7 +4676,8 @@ fn consecutive_transcript_items_do_not_insert_blank_rows() {
         .iter()
         .position(|line| line == "• 第二句")
         .expect("second assistant row");
-    assert_eq!(second, first + 1, "consecutive markers: {lines:?}");
+    assert_eq!(second, first + 2, "consecutive markers: {lines:?}");
+    assert_eq!(lines[first + 1], "");
 }
 
 #[test]
@@ -5203,7 +5812,8 @@ fn transcript_search_finds_logical_rows_and_moves_the_viewport() {
     app.rebuild_transcript_search();
     let search = app.transcript.search.as_ref().expect("search");
     assert_eq!(search.matches.len(), 2);
-    assert_eq!(search.current_line(), Some(7));
+    // 每个前置单元有标题、正文和一个消息间分隔行。
+    assert_eq!(search.current_line(), Some(10));
     assert!(app.transcript.scroll.offset_from_bottom > 0);
     let first_offset = app.transcript.scroll.offset_from_bottom;
 
@@ -6312,9 +6922,7 @@ fn transcript_width_reflow_keeps_the_first_visible_projection() {
         .expect("draw wide transcript");
     let visible_rows = app.layout.body.height.max(1) as usize;
     app.scroll_transcript(TranscriptScrollAction::PageUp, visible_rows);
-    let anchor = app
-        .first_visible_transcript_anchor()
-        .expect("wide anchor");
+    let anchor = app.first_visible_transcript_anchor().expect("wide anchor");
 
     let mut narrow = Terminal::new(TestBackend::new(54, 20)).expect("narrow terminal");
     narrow
@@ -8068,10 +8676,7 @@ async fn resume_thread_clears_previous_visible_transcript_state() {
             .collect::<Vec<_>>(),
         vec![TranscriptRole::User, TranscriptRole::CommandResult]
     );
-    assert_eq!(
-        app.command_messages[0].body,
-        vec!["/resume".to_owned()]
-    );
+    assert_eq!(app.command_messages[0].body, vec!["/resume".to_owned()]);
     assert!(
         app.command_messages[1]
             .body

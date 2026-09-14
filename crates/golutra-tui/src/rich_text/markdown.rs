@@ -1,16 +1,14 @@
 //! Pulldown-cmark adapter that builds a renderer-independent semantic document.
 
-use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Parser, Tag, TagEnd};
 
 use super::model::{
     InlineStyle, InlineTone, MarkdownBlock, MarkdownDocument, MarkdownList, MarkdownTable, RichText,
 };
 
 pub(super) fn parse_markdown(source: &str) -> MarkdownDocument {
-    let options =
-        Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
     let mut parser = MarkdownParser::new();
-    for event in Parser::new_ext(source, options) {
+    for event in Parser::new_ext(source, super::markdown_options()) {
         parser.event(event);
     }
     parser.finish()

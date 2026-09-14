@@ -50,6 +50,8 @@ pub(crate) struct TranscriptHistoryState {
     pub(crate) enabled: bool,
     pub(crate) committed_event_ids: HashSet<EventId>,
     pub(crate) committed_stream_lines: HashMap<EventId, usize>,
+    pub(crate) command_anchors: HashSet<EventId>,
+    pub(crate) tail: super::transcript_spacing::TranscriptTail,
     pub(crate) replay_generation: u64,
     pub(crate) replay_ready: bool,
 }
@@ -60,6 +62,8 @@ impl Default for TranscriptHistoryState {
             enabled: false,
             committed_event_ids: HashSet::new(),
             committed_stream_lines: HashMap::new(),
+            command_anchors: HashSet::new(),
+            tail: super::transcript_spacing::TranscriptTail::default(),
             replay_generation: 0,
             replay_ready: true,
         }
@@ -134,6 +138,7 @@ impl TranscriptState {
     }
 
     pub(crate) fn begin_history_replay(&mut self) {
+        self.history.tail = super::transcript_spacing::TranscriptTail::default();
         self.history.replay_generation = self.history.replay_generation.wrapping_add(1);
         self.history.replay_ready = false;
         self.set_committed_event_ids(HashSet::new());
@@ -141,6 +146,7 @@ impl TranscriptState {
     }
 
     pub(crate) fn request_history_rebuild(&mut self) {
+        self.history.tail = super::transcript_spacing::TranscriptTail::default();
         self.history.replay_generation = self.history.replay_generation.wrapping_add(1);
         self.set_committed_event_ids(HashSet::new());
         self.set_committed_stream_lines(HashMap::new());
@@ -209,11 +215,23 @@ impl OperationProjection {
             }
         };
         let mut item = item.clone();
-        let preview = if expanded {
+        let mut preview = if expanded {
             details.clone()
         } else {
             default_tool_preview(details)
         };
+        if !expanded && item.role == TranscriptRole::Activity {
+            // 进行中的进程保留有界尾部；文件正文和参数不进入默认卡片。
+            let mut tail = details
+                .iter()
+                .rev()
+                .filter(|line| line.starts_with("│ "))
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>();
+            tail.reverse();
+            preview.extend(tail);
+        }
         item.body.extend(preview);
         item
     }
@@ -227,7 +245,7 @@ impl OperationProjection {
         }
     }
 
-    fn is_assistant_message(&self) -> bool {
+    pub(crate) fn is_assistant_message(&self) -> bool {
         matches!(self, Self::Message { item } if item.role == TranscriptRole::Assistant)
     }
 
@@ -278,13 +296,22 @@ fn transcript_operation_projections_after(
         return Vec::new();
     }
     let mut items: Vec<OperationProjection> = Vec::new();
-    let event_items = event_operation_entries(&app.events);
+    let event_items = if committed_event_ids.is_some() {
+        history_event_operations(app)
+    } else {
+        event_operation_entries(&app.events)
+    };
     let has_event_items = !event_items.is_empty();
     items.extend(
         event_items
             .into_iter()
             .filter(|entry| {
-                committed_event_ids.is_none_or(|committed| !committed.contains(&entry.id))
+                committed_event_ids.is_none_or(|committed| {
+                    !entry
+                        .event_ids
+                        .iter()
+                        .all(|event_id| committed.contains(event_id))
+                })
             })
             .map(|entry| entry.projection),
     );
@@ -453,6 +480,7 @@ pub(crate) fn stable_event_operation_projection_count(events: &[RuntimeEvent]) -
 #[derive(Debug, Clone)]
 pub(crate) struct EventOperationEntry {
     pub(crate) id: EventId,
+    pub(crate) event_ids: Vec<EventId>,
     pub(crate) projection: OperationProjection,
     pub(crate) stable: bool,
     task_id: Option<TaskId>,
@@ -463,6 +491,7 @@ impl EventOperationEntry {
     fn new(event: &RuntimeEvent, projection: OperationProjection, stable: bool) -> Self {
         Self {
             id: event.id,
+            event_ids: vec![event.id],
             projection,
             task_id: event.task_id,
             turn_id: event.turn_id,
@@ -523,6 +552,23 @@ fn user_step_projection(step: &UserStep) -> Option<OperationProjection> {
 }
 
 pub(crate) fn event_operation_entries(events: &[RuntimeEvent]) -> Vec<EventOperationEntry> {
+    event_operation_entries_with_boundary(events, &HashSet::new(), &HashSet::new())
+}
+
+/// 已写入终端的工具单元是不可变边界，后来的调用只能进入新的单元。
+pub(crate) fn history_event_operations(app: &TuiApp) -> Vec<EventOperationEntry> {
+    event_operation_entries_with_boundary(
+        &app.events,
+        &app.transcript.history.committed_event_ids,
+        &app.transcript.history.command_anchors,
+    )
+}
+
+fn event_operation_entries_with_boundary(
+    events: &[RuntimeEvent],
+    committed: &HashSet<EventId>,
+    command_anchors: &HashSet<EventId>,
+) -> Vec<EventOperationEntry> {
     let mut typed_events = events.iter().collect::<Vec<_>>();
     typed_events.sort_by_key(|event| event.sequence_no);
 
@@ -723,6 +769,21 @@ pub(crate) fn event_operation_entries(events: &[RuntimeEvent]) -> Vec<EventOpera
                 };
                 let turn_id = event.turn_id.unwrap_or(step.turn_id);
                 turns_with_user_steps.insert(turn_id);
+                // 冻结后的批次不能被晚到的展示摘要重写；原始工具终态仍逐项保留。
+                if let UserStepKind::ToolBatch { tools, .. } = &step.kind
+                    && items.iter().any(|entry| {
+                        entry
+                            .event_ids
+                            .iter()
+                            .any(|id| committed.contains(id) || command_anchors.contains(id))
+                            && tools.iter().any(|tool| {
+                                entry.projection.id()
+                                    == Some(&OperationId(tool.tool_call_id.to_string()))
+                            })
+                    })
+                {
+                    continue;
+                }
                 apply_user_step(
                     event,
                     &step,
@@ -743,7 +804,7 @@ pub(crate) fn event_operation_entries(events: &[RuntimeEvent]) -> Vec<EventOpera
             }
         }
     }
-    coalesce_completed_tool_batches(items)
+    coalesce_completed_tool_batches(items, committed, command_anchors)
 }
 
 fn plain_projection(item: TranscriptItem) -> OperationProjection {
@@ -849,10 +910,12 @@ fn apply_user_step(
             items.push(EventOperationEntry::new(event, projection, true));
         }
         UserStepKind::ToolBatch { tools, .. } => {
-            let Some(projection) = user_step_projection(step) else {
+            let Some(mut projection) = user_step_projection(step) else {
                 return;
             };
             let mut replace_at = None;
+            let mut retained_details = Vec::new();
+            let mut retained_errors = Vec::new();
             for tool in tools {
                 let id = OperationId(tool.tool_call_id.to_string());
                 covered_user_step_tools.insert(id.clone());
@@ -862,15 +925,32 @@ fn apply_user_step(
                         .position(|record| record.projection.id() == Some(&id))
                 });
                 if let Some(index) = index {
+                    let original = &items[index].projection;
+                    let expanded = original.item(true);
+                    retained_details.push(expanded.title);
+                    retained_details.extend(expanded.body);
+                    if !original.is_successful_completed_tool() {
+                        retained_errors.extend(original.item(false).body);
+                    }
                     replace_at =
                         Some(replace_at.map_or(index, |current: usize| current.min(index)));
+                }
+            }
+            // UserStep 只替换摘要，不能销毁真实工具结果；默认保留错误，Ctrl+O 可展开原始证据。
+            if let OperationProjection::ToolActivity { item, details, .. } = &mut projection {
+                item.body.extend(retained_errors);
+                if !retained_details.is_empty() {
+                    details.push("Output".to_owned());
+                    details.extend(retained_details);
                 }
             }
             let Some(first_index) = replace_at else {
                 items.push(EventOperationEntry::new(event, projection, true));
                 return;
             };
+            let mut merged_ids = vec![event.id];
             if let Some(record) = items.get_mut(first_index) {
+                merged_ids.extend(record.event_ids.iter().copied());
                 record.projection = projection;
                 record.stable = true;
             }
@@ -887,7 +967,15 @@ fn apply_user_step(
             remove.sort_unstable();
             remove.dedup();
             for index in remove.into_iter().rev() {
+                if let Some(removed) = items.get(index) {
+                    merged_ids.extend(removed.event_ids.iter().copied());
+                }
                 remove_projected_item(index, items, indexes);
+            }
+            if let Some(record) = items.get_mut(first_index) {
+                merged_ids.sort();
+                merged_ids.dedup();
+                record.event_ids = merged_ids;
             }
         }
     }
@@ -1114,20 +1202,11 @@ const DEFAULT_TOOL_PREVIEW_LINES: usize = 5;
 fn default_tool_preview(details: &[String]) -> Vec<String> {
     let preview = details
         .iter()
+        // 默认工具卡只展示调用摘要；参数及原始输出由展开视图提供，不能靠 JSON 缩进猜测内容。
+        .take_while(|line| !matches!(line.as_str(), "Arguments" | "Output" | "Facts"))
         .filter(|line| {
             let line = line.as_str();
-            line != "Arguments"
-                && line != "Output"
-                && line != "Facts"
-                && !line.starts_with('{')
-                && !line.starts_with("exit ")
-                && !line.contains(" · ")
-                && !line.starts_with("    \"")
-                && !line.starts_with("    }")
-                && line != "}"
-                && line != "]"
-                && line != "{"
-                && line != "["
+            !line.starts_with("exit ") && !line.contains(" · ")
         })
         .take(DEFAULT_TOOL_PREVIEW_LINES)
         .cloned()
@@ -1295,6 +1374,7 @@ fn summarize_successful_tool_batch(entries: &[EventOperationEntry]) -> Option<Ev
         (ToolSummaryKind::Other, Vec::new()),
     ];
     let mut details = Vec::new();
+    let mut expanded_details = Vec::new();
     for entry in entries {
         let item = entry.projection.item(false);
         let object = tool_activity_object(&entry.projection).unwrap_or_default();
@@ -1321,8 +1401,13 @@ fn summarize_successful_tool_batch(entries: &[EventOperationEntry]) -> Option<Ev
         if let OperationProjection::ToolActivity { details: extra, .. }
         | OperationProjection::FileChange { details: extra, .. } = &entry.projection
         {
-            details.extend(extra.iter().cloned());
+            expanded_details.push(item.title);
+            expanded_details.extend(extra.iter().cloned());
         }
+    }
+    if !expanded_details.is_empty() {
+        details.push("Output".to_owned());
+        details.extend(expanded_details);
     }
 
     let parts = counts
@@ -1357,6 +1442,10 @@ fn summarize_successful_tool_batch(entries: &[EventOperationEntry]) -> Option<Ev
     }
 
     let mut first = entries[0].clone();
+    first.event_ids = entries
+        .iter()
+        .flat_map(|entry| entry.event_ids.iter().copied())
+        .collect();
     first.projection = OperationProjection::ToolActivity {
         id: OperationId(format!("batch:{}", first.id)),
         item: TranscriptItem {
@@ -1370,7 +1459,11 @@ fn summarize_successful_tool_batch(entries: &[EventOperationEntry]) -> Option<Ev
     Some(first)
 }
 
-fn coalesce_completed_tool_batches(items: Vec<EventOperationEntry>) -> Vec<EventOperationEntry> {
+fn coalesce_completed_tool_batches(
+    items: Vec<EventOperationEntry>,
+    committed: &HashSet<EventId>,
+    command_anchors: &HashSet<EventId>,
+) -> Vec<EventOperationEntry> {
     let mut coalesced = Vec::with_capacity(items.len());
     let mut index = 0;
     while index < items.len() {
@@ -1381,6 +1474,13 @@ fn coalesce_completed_tool_batches(items: Vec<EventOperationEntry>) -> Vec<Event
                 && items[end].projection.is_successful_completed_tool()
                 && items[end].turn_id.is_some()
                 && items[end].turn_id == items[index].turn_id
+                // /status 等本地记录插在调用之间时，重排也不能合并越过它。
+                && !items[end - 1].event_ids.iter().any(|id| command_anchors.contains(id))
+                && items[end].event_ids.iter().all(|id| committed.contains(id))
+                    == items[index]
+                        .event_ids
+                        .iter()
+                        .all(|id| committed.contains(id))
             {
                 end += 1;
             }
@@ -2205,7 +2305,14 @@ mod tests {
         assert_eq!(item.role, TranscriptRole::Success);
         let collapsed = projections[0].item(false);
         assert!(collapsed.body.iter().any(|line| line == "  └ cargo test"));
-        assert!(collapsed.body.iter().any(|line| line == "    one"));
+        assert!(!collapsed.body.iter().any(|line| line.contains("one")));
+        assert!(
+            projections[0]
+                .item(true)
+                .body
+                .iter()
+                .any(|line| line == "one")
+        );
         assert!(details.iter().any(|line| line == "cargo test"));
         assert!(details.iter().any(|line| line.contains("exit 0")));
         assert!(details.iter().all(|line| line != "Facts"));
@@ -2700,6 +2807,59 @@ mod tests {
             item.body
                 .iter()
                 .any(|line| line == "  └ git status --short")
+        );
+    }
+
+    #[test]
+    fn user_step_summary_keeps_failure_evidence_and_expandable_output() {
+        let turn_id = TurnId::new();
+        let tool_call_id = ToolCallId::new();
+        let events = vec![
+            tool_event_on_turn(
+                1,
+                Some(turn_id),
+                RuntimeEventType::ToolCompleted,
+                json!({
+                    "envelope": {"tool_call_id":tool_call_id,"tool_name":"shell","status":"error",
+                    "summary":"permission denied", "structured_facts":{"command":"check"},
+                    "model_visible_excerpt":"DIAGNOSTIC_ONLY_IN_DETAILS"}
+                }),
+            ),
+            tool_event_on_turn(
+                2,
+                Some(turn_id),
+                RuntimeEventType::UserStep,
+                json!({
+                    "step": UserStep { step_id: UserStepId::new(), turn_id,
+                        kind: UserStepKind::ToolBatch { summary:"check failed".into(), tools: vec![
+                            golutra_core::user_step_tool_from_envelope(tool_call_id, "shell".into(), ToolResultStatus::Error, &json!({"command":"check"}))
+                        ]}
+                    }
+                }),
+            ),
+        ];
+        let projections = event_operation_projections(&events);
+        assert_eq!(projections.len(), 1);
+        let compact = projections[0].item(false);
+        assert_eq!(compact.role, TranscriptRole::Error);
+        assert!(
+            compact
+                .body
+                .iter()
+                .any(|line| line.contains("permission denied"))
+        );
+        assert!(
+            !compact
+                .body
+                .iter()
+                .any(|line| line.contains("DIAGNOSTIC_ONLY_IN_DETAILS"))
+        );
+        assert!(
+            projections[0]
+                .item(true)
+                .body
+                .iter()
+                .any(|line| line.contains("DIAGNOSTIC_ONLY_IN_DETAILS"))
         );
     }
 
