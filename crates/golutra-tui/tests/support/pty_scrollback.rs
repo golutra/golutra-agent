@@ -238,6 +238,94 @@ fn submit(pty: &mut PtyHarness, parser: &mut ScreenModel, text: &str) {
     pty.write(b"\r");
 }
 
+fn assert_idle_composer_at_bottom(parser: &ScreenModel) {
+    let width = parser.screen().size().1;
+    let rows = parser.screen().rows(0, width).collect::<Vec<_>>();
+    let last = rows.len() - 1;
+    assert!(
+        rows[last].contains("pty-model"),
+        "footer must occupy the last screen row:\n{}",
+        rows.join("\n")
+    );
+    assert!(
+        rows[last - 1].contains("Ask Golutra"),
+        "idle composer must have no internal padding:\n{}",
+        rows.join("\n")
+    );
+    assert!(
+        rows[last - 2].starts_with('─'),
+        "composer border:\n{}",
+        rows.join("\n")
+    );
+}
+
+#[test]
+fn bottom_alignment_survives_completion_input_shrink_and_height_only_resize() {
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let markers = (1..=35)
+        .map(|n| format!("边缘检查{n:03}。"))
+        .collect::<Vec<_>>();
+    let server = FixtureServer::new(vec![format!("{}\n\nEDGE_DONE", markers.join("\n\n"))]);
+    server.install(home.path());
+    let mut pty = PtyHarness::spawn_configured(home.path(), workspace.path(), 100, 24, true);
+    let mut parser = ScreenModel::new(24, 100);
+    parser.process(&pty.collect_until(b"Ask Golutra", Duration::from_secs(8)));
+    parser.process(&pty.collect_for(Duration::from_millis(300)));
+    assert!(
+        parser
+            .screen()
+            .rows(0, 100)
+            .last()
+            .unwrap()
+            .trim()
+            .is_empty(),
+        "startup should retain compact inline layout"
+    );
+    submit(&mut pty, &mut parser, "底部边缘测试");
+    parser.process(&pty.collect_for(Duration::from_secs(3)));
+    assert_once_in_order(&all_terminal_rows(&mut parser), &markers);
+    assert_idle_composer_at_bottom(&parser);
+    let idle = pty.collect_for(Duration::from_millis(500));
+    assert!(
+        !idle.windows(4).any(|bytes| bytes == b"\x1b[3J"),
+        "idle frames must not repeatedly rebuild history"
+    );
+    parser.process(&idle);
+
+    pty.write("\x1b[200~草稿一\n草稿二\n草稿三\n草稿四\n草稿五\x1b[201~".as_bytes());
+    parser.process(&pty.collect_for(Duration::from_millis(500)));
+    pty.write(b"\x15");
+    parser.process(&pty.collect_for(Duration::from_millis(500)));
+    assert_idle_composer_at_bottom(&parser);
+    assert_once_in_order(&all_terminal_rows(&mut parser), &markers);
+    assert!(!all_terminal_rows(&mut parser).contains("草稿"));
+
+    submit(&mut pty, &mut parser, "/status");
+    parser.process(&pty.collect_for(Duration::from_millis(500)));
+    assert_idle_composer_at_bottom(&parser);
+    for height in [36, 112, 6, 28] {
+        pty.resize(100, height);
+        parser.screen_mut().set_size(height, 100);
+        parser.process(&pty.collect_for(Duration::from_millis(800)));
+        assert_idle_composer_at_bottom(&parser);
+        let text = all_terminal_rows(&mut parser);
+        assert_once_in_order(&text, &markers);
+        assert_eq!(text.matches("• Status").count(), 1, "{text}");
+    }
+    submit(&mut pty, &mut parser, "/resume");
+    parser.process(&pty.collect_for(Duration::from_millis(500)));
+    pty.resize(100, 32);
+    parser.screen_mut().set_size(32, 100);
+    parser.process(&pty.collect_for(Duration::from_millis(500)));
+    pty.write(b"\x1b");
+    parser.process(&pty.collect_for(Duration::from_millis(800)));
+    assert_idle_composer_at_bottom(&parser);
+    assert_once_in_order(&all_terminal_rows(&mut parser), &markers);
+    submit(&mut pty, &mut parser, "/quit");
+    assert!(pty.wait().1.success());
+}
+
 #[test]
 fn inline_scrollback_preserves_long_cjk_responses_prompts_and_status() {
     let home = tempdir().unwrap();

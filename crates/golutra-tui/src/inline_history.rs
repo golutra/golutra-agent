@@ -169,6 +169,7 @@ pub(crate) struct InlineHistoryState {
     last_anchor: Option<EventId>,
     last_source_prefix: Option<String>,
     tail: super::transcript_spacing::TranscriptTail,
+    pub(crate) align_replay_to_bottom: bool,
 }
 
 impl InlineHistoryState {
@@ -188,6 +189,7 @@ impl InlineHistoryState {
             last_anchor: None,
             last_source_prefix: None,
             tail: super::transcript_spacing::TranscriptTail::default(),
+            align_replay_to_bottom: false,
         }
     }
 
@@ -392,6 +394,16 @@ impl InlineHistoryState {
 
         let changed = !lines.is_empty();
         if changed {
+            if emit_header && self.align_replay_to_bottom {
+                // 收口重排只在页首补足空屏；不得把占位行夹进两条消息或历史与输入框之间。
+                let size = terminal.size()?;
+                let viewport_height = terminal.current_buffer_mut().area.height;
+                let padding = usize::from(size.height.saturating_sub(viewport_height))
+                    .saturating_sub(history_lines_height(&lines, width));
+                if padding > 0 {
+                    lines.splice(0..0, std::iter::repeat_n(Line::default(), padding));
+                }
+            }
             insert_history_lines(terminal, lines, width)?;
             self.header_emitted = true;
         }

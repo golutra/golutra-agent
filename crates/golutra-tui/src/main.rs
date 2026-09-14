@@ -4184,6 +4184,8 @@ async fn run_app(
 struct OverlayScreenState {
     active: bool,
     saved_inline: Option<Rect>,
+    inline_screen_size: Option<ratatui::layout::Size>,
+    inline_reached_bottom: bool,
 }
 
 impl OverlayScreenState {
@@ -4191,6 +4193,8 @@ impl OverlayScreenState {
         Self {
             active: false,
             saved_inline: None,
+            inline_screen_size: None,
+            inline_reached_bottom: false,
         }
     }
 }
@@ -4223,6 +4227,10 @@ fn draw_interactive_frame_inner(
     inline_history: &mut InlineHistoryState,
 ) -> miette::Result<()> {
     let overlay_visible = app.overlay_surface().is_some();
+    if !overlay_screen.active {
+        prepare_inline_screen(terminal, overlay_screen, app, inline_history)
+            .map_err(|error| miette::miette!("prepare inline screen: {error}"))?;
+    }
     // 历史先写入原活动区上方，再按剩余尾部调整输入区；顺序反转会擦掉尚未归档的行。
     if overlay_visible != overlay_screen.active && overlay_visible {
         inline_history
@@ -4231,11 +4239,16 @@ fn draw_interactive_frame_inner(
     }
     sync_overlay_screen(terminal, overlay_screen, overlay_visible)?;
     if !overlay_screen.active {
+        // 弹层内的尺寸变化留到主屏恢复后处理，不能用 alternate screen 的坐标更新历史锚点。
+        prepare_inline_screen(terminal, overlay_screen, app, inline_history)
+            .map_err(|error| miette::miette!("restore inline screen: {error}"))?;
         inline_history
             .flush_interactive(terminal, app)
             .map_err(|error| miette::miette!("write terminal history: {error}"))?;
         sync_inline_viewport_height(terminal, app)
             .map_err(|error| miette::miette!("resize inline viewport: {error}"))?;
+        settle_inline_composer(terminal, overlay_screen, app, inline_history)
+            .map_err(|error| miette::miette!("settle inline composer: {error}"))?;
     }
     terminal
         .draw(|frame| draw_ui(frame, app))
@@ -4250,6 +4263,56 @@ fn draw_interactive_frame_inner(
         app.request_older_inline_history_if_needed(visible_rows);
     }
     Ok(())
+}
+
+/// 屏幕尺寸只在主屏统一接管；先重绑已知矩形，避免 Ratatui 自动 resize 查询光标并补换行。
+fn prepare_inline_screen(
+    terminal: &mut InteractiveTerminal,
+    state: &mut OverlayScreenState,
+    app: &mut TuiApp,
+    history: &mut InlineHistoryState,
+) -> io::Result<()> {
+    let size = terminal.size()?;
+    let area = terminal.current_buffer_mut().area;
+    if let Some(previous) = state.inline_screen_size {
+        state.inline_reached_bottom |= area.bottom() == previous.height;
+        if previous != size {
+            restore_inline_viewport(terminal, restored_inline_viewport(Some(area), size))?;
+            // 高度缩小也可能让终端丢弃可见行，必须从语义历史恢复，不能只靠宽度变化触发。
+            app.request_history_rebuild();
+        }
+    }
+    state.inline_screen_size = Some(size);
+    history.align_replay_to_bottom = state.inline_reached_bottom;
+    Ok(())
+}
+
+/// 活动输出保持增量；空闲收口时补回底部对齐，且不在两条历史消息之间留下收缩占位行。
+fn settle_inline_composer(
+    terminal: &mut InteractiveTerminal,
+    state: &mut OverlayScreenState,
+    app: &mut TuiApp,
+    history: &mut InlineHistoryState,
+) -> io::Result<()> {
+    let size = terminal.size()?;
+    let area = terminal.current_buffer_mut().area;
+    state.inline_reached_bottom |= area.bottom() == size.height;
+    history.align_replay_to_bottom = state.inline_reached_bottom;
+    if !state.inline_reached_bottom
+        || area.bottom() == size.height
+        || !app.transcript.history.replay_ready
+        || live_status_text(app, usize::from(size.width)).is_some()
+        || app.transcript.search.is_some()
+        || app.history_search.is_some()
+    {
+        return Ok(());
+    }
+    // 在清空提交游标之前计算活动尾部高度；否则整段历史会误算成活动内容。
+    let height = inline_viewport_height(app, size.width, size.height);
+    app.request_history_rebuild();
+    restore_inline_viewport(terminal, Rect::new(0, 0, size.width.max(1), height))?;
+    history.flush_interactive(terminal, app)?;
+    sync_inline_viewport_height(terminal, app)
 }
 
 fn sync_overlay_screen(
