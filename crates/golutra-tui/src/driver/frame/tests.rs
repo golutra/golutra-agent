@@ -247,7 +247,7 @@ fn hit_regions_expose_visible_transcript_operation_toggles() {
     assert_eq!(toggle.pane, TuiHitPane::Transcript);
     assert_eq!(
         (toggle.x, toggle.y, toggle.width, toggle.height),
-        (0, 0, 4, 1)
+        (0, 0, 80, 1)
     );
 }
 

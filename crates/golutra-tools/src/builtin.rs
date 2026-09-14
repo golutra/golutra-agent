@@ -344,7 +344,7 @@ pub(super) fn contract(tool_name: &str, side_effect_type: SideEffectType) -> Too
                     "type": "string",
                     "minLength": 1,
                     "maxLength": MAX_SHELL_COMMAND_CHARS,
-                    "description": "Command; use bash -lc for pipes, redirects, compound commands, or heredoc."
+                    "description": "Command string; prefer omitting argv. Use bash -lc for pipes, redirects, compound commands, or heredoc."
                 },
                 "argv": {
                     "type": "array",
@@ -355,7 +355,7 @@ pub(super) fn contract(tool_name: &str, side_effect_type: SideEffectType) -> Too
                         "minLength": 1,
                         "maxLength": MAX_SHELL_COMMAND_CHARS
                     },
-                    "description": "Direct argv; if combined, match command/prefix."
+                    "description": "Argument vector; prefer omitting command. If both are supplied, command must parse to an argv prefix with matching argument values."
                 },
                 "workdir": {
                     "type": "string",

@@ -55,7 +55,8 @@ use golutra_tui::{
     SlashCommandCandidate, SlashDebugCommand, SlashInput, TranscriptScrollAction,
     parse_slash_input, ratatui_vertical_scroll, slash_command_candidates,
 };
-use ratatui::{Terminal, TerminalOptions, Viewport, layout::Rect};
+use managed_terminal::{Frame, Terminal};
+use ratatui::{TerminalOptions, Viewport, layout::Rect};
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -93,6 +94,7 @@ mod history_source;
 mod inline_history;
 mod interaction;
 mod live_status;
+mod managed_terminal;
 mod preferences;
 mod provider_status;
 mod question_dialog;
@@ -100,9 +102,12 @@ mod render;
 mod rich_text;
 mod runtime_controller;
 mod session;
+mod session_banner;
 mod settings;
 mod stream_commit;
 mod terminal_integration;
+mod tool_detail;
+mod transcript_interaction;
 mod transcript_spacing;
 mod transcript_view;
 mod transcript_widget;
@@ -132,6 +137,7 @@ pub(crate) use render::*;
 pub(crate) use rich_text::*;
 pub(crate) use runtime_controller::*;
 pub(crate) use session::*;
+pub(crate) use session_banner::*;
 pub(crate) use settings::*;
 pub(crate) use terminal_integration::*;
 pub(crate) use transcript_view::*;
@@ -155,8 +161,8 @@ struct Args {
     task_id: Option<String>,
     #[arg(long, global = true)]
     debug: bool,
-    /// Compatibility flag; inline rendering is now the default.
-    #[arg(long, global = true)]
+    /// Compatibility flag; the conversation uses inline rendering by default.
+    #[arg(long, global = true, hide = true)]
     inline: bool,
     /// Disable workspace, sensitive-path, shell and OS sandbox restrictions
     /// for prompts submitted by this TUI.
@@ -337,8 +343,14 @@ struct TuiApp {
     projection: Option<UserProjection>,
     developer_projection: Option<golutra_protocol::DebugProjection>,
     developer_error: Option<String>,
+    debug_scroll: PaneScrollState,
     events: Vec<RuntimeEvent>,
     command_messages: Vec<TranscriptItem>,
+    transcript_screen: Option<ratatui::buffer::Buffer>,
+    transcript_pointer: Option<transcript_interaction::TranscriptPointer>,
+    tool_detail: Option<tool_detail::ToolDetailState>,
+    history_tool_hits: Vec<(Rect, OperationId)>,
+    history_tool_press: Option<(u16, u16, OperationId)>,
     resume_picker: Option<ResumePickerState>,
     queue_picker: Option<QueuePickerState>,
     approval_dialog: Option<ApprovalDialogState>,
@@ -361,6 +373,7 @@ struct TuiApp {
     selected_attachment: Option<usize>,
     prompt_stash: Option<String>,
     slash_selected: usize,
+    slash_dismissed_input: Option<String>,
     status_message: String,
     provider_message: String,
     provider_model: String,
@@ -649,8 +662,17 @@ impl TuiApp {
             projection: None,
             developer_projection: None,
             developer_error: None,
+            debug_scroll: PaneScrollState {
+                follow_tail: true,
+                ..PaneScrollState::default()
+            },
             events: Vec::new(),
             command_messages: Vec::new(),
+            transcript_screen: None,
+            transcript_pointer: None,
+            tool_detail: None,
+            history_tool_hits: Vec::new(),
+            history_tool_press: None,
             resume_picker: None,
             queue_picker: None,
             approval_dialog: None,
@@ -673,6 +695,7 @@ impl TuiApp {
             selected_attachment: None,
             prompt_stash: None,
             slash_selected: 0,
+            slash_dismissed_input: None,
             status_message: String::new(),
             provider_message,
             provider_model,
@@ -1426,10 +1449,37 @@ impl TuiApp {
             || self.overlay_surface().is_some()
             || self.transcript.search.is_some()
             || self.history_search.is_some()
+            || self.slash_dismissed_input.as_deref() == Some(self.input.text())
         {
             return Vec::new();
         }
         slash_command_candidates(self.input.text())
+    }
+
+    fn complete_slash_candidate(&mut self) -> bool {
+        let candidates = self.slash_candidates();
+        let Some(candidate) =
+            candidates.get(self.slash_selected.min(candidates.len().saturating_sub(1)))
+        else {
+            return false;
+        };
+        let suffix = if candidate.execute_on_select { "" } else { " " };
+        self.input
+            .set_text(format!("{}{suffix}", candidate.command));
+        self.slash_selected = 0;
+        // 补全只改草稿；收起当前候选，避免下一次 Enter 误选另一个同前缀命令。
+        self.slash_dismissed_input = Some(self.input.text().to_owned());
+        self.status_message = "command completed; Enter to submit".to_owned();
+        true
+    }
+
+    fn dismiss_slash_candidates(&mut self) -> bool {
+        if self.slash_candidates().is_empty() {
+            return false;
+        }
+        self.slash_dismissed_input = Some(self.input.text().to_owned());
+        self.status_message = "command suggestions closed".to_owned();
+        true
     }
 
     fn move_slash_selection(&mut self, direction: ResumeSelectionDirection) -> bool {
@@ -1450,6 +1500,7 @@ impl TuiApp {
 
     fn reset_slash_selection(&mut self) {
         self.slash_selected = 0;
+        self.slash_dismissed_input = None;
     }
 
     fn refresh_mention_completion(&mut self) {
@@ -1816,6 +1867,12 @@ impl TuiApp {
     }
 
     fn reset_transcript_view(&mut self) {
+        self.tool_detail = None;
+        self.history_tool_hits.clear();
+        self.history_tool_press = None;
+        self.transcript_pointer = None;
+        self.transcript_screen = None;
+        self.debug_scroll.reset(0);
         self.transcript.reset_view();
         self.transcript
             .scroll
@@ -1992,11 +2049,8 @@ impl TuiApp {
         )
     }
 
-    fn request_older_inline_history_if_needed(&mut self, visible_rows: usize) {
-        if self.history_has_more_before
-            && self.transcript.history.enabled
-            && self.transcript_is_scrolled_to_oldest(visible_rows)
-        {
+    fn request_older_history_if_needed(&mut self, visible_rows: usize) {
+        if self.history_has_more_before && self.transcript_is_scrolled_to_oldest(visible_rows) {
             self.history_load_requested = true;
         }
     }
@@ -2267,12 +2321,18 @@ impl TuiApp {
         let layout = full_transcript_layout(self, area);
         let lines = layout.plain_lines();
         let text = self
-            .transcript
-            .search
+            .transcript_pointer
             .as_ref()
-            .and_then(TranscriptSearchState::current_line)
-            .and_then(|line| lines.get(line).cloned())
-            .unwrap_or_else(|| layout.plain_text());
+            .filter(|pointer| pointer.is_selection())
+            .map(transcript_interaction::TranscriptPointer::text)
+            .unwrap_or_else(|| {
+                self.transcript
+                    .search
+                    .as_ref()
+                    .and_then(TranscriptSearchState::current_line)
+                    .and_then(|line| lines.get(line).cloned())
+                    .unwrap_or_else(|| layout.plain_text())
+            });
         self.status_message = match copy_to_terminal_clipboard(&text) {
             Ok((bytes, true)) => format!("copied {bytes} bytes (clipboard limit reached)"),
             Ok((bytes, false)) => format!("copied {bytes} bytes"),
@@ -2281,7 +2341,17 @@ impl TuiApp {
     }
 
     fn scroll_active_pane(&mut self, action: TranscriptScrollAction) {
-        if self.debug_mode || self.transcript.history.enabled {
+        if self.transcript.fullscreen && self.layout.body_mode != BodyLayoutMode::Transcript {
+            let rows = usize::from(self.layout.body.height.max(1));
+            self.debug_scroll.scroll(action, rows);
+            if self.history_has_more_before
+                && self.debug_scroll.offset_from_bottom == self.debug_scroll.max_offset(rows)
+            {
+                self.history_load_requested = true;
+            }
+            return;
+        }
+        if (self.debug_mode && !self.transcript.fullscreen) || self.transcript.history.enabled {
             return;
         }
         let rows = self.layout.transcript.height.max(1) as usize;
@@ -2548,6 +2618,7 @@ impl TuiApp {
                 self.invalidate_activity_snapshot();
                 self.change_projection = ChangeProjection::default();
                 self.command_messages.clear();
+                self.transcript.local_entries.clear();
                 self.input.reset();
                 self.mention_completion = None;
                 self.attachments.clear();
@@ -2710,6 +2781,7 @@ impl TuiApp {
             SlashCommand::Stash => self.toggle_prompt_stash(),
             SlashCommand::Clear => {
                 self.command_messages.clear();
+                self.transcript.local_entries.clear();
                 self.reset_transcript_view();
                 self.status_message = "local command messages cleared".to_owned();
             }
@@ -3026,6 +3098,7 @@ impl TuiApp {
         self.invalidate_activity_snapshot();
         self.change_projection = ChangeProjection::default();
         self.command_messages.clear();
+        self.transcript.local_entries.clear();
         self.input.reset();
         self.mention_completion = None;
         self.attachments.clear();
@@ -3065,6 +3138,7 @@ impl TuiApp {
         self.invalidate_activity_snapshot();
         self.change_projection = ChangeProjection::default();
         self.command_messages.clear();
+        self.transcript.local_entries.clear();
         self.input.reset();
         self.mention_completion = None;
         self.attachments.clear();
@@ -3250,10 +3324,7 @@ impl TuiApp {
             title: result.clone(),
             body: vec![result],
         });
-        if self.command_messages.len() > 12 {
-            self.command_messages
-                .drain(0..self.command_messages.len().saturating_sub(12));
-        }
+        archive_local_messages(self);
         self.invalidate_transcript_layout();
         self.sync_transcript_row_count(self.transcript.scroll.row_count);
         self.clamp_transcript_scroll();
@@ -3281,10 +3352,7 @@ impl TuiApp {
             title: "You".to_owned(),
             body: vec![command.to_owned()],
         });
-        if self.command_messages.len() > 12 {
-            self.command_messages
-                .drain(0..self.command_messages.len().saturating_sub(12));
-        }
+        archive_local_messages(self);
         self.invalidate_transcript_layout();
         self.sync_transcript_row_count(self.transcript.scroll.row_count);
         self.clamp_transcript_scroll();
@@ -3731,10 +3799,7 @@ impl TuiApp {
             title: self.status_message.clone(),
             body,
         });
-        if self.command_messages.len() > 12 {
-            self.command_messages
-                .drain(0..self.command_messages.len().saturating_sub(12));
-        }
+        archive_local_messages(self);
         self.invalidate_transcript_layout();
         self.sync_transcript_row_count(self.transcript.scroll.row_count);
         self.clamp_transcript_scroll();
@@ -3963,6 +4028,7 @@ async fn run_interactive(
         app = app.with_tool_profile(profile);
     }
     app = app.with_loaded_preferences();
+    app.transcript.compact_tools = true;
     if let Some(hint) = continuation_hint {
         app.push_system_message(
             "继续未完成任务",
@@ -3978,10 +4044,9 @@ async fn run_interactive(
         );
     }
     app.enable_inline_history();
-    let (terminal_width, terminal_height) = crossterm::terminal::size()
+    let (width, height) = crossterm::terminal::size()
         .map_err(|error| miette::miette!("read terminal size: {error}"))?;
-    let viewport_height = inline_viewport_height(&app, terminal_width, terminal_height);
-    let mut terminal = setup_terminal(viewport_height)?;
+    let mut terminal = setup_terminal(inline_viewport_height(&app, width, height))?;
     let terminal_restore = TerminalRestoreCoordinator::new(false);
     let panic_restore = terminal_restore.clone();
     install_terminal_panic_hook(move || {
@@ -4070,6 +4135,8 @@ async fn run_app(
     mut app: TuiApp,
     transport: RuntimeTransport,
 ) -> miette::Result<()> {
+    let mut inline_history = InlineHistoryState::new(app.session_id);
+    let mut overlay_screen = OverlayScreenState::new();
     let cleanup_transport = transport.clone();
     let mut controller = match TuiRuntimeController::attach(&mut app, transport).await {
         Ok(controller) => controller,
@@ -4085,8 +4152,6 @@ async fn run_app(
     let mut activity_status = tokio::time::interval(ACTIVITY_STATUS_INTERVAL);
     activity_status.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     activity_status.tick().await;
-    let mut inline_history = InlineHistoryState::new(app.session_id);
-    let mut overlay_screen = OverlayScreenState::new();
     let parent_watch = ParentDeathWatch::new();
     let parent_watch_enabled = parent_watch.enabled();
     let parent_watch_future = parent_watch.wait();
@@ -4185,7 +4250,6 @@ struct OverlayScreenState {
     active: bool,
     saved_inline: Option<Rect>,
     inline_screen_size: Option<ratatui::layout::Size>,
-    inline_reached_bottom: bool,
 }
 
 impl OverlayScreenState {
@@ -4194,7 +4258,6 @@ impl OverlayScreenState {
             active: false,
             saved_inline: None,
             inline_screen_size: None,
-            inline_reached_bottom: false,
         }
     }
 }
@@ -4226,12 +4289,12 @@ fn draw_interactive_frame_inner(
     app: &mut TuiApp,
     inline_history: &mut InlineHistoryState,
 ) -> miette::Result<()> {
-    let overlay_visible = app.overlay_surface().is_some();
+    let overlay_visible = app.overlay_surface().is_some() || app.tool_detail.is_some();
     if !overlay_screen.active {
-        prepare_inline_screen(terminal, overlay_screen, app, inline_history)
+        prepare_inline_screen(terminal, overlay_screen, inline_history)
             .map_err(|error| miette::miette!("prepare inline screen: {error}"))?;
     }
-    // 历史先写入原活动区上方，再按剩余尾部调整输入区；顺序反转会擦掉尚未归档的行。
+    // 历史写入内部先冻结待归档行，再按剩余尾部调整活动区；不能沿用已完成长块的旧高度。
     if overlay_visible != overlay_screen.active && overlay_visible {
         inline_history
             .flush_interactive(terminal, app)
@@ -4240,15 +4303,13 @@ fn draw_interactive_frame_inner(
     sync_overlay_screen(terminal, overlay_screen, overlay_visible)?;
     if !overlay_screen.active {
         // 弹层内的尺寸变化留到主屏恢复后处理，不能用 alternate screen 的坐标更新历史锚点。
-        prepare_inline_screen(terminal, overlay_screen, app, inline_history)
+        prepare_inline_screen(terminal, overlay_screen, inline_history)
             .map_err(|error| miette::miette!("restore inline screen: {error}"))?;
         inline_history
             .flush_interactive(terminal, app)
             .map_err(|error| miette::miette!("write terminal history: {error}"))?;
         sync_inline_viewport_height(terminal, app)
             .map_err(|error| miette::miette!("resize inline viewport: {error}"))?;
-        settle_inline_composer(terminal, overlay_screen, app, inline_history)
-            .map_err(|error| miette::miette!("settle inline composer: {error}"))?;
     }
     terminal
         .draw(|frame| draw_ui(frame, app))
@@ -4259,60 +4320,29 @@ fn draw_interactive_frame_inner(
             .get_or_insert(terminal.current_buffer_mut().area);
     } else {
         overlay_screen.saved_inline = Some(terminal.current_buffer_mut().area);
+        app.history_tool_hits =
+            inline_history.visible_tool_hits(terminal.current_buffer_mut().area);
         let visible_rows = app.layout.transcript.height.saturating_sub(1) as usize;
-        app.request_older_inline_history_if_needed(visible_rows);
+        app.request_older_history_if_needed(visible_rows);
     }
     Ok(())
 }
 
-/// 屏幕尺寸只在主屏统一接管；先重绑已知矩形，避免 Ratatui 自动 resize 查询光标并补换行。
+/// 物理窗口缩放只在主屏接管；候选高度变化不触发历史重排。
 fn prepare_inline_screen(
     terminal: &mut InteractiveTerminal,
     state: &mut OverlayScreenState,
-    app: &mut TuiApp,
     history: &mut InlineHistoryState,
 ) -> io::Result<()> {
     let size = terminal.size()?;
     let area = terminal.current_buffer_mut().area;
-    if let Some(previous) = state.inline_screen_size {
-        state.inline_reached_bottom |= area.bottom() == previous.height;
-        if previous != size {
-            restore_inline_viewport(terminal, restored_inline_viewport(Some(area), size))?;
-            // 高度缩小也可能让终端丢弃可见行，必须从语义历史恢复，不能只靠宽度变化触发。
-            app.request_history_rebuild();
-        }
+    if let Some(previous) = state.inline_screen_size
+        && previous != size
+    {
+        history.resize_visible_history(terminal, state.saved_inline.unwrap_or(area), size)?;
     }
     state.inline_screen_size = Some(size);
-    history.align_replay_to_bottom = state.inline_reached_bottom;
     Ok(())
-}
-
-/// 活动输出保持增量；空闲收口时补回底部对齐，且不在两条历史消息之间留下收缩占位行。
-fn settle_inline_composer(
-    terminal: &mut InteractiveTerminal,
-    state: &mut OverlayScreenState,
-    app: &mut TuiApp,
-    history: &mut InlineHistoryState,
-) -> io::Result<()> {
-    let size = terminal.size()?;
-    let area = terminal.current_buffer_mut().area;
-    state.inline_reached_bottom |= area.bottom() == size.height;
-    history.align_replay_to_bottom = state.inline_reached_bottom;
-    if !state.inline_reached_bottom
-        || area.bottom() == size.height
-        || !app.transcript.history.replay_ready
-        || live_status_text(app, usize::from(size.width)).is_some()
-        || app.transcript.search.is_some()
-        || app.history_search.is_some()
-    {
-        return Ok(());
-    }
-    // 在清空提交游标之前计算活动尾部高度；否则整段历史会误算成活动内容。
-    let height = inline_viewport_height(app, size.width, size.height);
-    app.request_history_rebuild();
-    restore_inline_viewport(terminal, Rect::new(0, 0, size.width.max(1), height))?;
-    history.flush_interactive(terminal, app)?;
-    sync_inline_viewport_height(terminal, app)
 }
 
 fn sync_overlay_screen(
@@ -4337,23 +4367,22 @@ fn enter_overlay_screen(
     overlay_screen: &mut OverlayScreenState,
 ) -> miette::Result<()> {
     overlay_screen.saved_inline = Some(terminal.current_buffer_mut().area);
-    execute!(terminal.backend_mut(), EnterAlternateScreen)
-        .map_err(|error| miette::miette!("enter overlay screen: {error}"))?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        event::EnableMouseCapture
+    )
+    .map_err(|error| miette::miette!("enter overlay screen: {error}"))?;
     set_alternate_screen_active(true);
-    let size = terminal
-        .size()
-        .map_err(|error| miette::miette!("read overlay screen size: {error}"))?;
-    // 对照 Codex：进入 alt-screen 后扩大到全屏，但不按当前光标重建 Inline viewport。
-    // Inline 重建会在光标后再追加 live 区高度，宽屏/窄屏底栏不同，退出后错位程度也就不同。
-    match switch_terminal_viewport(
-        terminal,
-        Viewport::Fixed(Rect::new(0, 0, size.width, size.height)),
-    ) {
-        Ok(()) => terminal
-            .clear()
-            .map_err(|error| miette::miette!("clear overlay screen: {error}")),
+    // 使用同一终端对象切换矩形，原主屏锚点只由 saved_inline 保存。
+    match terminal.set_viewport(Viewport::Fullscreen) {
+        Ok(()) => Ok(()),
         Err(error) => {
-            let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+            let _ = execute!(
+                terminal.backend_mut(),
+                event::DisableMouseCapture,
+                LeaveAlternateScreen
+            );
             set_alternate_screen_active(false);
             Err(miette::miette!("expand overlay viewport: {error}"))
         }
@@ -4368,11 +4397,15 @@ fn leave_overlay_screen(
         .size()
         .map_err(|error| miette::miette!("read restored screen size: {error}"))?;
     let restored = restored_inline_viewport(overlay_screen.saved_inline, size);
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)
-        .map_err(|error| miette::miette!("leave overlay screen: {error}"))?;
+    execute!(
+        terminal.backend_mut(),
+        event::DisableMouseCapture,
+        LeaveAlternateScreen
+    )
+    .map_err(|error| miette::miette!("leave overlay screen: {error}"))?;
     set_alternate_screen_active(false);
-    // 对照 Codex：离开 alt-screen 只恢复进入前的 viewport，不按 CSI 6n 再 append_lines。
-    restore_inline_viewport(terminal, restored)
+    terminal
+        .restore_inline(restored)
         .map_err(|error| miette::miette!("restore inline viewport: {error}"))
 }
 
@@ -4462,7 +4495,20 @@ async fn handle_key(
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return Ok(());
     }
+    if app.tool_detail.is_some() {
+        tool_detail::handle_tool_detail_key(key, app);
+        return Ok(());
+    }
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if app
+            .transcript_pointer
+            .as_ref()
+            .is_some_and(|pointer| pointer.is_selection())
+        {
+            app.copy_transcript();
+            app.transcript_pointer = None;
+            return Ok(());
+        }
         return app.interrupt_or_quit(transport).await;
     }
     if key.code == KeyCode::F(1)
@@ -4559,6 +4605,16 @@ async fn handle_key(
         return Ok(());
     }
     if key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if app.transcript.compact_tools {
+            if let Some(id) = history_event_operations(app)
+                .iter()
+                .rev()
+                .find_map(|entry| entry.projection.id().cloned())
+            {
+                tool_detail::open_tool_detail(app, id);
+            }
+            return Ok(());
+        }
         app.toggle_transcript_details();
         return Ok(());
     }
@@ -4588,6 +4644,9 @@ async fn handle_key(
         }
     }
 
+    if key.code == KeyCode::Esc && app.dismiss_slash_candidates() {
+        return Ok(());
+    }
     if app.composer_mode == ComposerMode::VimInsert
         && key.code == KeyCode::Esc
         && key.modifiers.is_empty()
@@ -4656,8 +4715,8 @@ async fn handle_key(
         KeyCode::Tab => {
             if app.accept_mention_completion() {
                 app.status_message = "reference completed".to_owned();
-            } else if app.move_slash_selection(ResumeSelectionDirection::Next) {
-                app.status_message = "slash command selected".to_owned();
+            } else {
+                app.complete_slash_candidate();
             }
         }
         KeyCode::Up => {
@@ -5253,6 +5312,9 @@ async fn handle_export_key(
 }
 
 fn handle_paste(pasted: &str, app: &mut TuiApp) {
+    if app.tool_detail.is_some() {
+        return;
+    }
     let normalized = pasted.replace("\r\n", "\n").replace('\r', "\n");
     let single_line = normalized.lines().collect::<Vec<_>>().join(" ");
 
@@ -5690,7 +5752,101 @@ fn handle_dashboard_key(key: KeyEvent, app: &mut TuiApp) {
 }
 
 fn handle_mouse(mouse: MouseEvent, app: &mut TuiApp) -> Option<UiMouseActivation> {
+    if app.tool_detail.is_some() && tool_detail::handle_tool_detail_navigation(mouse, app) {
+        return None;
+    }
+    if app.tool_detail.is_none()
+        && app.overlay_surface().is_none()
+        && app.transcript.history.enabled
+        && app.transcript.compact_tools
+    {
+        let hit = app
+            .history_tool_hits
+            .iter()
+            .find(|(rect, _)| {
+                mouse.column >= rect.x
+                    && mouse.column < rect.right()
+                    && mouse.row >= rect.y
+                    && mouse.row < rect.bottom()
+            })
+            .map(|(_, id)| id.clone())
+            .or_else(|| transcript_toggle_at(app, app.layout.transcript, mouse.column, mouse.row));
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) if hit.is_some() => {
+                app.history_tool_press = hit.map(|id| (mouse.column, mouse.row, id));
+                return None;
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some((x, y, id)) = app.history_tool_press.take() {
+                    if x == mouse.column && y == mouse.row && hit.as_ref() == Some(&id) {
+                        tool_detail::open_tool_detail(app, id);
+                    }
+                    return None;
+                }
+            }
+            MouseEventKind::Drag(_) => app.history_tool_press = None,
+            _ => {}
+        }
+    }
     let target = app.layout.hit_test(mouse.column, mouse.row, app);
+    if (app.transcript.fullscreen || app.tool_detail.is_some()) && app.overlay_surface().is_none() {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) if target == UiHitTarget::Transcript => {
+                app.transcript_pointer = app.transcript_screen.clone().map(|snapshot| {
+                    transcript_interaction::TranscriptPointer {
+                        start: (mouse.column, mouse.row),
+                        end: (mouse.column, mouse.row),
+                        operation: if app.tool_detail.is_some() {
+                            None
+                        } else {
+                            transcript_toggle_at(
+                                app,
+                                app.layout.transcript,
+                                mouse.column,
+                                mouse.row,
+                            )
+                        },
+                        snapshot,
+                        area: app.layout.transcript,
+                        released: false,
+                    }
+                });
+                return None;
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(pointer) = &mut app.transcript_pointer
+                    && !pointer.released
+                {
+                    pointer.end = (
+                        mouse
+                            .column
+                            .clamp(pointer.area.x, pointer.area.right().saturating_sub(1)),
+                        mouse
+                            .row
+                            .clamp(pointer.area.y, pointer.area.bottom().saturating_sub(1)),
+                    );
+                }
+                return None;
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(mut pointer) = app.transcript_pointer.take() {
+                    pointer.released = true;
+                    if pointer.is_selection() {
+                        app.transcript_pointer = Some(pointer);
+                    } else if pointer.start == (mouse.column, mouse.row)
+                        && let Some(id) = pointer.operation
+                    {
+                        app.toggle_operation(id);
+                    }
+                    return None;
+                }
+            }
+            MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                app.transcript_pointer = None;
+            }
+            _ => {}
+        }
+    }
     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
         if let Some(press) = mouse_press_at(app, mouse.column, mouse.row) {
             apply_mouse_press(app, press);
@@ -5702,7 +5858,11 @@ fn handle_mouse(mouse: MouseEvent, app: &mut TuiApp) -> Option<UiMouseActivation
             && let Some(operation_id) =
                 transcript_toggle_at(app, app.layout.transcript, mouse.column, mouse.row)
         {
-            app.toggle_operation(operation_id);
+            if app.transcript.compact_tools {
+                tool_detail::open_tool_detail(app, operation_id);
+            } else {
+                app.toggle_operation(operation_id);
+            }
             return None;
         }
     }
@@ -6222,7 +6382,12 @@ type InteractiveTerminal = Terminal<CursorFallbackBackend<ContiguousCrosstermBac
 fn setup_terminal(viewport_height: u16) -> miette::Result<InteractiveTerminal> {
     enable_raw_mode().map_err(|error| miette::miette!("{error}"))?;
     let mut stdout = io::stdout();
-    if let Err(error) = execute!(stdout, EnableBracketedPaste, SetCursorStyle::SteadyBar) {
+    if let Err(error) = execute!(
+        stdout,
+        event::DisableMouseCapture,
+        EnableBracketedPaste,
+        SetCursorStyle::SteadyBar
+    ) {
         return Err(rollback_terminal_setup(error, false));
     }
     match Terminal::with_options(

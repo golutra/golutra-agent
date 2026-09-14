@@ -36,6 +36,103 @@ pub(crate) struct TranscriptItem {
     pub(crate) body: Vec<String>,
 }
 
+/// 本地命令按事件和源文本锚定；流式续写、换行重排不能改变它的时间位置。
+#[derive(Debug, Clone)]
+pub(crate) struct LocalTranscriptEntry {
+    anchor: Option<EventId>,
+    source_prefix: Option<String>,
+    items: Vec<TranscriptItem>,
+}
+
+pub(crate) fn archive_local_messages(app: &mut TuiApp) {
+    if !app.transcript.fullscreen
+        || app.transcript.history.enabled
+        || app.command_messages.is_empty()
+    {
+        return;
+    }
+    let entries = history_event_operations(app);
+    let last = entries.last();
+    let anchor = last.and_then(|entry| entry.event_ids.last().copied());
+    let source_prefix = last.and_then(|entry| match &entry.projection {
+        OperationProjection::Message { item } if item.role == TranscriptRole::Assistant => {
+            let mut source = item.body.join("\n");
+            if !entry.stable {
+                // 命令插在完整 Markdown 块之间，不能把正在生成的一句话或代码围栏切断。
+                source.truncate(super::stream_commit::stable_source_end(&source));
+            }
+            Some(source)
+        }
+        _ => None,
+    });
+    if let Some(anchor) = anchor {
+        app.transcript.history.command_anchors.insert(anchor);
+    }
+    app.transcript.local_entries.push(LocalTranscriptEntry {
+        anchor,
+        source_prefix,
+        items: std::mem::take(&mut app.command_messages),
+    });
+}
+
+fn interleave_local_entries(
+    entries: Vec<EventOperationEntry>,
+    locals: &[LocalTranscriptEntry],
+) -> Vec<OperationProjection> {
+    let mut result = Vec::new();
+    // 被分页裁掉的锚点仍保留本地记录，在已加载历史的最前端显示。
+    for local in locals.iter().filter(|local| {
+        local
+            .anchor
+            .is_none_or(|id| !entries.iter().any(|entry| entry.event_ids.contains(&id)))
+    }) {
+        result.extend(local.items.iter().cloned().map(notice_projection));
+    }
+    for entry in entries {
+        let attached = locals
+            .iter()
+            .filter(|local| local.anchor.is_some_and(|id| entry.event_ids.contains(&id)))
+            .collect::<Vec<_>>();
+        if attached.is_empty() {
+            result.push(entry.projection);
+            continue;
+        }
+        if let OperationProjection::Message { item } = &entry.projection
+            && item.role == TranscriptRole::Assistant
+        {
+            let source = item.body.join("\n");
+            let mut offset = 0;
+            for local in attached {
+                // final 若修订了流式前缀，保留完整 final，并把命令放在其后，绝不截掉修订文本。
+                let end = local
+                    .source_prefix
+                    .as_ref()
+                    .filter(|prefix| source.starts_with(prefix.as_str()))
+                    .map_or(source.len(), String::len)
+                    .max(offset);
+                if end > offset {
+                    let mut part = item.clone();
+                    part.body = vec![source[offset..end].to_owned()];
+                    result.push(message_projection(part));
+                }
+                offset = end;
+                result.extend(local.items.iter().cloned().map(notice_projection));
+            }
+            if offset < source.len() {
+                let mut part = item.clone();
+                part.body = vec![source[offset..].to_owned()];
+                result.push(message_projection(part));
+            }
+        } else {
+            result.push(entry.projection);
+            for local in attached {
+                result.extend(local.items.iter().cloned().map(notice_projection));
+            }
+        }
+    }
+    result
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct OperationId(String);
 
@@ -47,6 +144,7 @@ impl OperationId {
 
 #[derive(Debug, Clone)]
 pub(crate) struct TranscriptHistoryState {
+    pub(crate) native_render_width: Option<u16>,
     pub(crate) enabled: bool,
     pub(crate) committed_event_ids: HashSet<EventId>,
     pub(crate) committed_stream_lines: HashMap<EventId, usize>,
@@ -59,6 +157,7 @@ pub(crate) struct TranscriptHistoryState {
 impl Default for TranscriptHistoryState {
     fn default() -> Self {
         Self {
+            native_render_width: None,
             enabled: false,
             committed_event_ids: HashSet::new(),
             committed_stream_lines: HashMap::new(),
@@ -72,7 +171,11 @@ impl Default for TranscriptHistoryState {
 
 #[derive(Debug, Clone)]
 pub(crate) struct TranscriptState {
+    pub(crate) compact_tools: bool,
+    pub(crate) fullscreen: bool,
+    pub(crate) local_entries: Vec<LocalTranscriptEntry>,
     pub(crate) expanded_operations: HashSet<OperationId>,
+    collapsed_operations: HashSet<OperationId>,
     pub(crate) details_expanded: bool,
     pub(crate) scroll: PaneScrollState,
     pub(crate) top_row_override: Option<usize>,
@@ -88,6 +191,10 @@ impl Default for TranscriptState {
     fn default() -> Self {
         Self {
             expanded_operations: HashSet::new(),
+            collapsed_operations: HashSet::new(),
+            fullscreen: false,
+            compact_tools: false,
+            local_entries: Vec::new(),
             details_expanded: false,
             scroll: PaneScrollState {
                 follow_tail: true,
@@ -112,22 +219,38 @@ impl TranscriptState {
 
     pub(crate) fn reset_view(&mut self) {
         self.expanded_operations.clear();
+        self.collapsed_operations.clear();
         self.details_expanded = false;
         self.top_row_override = None;
         self.invalidate_layout();
     }
 
     pub(crate) fn toggle_operation(&mut self, id: OperationId) {
-        if !self.expanded_operations.insert(id.clone()) {
-            self.expanded_operations.remove(&id);
+        let overrides = if self.details_expanded {
+            &mut self.collapsed_operations
+        } else {
+            &mut self.expanded_operations
+        };
+        if !overrides.insert(id.clone()) {
+            overrides.remove(&id);
         }
         self.invalidate_layout();
     }
 
     pub(crate) fn toggle_details(&mut self) -> bool {
         self.details_expanded = !self.details_expanded;
+        self.expanded_operations.clear();
+        self.collapsed_operations.clear();
         self.invalidate_layout();
         self.details_expanded
+    }
+
+    pub(crate) fn is_expanded(&self, id: Option<&OperationId>) -> bool {
+        if self.details_expanded {
+            !id.is_some_and(|id| self.collapsed_operations.contains(id))
+        } else {
+            id.is_some_and(|id| self.expanded_operations.contains(id))
+        }
     }
 
     pub(crate) fn enable_inline_history(&mut self) {
@@ -268,10 +391,7 @@ pub(crate) fn transcript_items(app: &TuiApp) -> Vec<TranscriptItem> {
     transcript_operation_projections(app)
         .into_iter()
         .map(|projection| {
-            let expanded = app.transcript.details_expanded
-                || projection
-                    .id()
-                    .is_some_and(|id| app.transcript.expanded_operations.contains(id));
+            let expanded = app.transcript.is_expanded(projection.id());
             projection.item(expanded)
         })
         .collect()
@@ -296,25 +416,27 @@ fn transcript_operation_projections_after(
         return Vec::new();
     }
     let mut items: Vec<OperationProjection> = Vec::new();
-    let event_items = if committed_event_ids.is_some() {
+    let event_items = if committed_event_ids.is_some() || app.transcript.fullscreen {
         history_event_operations(app)
     } else {
         event_operation_entries(&app.events)
     };
     let has_event_items = !event_items.is_empty();
-    items.extend(
-        event_items
-            .into_iter()
-            .filter(|entry| {
-                committed_event_ids.is_none_or(|committed| {
-                    !entry
-                        .event_ids
-                        .iter()
-                        .all(|event_id| committed.contains(event_id))
-                })
+    let event_items = event_items
+        .into_iter()
+        .filter(|entry| {
+            committed_event_ids.is_none_or(|committed| {
+                !entry
+                    .event_ids
+                    .iter()
+                    .all(|event_id| committed.contains(event_id))
             })
-            .map(|entry| entry.projection),
-    );
+        })
+        .collect::<Vec<_>>();
+    items.extend(interleave_local_entries(
+        event_items,
+        &app.transcript.local_entries,
+    ));
     items.extend(app.command_messages.iter().cloned().map(notice_projection));
     if let Some(projection) = &app.projection {
         if has_event_items {
@@ -479,6 +601,7 @@ pub(crate) fn stable_event_operation_projection_count(events: &[RuntimeEvent]) -
 
 #[derive(Debug, Clone)]
 pub(crate) struct EventOperationEntry {
+    tool_kind: ToolSummaryKind,
     pub(crate) id: EventId,
     pub(crate) event_ids: Vec<EventId>,
     pub(crate) projection: OperationProjection,
@@ -490,6 +613,19 @@ pub(crate) struct EventOperationEntry {
 impl EventOperationEntry {
     fn new(event: &RuntimeEvent, projection: OperationProjection, stable: bool) -> Self {
         Self {
+            tool_kind: ToolSummaryKind::from_tool_name(
+                event
+                    .payload
+                    .get("tool_name")
+                    .or_else(|| {
+                        event
+                            .payload
+                            .get("envelope")
+                            .and_then(|value| value.get("tool_name"))
+                    })
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+            ),
             id: event.id,
             event_ids: vec![event.id],
             projection,
@@ -552,7 +688,13 @@ fn user_step_projection(step: &UserStep) -> Option<OperationProjection> {
 }
 
 pub(crate) fn event_operation_entries(events: &[RuntimeEvent]) -> Vec<EventOperationEntry> {
-    event_operation_entries_with_boundary(events, &HashSet::new(), &HashSet::new())
+    event_operation_entries_with_boundary(
+        events,
+        &HashSet::new(),
+        &HashSet::new(),
+        false,
+        &HashSet::new(),
+    )
 }
 
 /// 已写入终端的工具单元是不可变边界，后来的调用只能进入新的单元。
@@ -561,6 +703,13 @@ pub(crate) fn history_event_operations(app: &TuiApp) -> Vec<EventOperationEntry>
         &app.events,
         &app.transcript.history.committed_event_ids,
         &app.transcript.history.command_anchors,
+        app.transcript.compact_tools || app.transcript.fullscreen,
+        &app.transcript
+            .expanded_operations
+            .union(&app.transcript.collapsed_operations)
+            .cloned()
+            .chain(app.tool_detail.as_ref().map(|detail| detail.id.clone()))
+            .collect(),
     )
 }
 
@@ -568,6 +717,8 @@ fn event_operation_entries_with_boundary(
     events: &[RuntimeEvent],
     committed: &HashSet<EventId>,
     command_anchors: &HashSet<EventId>,
+    semantic_groups: bool,
+    operation_boundaries: &HashSet<OperationId>,
 ) -> Vec<EventOperationEntry> {
     let mut typed_events = events.iter().collect::<Vec<_>>();
     typed_events.sort_by_key(|event| event.sequence_no);
@@ -752,10 +903,32 @@ fn event_operation_entries_with_boundary(
                     indexes.active_tools.remove(&id);
                     continue;
                 }
-                if let Some(projection) = tool_operation_projection(event) {
+                if let Some(mut projection) = tool_operation_projection(event) {
                     if let Some(id) = projection.id().cloned()
                         && let Some(index) = indexes.active_tools.remove(&id)
                     {
+                        if semantic_groups {
+                            let original = items[index].projection.item(true);
+                            if let Some(start) =
+                                original.body.iter().position(|line| line == "Arguments")
+                            {
+                                match &mut projection {
+                                    OperationProjection::ToolActivity { details, .. }
+                                    | OperationProjection::FileChange { details, .. } => {
+                                        details.push("Arguments".to_owned());
+                                        details.extend(
+                                            original.body[start + 1..]
+                                                .iter()
+                                                .take_while(|line| {
+                                                    !matches!(line.as_str(), "Output" | "Facts")
+                                                })
+                                                .cloned(),
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
                         items[index].projection = projection;
                         items[index].stable = true;
                     } else {
@@ -767,6 +940,19 @@ fn event_operation_entries_with_boundary(
                 let Some(step) = user_step_from_event(event) else {
                     continue;
                 };
+                // 全屏用真实工具身份分组，已有完整工具事件时不让上层混合摘要覆盖执行边界。
+                if semantic_groups
+                    && let UserStepKind::ToolBatch { tools, .. } = &step.kind
+                    && !tools.is_empty()
+                    && tools.iter().all(|tool| {
+                        items.iter().any(|entry| {
+                            entry.projection.id()
+                                == Some(&OperationId(tool.tool_call_id.to_string()))
+                        })
+                    })
+                {
+                    continue;
+                }
                 let turn_id = event.turn_id.unwrap_or(step.turn_id);
                 turns_with_user_steps.insert(turn_id);
                 // 冻结后的批次不能被晚到的展示摘要重写；原始工具终态仍逐项保留。
@@ -804,7 +990,13 @@ fn event_operation_entries_with_boundary(
             }
         }
     }
-    coalesce_completed_tool_batches(items, committed, command_anchors)
+    coalesce_completed_tool_batches(
+        items,
+        committed,
+        command_anchors,
+        semantic_groups,
+        operation_boundaries,
+    )
 }
 
 fn plain_projection(item: TranscriptItem) -> OperationProjection {
@@ -1291,12 +1483,15 @@ enum ToolSummaryKind {
 }
 
 impl ToolSummaryKind {
+    fn is_exploration(self) -> bool {
+        matches!(self, Self::Read | Self::Listed | Self::Searched)
+    }
     fn from_tool_name(tool_name: &str) -> Self {
         match tool_name {
             "read_file" => Self::Read,
             "list_dir" => Self::Listed,
             "rg_search" | "symbol_search" | "find_references" => Self::Searched,
-            "write_file" | "edit_file" => Self::Edited,
+            "write_file" | "edit_file" | "apply_patch" => Self::Edited,
             "shell" | "shell_session" => Self::Ran,
             _ => Self::Other,
         }
@@ -1447,7 +1642,11 @@ fn summarize_successful_tool_batch(entries: &[EventOperationEntry]) -> Option<Ev
         .flat_map(|entry| entry.event_ids.iter().copied())
         .collect();
     first.projection = OperationProjection::ToolActivity {
-        id: OperationId(format!("batch:{}", first.id)),
+        id: first
+            .projection
+            .id()
+            .cloned()
+            .unwrap_or_else(|| OperationId(format!("batch:{}", first.id))),
         item: TranscriptItem {
             role: TranscriptRole::Success,
             title: parts.join(", "),
@@ -1463,6 +1662,8 @@ fn coalesce_completed_tool_batches(
     items: Vec<EventOperationEntry>,
     committed: &HashSet<EventId>,
     command_anchors: &HashSet<EventId>,
+    semantic_groups: bool,
+    operation_boundaries: &HashSet<OperationId>,
 ) -> Vec<EventOperationEntry> {
     let mut coalesced = Vec::with_capacity(items.len());
     let mut index = 0;
@@ -1474,6 +1675,9 @@ fn coalesce_completed_tool_batches(
                 && items[end].projection.is_successful_completed_tool()
                 && items[end].turn_id.is_some()
                 && items[end].turn_id == items[index].turn_id
+                // 用户正在查看的单元不能在完成或补页时被前一个分组吞掉。
+                && !items[end].projection.id().is_some_and(|id| operation_boundaries.contains(id))
+                && (!semantic_groups || (items[index].tool_kind.is_exploration() && items[end].tool_kind.is_exploration()))
                 // /status 等本地记录插在调用之间时，重排也不能合并越过它。
                 && !items[end - 1].event_ids.iter().any(|id| command_anchors.contains(id))
                 && items[end].event_ids.iter().all(|id| committed.contains(id))
@@ -2135,6 +2339,304 @@ mod tests {
 
     fn tool_event(sequence_no: u64, event_type: RuntimeEventType, payload: Value) -> RuntimeEvent {
         tool_event_on_turn(sequence_no, None, event_type, payload)
+    }
+
+    fn fullscreen_app() -> TuiApp {
+        let mut app = TuiApp::new(
+            golutra_core::ThreadId::new(),
+            SessionId::new(),
+            None,
+            false,
+            "ready (mock)".into(),
+            None,
+        );
+        app.transcript.fullscreen = true;
+        app
+    }
+
+    #[test]
+    fn fullscreen_groups_exploration_but_keeps_execution_and_failure_boundaries() {
+        let turn = TurnId::new();
+        let mut app = fullscreen_app();
+        app.events.extend(completed_read(1, turn, "a.txt"));
+        let first_id = history_event_operations(&app)[0]
+            .projection
+            .id()
+            .cloned()
+            .unwrap();
+        app.transcript.toggle_operation(first_id.clone());
+        app.events.extend(completed_read(3, turn, "b.txt"));
+        for (sequence, name, status) in [
+            (5, "shell", "ok"),
+            (8, "write_file", "ok"),
+            (9, "shell", "error"),
+        ] {
+            app.events.push(tool_event_on_turn(sequence, Some(turn), RuntimeEventType::ToolCompleted,
+                json!({"envelope":{"tool_call_id":ToolCallId::new(), "tool_name":name, "status":status,
+                    "summary":"actual failure", "structured_facts":{"command":"cargo test", "path":"out.txt"}}})));
+            if sequence == 5 {
+                app.events.extend(completed_read(6, turn, "c.txt"));
+            }
+        }
+        let entries = history_event_operations(&app);
+        assert_eq!(entries.len(), 5);
+        assert_eq!(entries[0].projection.item(false).title, "read 2 files");
+        assert_eq!(entries[0].projection.id(), Some(&first_id));
+        assert!(app.transcript.is_expanded(entries[0].projection.id()));
+        assert_eq!(entries[1].tool_kind, ToolSummaryKind::Ran);
+        assert_eq!(entries[2].tool_kind, ToolSummaryKind::Read);
+        assert_eq!(entries[3].tool_kind, ToolSummaryKind::Edited);
+        assert_eq!(
+            entries[4].projection.item(false).role,
+            TranscriptRole::Error
+        );
+        assert!(
+            entries[4]
+                .projection
+                .item(false)
+                .body
+                .iter()
+                .any(|line| line.contains("actual failure"))
+        );
+        assert!(
+            entries[0]
+                .projection
+                .item(true)
+                .body
+                .iter()
+                .any(|line| line.contains("Arguments"))
+        );
+    }
+
+    #[test]
+    fn fullscreen_status_anchors_at_complete_blocks_and_preserves_revised_final() {
+        let turn = TurnId::new();
+        let mut app = fullscreen_app();
+        app.events
+            .push(assistant_delta(1, turn, "完整段落。\n\n尚未"));
+        app.record_slash_command("/status");
+        app.push_system_message("Status", vec!["Running".into()]);
+        app.events
+            .push(assistant_delta(2, turn, "完成的段落。\n\n最后一段。"));
+        let items = transcript_items(&app);
+        let text = items
+            .iter()
+            .map(|item| item.body.join("\n"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.find("完整段落。").unwrap() < text.find("/status").unwrap());
+        assert!(text.find("/status").unwrap() < text.find("尚未完成的段落。").unwrap());
+        assert_eq!(text.matches("Running").count(), 1);
+        app.events.push(tool_event_on_turn(
+            3,
+            Some(turn),
+            RuntimeEventType::AssistantMessage,
+            json!({"content":"最终修订后的完整回答。"}),
+        ));
+        let text = transcript_items(&app)
+            .iter()
+            .map(|item| item.body.join("\n"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(text.matches("最终修订后的完整回答。").count(), 1);
+        assert_eq!(text.matches("/status").count(), 1);
+    }
+
+    #[test]
+    fn individual_tool_can_collapse_after_expand_all() {
+        let id = OperationId("test".into());
+        let mut state = TranscriptState::default();
+        state.toggle_details();
+        assert!(state.is_expanded(Some(&id)));
+        state.toggle_operation(id.clone());
+        assert!(!state.is_expanded(Some(&id)));
+        state.toggle_operation(id.clone());
+        assert!(state.is_expanded(Some(&id)));
+        state.toggle_details();
+        assert!(!state.is_expanded(Some(&id)));
+    }
+
+    #[test]
+    fn opened_running_tool_keeps_its_identity_when_it_completes() {
+        let mut app = fullscreen_app();
+        let turn = TurnId::new();
+        app.events.extend(completed_read(1, turn, "a.txt"));
+        let mut second = completed_read(3, turn, "b.txt");
+        let completion = second.pop().unwrap();
+        app.events.extend(second);
+        let id = history_event_operations(&app)[1]
+            .projection
+            .id()
+            .cloned()
+            .unwrap();
+        app.transcript.toggle_operation(id.clone());
+        app.events.push(completion);
+        let entries = history_event_operations(&app);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].projection.id(), Some(&id));
+        assert!(app.transcript.is_expanded(Some(&id)));
+    }
+
+    #[test]
+    fn inline_tool_detail_keeps_running_identity_and_hidden_draft_on_completion() {
+        let mut app = fullscreen_app();
+        app.transcript.fullscreen = false;
+        app.transcript.compact_tools = true;
+        app.enable_inline_history();
+        app.input.insert_str("保留中文草稿🙂");
+        let turn = TurnId::new();
+        app.events.extend(completed_read(1, turn, "a.txt"));
+        let mut second = completed_read(3, turn, "b.txt");
+        let completion = second.pop().unwrap();
+        app.events.extend(second);
+        let id = history_event_operations(&app)[1]
+            .projection
+            .id()
+            .cloned()
+            .unwrap();
+        crate::tool_detail::open_tool_detail(&mut app, id.clone());
+        crate::handle_paste("不能修改草稿", &mut app);
+        app.events.push(completion);
+        let mut terminal =
+            crate::managed_terminal::Terminal::new(ratatui::backend::TestBackend::new(80, 24))
+                .unwrap();
+        terminal
+            .draw(|frame| crate::draw_ui(frame, &mut app))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("b.txt"), "{text}");
+        assert!(
+            !text.contains("a.txt"),
+            "selected tool must not be swallowed by its predecessor"
+        );
+        assert!(
+            !text.contains("Reading"),
+            "completion must update the open detail"
+        );
+        assert!(
+            app.transcript.expanded_operations.is_empty(),
+            "opening details must not expand inline history"
+        );
+        assert_eq!(history_event_operations(&app)[1].projection.id(), Some(&id));
+        crate::tool_detail::close_tool_detail(&mut app);
+        assert_eq!(app.input.text(), "保留中文草稿🙂");
+        assert!(app.transcript.history.enabled);
+        assert!(!app.transcript.fullscreen);
+    }
+
+    #[test]
+    fn tool_detail_scrolls_failed_output_and_survives_tiny_viewports() {
+        let mut app = fullscreen_app();
+        app.transcript.fullscreen = false;
+        app.transcript.compact_tools = true;
+        let output = (0..80)
+            .map(|n| format!("输出{n:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.events.push(tool_event(1, RuntimeEventType::ToolCompleted, json!({
+            "envelope": {"tool_call_id": ToolCallId::new(), "tool_name":"shell", "status":"error",
+                "summary":"exit 2: syntax error", "structured_facts":{"command":"cargo test", "exit_code":2},
+                "model_visible_excerpt":output}
+        })));
+        let id = history_event_operations(&app)[0]
+            .projection
+            .id()
+            .cloned()
+            .unwrap();
+        crate::tool_detail::open_tool_detail(&mut app, id);
+        let mut terminal =
+            crate::managed_terminal::Terminal::new(ratatui::backend::TestBackend::new(60, 12))
+                .unwrap();
+        terminal
+            .draw(|frame| crate::draw_ui(frame, &mut app))
+            .unwrap();
+        let first = terminal.backend().buffer().clone();
+        assert!(
+            first
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
+                .contains("Failed")
+        );
+        crate::tool_detail::handle_tool_detail_key(
+            crate::KeyEvent::new(crate::KeyCode::End, crate::KeyModifiers::NONE),
+            &mut app,
+        );
+        terminal
+            .draw(|frame| crate::draw_ui(frame, &mut app))
+            .unwrap();
+        assert_ne!(terminal.backend().buffer(), &first);
+        for (width, height) in [(1, 1), (8, 2), (60, 12)] {
+            terminal.backend_mut().resize(width, height);
+            terminal
+                .resize(ratatui::layout::Rect::new(0, 0, width, height))
+                .unwrap();
+            terminal
+                .draw(|frame| crate::draw_ui(frame, &mut app))
+                .unwrap();
+        }
+        crate::tool_detail::handle_tool_detail_key(
+            crate::KeyEvent::new(crate::KeyCode::Esc, crate::KeyModifiers::NONE),
+            &mut app,
+        );
+        assert!(app.tool_detail.is_none());
+    }
+
+    #[test]
+    fn fullscreen_summary_bounds_long_commands_without_hiding_failure_or_details() {
+        let mut app = fullscreen_app();
+        let command = "echo 中文参数 ".repeat(200);
+        app.events.push(tool_event_on_turn(1, Some(TurnId::new()), RuntimeEventType::ToolCompleted,
+            json!({"envelope":{"tool_call_id":ToolCallId::new(), "tool_name":"shell", "status":"error",
+                "summary":"exit 2: syntax error", "structured_facts":{"command":command}}})));
+        let area = ratatui::layout::Rect::new(0, 0, 32, 24);
+        let collapsed = crate::transcript_layout(&app, area);
+        assert!(collapsed.row_count < 20);
+        assert!(collapsed.plain_text().contains("Failed"));
+        assert!(collapsed.plain_text().contains("syntax error"));
+        app.transcript.toggle_details();
+        let expanded = crate::transcript_layout(&app, area);
+        assert!(expanded.plain_text().contains(&command));
+        assert!(expanded.row_count > collapsed.row_count);
+    }
+
+    #[test]
+    fn fullscreen_observation_history_remains_scrollable() {
+        let mut app = fullscreen_app();
+        app.debug_mode = true;
+        let turn = TurnId::new();
+        for n in 0..100 {
+            app.events.push(assistant_delta(
+                n + 1,
+                turn,
+                &format!("观察内容{n:03}。\n\n"),
+            ));
+        }
+        let mut terminal =
+            crate::managed_terminal::Terminal::new(ratatui::backend::TestBackend::new(100, 24))
+                .unwrap();
+        terminal
+            .draw(|frame| crate::draw_ui(frame, &mut app))
+            .unwrap();
+        let tail = terminal.backend().buffer().clone();
+        app.scroll_active_pane(golutra_tui::TranscriptScrollAction::Top);
+        terminal
+            .draw(|frame| crate::draw_ui(frame, &mut app))
+            .unwrap();
+        assert!(app.debug_scroll.offset_from_bottom > 0);
+        assert_ne!(terminal.backend().buffer(), &tail);
+        app.scroll_active_pane(golutra_tui::TranscriptScrollAction::Bottom);
+        terminal
+            .draw(|frame| crate::draw_ui(frame, &mut app))
+            .unwrap();
+        assert_eq!(terminal.backend().buffer(), &tail);
     }
 
     fn tool_event_on_turn(

@@ -1,7 +1,6 @@
 //! Ratatui widget for the developer projection.
 
 use ratatui::{
-    Frame,
     layout::Rect,
     style::Style,
     text::{Line, Span},
@@ -10,18 +9,28 @@ use ratatui::{
 
 use super::*;
 
-pub(crate) fn draw_debug_timeline(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+pub(crate) fn draw_debug_timeline(frame: &mut Frame<'_>, area: Rect, app: &mut TuiApp) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let lines = debug_split_live_lines(app, area.width, area.height);
+    let mut lines = debug_split_live_lines(app, area.width, area.height);
+    if app.transcript.fullscreen {
+        app.debug_scroll.set_row_count(lines.len());
+        app.debug_scroll.clamp(usize::from(area.height));
+        let window = transcript_visible_window(
+            lines.len(),
+            usize::from(area.height),
+            app.debug_scroll.offset_from_bottom,
+        );
+        lines = lines[window].to_vec();
+    }
     if lines.is_empty() {
         return;
     }
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-pub(crate) fn draw_developer_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
+pub(crate) fn draw_developer_panel(frame: &mut Frame<'_>, area: Rect, app: &mut TuiApp) {
     let palette = app.palette();
     let content_width = area.width;
     let visible_rows = area.height as usize;
@@ -94,7 +103,12 @@ pub(crate) fn draw_developer_panel(frame: &mut Frame<'_>, area: Rect, app: &TuiA
         events = events.wrap(Wrap { trim: false });
     }
     let event_rows = events.line_count(event_area.width.max(1));
-    let scroll = event_rows.saturating_sub(usize::from(event_area.height));
+    let mut scroll = event_rows.saturating_sub(usize::from(event_area.height));
+    if app.transcript.fullscreen {
+        app.debug_scroll.set_row_count(event_rows);
+        app.debug_scroll.clamp(usize::from(event_area.height));
+        scroll = scroll.saturating_sub(app.debug_scroll.offset_from_bottom);
+    }
     events = events.scroll((ratatui_vertical_scroll(scroll, event_area.height), 0));
     let top_padding = if app.transcript.history.enabled {
         event_area.height.saturating_sub(

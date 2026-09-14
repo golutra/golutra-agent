@@ -1131,7 +1131,7 @@ fn inline_viewport_height_stays_near_the_composer() {
 }
 
 #[test]
-fn typing_a_slash_prefix_does_not_resize_the_inline_viewport() {
+fn typing_a_slash_prefix_reserves_space_for_visible_candidates() {
     let mut app = TuiApp::new(
         ThreadId::new(),
         SessionId::new(),
@@ -1148,9 +1148,9 @@ fn typing_a_slash_prefix_does_not_resize_the_inline_viewport() {
     let with_slash = inline_viewport_height(&app, width, screen_height);
     app.input.set_text("/re");
     let with_prefix = inline_viewport_height(&app, width, screen_height);
-    assert_eq!(idle, with_slash);
-    assert_eq!(idle, with_prefix);
-    assert!(bottom_pane_height_for_width(&app, width) > idle);
+    assert_eq!(with_slash, idle + 5);
+    assert_eq!(with_prefix, idle + 2);
+    assert_eq!(bottom_pane_height_for_width(&app, width), with_prefix);
 }
 
 #[test]
@@ -3999,6 +3999,190 @@ fn slash_candidates_render_below_composer_with_selection() {
     assert!(lines.contains("/resume"));
     assert!(lines.contains("› /resume"));
     assert_eq!(bottom_pane_height(&app), 8);
+}
+
+#[tokio::test]
+async fn slash_menu_tab_only_completes_and_enter_submits() {
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    let mut app = TuiApp::new(
+        transport.default_thread_id(),
+        transport.default_session_id(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.input.set_text("/");
+    for _ in 0..3 {
+        handle_key(
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &mut app,
+            &transport,
+        )
+        .await
+        .unwrap();
+    }
+    handle_key(
+        KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .unwrap();
+    assert_eq!(app.input.text(), "/status");
+    assert!(app.command_messages.is_empty());
+    assert!(app.slash_candidates().is_empty());
+    assert!(app.overlay_surface().is_none());
+    handle_key(
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .unwrap();
+    assert!(app.input.is_empty());
+    assert!(
+        app.command_messages
+            .iter()
+            .any(|message| message.title == "Status")
+    );
+
+    app.input.set_text("/f");
+    handle_key(
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .unwrap();
+    assert_eq!(app.input.text(), "/fork ");
+    assert!(app.slash_candidates().is_empty());
+}
+
+#[tokio::test]
+async fn slash_menu_escape_preserves_draft_and_does_not_interrupt_task() {
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    let session_id = transport.default_session_id();
+    let mut app = TuiApp::new(
+        transport.default_thread_id(),
+        session_id,
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.projection = Some(UserProjection {
+        session_id,
+        task_id: Some(TaskId::new()),
+        status: golutra_core::TaskStatus::Running,
+        visible_steps: Vec::new(),
+        pending_approval: None,
+        final_message: None,
+        residual_risks: Vec::new(),
+    });
+    app.input.set_text("/");
+    handle_key(
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .unwrap();
+    assert_eq!(app.input.text(), "/");
+    assert!(app.slash_candidates().is_empty());
+    assert!(app.last_control_ack.is_none());
+    handle_key(
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .unwrap();
+    assert_eq!(app.input.text(), "/r");
+    assert_eq!(app.slash_candidates().len(), 2);
+    handle_key(
+        KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .unwrap();
+    assert_eq!(app.input.text(), "/resume");
+    assert!(app.resume_picker.is_none());
+    assert!(app.command_messages.is_empty());
+}
+
+#[test]
+fn slash_menu_wraps_descriptions_and_shares_footer_without_hiding_selection() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".into(),
+        None,
+    )
+    .with_footer_context("/workspace", "test-model");
+    app.input.set_text("/");
+    let wide_height = bottom_pane_height_for_width(&app, 100);
+    let narrow_height = bottom_pane_height_for_width(&app, 24);
+    assert!(
+        narrow_height > wide_height,
+        "wrapped descriptions must reserve additional rows"
+    );
+    for width in [20, 24, 40, 80] {
+        for selected in 0..5 {
+            app.slash_selected = selected;
+            let height = bottom_pane_height_for_width(&app, width);
+            let command = app.slash_candidates()[selected].command.clone();
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| draw_bottom_pane(frame, frame.area(), &app))
+                .unwrap();
+            let rows = terminal_buffer_rows(&terminal);
+            let text = rows.join("\n");
+            assert!(
+                text.contains(&format!("› {command}")),
+                "selected command at {width} columns:\n{text}"
+            );
+            assert!(
+                !text.contains("test-model"),
+                "popup replaces ordinary footer"
+            );
+            assert!(
+                rows.last().unwrap().contains("select"),
+                "popup hint should fit:\n{text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn slash_menu_small_viewport_keeps_selection_and_footer_visible() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    )
+    .with_footer_context("/workspace", "test-model");
+    app.input.set_text("/");
+    app.slash_selected = 4;
+    let mut terminal = Terminal::new(TestBackend::new(50, 6)).unwrap();
+    terminal.draw(|frame| draw_ui(frame, &mut app)).unwrap();
+    let text = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(text.contains("› /new"), "{text}");
+    assert!(text.contains("Esc close"), "{text}");
+    assert!(!text.contains("test-model"), "{text}");
+    assert!(!text.contains("/help"), "{text}");
 }
 
 #[test]

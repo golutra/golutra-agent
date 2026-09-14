@@ -1,18 +1,15 @@
-//! Native terminal scrollback for finalized transcript content.
+//! 主聊天的终端历史归档、语义行定位与 debug 时间线排版。
 
-use std::{
-    collections::{HashMap, HashSet},
-    io,
-    sync::Arc,
-};
+use std::collections::{HashMap, HashSet};
+use std::{io, sync::Arc};
 
-use golutra_core::{EventId, SessionId};
+use golutra_core::EventId;
+use golutra_core::SessionId;
+use ratatui::backend::Backend;
 use ratatui::{
-    Terminal,
-    backend::Backend,
     buffer::Buffer,
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::Style,
     text::{Line, Span},
     widgets::{Paragraph, Widget, Wrap},
 };
@@ -20,66 +17,50 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use super::*;
 
-const SESSION_PANEL_MAX_WIDTH: usize = 60;
-const SESSION_PANEL_MIN_WIDTH: usize = 40;
-const SESSION_OUTER_MARGIN: usize = 2;
-const SESSION_LOGO_GAP: usize = 3;
-const SESSION_FIELD_LABEL_WIDTH: usize = 7;
-const GOLUTRA_LOGO_GLYPHS: [[&str; 6]; 7] = [
-    [
-        " ██████╗",
-        "██╔════╝",
-        "██║  ███╗",
-        "██║   ██║",
-        "╚██████╔╝",
-        " ╚═════╝",
-    ],
-    [
-        " ██████╗",
-        "██╔═══██╗",
-        "██║   ██║",
-        "██║   ██║",
-        "╚██████╔╝",
-        " ╚═════╝",
-    ],
-    ["██╗", "██║", "██║", "██║", "███████╗", "╚══════╝"],
-    [
-        "██╗   ██╗",
-        "██║   ██║",
-        "██║   ██║",
-        "██║   ██║",
-        "╚██████╔╝",
-        " ╚═════╝",
-    ],
-    [
-        "████████╗",
-        "╚══██╔══╝",
-        "   ██║",
-        "   ██║",
-        "   ██║",
-        "   ╚═╝",
-    ],
-    [
-        "██████╗",
-        "██╔══██╗",
-        "██████╔╝",
-        "██╔══██╗",
-        "██║  ██║",
-        "╚═╝  ╚═╝",
-    ],
-    [
-        " █████╗",
-        "██╔══██╗",
-        "███████║",
-        "██╔══██║",
-        "██║  ██║",
-        "╚═╝  ╚═╝",
-    ],
-];
-const SESSION_LOGO_GRADIENT: [[u8; 3]; 3] =
-    [[0x0E, 0xA5, 0xE9], [0x10, 0xB9, 0x81], [0xF5, 0x9E, 0x0B]];
 const MIN_INLINE_BOTTOM_ROWS: u16 = 3;
 const HISTORY_OMISSION_MARKER: &str = "…";
+
+#[derive(Debug, Clone)]
+pub(crate) struct HistoryDisplayRow {
+    line: Line<'static>,
+    pub(crate) tool_id: Option<OperationId>,
+}
+
+fn unpadded_history_line(mut spans: Vec<Span<'static>>) -> Line<'static> {
+    // 缓存的是实际文字而非 Buffer 的补齐空格；缩窄时补齐格不能再次折成空白行。
+    while let Some(last) = spans.last_mut() {
+        last.content = last.content.trim_end().to_owned().into();
+        if !last.content.is_empty() {
+            break;
+        }
+        spans.pop();
+    }
+    Line::from(spans)
+}
+
+fn retain_screen_rows(rows: &mut Vec<HistoryDisplayRow>, screen_height: u16) {
+    let remove = rows.len().saturating_sub(usize::from(screen_height));
+    rows.drain(..remove);
+}
+
+fn append_tool_fragment(
+    tail: &mut super::transcript_spacing::TranscriptTail,
+    lines: &mut Vec<Line<'static>>,
+    fragment: &[Line<'static>],
+    event_id: Option<EventId>,
+    tool_id: Option<&OperationId>,
+    ranges: &mut Vec<(std::ops::Range<usize>, OperationId)>,
+) {
+    tail.append(lines, fragment, event_id);
+    if let Some(id) = tool_id
+        && !fragment.is_empty()
+    {
+        ranges.push((
+            lines.len().saturating_sub(fragment.len())..lines.len(),
+            id.clone(),
+        ));
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InlineHistoryMode {
@@ -107,6 +88,7 @@ impl InlineHistoryMode {
 
 #[derive(Debug, Clone)]
 struct RenderedHistoryEntry {
+    tool_id: Option<OperationId>,
     event_ids: Vec<EventId>,
     lines: Vec<Line<'static>>,
     stable_line_count: usize,
@@ -154,6 +136,8 @@ impl RenderedHistoryEntry {
 
 #[derive(Debug, Clone)]
 pub(crate) struct InlineHistoryState {
+    native_scrollback: bool,
+    display_rows: Arc<Vec<HistoryDisplayRow>>,
     session_id: SessionId,
     generation: u64,
     mode: InlineHistoryMode,
@@ -169,12 +153,67 @@ pub(crate) struct InlineHistoryState {
     last_anchor: Option<EventId>,
     last_source_prefix: Option<String>,
     tail: super::transcript_spacing::TranscriptTail,
-    pub(crate) align_replay_to_bottom: bool,
 }
 
 impl InlineHistoryState {
+    /// 只重画缩放前主屏可见的应用行；已进入 scrollback 的正文和 shell 前缀均不清除。
+    pub(crate) fn resize_visible_history(
+        &mut self,
+        terminal: &mut InteractiveTerminal,
+        previous: Rect,
+        size: ratatui::layout::Size,
+    ) -> io::Result<()> {
+        let count = self.display_rows.len().min(usize::from(previous.y));
+        let start = previous
+            .y
+            .saturating_sub(count as u16)
+            .min(size.height.saturating_sub(1));
+        let visible = self.display_rows[self.display_rows.len() - count..].to_vec();
+        let mut rows = Vec::new();
+        for row in visible {
+            rows.extend(
+                wrapped_history_rows(vec![row.line], size.width)
+                    .into_iter()
+                    .map(|spans| HistoryDisplayRow {
+                        line: unpadded_history_line(spans),
+                        tool_id: row.tool_id.clone(),
+                    }),
+            );
+        }
+        clear_inline_region(terminal, start, previous.height.min(size.height))?;
+        insert_history_lines(
+            terminal,
+            rows.iter().map(|row| row.line.clone()).collect(),
+            size.width,
+        )?;
+        let display = Arc::make_mut(&mut self.display_rows);
+        display.truncate(display.len() - count);
+        display.extend(rows);
+        retain_screen_rows(display, size.height);
+        Ok(())
+    }
+
+    pub(crate) fn visible_tool_hits(&self, viewport: Rect) -> Vec<(Rect, OperationId)> {
+        let count = self.display_rows.len().min(usize::from(viewport.y));
+        let first_y = viewport.y.saturating_sub(count as u16);
+        self.display_rows[self.display_rows.len() - count..]
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| {
+                row.tool_id.as_ref().map(|id| {
+                    (
+                        Rect::new(0, first_y + index as u16, viewport.width, 1),
+                        id.clone(),
+                    )
+                })
+            })
+            .collect()
+    }
+
     pub(crate) fn new(session_id: SessionId) -> Self {
         Self {
+            native_scrollback: false,
+            display_rows: Arc::new(Vec::new()),
             session_id,
             generation: 0,
             mode: InlineHistoryMode::Transcript,
@@ -189,7 +228,6 @@ impl InlineHistoryState {
             last_anchor: None,
             last_source_prefix: None,
             tail: super::transcript_spacing::TranscriptTail::default(),
-            align_replay_to_bottom: false,
         }
     }
 
@@ -217,20 +255,37 @@ impl InlineHistoryState {
         terminal: &mut InteractiveTerminal,
         app: &mut TuiApp,
     ) -> io::Result<bool> {
-        self.flush_with_rebuild(terminal, app, clear_inline_scrollback)
+        self.native_scrollback = true;
+        self.flush_with_callbacks(
+            terminal,
+            app,
+            |_terminal| Ok(()),
+            sync_inline_viewport_height,
+        )
     }
 
+    #[cfg(test)]
     fn flush_with_rebuild<B: Backend>(
         &mut self,
         terminal: &mut Terminal<B>,
         app: &mut TuiApp,
         rebuild_terminal: impl FnMut(&mut Terminal<B>) -> io::Result<()>,
     ) -> io::Result<bool> {
+        self.flush_with_callbacks(terminal, app, rebuild_terminal, |_, _| Ok(()))
+    }
+
+    fn flush_with_callbacks<B: Backend>(
+        &mut self,
+        terminal: &mut Terminal<B>,
+        app: &mut TuiApp,
+        rebuild_terminal: impl FnMut(&mut Terminal<B>) -> io::Result<()>,
+        prepare_insert: impl FnMut(&mut Terminal<B>, &TuiApp) -> io::Result<()>,
+    ) -> io::Result<bool> {
         // 归档标记与本地命令只有在终端写入成功后才能提交；失败不能吞掉待显示内容。
         let mut next = self.clone();
         let previous_history = app.transcript.history.clone();
         let previous_commands = app.command_messages.clone();
-        match next.flush_prepared(terminal, app, rebuild_terminal) {
+        match next.flush_prepared(terminal, app, rebuild_terminal, prepare_insert) {
             Ok(changed) => {
                 *self = next;
                 Ok(changed)
@@ -249,20 +304,35 @@ impl InlineHistoryState {
         terminal: &mut Terminal<B>,
         app: &mut TuiApp,
         mut rebuild_terminal: impl FnMut(&mut Terminal<B>) -> io::Result<()>,
+        mut prepare_insert: impl FnMut(&mut Terminal<B>, &TuiApp) -> io::Result<()>,
     ) -> io::Result<bool> {
-        // History is inserted before the normal frame draw, while ratatui normally performs its
-        // autoresize at the start of that draw. Synchronize the internal inline buffer first so
-        // wrapping and insert_before use the same physical dimensions after a resize.
+        // 归档发生在普通帧绘制之前；独立调用也必须先同步尺寸，使换行与插入共享同一物理宽度。
         terminal.autoresize()?;
         let mode = InlineHistoryMode::from_app(app);
         let buffer_area = terminal.current_buffer_mut().area;
         let width = buffer_area.width.max(1);
+        // 原生历史只追加；布局刷新不能清除 shell 历史，也不能重复提交已显示消息。
+        if self.native_scrollback && self.session_id == app.session_id {
+            app.set_inline_history_committed_event_ids(self.committed_event_ids.clone());
+            app.set_inline_history_committed_stream_lines(self.committed_stream_lines.clone());
+            app.transcript.history.tail = self.tail.clone();
+        }
+        let layout_width = if self.native_scrollback
+            && self.session_id == app.session_id
+            && !self.committed_stream_lines.is_empty()
+        {
+            self.rendered_width.max(1)
+        } else {
+            width
+        };
+        app.transcript.history.native_render_width = self.native_scrollback.then_some(layout_width);
         // 对照 Codex：viewport 高度变化（slash 弹层、overlay 进出、流式尾巴）不能重建 scrollback。
         let identity_changed = self.initialized
             && (self.session_id != app.session_id
-                || self.generation != app.transcript.history.replay_generation
-                || self.mode != mode
-                || self.rendered_width != width);
+                || (!self.native_scrollback
+                    && (self.generation != app.transcript.history.replay_generation
+                        || self.mode != mode
+                        || self.rendered_width != width)));
         let clear_previous_history =
             identity_changed && (self.header_emitted || !self.committed_event_ids.is_empty());
 
@@ -284,7 +354,7 @@ impl InlineHistoryState {
             self.session_id = app.session_id;
             self.generation = app.transcript.history.replay_generation;
             self.mode = mode;
-            self.rendered_width = width;
+            self.rendered_width = layout_width;
             self.initialized = true;
             self.header_emitted = false;
             self.committed_event_ids.clear();
@@ -307,7 +377,7 @@ impl InlineHistoryState {
             self.rebuild_after_replay = true;
             return Ok(history_cleared);
         }
-        if self.rebuild_after_replay {
+        if self.rebuild_after_replay && !self.native_scrollback {
             if !history_cleared {
                 rebuild_terminal(terminal)?;
                 history_cleared = true;
@@ -320,7 +390,8 @@ impl InlineHistoryState {
             .iter()
             .filter_map(|entry| entry.anchor)
             .collect();
-        let mut history_entries = rendered_history_entries(app, width, mode);
+        self.rendered_width = layout_width;
+        let mut history_entries = rendered_history_entries(app, layout_width, mode);
         let committable_ids = history_entries
             .iter()
             .flat_map(|entry| entry.event_ids.iter().copied())
@@ -336,10 +407,11 @@ impl InlineHistoryState {
                     .is_some_and(|prefix| !entry.lines.starts_with(prefix))
             })
         });
-        if (!matches!(mode, InlineHistoryMode::Transcript)
-            && !self.committed_event_ids.is_subset(&committable_ids))
-            || grouping_changed
-            || stream_prefix_changed
+        if !self.native_scrollback
+            && ((!matches!(mode, InlineHistoryMode::Transcript)
+                && !self.committed_event_ids.is_subset(&committable_ids))
+                || grouping_changed
+                || stream_prefix_changed)
         {
             if !history_cleared {
                 rebuild_terminal(terminal)?;
@@ -360,9 +432,29 @@ impl InlineHistoryState {
             // 取消旧提交边界后重新投影，不能沿用受旧分组边界影响的条目。
             history_entries = rendered_history_entries(app, width, mode);
         }
+        let native_stream_revised = self.native_scrollback && stream_prefix_changed;
+        if native_stream_revised {
+            // 已进入终端历史的流式正文不可擦除；真正的最终修订以明确标记追加，不能按旧行数截掉新答案。
+            for entry in &history_entries {
+                for id in &entry.event_ids {
+                    if self
+                        .committed_stream_prefixes
+                        .get(id)
+                        .is_some_and(|prefix| !entry.lines.starts_with(prefix))
+                    {
+                        self.committed_stream_prefixes.remove(id);
+                        self.committed_stream_lines.remove(id);
+                    }
+                }
+            }
+        }
         self.committed_stream_prefixes
             .retain(|id, _| committable_ids.contains(id));
+        if history_cleared || !self.header_emitted {
+            self.display_rows = Arc::new(Vec::new());
+        }
         let mut lines = Vec::new();
+        let mut tool_ranges = Vec::new();
         let emit_header = !self.header_emitted;
         if emit_header {
             lines.extend(session_history_lines(app, width));
@@ -389,29 +481,55 @@ impl InlineHistoryState {
             }
         }
 
-        self.append_event_lines(app, history_entries, width, &mut lines);
+        if native_stream_revised {
+            self.tail.append(
+                &mut lines,
+                &[Line::from(
+                    "• Updated response (replaces earlier streamed text)",
+                )],
+                None,
+            );
+        }
+        self.append_event_lines(
+            app,
+            history_entries,
+            layout_width,
+            &mut lines,
+            &mut tool_ranges,
+        );
         self.append_local_messages(app, width, &mut lines);
 
-        let changed = !lines.is_empty();
-        if changed {
-            if emit_header && self.align_replay_to_bottom {
-                // 收口重排只在页首补足空屏；不得把占位行夹进两条消息或历史与输入框之间。
-                let size = terminal.size()?;
-                let viewport_height = terminal.current_buffer_mut().area.height;
-                let padding = usize::from(size.height.saturating_sub(viewport_height))
-                    .saturating_sub(history_lines_height(&lines, width));
-                if padding > 0 {
-                    lines.splice(0..0, std::iter::repeat_n(Line::default(), padding));
-                }
-            }
-            insert_history_lines(terminal, lines, width)?;
-            self.header_emitted = true;
-        }
         app.set_inline_history_committed_event_ids(self.committed_event_ids.clone());
         app.set_inline_history_committed_stream_lines(self.committed_stream_lines.clone());
         if app.transcript.history.tail != self.tail {
             app.transcript.history.tail = self.tail.clone();
             app.invalidate_transcript_layout();
+        }
+        let changed = !lines.is_empty();
+        if changed {
+            // 已归档部分不再占用活动区；先按剩余尾部确定高度，再插入历史。
+            // 否则长代码块会先被旧的整屏活动区全部挤入 scrollback，收缩后只剩一屏空白。
+            // 这里的提交标记仍在外层事务内，任何终端操作失败都会回滚。
+            prepare_insert(terminal, app)?;
+            let display = Arc::make_mut(&mut self.display_rows);
+            for (index, line) in lines.iter().enumerate() {
+                let tool_id = tool_ranges
+                    .iter()
+                    .find(|(range, _)| range.contains(&index))
+                    .map(|(_, id)| id.clone());
+                display.extend(
+                    wrapped_history_rows(vec![line.clone()], width)
+                        .into_iter()
+                        .map(|spans| HistoryDisplayRow {
+                            line: unpadded_history_line(spans),
+                            tool_id: tool_id.clone(),
+                        }),
+                );
+            }
+            // 仅缓存一屏，缩放不会复制整段会话；更早正文由终端 scrollback 和持久事件保管。
+            retain_screen_rows(display, terminal.size()?.height);
+            insert_history_lines(terminal, lines, width)?;
+            self.header_emitted = true;
         }
         Ok(changed || history_cleared)
     }
@@ -422,6 +540,7 @@ impl InlineHistoryState {
         entries: Vec<RenderedHistoryEntry>,
         width: u16,
         lines: &mut Vec<Line<'static>>,
+        tool_ranges: &mut Vec<(std::ops::Range<usize>, OperationId)>,
     ) {
         for entry in self
             .local_entries
@@ -462,15 +581,27 @@ impl InlineHistoryState {
                         continue;
                     }
                     let offset = offset.max(cursor);
-                    self.tail
-                        .append(lines, &entry.lines[cursor..offset], event_id);
+                    append_tool_fragment(
+                        &mut self.tail,
+                        lines,
+                        &entry.lines[cursor..offset],
+                        event_id,
+                        entry.tool_id.as_ref(),
+                        tool_ranges,
+                    );
                     self.tail
                         .append(lines, &local_entry_lines(app, &local.items, width), None);
                     cursor = offset;
                     local.emitted = true;
                 }
-                self.tail
-                    .append(lines, &entry.lines[cursor..commit_until], event_id);
+                append_tool_fragment(
+                    &mut self.tail,
+                    lines,
+                    &entry.lines[cursor..commit_until],
+                    event_id,
+                    entry.tool_id.as_ref(),
+                    tool_ranges,
+                );
                 self.last_anchor = entry.event_ids.last().copied();
                 self.last_source_prefix = entry.source_prefix.clone();
             }
@@ -566,6 +697,7 @@ fn rendered_history_entries(
                         developer_event_history_lines(&event, width, expanded, app.palette());
                     let commit_event = !event.is_open_provider_stream();
                     RenderedHistoryEntry {
+                        tool_id: None,
                         event_ids: event.event_ids,
                         stable_line_count: if commit_event {
                             lines.len()
@@ -592,6 +724,7 @@ fn history_entry_from_projection(
     stable: bool,
     width: u16,
 ) -> RenderedHistoryEntry {
+    let tool_id = projection.id().cloned();
     let source_prefix = (!stable && projection.is_assistant_message()).then(|| {
         let source = projection.item(false).body.join("\n");
         source[..super::stream_commit::stable_source_end(&source)].to_owned()
@@ -606,6 +739,7 @@ fn history_entry_from_projection(
         });
     let lines = render_operation_projection_lines(app, vec![projection], width);
     RenderedHistoryEntry {
+        tool_id,
         event_ids,
         stable_line_count: if stable {
             lines.len()
@@ -684,6 +818,7 @@ fn debug_split_event_entries(
             developer_event_history_lines(&event, developer_width, expanded, app.palette());
         let lines = debug_split_history_lines(transcript, developer, width);
         entries.push(RenderedHistoryEntry {
+            tool_id: None,
             event_ids: event.event_ids,
             stable_line_count: if commit_event {
                 lines.len()
@@ -746,6 +881,11 @@ pub(crate) fn debug_split_live_lines(
         width,
     ));
 
+    if app.transcript.fullscreen {
+        let mut lines = facts;
+        lines.extend(timeline);
+        return lines;
+    }
     let capacity = usize::from(visible_rows);
     // Interactive history can rely on native scrollback. Offscreen snapshots cannot, so reserve
     // space for governance facts and prioritize user-visible transcript plus event headers.
@@ -911,7 +1051,10 @@ fn max_history_chunk_rows(width: u16) -> usize {
     (RATATUI_MAX_BUFFER_CELLS / width).clamp(1, RATATUI_MAX_SCROLL_ROWS)
 }
 
-fn wrapped_history_rows(lines: Vec<Line<'static>>, width: u16) -> Vec<Vec<Span<'static>>> {
+pub(crate) fn wrapped_history_rows(
+    lines: Vec<Line<'static>>,
+    width: u16,
+) -> Vec<Vec<Span<'static>>> {
     if lines.is_empty() || width == 0 {
         return Vec::new();
     }
@@ -1096,10 +1239,8 @@ fn clear_history_terminal<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<
 }
 
 pub(crate) fn inline_viewport_height(app: &TuiApp, width: u16, screen_height: u16) -> u16 {
-    // 对照 Codex：slash/mention 弹层画在 composer 内部，不改变 inline viewport。
-    // 否则每敲一个 `/` 都会重建 Terminal，整屏闪一下。
-    let bottom =
-        bottom_pane_height_for_width_without_popups(app, width).max(MIN_INLINE_BOTTOM_ROWS);
+    // 候选属于活动输入区，必须计入高度；通过原生视口扩缩腾出空间，不覆盖历史或切入备用屏。
+    let bottom = bottom_pane_height_for_width(app, width).max(MIN_INLINE_BOTTOM_ROWS);
     let live = live_transcript_body_rows(app, width);
     bottom.saturating_add(live).min(screen_height).max(1)
 }
@@ -1126,332 +1267,7 @@ pub(crate) fn sync_inline_viewport_height(
     if current.height == desired && current.width == size.width && current.bottom() <= size.height {
         return Ok(());
     }
-    resize_inline_surface(terminal, desired, size)
-}
-
-pub(crate) fn session_history_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
-    let palette = app.palette();
-    let available = usize::from(width);
-    if available < 8 {
-        return vec![Line::from(Span::styled(
-            truncate_end_to_width("GOLUTRA", available),
-            Style::default()
-                .fg(palette.accent)
-                .add_modifier(Modifier::BOLD),
-        ))];
-    }
-
-    let margin_width = if available >= 16 {
-        SESSION_OUTER_MARGIN
-    } else {
-        0
-    };
-    let usable_width = available.saturating_sub(margin_width.saturating_mul(2));
-    let logo_width = session_logo_width();
-    let show_logo = !app.preferences.screen_reader
-        && usable_width
-            >= logo_width
-                .saturating_add(SESSION_LOGO_GAP)
-                .saturating_add(SESSION_PANEL_MIN_WIDTH);
-    let panel_width = if show_logo {
-        usable_width
-            .saturating_sub(logo_width)
-            .saturating_sub(SESSION_LOGO_GAP)
-            .min(SESSION_PANEL_MAX_WIDTH)
-    } else {
-        usable_width.min(SESSION_PANEL_MAX_WIDTH)
-    };
-
-    let model = app.runtime_controls.effective_model().trim();
-    let model = if model.is_empty() {
-        "unconfigured"
-    } else {
-        model
-    };
-    let directory = workspace_path_label(&app.workspace_path);
-    let panel = session_panel_lines(app, panel_width, model, &directory);
-    let mut lines = if show_logo {
-        let gradient =
-            app.preferences.theme != ColorTheme::Monochrome && !app.preferences.high_contrast;
-        combine_session_logo_and_panel(
-            session_logo_lines(palette, gradient),
-            panel,
-            margin_width,
-            logo_width,
-        )
-    } else {
-        panel
-            .into_iter()
-            .map(|line| prepend_session_margin(line, margin_width))
-            .collect()
-    };
-
-    lines.push(Line::default());
-    lines.push(Line::from(vec![
-        Span::styled("  Tip:", Style::default().fg(palette.accent)),
-        Span::styled(
-            truncate_end_to_width(
-                " Use /help to view commands and interaction options.",
-                available.saturating_sub(6),
-            ),
-            Style::default().fg(palette.muted),
-        ),
-    ]));
-    // 页首提示与第一条消息共用一行分隔，后续提交不能再叠加留白。
-    lines.push(Line::default());
-    lines
-}
-
-fn session_logo_width() -> usize {
-    GOLUTRA_LOGO_GLYPHS
-        .iter()
-        .map(|glyph| {
-            glyph
-                .iter()
-                .map(|row| display_width(row))
-                .max()
-                .unwrap_or(0)
-        })
-        .sum::<usize>()
-        .saturating_add(GOLUTRA_LOGO_GLYPHS.len().saturating_sub(1))
-}
-
-fn session_logo_lines(palette: TuiPalette, gradient: bool) -> Vec<Line<'static>> {
-    let logo_width = session_logo_width();
-    (0..GOLUTRA_LOGO_GLYPHS[0].len())
-        .map(|row| {
-            let mut text = String::with_capacity(logo_width);
-            for (index, glyph) in GOLUTRA_LOGO_GLYPHS.iter().enumerate() {
-                if index > 0 {
-                    text.push(' ');
-                }
-                let glyph_width = glyph
-                    .iter()
-                    .map(|line| display_width(line))
-                    .max()
-                    .unwrap_or(0);
-                text.push_str(glyph[row]);
-                text.push_str(&" ".repeat(glyph_width.saturating_sub(display_width(glyph[row]))));
-            }
-            session_logo_line(text, palette, gradient, logo_width)
-        })
-        .collect()
-}
-
-fn session_logo_line(
-    text: String,
-    palette: TuiPalette,
-    gradient: bool,
-    logo_width: usize,
-) -> Line<'static> {
-    let style = Style::default().add_modifier(Modifier::BOLD);
-    if !gradient {
-        return Line::from(Span::styled(text, style.fg(palette.accent)));
-    }
-
-    Line::from(
-        text.chars()
-            .enumerate()
-            .map(|(column, character)| {
-                if character == ' ' {
-                    Span::raw(" ")
-                } else {
-                    Span::styled(
-                        character.to_string(),
-                        style.fg(session_logo_gradient_color(column, logo_width)),
-                    )
-                }
-            })
-            .collect::<Vec<_>>(),
-    )
-}
-
-fn session_logo_gradient_color(column: usize, width: usize) -> Color {
-    let last = SESSION_LOGO_GRADIENT.len().saturating_sub(1);
-    let denominator = width.saturating_sub(1);
-    if denominator == 0 || column >= denominator {
-        let [red, green, blue] = SESSION_LOGO_GRADIENT[last];
-        return Color::Rgb(red, green, blue);
-    }
-
-    let scaled = column.saturating_mul(last);
-    let segment = scaled / denominator;
-    let numerator = scaled % denominator;
-    let start = SESSION_LOGO_GRADIENT[segment];
-    let end = SESSION_LOGO_GRADIENT[segment.saturating_add(1)];
-    Color::Rgb(
-        interpolate_logo_channel(start[0], end[0], numerator, denominator),
-        interpolate_logo_channel(start[1], end[1], numerator, denominator),
-        interpolate_logo_channel(start[2], end[2], numerator, denominator),
-    )
-}
-
-fn interpolate_logo_channel(start: u8, end: u8, numerator: usize, denominator: usize) -> u8 {
-    let start = usize::from(start);
-    let end = usize::from(end);
-    let value = start
-        .saturating_mul(denominator.saturating_sub(numerator))
-        .saturating_add(end.saturating_mul(numerator))
-        .saturating_add(denominator / 2)
-        / denominator;
-    u8::try_from(value).unwrap_or(u8::MAX)
-}
-
-fn session_panel_lines(
-    app: &TuiApp,
-    panel_width: usize,
-    model: &str,
-    directory: &str,
-) -> Vec<Line<'static>> {
-    let palette = app.palette();
-    let border_style = Style::default().fg(palette.subtle);
-    let content_width = panel_width.saturating_sub(4);
-    let value_width = content_width.saturating_sub(SESSION_FIELD_LABEL_WIDTH);
-    let model_hint = "  /model";
-    let show_model_hint =
-        display_width(model).saturating_add(display_width(model_hint)) <= value_width;
-    let model = if show_model_hint {
-        model.to_owned()
-    } else {
-        truncate_end_to_width(model, value_width)
-    };
-    let directory = truncate_start_to_width(directory, value_width);
-    let (guard, guard_style) = match app.runtime_controls.permission_mode {
-        PermissionMode::Unrestricted => (
-            "unrestricted",
-            Style::default()
-                .fg(palette.warning)
-                .add_modifier(Modifier::BOLD),
-        ),
-        PermissionMode::Guarded => (
-            "guarded",
-            Style::default()
-                .fg(palette.success)
-                .add_modifier(Modifier::BOLD),
-        ),
-    };
-
-    let mut engine_spans = vec![session_field_label("engine", palette)];
-    engine_spans.push(Span::styled(model, Style::default().fg(palette.text)));
-    if show_model_hint {
-        engine_spans.push(Span::styled(
-            model_hint.to_owned(),
-            Style::default().fg(palette.accent),
-        ));
-    }
-
-    vec![
-        Line::from(Span::styled(
-            format!("╭{}╮", "─".repeat(panel_width.saturating_sub(2))),
-            border_style,
-        )),
-        session_panel_row(
-            vec![
-                Span::styled(
-                    "GOLUTRA",
-                    Style::default()
-                        .fg(palette.accent)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("  v{}", env!("CARGO_PKG_VERSION")),
-                    Style::default().fg(palette.muted),
-                ),
-            ],
-            content_width,
-            border_style,
-        ),
-        session_panel_row(engine_spans, content_width, border_style),
-        session_panel_row(
-            vec![
-                session_field_label("scope", palette),
-                Span::styled(directory, Style::default().fg(palette.text)),
-            ],
-            content_width,
-            border_style,
-        ),
-        session_panel_row(
-            vec![
-                session_field_label("guard", palette),
-                Span::styled(guard, guard_style),
-            ],
-            content_width,
-            border_style,
-        ),
-        Line::from(Span::styled(
-            format!("╰{}╯", "─".repeat(panel_width.saturating_sub(2))),
-            border_style,
-        )),
-    ]
-}
-
-fn session_field_label(label: &str, palette: TuiPalette) -> Span<'static> {
-    Span::styled(
-        format!("{label:<SESSION_FIELD_LABEL_WIDTH$}"),
-        Style::default().fg(palette.muted),
-    )
-}
-
-fn session_panel_row(
-    spans: Vec<Span<'static>>,
-    content_width: usize,
-    border_style: Style,
-) -> Line<'static> {
-    let mut fitted = Vec::new();
-    let mut remaining = content_width;
-    for span in spans {
-        if remaining == 0 {
-            break;
-        }
-        let style = span.style;
-        let content = span.content.into_owned();
-        let content_width = display_width(&content);
-        if content_width <= remaining {
-            fitted.push(Span::styled(content, style));
-            remaining = remaining.saturating_sub(content_width);
-        } else {
-            let content = truncate_end_to_width(&content, remaining);
-            remaining = remaining.saturating_sub(display_width(&content));
-            fitted.push(Span::styled(content, style));
-            break;
-        }
-    }
-    fitted.push(Span::raw(" ".repeat(remaining)));
-
-    let mut row = vec![Span::styled("│ ", border_style)];
-    row.extend(fitted);
-    row.push(Span::styled(" │", border_style));
-    Line::from(row)
-}
-
-fn combine_session_logo_and_panel(
-    logo: Vec<Line<'static>>,
-    panel: Vec<Line<'static>>,
-    margin_width: usize,
-    logo_width: usize,
-) -> Vec<Line<'static>> {
-    let logo_offset = panel.len().saturating_sub(logo.len()) / 2;
-    panel
-        .into_iter()
-        .enumerate()
-        .map(|(row, panel_line)| {
-            let mut spans = vec![Span::raw(" ".repeat(margin_width))];
-            if let Some(logo_line) = row.checked_sub(logo_offset).and_then(|row| logo.get(row)) {
-                spans.extend(logo_line.spans.iter().cloned());
-            } else {
-                spans.push(Span::raw(" ".repeat(logo_width)));
-            }
-            spans.push(Span::raw(" ".repeat(SESSION_LOGO_GAP)));
-            spans.extend(panel_line.spans);
-            Line::from(spans)
-        })
-        .collect()
-}
-
-fn prepend_session_margin(line: Line<'static>, margin_width: usize) -> Line<'static> {
-    let mut spans = vec![Span::raw(" ".repeat(margin_width))];
-    spans.extend(line.spans);
-    Line::from(spans)
+    terminal.resize_inline(desired, size)
 }
 
 fn insert_history_lines<B: Backend>(
@@ -1549,6 +1365,88 @@ fn history_lines_height(lines: &[Line<'static>], width: u16) -> usize {
 #[cfg(test)]
 mod boundary_tests {
     use super::*;
+
+    #[test]
+    fn native_history_preserves_commits_and_labels_a_revised_final_without_clearing() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let mut app = TuiApp::new(
+            ThreadId::new(),
+            session_id,
+            None,
+            false,
+            "mock".into(),
+            None,
+        );
+        app.enable_inline_history();
+        let mut event = RuntimeEvent {
+            schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+            causal_context: Default::default(),
+            causal_links: vec![],
+            id: EventId::new(),
+            sequence_no: 1,
+            session_id,
+            turn_id: Some(turn_id),
+            task_id: None,
+            parent_event_id: None,
+            event_type: golutra_protocol::RuntimeEventType::ProviderStreamed,
+            timestamp: chrono::Utc::now(),
+            source: golutra_protocol::RuntimeEventSource::Tool,
+            payload: json!({"delta":{"kind":"text_delta","text":"Earlier paragraph.\n\nUnfinished"}}),
+            payload_ref: None,
+            durable: false,
+        };
+        app.events.push(event.clone());
+        let mut terminal = Terminal::with_options(
+            ratatui::backend::TestBackend::new(100, 80),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Inline(3),
+            },
+        )
+        .unwrap();
+        let mut history = InlineHistoryState::new(session_id);
+        history.native_scrollback = true;
+        history
+            .flush_with_rebuild(&mut terminal, &mut app, |_| {
+                panic!("native history must not clear terminal")
+            })
+            .unwrap();
+        assert!(!history.committed_stream_prefixes.is_empty());
+        app.request_history_rebuild();
+        event.id = EventId::new();
+        event.sequence_no = 2;
+        event.event_type = golutra_protocol::RuntimeEventType::AssistantMessage;
+        event.payload = json!({"content":"Corrected final answer."});
+        app.events.push(event);
+        history
+            .flush_with_rebuild(&mut terminal, &mut app, |_| {
+                panic!("native history must not clear terminal")
+            })
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            text.contains("Earlier paragraph."),
+            "already emitted facts stay in native history"
+        );
+        let notice = text.find("Updated response").expect("revision marker");
+        assert!(
+            notice
+                < text
+                    .find("Corrected final answer.")
+                    .expect("complete final answer")
+        );
+        assert!(
+            !history
+                .flush_with_rebuild(&mut terminal, &mut app, |_| panic!("unexpected reset"))
+                .unwrap()
+        );
+    }
 
     #[test]
     fn debug_history_does_not_truncate_beyond_the_ratatui_buffer_boundary() {

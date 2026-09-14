@@ -141,13 +141,28 @@ pub(crate) fn transcript_layout(app: &TuiApp, area: Rect) -> TranscriptLayout {
     transcript_layout_from_rows(transcript_render_rows_at_width(app, area.width), area)
 }
 
+pub(crate) fn expanded_tool_layout(
+    app: &TuiApp,
+    projection: &super::OperationProjection,
+    area: Rect,
+) -> TranscriptLayout {
+    transcript_layout_from_rows(
+        render_item_rows(app, projection.item(true), None, false, 0, area.width, 0),
+        area,
+    )
+}
+
 pub(crate) fn full_transcript_layout(app: &TuiApp, area: Rect) -> TranscriptLayout {
     transcript_layout_from_rows(
-        render_operation_projections(
+        with_session_banner(
             app,
-            transcript_operation_projections(app),
             area.width,
-            false,
+            render_operation_projections(
+                app,
+                transcript_operation_projections(app),
+                area.width,
+                false,
+            ),
         ),
         area,
     )
@@ -185,12 +200,35 @@ pub(crate) fn transcript_render_rows(app: &TuiApp) -> Vec<TranscriptRenderRow> {
 }
 
 fn transcript_render_rows_at_width(app: &TuiApp, width: u16) -> Vec<TranscriptRenderRow> {
-    render_operation_projections(
+    let rows = render_operation_projections(
         app,
         rendered_transcript_operation_projections(app),
         width,
         true,
-    )
+    );
+    with_session_banner(app, width, rows)
+}
+
+fn with_session_banner(
+    app: &TuiApp,
+    width: u16,
+    mut rows: Vec<TranscriptRenderRow>,
+) -> Vec<TranscriptRenderRow> {
+    if app.transcript.fullscreen && app.auth_dialog.is_none() {
+        let mut banner = super::session_history_lines(app, width)
+            .into_iter()
+            .map(|line| TranscriptRenderRow {
+                line,
+                operation_id: None,
+                toggle: false,
+                projection_index: usize::MAX,
+            })
+            .collect::<Vec<_>>();
+        banner.append(&mut rows);
+        banner
+    } else {
+        rows
+    }
 }
 
 pub(crate) fn live_transcript_render_rows(app: &TuiApp, width: u16) -> Vec<TranscriptRenderRow> {
@@ -221,6 +259,12 @@ fn render_operation_projections(
     width: u16,
     skip_committed_stream_lines: bool,
 ) -> Vec<TranscriptRenderRow> {
+    // 原生归档的活动流使用固定的语义排版宽度，实际显示仍按当前终端宽度换行。
+    let width = if skip_committed_stream_lines && app.transcript.history.enabled {
+        app.transcript.history.native_render_width.unwrap_or(width)
+    } else {
+        width
+    };
     let (skips, continues_history) = if skip_committed_stream_lines {
         live_stream_line_skips(app, projections.len())
     } else {
@@ -236,13 +280,37 @@ fn render_operation_projections(
     };
     let mut result = Vec::new();
     for (projection_index, projection) in projections.into_iter().enumerate() {
-        let expanded = app.transcript.details_expanded
-            || projection
-                .id()
-                .is_some_and(|id| app.transcript.expanded_operations.contains(id));
+        let expanded = app.transcript.is_expanded(projection.id());
         let operation_id = projection.id().cloned();
         let toggle = projection.is_expandable();
-        let item = projection.item(expanded);
+        let mut item = projection.item(expanded);
+        if (app.transcript.compact_tools || app.transcript.fullscreen) && toggle {
+            if !expanded
+                && item.role == TranscriptRole::Success
+                && item
+                    .title
+                    .strip_prefix("read ")
+                    .is_some_and(|name| !name.starts_with(|ch: char| ch.is_ascii_digit()))
+            {
+                // 单文件标题已经带文件名，不再把同一路径重复展示一遍。
+                item.body.clear();
+            }
+            item.title = format!("{} {}", if expanded { "▾" } else { "▸" }, item.title);
+            if !expanded {
+                item.title = super::truncate_end_to_width(
+                    &item.title,
+                    usize::from(width.saturating_sub(2).max(1)),
+                );
+                // 折叠预算按显示宽度限制，长命令和宽字符不能把摘要撑成半屏。
+                item.body.truncate(3);
+                for line in &mut item.body {
+                    *line = super::truncate_end_to_width(
+                        line,
+                        usize::from(width.saturating_sub(4).max(1)),
+                    );
+                }
+            }
+        }
         let rows = render_item_rows(
             app,
             item,
@@ -318,8 +386,7 @@ pub(crate) fn transcript_toggle_at(
     column: u16,
     row: u16,
 ) -> Option<OperationId> {
-    if column < area.x || column >= area.x.saturating_add(4) || row < area.y || row >= area.bottom()
-    {
+    if column < area.x || column >= area.right() || row < area.y || row >= area.bottom() {
         return None;
     }
     let layout = transcript_layout(app, area);
@@ -377,7 +444,7 @@ pub(crate) fn transcript_toggle_regions(app: &TuiApp, area: Rect) -> Vec<(String
                 Rect::new(
                     area.x,
                     y,
-                    area.width.min(4),
+                    area.width,
                     u16::try_from(end.saturating_sub(start)).unwrap_or(u16::MAX),
                 ),
             ))

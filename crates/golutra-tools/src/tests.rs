@@ -455,6 +455,13 @@ fn shell_contract_explains_how_to_submit_compound_commands() {
     assert!(description.contains("bash -lc"));
     assert!(description.contains("pipes"));
     assert!(description.contains("heredoc"));
+    assert!(description.contains("prefer omitting argv"));
+    let argv = contract.input_schema["properties"]["argv"]["description"]
+        .as_str()
+        .expect("argv description");
+    assert!(argv.contains("prefer omitting command"));
+    assert!(argv.contains("parse to an argv prefix"));
+    assert!(argv.contains("matching argument values"));
     let timeout = contract.input_schema["properties"]["timeout_ms"]["description"]
         .as_str()
         .expect("timeout description");

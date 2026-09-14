@@ -722,15 +722,18 @@ async fn inspect_and_stdio_driver_execute_real_offscreen_tui() {
             driver.receive(request_id).await["code"],
             "session_binding_immutable"
         );
-        let clear_id = format!("{request_id}-clear");
-        driver
-            .send(json!({
-                "request_id": clear_id,
-                "type": "input_key",
-                "key": "escape"
-            }))
-            .await;
-        assert_eq!(driver.receive(&clear_id).await["type"], "accepted");
+        // 第一次 Esc 仅收起候选，第二次才清空草稿；下一次粘贴不能接到旧前缀后面。
+        for action in ["dismiss", "clear"] {
+            let clear_id = format!("{request_id}-{action}");
+            driver
+                .send(json!({
+                    "request_id": clear_id,
+                    "type": "input_key",
+                    "key": "escape"
+                }))
+                .await;
+            assert_eq!(driver.receive(&clear_id).await["type"], "accepted");
+        }
     }
 
     driver
@@ -771,6 +774,14 @@ async fn inspect_and_stdio_driver_execute_real_offscreen_tui() {
         }))
         .await;
     assert_eq!(driver.receive("clear-new").await["type"], "accepted");
+    driver
+        .send(json!({
+            "request_id": "clear-new-draft",
+            "type": "input_key",
+            "key": "escape"
+        }))
+        .await;
+    assert_eq!(driver.receive("clear-new-draft").await["type"], "accepted");
 
     driver
         .send(json!({

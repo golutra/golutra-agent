@@ -299,7 +299,8 @@ fn shell_provider_description_distinguishes_lifetime_from_initial_wait() {
     assert!(description.contains("background"));
     assert!(description.contains("omit timeout_ms"));
     assert!(description.contains("hard lifetime"));
-    assert!(description.contains("initial return"));
+    assert!(description.contains("prefer only one"));
+    assert!(description.contains("up to yield_time_ms"));
     assert!(description.len() < 260);
 }
 

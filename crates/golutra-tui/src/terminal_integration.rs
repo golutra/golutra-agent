@@ -1,4 +1,4 @@
-//! Terminal capabilities that are deliberately kept outside the render loop.
+//! 终端后端、能力降级和剪贴板等集成；活动区几何与历史滚动由 managed_terminal 统一管理。
 
 use std::{
     fs,
@@ -7,6 +7,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+use crate::InteractiveTerminal;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crossterm::{
     cursor::MoveTo,
@@ -18,16 +19,14 @@ use crossterm::{
     },
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use ratatui::layout::Rect;
 use ratatui::{
-    Terminal, TerminalOptions, Viewport,
     backend::{Backend, ClearType, CrosstermBackend, WindowSize},
     buffer::Cell,
-    layout::{Position, Rect, Size},
+    layout::{Position, Size},
     style::{Color, Modifier},
 };
 use unicode_width::UnicodeWidthStr;
-
-use crate::InteractiveTerminal;
 
 const MAX_OSC52_BYTES: usize = 100 * 1024;
 static ALTERNATE_SCREEN_ACTIVE: AtomicBool = AtomicBool::new(true);
@@ -228,13 +227,11 @@ impl ModifierDiff {
     }
 }
 
-/// Keeps ratatui's inline viewport usable when a terminal does not answer a cursor-position query.
+/// 启动时终端不回答光标查询则降级；后续布局只使用已知视口，不再发起查询。
 pub(crate) struct CursorFallbackBackend<B> {
     inner: B,
     last_known_cursor_position: Position,
     cursor_queries_supported: bool,
-    // 对照 Codex：离开 alt-screen 只恢复原来的 viewport，不能按 CSI 6n 再 append_lines。
-    restoring_inline_viewport: bool,
 }
 
 impl<B> CursorFallbackBackend<B> {
@@ -243,17 +240,7 @@ impl<B> CursorFallbackBackend<B> {
             inner,
             last_known_cursor_position: Position::ORIGIN,
             cursor_queries_supported: true,
-            restoring_inline_viewport: false,
         }
-    }
-
-    pub(crate) fn begin_inline_restore(&mut self, position: Position) {
-        self.last_known_cursor_position = position;
-        self.restoring_inline_viewport = true;
-    }
-
-    pub(crate) fn end_inline_restore(&mut self) {
-        self.restoring_inline_viewport = false;
     }
 
     fn resolve_cursor_position(&mut self, result: io::Result<Position>) -> Position {
@@ -284,9 +271,6 @@ impl<B: Backend> Backend for CursorFallbackBackend<B> {
     }
 
     fn append_lines(&mut self, count: u16) -> io::Result<()> {
-        if self.restoring_inline_viewport {
-            return Ok(());
-        }
         self.inner.append_lines(count)
     }
 
@@ -299,7 +283,7 @@ impl<B: Backend> Backend for CursorFallbackBackend<B> {
     }
 
     fn get_cursor_position(&mut self) -> io::Result<Position> {
-        if self.restoring_inline_viewport || !self.cursor_queries_supported {
+        if !self.cursor_queries_supported {
             return Ok(self.last_known_cursor_position);
         }
         let result = self.inner.get_cursor_position();
@@ -342,69 +326,6 @@ pub(crate) fn alternate_screen_active() -> bool {
     ALTERNATE_SCREEN_ACTIVE.load(Ordering::Relaxed)
 }
 
-pub(crate) fn switch_terminal_viewport(
-    terminal: &mut InteractiveTerminal,
-    viewport: Viewport,
-) -> io::Result<()> {
-    // ratatui 不允许移出 backend。先换成占位 stdout，再把真正的 backend 交给新 Terminal。
-    let backend = std::mem::replace(
-        terminal.backend_mut(),
-        CursorFallbackBackend::new(ContiguousCrosstermBackend::new(io::stdout())),
-    );
-    match Terminal::with_options(backend, TerminalOptions { viewport }) {
-        Ok(next) => {
-            *terminal = next;
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
-}
-
-pub(crate) fn restore_inline_viewport(
-    terminal: &mut InteractiveTerminal,
-    area: Rect,
-) -> io::Result<()> {
-    let position = Position {
-        x: area.x,
-        y: area.y,
-    };
-    terminal.set_cursor_position(position)?;
-    terminal.backend_mut().begin_inline_restore(position);
-    let result = switch_terminal_viewport(terminal, Viewport::Inline(area.height.max(1)));
-    terminal.backend_mut().end_inline_restore();
-    result
-}
-
-/// 活动区只从原锚点向下增长；不足的空间通过真实滚屏获得，不能覆盖上方历史。
-pub(crate) fn resize_inline_surface(
-    terminal: &mut InteractiveTerminal,
-    height: u16,
-    size: Size,
-) -> io::Result<()> {
-    let old = terminal.current_buffer_mut().area;
-    let height = height.max(1).min(size.height.max(1));
-    let top = old.y.min(size.height.saturating_sub(1));
-    let scroll = top.saturating_add(height).saturating_sub(size.height);
-    let writer = terminal.backend_mut();
-    // 只清除活动区；先清后滚，防止旧输入框被当成历史推入 scrollback。
-    queue!(
-        writer,
-        MoveTo(0, top),
-        crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown)
-    )?;
-    if scroll > 0 {
-        queue!(writer, MoveTo(0, size.height.saturating_sub(1)))?;
-        for _ in 0..scroll {
-            writer.write_all(b"\r\n")?;
-        }
-    }
-    Write::flush(writer)?;
-    restore_inline_viewport(
-        terminal,
-        Rect::new(0, top.saturating_sub(scroll), size.width.max(1), height),
-    )
-}
-
 pub(crate) fn restored_inline_viewport(saved: Option<Rect>, size: Size) -> Rect {
     let saved = saved.unwrap_or(Rect::new(0, 0, size.width, size.height.max(1)));
     let width = saved.width.min(size.width).max(1);
@@ -413,20 +334,18 @@ pub(crate) fn restored_inline_viewport(saved: Option<Rect>, size: Size) -> Rect 
     Rect::new(0, saved.y.min(max_y), width, height)
 }
 
-pub(crate) fn clear_inline_scrollback(terminal: &mut InteractiveTerminal) -> io::Result<()> {
+pub(crate) fn clear_inline_region(
+    terminal: &mut InteractiveTerminal,
+    start: u16,
+    height: u16,
+) -> io::Result<()> {
     let size = terminal.size()?;
-    terminal.set_cursor_position(Position::ORIGIN)?;
-    let backend = terminal.backend_mut();
-    Write::write_all(backend, b"\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[3J\x1b[H")?;
-    Write::flush(backend)?;
-    let result = terminal.resize(ratatui::layout::Rect::new(0, 0, size.width, size.height));
-    if result.is_ok() {
-        // `Terminal::resize` resets the inactive buffer, while the inline rebuild begins with
-        // the previously rendered buffer still current. Clear it too so the replay-loading
-        // frame cannot carry old transcript rows into the next scrollback insertion.
-        terminal.current_buffer_mut().reset();
-    }
-    result
+    terminal.restore_inline(Rect::new(
+        0,
+        start,
+        size.width,
+        height.max(1).min(size.height.saturating_sub(start).max(1)),
+    ))
 }
 
 pub(crate) fn copy_to_terminal_clipboard(value: &str) -> io::Result<(usize, bool)> {
@@ -651,17 +570,15 @@ mod tests {
 
     #[test]
     fn restoring_inline_viewport_does_not_append_blank_lines() {
-        let mut backend = CursorFallbackBackend::new(TestBackend::new(80, 24));
-        let pinned = Position { x: 0, y: 13 };
-        backend.begin_inline_restore(pinned);
-        backend
-            .append_lines(10)
-            .expect("restore must not grow the screen");
+        let mut terminal =
+            crate::managed_terminal::Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let area = Rect::new(0, 13, 80, 3);
+        terminal.restore_inline(area).unwrap();
+        assert_eq!(terminal.current_buffer_mut().area, area);
         assert_eq!(
-            backend.get_cursor_position().expect("pinned cursor"),
-            pinned
+            terminal.backend_mut().get_cursor_position().unwrap(),
+            Position::new(0, 13)
         );
-        backend.end_inline_restore();
     }
 
     #[test]

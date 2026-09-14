@@ -28,6 +28,8 @@ struct PtyHarness {
     child: Box<dyn portable_pty::Child + Send + Sync>,
     chunks: Receiver<Vec<u8>>,
     buffered: Vec<u8>,
+    cursor_screen: vt100::Parser,
+    cursor_query: [u8; 4],
 }
 
 impl Drop for PtyHarness {
@@ -53,6 +55,18 @@ impl PtyHarness {
         live: bool,
         resume: Option<&str>,
     ) -> Self {
+        Self::spawn_with_shell_lines(home, cwd, width, height, live, resume, 0)
+    }
+
+    fn spawn_with_shell_lines(
+        home: &Path,
+        cwd: &Path,
+        width: u16,
+        height: u16,
+        live: bool,
+        resume: Option<&str>,
+        shell_lines: u16,
+    ) -> Self {
         let system = native_pty_system();
         let pair = system
             .openpty(PtySize {
@@ -62,7 +76,12 @@ impl PtyHarness {
                 pixel_height: 0,
             })
             .expect("open PTY");
-        let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_golutra-tui"));
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.arg("-c");
+        command.arg("i=0; while [ \"$i\" -lt \"$GOLUTRA_PTY_SHELL_LINES\" ]; do printf 'BUILD_LOG\\n'; i=$((i + 1)); done; printf 'SHELL_HISTORY_MARKER\\nSTART_COMMAND_MARKER cargo run -p golutra-tui -- --yolo\\n'; exec \"$@\"");
+        command.env("GOLUTRA_PTY_SHELL_LINES", shell_lines.to_string());
+        command.arg("golutra-pty");
+        command.arg(env!("CARGO_BIN_EXE_golutra-tui"));
         command.arg("--cwd");
         command.arg(cwd);
         if let Some(resume) = resume {
@@ -101,12 +120,28 @@ impl PtyHarness {
             child,
             chunks,
             buffered: Vec::new(),
+            cursor_screen: vt100::Parser::new(height, width, 0),
+            cursor_query: [0; 4],
         }
     }
 
     fn write(&mut self, bytes: &[u8]) {
         self.writer.write_all(bytes).expect("write PTY input");
         self.writer.flush().expect("flush PTY input");
+    }
+
+    // 真实终端会回答 DSR；测试也必须从非零 shell 光标启动，不能让原点回退掩盖启动覆盖。
+    fn receive_chunk(&mut self, bytes: Vec<u8>) {
+        for &byte in &bytes {
+            self.cursor_screen.process(&[byte]);
+            self.cursor_query.rotate_left(1);
+            self.cursor_query[3] = byte;
+            if self.cursor_query == *b"\x1b[6n" {
+                let (row, column) = self.cursor_screen.screen().cursor_position();
+                self.write(format!("\x1b[{};{}R", row + 1, column + 1).as_bytes());
+            }
+        }
+        self.buffered.extend(bytes);
     }
 
     fn collect_for(&mut self, duration: Duration) -> Vec<u8> {
@@ -118,7 +153,7 @@ impl PtyHarness {
                 .recv_timeout(remaining.min(Duration::from_millis(100)))
             {
                 Ok(chunk) => {
-                    self.buffered.extend_from_slice(&chunk);
+                    self.receive_chunk(chunk);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -138,7 +173,7 @@ impl PtyHarness {
                 .chunks
                 .recv_timeout(remaining.min(Duration::from_millis(100)))
             {
-                Ok(chunk) => self.buffered.extend_from_slice(&chunk),
+                Ok(chunk) => self.receive_chunk(chunk),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     return std::mem::take(&mut self.buffered);
@@ -153,7 +188,8 @@ impl PtyHarness {
         (tail, status)
     }
 
-    fn resize(&self, width: u16, height: u16) {
+    fn resize(&mut self, width: u16, height: u16) {
+        self.cursor_screen.screen_mut().set_size(height, width);
         self.master
             .resize(PtySize {
                 rows: height,

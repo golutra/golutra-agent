@@ -2,7 +2,6 @@
 
 use crossterm::terminal::size;
 use ratatui::{
-    Frame,
     buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -80,7 +79,7 @@ fn rect_contains(area: Rect, x: u16, y: u16) -> bool {
 
 pub(crate) fn ui_layout(area: Rect, app: &TuiApp) -> UiLayoutSnapshot {
     let bottom_height = bottom_pane_height_for_width(app, area.width);
-    // 对照 Codex：inline live 区只留 composer。overlay 才需要上方内容区占满屏幕。
+    // 输入区固定在底部；上方历史使用剩余高度，极小窗口允许历史退化为零行。
     let body_constraint = if app.overlay_surface().is_some() {
         Constraint::Min(8)
     } else {
@@ -126,6 +125,10 @@ pub(crate) fn ui_layout(area: Rect, app: &TuiApp) -> UiLayoutSnapshot {
 }
 
 pub(crate) fn draw_ui(frame: &mut Frame<'_>, app: &mut TuiApp) {
+    if app.tool_detail.is_some() {
+        super::tool_detail::draw_tool_detail(frame, app);
+        return;
+    }
     let next_layout = ui_layout(frame.area(), app);
     if next_layout.body_mode == BodyLayoutMode::Transcript {
         app.ensure_transcript_layout(next_layout.transcript);
@@ -149,6 +152,9 @@ pub(crate) fn draw_ui(frame: &mut Frame<'_>, app: &mut TuiApp) {
     }
     draw_bottom_pane(frame, layout.bottom, app);
     apply_palette_to_buffer(frame.buffer_mut(), app.palette());
+    if app.transcript.fullscreen {
+        super::transcript_interaction::update_transcript_screen(app, frame.buffer_mut());
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -169,18 +175,8 @@ fn bottom_pane_height_parts(app: &TuiApp, width: u16, include_popups: bool) -> u
     let composer_suppressed = app.overlay_surface().is_some()
         || app.transcript.search.is_some()
         || app.history_search.is_some();
-    let mention_rows = if !include_popups || composer_suppressed {
-        0
-    } else {
-        app.mention_completion
-            .as_ref()
-            .map_or(0, |completion| completion.candidates.len().min(6)) as u16
-    };
-    let slash_rows = if !include_popups || mention_rows > 0 {
-        0
-    } else {
-        app.slash_candidates().len() as u16
-    };
+    let popup = completion_popup_layout(app, width);
+    let popup_rows = if include_popups { popup.height() } else { 0 };
     let queued_rows = if composer_suppressed {
         0
     } else {
@@ -188,7 +184,7 @@ fn bottom_pane_height_parts(app: &TuiApp, width: u16, include_popups: bool) -> u
     };
     let attachment_rows = u16::from(!composer_suppressed && !app.attachments.is_empty());
     let overlay_rows = u16::from(app.overlay_surface().is_some());
-    let provider_rows = u16::from(provider_footer_line(app).is_some());
+    let provider_rows = u16::from(!popup.active() && provider_footer_line(app).is_some());
     let activity_rows = u16::from(live_status_text(app, usize::from(width)).is_some());
     let composer_rows = if app.transcript.search.is_some()
         || app.history_search.is_some()
@@ -207,8 +203,7 @@ fn bottom_pane_height_parts(app: &TuiApp, width: u16, include_popups: bool) -> u
             .unwrap_or(MAX_COMPOSER_ROWS)
     };
     2 + composer_rows
-        + mention_rows
-        + slash_rows
+        + popup_rows
         + queued_rows
         + attachment_rows
         + overlay_rows
@@ -2712,7 +2707,7 @@ pub(crate) fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
         Some(OverlaySurface::Export) => Some("Enter continue   Esc cancel   Ctrl+C twice quit"),
         None => None,
     };
-    let candidates = app.slash_candidates();
+    let popup = completion_popup_layout(app, area.width);
     let mut lines = if surface == Some(OverlaySurface::Help) {
         vec![Line::from(vec![
             Span::styled(composer_prefix, Style::default().fg(palette.accent)),
@@ -2803,11 +2798,11 @@ pub(crate) fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
     let composer_visible =
         surface.is_none() && app.transcript.search.is_none() && app.history_search.is_none();
     if composer_visible {
-        if let Some(completion) = &app.mention_completion {
-            lines.extend(mention_candidate_lines(app, completion));
-        } else {
-            lines.extend(slash_candidate_lines(app, &candidates));
-        }
+        let capacity = usize::from(
+            area.height
+                .saturating_sub(bottom_pane_height_for_width_without_popups(app, area.width)),
+        );
+        lines.extend(popup.visible_rows(capacity));
         if !app.attachments.is_empty() {
             lines.push(attachment_line(
                 app,
@@ -2818,7 +2813,7 @@ pub(crate) fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
         }
         lines.extend(queued_prompt_lines(app, usize::from(area.width)));
     }
-    if let Some(provider_line) = provider_footer_line(app) {
+    if let Some(provider_line) = provider_footer_line(app).filter(|_| !popup.active()) {
         lines.push(Line::from(Span::styled(
             provider_line,
             Style::default().fg(provider_color(app)),
@@ -2830,7 +2825,14 @@ pub(crate) fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
             Style::default().fg(palette.muted),
         )));
     }
-    if overlay_help.is_some() {
+    if popup.active() {
+        let hint = if area.width < 55 {
+            "↑↓ select · Tab fill · Esc close"
+        } else {
+            "↑/↓ select · Tab complete · Enter accept · Esc close"
+        };
+        lines.push(Line::styled(hint, Style::default().fg(palette.muted)));
+    } else if overlay_help.is_some() {
         lines.push(footer_status_line(app));
     } else {
         lines.push(footer_context_line(app, usize::from(area.width)));
@@ -2926,6 +2928,77 @@ fn auth_cursor_column(dialog: &AuthDialogState) -> Option<u16> {
         _ => None,
     }?;
     Some(display_width(value).min(u16::MAX as usize) as u16)
+}
+
+// 描述换行后再计算窗口；高度测量与绘制共享同一组物理行，避免窄屏截断选中项。
+const MAX_COMPLETION_ROWS: usize = 8;
+
+struct CompletionPopupLayout {
+    rows: Vec<Line<'static>>,
+    selected: std::ops::Range<usize>,
+}
+
+impl CompletionPopupLayout {
+    fn active(&self) -> bool {
+        !self.rows.is_empty()
+    }
+
+    fn height(&self) -> u16 {
+        self.rows.len().min(MAX_COMPLETION_ROWS) as u16
+    }
+
+    fn visible_rows(&self, capacity: usize) -> Vec<Line<'static>> {
+        let capacity = capacity.min(MAX_COMPLETION_ROWS);
+        // 选中项自身超过窗口时优先显示命令开头，不能只剩描述尾部。
+        let start = self
+            .selected
+            .end
+            .saturating_sub(capacity)
+            .min(self.selected.start);
+        self.rows
+            .iter()
+            .skip(start)
+            .take(capacity)
+            .cloned()
+            .collect()
+    }
+}
+
+fn completion_popup_layout(app: &TuiApp, width: u16) -> CompletionPopupLayout {
+    let mut layout = CompletionPopupLayout {
+        rows: Vec::new(),
+        selected: 0..0,
+    };
+    if app.overlay_surface().is_some()
+        || app.transcript.search.is_some()
+        || app.history_search.is_some()
+    {
+        return layout;
+    }
+    let (candidates, selected) = if let Some(completion) = &app.mention_completion {
+        (
+            mention_candidate_lines(app, completion),
+            completion.selected,
+        )
+    } else {
+        (
+            slash_candidate_lines(app, &app.slash_candidates()),
+            app.slash_selected,
+        )
+    };
+    let selected = selected.min(candidates.len().saturating_sub(1));
+    for (index, line) in candidates.into_iter().enumerate() {
+        let start = layout.rows.len();
+        layout.rows.extend(
+            wrapped_history_rows(vec![line], width.max(1))
+                .into_iter()
+                .map(Line::from),
+        );
+        if index == selected {
+            layout.selected = start..layout.rows.len();
+        }
+    }
+    layout
 }
 
 pub(crate) fn slash_candidate_lines(

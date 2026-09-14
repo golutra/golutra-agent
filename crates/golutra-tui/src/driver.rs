@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::managed_terminal::Terminal;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use golutra_client::{RuntimeClient, RuntimeTransport};
 use golutra_core::{ActorKind, CommandId, QueryId, RedactionStatus, TaskId, TaskStatus, TurnId};
@@ -18,7 +19,7 @@ use golutra_protocol::{
     TUI_DRIVER_MIN_PROTOCOL_VERSION, TUI_DRIVER_PROTOCOL_VERSION, TuiFrame, WaitCondition,
     response,
 };
-use ratatui::{Terminal, backend::TestBackend};
+use ratatui::backend::TestBackend;
 use uuid::Uuid;
 
 use super::*;

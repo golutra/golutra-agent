@@ -2463,7 +2463,7 @@ pub fn provider_tool_description(tool_name: &str) -> &'static str {
             "Delegate one complete, self-contained task to an isolated child agent and wait for its result. The child does not receive this conversation. Omit model and reasoning_effort to inherit the current agent settings; specify either field only when the task benefits from an explicit override."
         }
         "shell" => {
-            "Run via argv or command; use bash -lc for pipes, redirects, heredoc, or compound commands. background=true returns after initial return; shell_session waits. timeout_ms is a hard lifetime; omit timeout_ms normally."
+            "Run with argv or command; prefer only one. Use bash -lc for pipes, redirects, heredoc, or compound commands. background=true returns after up to yield_time_ms; shell_session waits. timeout_ms is a hard lifetime; omit timeout_ms normally."
         }
         "process_list" => {
             "List managed background processes owned by the current session, including redacted commands, states, exit codes, and output statistics. This does not consume process output or advance a cursor."

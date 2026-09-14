@@ -573,7 +573,10 @@ pub fn slash_command_candidates(input: &str) -> Vec<SlashCommandCandidate> {
 
     let tokens = input.split_whitespace().collect::<Vec<_>>();
     let first_token = tokens.first().copied().unwrap_or("/");
-    let suggestions = if first_token == "/auth"
+    if tokens.len() > 2 || (tokens.len() > 1 && input.ends_with(char::is_whitespace)) {
+        return Vec::new();
+    }
+    let mut suggestions = if first_token == "/auth"
         && (input.ends_with(char::is_whitespace) || tokens.len() > 1)
     {
         let action_prefix = if input.ends_with(char::is_whitespace) && tokens.len() == 1 {
@@ -590,10 +593,22 @@ pub fn slash_command_candidates(input: &str) -> Vec<SlashCommandCandidate> {
             tokens.get(1).copied().unwrap_or("")
         };
         matching_hints(DEBUG_SLASH_HINTS, action_prefix, "/debug ")
+    } else if tokens.len() > 1 || input.ends_with(char::is_whitespace) {
+        Vec::new()
     } else {
         matching_hints(SEARCHABLE_SLASH_HINTS, first_token, "")
     };
 
+    if input == "/" {
+        // 裸斜杠优先呈现日常入口，其余命令继续通过前缀筛选访问。
+        let common = ["/help", "/model", "/resume", "/status", "/new"];
+        suggestions.sort_by_key(|candidate| {
+            common
+                .iter()
+                .position(|command| *command == candidate.command)
+                .unwrap_or(usize::MAX)
+        });
+    }
     suggestions.into_iter().take(5).collect()
 }
 
@@ -1571,10 +1586,10 @@ mod tests {
             slash_command_suggestions("/"),
             vec![
                 "/help - open contextual keyboard reference".to_owned(),
-                "/whats-new - show release notes for this version".to_owned(),
-                "/new - start a new session".to_owned(),
+                "/model - select or override the session model".to_owned(),
                 "/resume - open the full-screen session picker".to_owned(),
-                "/export - export session history and runtime facts".to_owned(),
+                "/status - show runtime status".to_owned(),
+                "/new - start a new session".to_owned(),
             ]
         );
         assert_eq!(
@@ -1646,6 +1661,14 @@ mod tests {
 
     #[test]
     fn slash_candidates_mark_fill_only_commands() {
+        for input in [
+            "/fork ",
+            "/model my-model",
+            "/auth login ",
+            "/auth login --key value",
+        ] {
+            assert!(slash_command_candidates(input).is_empty(), "{input}");
+        }
         let fork = slash_command_candidates("/f")
             .into_iter()
             .find(|candidate| candidate.command == "/fork")

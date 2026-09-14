@@ -199,6 +199,16 @@ fn all_terminal_rows(parser: &mut ScreenModel) -> String {
 
 fn assert_once_in_order(text: &str, needles: &[String]) {
     assert_message_spacing(text);
+    assert_eq!(
+        text.matches("SHELL_HISTORY_MARKER").count(),
+        1,
+        "shell prefix must survive:\n{text}"
+    );
+    assert_eq!(
+        text.matches("START_COMMAND_MARKER").count(),
+        1,
+        "launch command must survive:\n{text}"
+    );
     let mut previous = 0;
     for needle in needles {
         assert_eq!(
@@ -239,9 +249,24 @@ fn submit(pty: &mut PtyHarness, parser: &mut ScreenModel, text: &str) {
 }
 
 fn assert_idle_composer_at_bottom(parser: &ScreenModel) {
+    assert_idle_composer_compact(parser, true);
+}
+
+fn assert_idle_composer_compact(parser: &ScreenModel, at_bottom: bool) {
     let width = parser.screen().size().1;
     let rows = parser.screen().rows(0, width).collect::<Vec<_>>();
-    let last = rows.len() - 1;
+    let last = rows
+        .iter()
+        .rposition(|line| line.contains("pty-model"))
+        .expect("visible footer");
+    if at_bottom {
+        assert_eq!(
+            last,
+            rows.len() - 1,
+            "footer should reach bottom:\n{}",
+            rows.join("\n")
+        );
+    }
     assert!(
         rows[last].contains("pty-model"),
         "footer must occupy the last screen row:\n{}",
@@ -260,7 +285,267 @@ fn assert_idle_composer_at_bottom(parser: &ScreenModel) {
 }
 
 #[test]
-fn bottom_alignment_survives_completion_input_shrink_and_height_only_resize() {
+fn startup_banner_stays_next_to_shell_command_at_any_cursor_row() {
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let server = FixtureServer::new(vec![]);
+    server.install(home.path());
+    // 编译日志常使 shell 光标触底；从空屏启动无法覆盖这一真实入口。
+    for (width, height, shell_lines) in [(120, 48, 0), (120, 48, 44), (120, 48, 60), (60, 24, 30)] {
+        let mut pty = PtyHarness::spawn_with_shell_lines(
+            home.path(),
+            workspace.path(),
+            width,
+            height,
+            true,
+            None,
+            shell_lines,
+        );
+        let mut parser = ScreenModel::new(height, width);
+        parser.process(&pty.collect_until(b"Ask Golutra", Duration::from_secs(8)));
+        parser.process(&pty.collect_for(Duration::from_millis(300)));
+        let text = all_terminal_rows(&mut parser);
+        assert_once_in_order(&text, &[]);
+        let rows = text.lines().collect::<Vec<_>>();
+        let command = rows
+            .iter()
+            .position(|row| row.contains("START_COMMAND_MARKER"))
+            .unwrap();
+        let banner = rows
+            .iter()
+            .enumerate()
+            .skip(command + 1)
+            .find(|(_, row)| row.contains("██") || row.contains("GOLUTRA"))
+            .map(|(index, _)| index)
+            .expect("startup banner");
+        assert!(
+            banner - command <= 3,
+            "startup must not pad before the banner (shell_lines={shell_lines}):\n{text}"
+        );
+        assert!(!parser.screen().alternate_screen());
+        assert_eq!(
+            parser.screen().mouse_protocol_mode(),
+            vt100::MouseProtocolMode::None
+        );
+        submit(&mut pty, &mut parser, "/quit");
+        assert!(pty.wait().1.success());
+    }
+}
+
+#[test]
+fn slash_suggestions_expand_inline_complete_and_restore_history() {
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let markers = (1..=25)
+        .map(|n| format!("SLASH_HISTORY_{n:03}"))
+        .collect::<Vec<_>>();
+    let server = FixtureServer::new(vec![markers.join("\n\n")]);
+    server.install(home.path());
+    let mut pty = PtyHarness::spawn_configured(home.path(), workspace.path(), 100, 26, true);
+    let mut parser = ScreenModel::new(26, 100);
+    parser.process(&pty.collect_until(b"Ask Golutra", Duration::from_secs(8)));
+    // 初始短历史和长回复触底后都必须能完整显示候选。
+    for after_reply in [false, true] {
+        if after_reply {
+            submit(&mut pty, &mut parser, "生成历史");
+            parser.process(&pty.collect_for(Duration::from_secs(3)));
+        }
+        let idle_y = screen_row(&parser, "Ask Golutra");
+        let last_history_y = after_reply.then(|| screen_row(&parser, "SLASH_HISTORY_025"));
+        pty.write(b"/");
+        let expanded = pty.collect_for(Duration::from_millis(350));
+        assert!(
+            !expanded.windows(4).any(|bytes| bytes == b"\x1b[6n"),
+            "expansion must not query cursor"
+        );
+        parser.process(&expanded);
+        let expanded_y = screen_row(&parser, "› /");
+        if let Some(history_y) = last_history_y {
+            assert!(
+                expanded_y < idle_y,
+                "full screen must scroll up for suggestions"
+            );
+            assert_eq!(
+                screen_row(&parser, "SLASH_HISTORY_025"),
+                history_y - (idle_y - expanded_y)
+            );
+        } else {
+            assert_eq!(
+                expanded_y, idle_y,
+                "free space should be consumed before scrolling"
+            );
+        }
+        let text = parser.screen().contents();
+        for command in ["/help", "/model", "/resume", "/status", "/new"] {
+            assert!(text.contains(command), "missing {command}:\n{text}");
+        }
+        assert!(!parser.screen().alternate_screen());
+        assert_eq!(
+            parser.screen().mouse_protocol_mode(),
+            vt100::MouseProtocolMode::None
+        );
+        // 筛选与恢复列表只改变高度，不能把历史反向拉回屏幕。
+        pty.write(b"re");
+        parser.process(&pty.collect_for(Duration::from_millis(200)));
+        assert_eq!(screen_row(&parser, "› /re"), expanded_y);
+        pty.write(b"\x7f\x7f");
+        parser.process(&pty.collect_for(Duration::from_millis(200)));
+        assert_eq!(screen_row(&parser, "› /"), expanded_y);
+        pty.write(b"\x1b");
+        parser.process(&pty.collect_for(Duration::from_millis(350)));
+        let text = parser.screen().contents();
+        assert!(text.lines().any(|line| line.trim() == "› /"), "{text}");
+        assert_eq!(screen_row(&parser, "› /"), expanded_y);
+        assert!(
+            !text.contains("open contextual keyboard reference"),
+            "{text}"
+        );
+        pty.write(b"\x15");
+        parser.process(&pty.collect_for(Duration::from_millis(250)));
+    }
+    pty.write(b"/");
+    parser.process(&pty.collect_for(Duration::from_millis(250)));
+    pty.resize(60, 6);
+    parser.screen_mut().set_size(6, 60);
+    parser.process(&pty.collect_for(Duration::from_millis(350)));
+    pty.write(b"\x1b[B\x1b[B\x1b[B\x1b[B");
+    parser.process(&pty.collect_for(Duration::from_millis(350)));
+    assert!(parser.screen().contents().contains("› /new"));
+    assert!(parser.screen().contents().contains("Esc close"));
+    pty.resize(100, 26);
+    parser.screen_mut().set_size(26, 100);
+    parser.process(&pty.collect_for(Duration::from_millis(350)));
+    pty.write(b"\x1b[A\t");
+    parser.process(&pty.collect_for(Duration::from_millis(350)));
+    assert!(parser.screen().contents().contains("› /status"));
+    assert!(!parser.screen().contents().contains("• Status"));
+    pty.write(b"\r");
+    parser.process(&pty.collect_for(Duration::from_millis(500)));
+    assert!(parser.screen().contents().contains("• Status"));
+    assert_once_in_order(&all_terminal_rows(&mut parser), &markers);
+    pty.write(b"/re\t");
+    parser.process(&pty.collect_for(Duration::from_millis(350)));
+    assert!(parser.screen().contents().contains("› /resume"));
+    assert!(!parser.screen().alternate_screen());
+    pty.write(b"\r");
+    parser.process(&pty.collect_for(Duration::from_millis(500)));
+    assert!(parser.screen().alternate_screen());
+    pty.write(b"\x1b");
+    parser.process(&pty.collect_for(Duration::from_millis(350)));
+    assert!(!parser.screen().alternate_screen());
+    assert_eq!(
+        parser.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None
+    );
+    assert_once_in_order(&all_terminal_rows(&mut parser), &markers);
+    submit(&mut pty, &mut parser, "/quit");
+    assert!(pty.wait().1.success());
+}
+
+fn screen_row(parser: &ScreenModel, marker: &str) -> usize {
+    parser
+        .screen()
+        .contents()
+        .lines()
+        .position(|line| line.contains(marker))
+        .unwrap_or_else(|| panic!("missing {marker}:\n{}", parser.screen().contents()))
+}
+
+fn visible_screen_rows(parser: &ScreenModel) -> Vec<String> {
+    // VT 将显式写入的空格与擦除后的空格区别保存；比较显示内容和行位置，忽略行尾编码差异。
+    parser
+        .screen()
+        .rows(0, parser.screen().size().1)
+        .map(|line| line.trim_end().to_owned())
+        .collect()
+}
+
+#[test]
+fn streaming_with_suggestions_and_status_preserves_every_message_once() {
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let markers = (1..=350)
+        .map(|n| format!("并发候选段落{n:03}完整有序。"))
+        .collect::<Vec<_>>();
+    let server = FixtureServer::new(vec![format!(
+        "{}\n\nPOPUP_STREAM_DONE",
+        markers.join("\n\n")
+    )]);
+    server.install(home.path());
+    let mut pty = PtyHarness::spawn_configured(home.path(), workspace.path(), 100, 26, true);
+    let mut parser = ScreenModel::new(26, 100);
+    parser.process(&pty.collect_until(b"Ask Golutra", Duration::from_secs(8)));
+    submit(&mut pty, &mut parser, "生成时检查候选和状态");
+    for _ in 0..80 {
+        parser.process(&pty.collect_for(Duration::from_millis(50)));
+        if all_terminal_rows(&mut parser).contains(&markers[9]) {
+            break;
+        }
+    }
+    assert!(!all_terminal_rows(&mut parser).contains("POPUP_STREAM_DONE"));
+    pty.write(b"/");
+    parser.process(&pty.collect_for(Duration::from_millis(200)));
+    assert!(parser.screen().contents().contains("/resume"));
+    pty.write(b"st\t");
+    parser.process(&pty.collect_for(Duration::from_millis(150)));
+    assert!(parser.screen().contents().contains("› /status"));
+    assert!(!all_terminal_rows(&mut parser).contains("• Status"));
+    pty.write(b"\r");
+    parser.process(&pty.collect_for(Duration::from_secs(7)));
+    let text = all_terminal_rows(&mut parser);
+    assert_once_in_order(&text, &markers);
+    for marker in [
+        "SHELL_HISTORY_MARKER",
+        "START_COMMAND_MARKER",
+        "› 生成时检查候选和状态",
+        "› /status",
+        "• Status",
+        "POPUP_STREAM_DONE",
+    ] {
+        assert_eq!(text.matches(marker).count(), 1, "{marker}:\n{text}");
+    }
+    assert!(
+        !text.contains("↑/↓ select"),
+        "transient popup must not enter history"
+    );
+    assert!(!parser.screen().alternate_screen());
+    assert_eq!(
+        parser.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None
+    );
+    submit(&mut pty, &mut parser, "/quit");
+    assert!(pty.wait().1.success());
+}
+
+#[test]
+fn completed_fullscreen_height_stream_does_not_leave_a_page_gap() {
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    // 单个长代码块在完成前全部属于活动尾部；完成后一次归档，不能继续为旧尾部保留一整屏。
+    let markers = (1..=100)
+        .map(|n| format!("TAIL_{n:03}"))
+        .collect::<Vec<_>>();
+    let server = FixtureServer::new(vec![format!("```text\n{}\n```", markers.join("\n"))]);
+    server.install(home.path());
+    let mut pty = PtyHarness::spawn_configured(home.path(), workspace.path(), 100, 40, true);
+    let mut parser = ScreenModel::new(40, 100);
+    parser.process(&pty.collect_until(b"Ask Golutra", Duration::from_secs(8)));
+    submit(&mut pty, &mut parser, "长代码块");
+    parser.process(&pty.collect_for(Duration::from_secs(3)));
+    assert_idle_composer_compact(&parser, false);
+    assert_eq!(
+        screen_row(&parser, "Ask Golutra"),
+        screen_row(&parser, "TAIL_100") + 2
+    );
+    submit(&mut pty, &mut parser, "/status");
+    parser.process(&pty.collect_for(Duration::from_millis(500)));
+    assert_once_in_order(&all_terminal_rows(&mut parser), &markers);
+    submit(&mut pty, &mut parser, "/quit");
+    assert!(pty.wait().1.success());
+}
+
+#[test]
+fn compact_anchor_survives_completion_input_shrink_and_height_only_resize() {
     let home = tempdir().unwrap();
     let workspace = tempdir().unwrap();
     let markers = (1..=35)
@@ -285,7 +570,7 @@ fn bottom_alignment_survives_completion_input_shrink_and_height_only_resize() {
     submit(&mut pty, &mut parser, "底部边缘测试");
     parser.process(&pty.collect_for(Duration::from_secs(3)));
     assert_once_in_order(&all_terminal_rows(&mut parser), &markers);
-    assert_idle_composer_at_bottom(&parser);
+    assert_idle_composer_compact(&parser, false);
     let idle = pty.collect_for(Duration::from_millis(500));
     assert!(
         !idle.windows(4).any(|bytes| bytes == b"\x1b[3J"),
@@ -297,7 +582,7 @@ fn bottom_alignment_survives_completion_input_shrink_and_height_only_resize() {
     parser.process(&pty.collect_for(Duration::from_millis(500)));
     pty.write(b"\x15");
     parser.process(&pty.collect_for(Duration::from_millis(500)));
-    assert_idle_composer_at_bottom(&parser);
+    assert_idle_composer_compact(&parser, false);
     assert_once_in_order(&all_terminal_rows(&mut parser), &markers);
     assert!(!all_terminal_rows(&mut parser).contains("草稿"));
 
@@ -308,7 +593,7 @@ fn bottom_alignment_survives_completion_input_shrink_and_height_only_resize() {
         pty.resize(100, height);
         parser.screen_mut().set_size(height, 100);
         parser.process(&pty.collect_for(Duration::from_millis(800)));
-        assert_idle_composer_at_bottom(&parser);
+        assert_idle_composer_compact(&parser, false);
         let text = all_terminal_rows(&mut parser);
         assert_once_in_order(&text, &markers);
         assert_eq!(text.matches("• Status").count(), 1, "{text}");
@@ -320,7 +605,7 @@ fn bottom_alignment_survives_completion_input_shrink_and_height_only_resize() {
     parser.process(&pty.collect_for(Duration::from_millis(500)));
     pty.write(b"\x1b");
     parser.process(&pty.collect_for(Duration::from_millis(800)));
-    assert_idle_composer_at_bottom(&parser);
+    assert_idle_composer_compact(&parser, false);
     assert_once_in_order(&all_terminal_rows(&mut parser), &markers);
     submit(&mut pty, &mut parser, "/quit");
     assert!(pty.wait().1.success());
@@ -545,9 +830,9 @@ fn narration_and_real_tool_results_remain_in_order_without_raw_file_previews() {
         &[
             "› 检查两个文件",
             "先读第一个文件。",
-            "• read first.txt",
+            "• ▸ read first.txt",
             "第一个已读，继续读第二个。",
-            "• read second.txt",
+            "• ▸ read second.txt",
             "读取完成，两个文件都已检查。",
         ]
         .map(str::to_owned),
@@ -564,16 +849,213 @@ fn narration_and_real_tool_results_remain_in_order_without_raw_file_previews() {
         !text.contains("Task Completed"),
         "redundant system completion card:\n{text}"
     );
-    pty.write(b"\x0f");
-    parser.process(&pty.collect_for(Duration::from_millis(600)));
-    let expanded = all_terminal_rows(&mut parser);
     assert!(
-        expanded.contains("RAW_HTML_SHOULD_STAY_IN_DETAILS"),
-        "archived tools must remain inspectable with Ctrl+O:\n{expanded}"
+        !parser.screen().alternate_screen(),
+        "chat must remain inline"
+    );
+    pty.write("\x1b[200~保留草稿\x1b[201~".as_bytes());
+    parser.process(&pty.collect_for(Duration::from_millis(300)));
+    let inline_screen = visible_screen_rows(&parser);
+    let inline_cursor = parser.screen().cursor_position();
+    assert_eq!(
+        parser.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None,
+        "inline must allow native scroll and selection"
     );
     pty.write(b"\x0f");
+    parser.process(&pty.collect_for(Duration::from_millis(500)));
+    assert!(
+        parser.screen().alternate_screen(),
+        "{}",
+        parser.screen().contents()
+    );
+    assert_ne!(
+        parser.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None
+    );
+    let expanded = parser.screen().contents();
+    assert!(expanded.contains("Back"), "{expanded}");
+    assert!(
+        expanded.contains("RAW_HTML_SHOULD_STAY_IN_DETAILS"),
+        "{expanded}"
+    );
+    assert!(
+        !expanded.contains("first.txt"),
+        "only the selected tool opens: {expanded}"
+    );
+
+    // Details consume paste/typing without changing the hidden composer.
+    pty.write("\x1b[200~不可混入草稿\x1b[201~x".as_bytes());
+    parser.process(&pty.collect_for(Duration::from_millis(200)));
+    pty.write(b"\x1b");
+    parser.process(&pty.collect_for(Duration::from_millis(500)));
+    assert!(!parser.screen().alternate_screen());
+    assert_eq!(
+        visible_screen_rows(&parser),
+        inline_screen,
+        "Back restores exact inline screen and draft"
+    );
+    assert_eq!(parser.screen().cursor_position(), inline_cursor);
+
+    // Keyboard access and resizing must use the same reversible screen lifecycle.
+    pty.write(b"\x0f");
+    parser.process(&pty.collect_for(Duration::from_millis(300)));
+    assert!(parser.screen().alternate_screen());
+    pty.resize(80, 30);
+    parser.screen_mut().set_size(30, 80);
+    parser.process(&pty.collect_for(Duration::from_millis(500)));
+    assert!(
+        parser
+            .screen()
+            .rows(0, 80)
+            .last()
+            .unwrap()
+            .contains("Tool details")
+    );
+    pty.write(b"\x1b[<0;3;1M\x1b[<0;3;1m");
     parser.process(&pty.collect_for(Duration::from_millis(600)));
+    assert!(!parser.screen().alternate_screen());
+    assert!(parser.screen().contents().contains("保留草稿"));
     assert!(!all_terminal_rows(&mut parser).contains("RAW_HTML_SHOULD_STAY_IN_DETAILS"));
+    pty.write(b"\x15");
+    parser.process(&pty.collect_for(Duration::from_millis(200)));
+    assert_once_in_order(
+        &all_terminal_rows(&mut parser),
+        &[
+            "› 检查两个文件".to_owned(),
+            "• ▸ read first.txt".to_owned(),
+            "• ▸ read second.txt".to_owned(),
+            "读取完成，两个文件都已检查。".to_owned(),
+        ],
+    );
+    assert_eq!(
+        parser.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None
+    );
+    assert_eq!(
+        all_terminal_rows(&mut parser)
+            .matches("SHELL_HISTORY_MARKER")
+            .count(),
+        1
+    );
+    assert_eq!(
+        all_terminal_rows(&mut parser)
+            .matches("START_COMMAND_MARKER")
+            .count(),
+        1
+    );
+    pty.write(b"\x0f");
+    parser.process(&pty.collect_for(Duration::from_millis(200)));
+    pty.write(b"\x1b[D");
+    parser.process(&pty.collect_for(Duration::from_millis(300)));
+    assert!(parser.screen().contents().contains("first.txt"));
+    assert!(!parser.screen().contents().contains("second.txt"));
+    pty.write(b"\x1b");
+    parser.process(&pty.collect_for(Duration::from_millis(300)));
+    submit(&mut pty, &mut parser, "/quit");
+    assert!(pty.wait().1.success());
+}
+
+#[test]
+fn output_arriving_in_tool_details_is_archived_once_after_return() {
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    std::fs::write(workspace.path().join("live.txt"), "DETAIL_ONLY_MARKER").unwrap();
+    let markers = (1..=300)
+        .map(|n| format!("后台回复段落{n:03}保持完整。"))
+        .collect::<Vec<_>>();
+    let server = FixtureServer::with_rounds(vec![
+        (
+            "检查文件。".into(),
+            vec![json!({"index":0,"id":"live-read","type":"function",
+            "function":{"name":"read_file","arguments":json!({"path":"live.txt","offset":1,"limit":20}).to_string()}})],
+        ),
+        (
+            format!("{}\n\nWHILE_DETAILS_DONE", markers.join("\n\n")),
+            vec![],
+        ),
+    ]);
+    server.install(home.path());
+    let mut pty = PtyHarness::spawn_configured(home.path(), workspace.path(), 100, 24, true);
+    let mut parser = ScreenModel::new(24, 100);
+    parser.process(&pty.collect_until(b"Ask Golutra", Duration::from_secs(8)));
+    parser.process(&pty.collect_for(Duration::from_millis(300)));
+    submit(&mut pty, &mut parser, "边读详情边接收回复");
+    for _ in 0..60 {
+        parser.process(&pty.collect_for(Duration::from_millis(50)));
+        if all_terminal_rows(&mut parser).contains("▸ read live.txt") {
+            break;
+        }
+    }
+    assert!(!all_terminal_rows(&mut parser).contains("WHILE_DETAILS_DONE"));
+    pty.write(b"\x0f");
+    parser.process(&pty.collect_for(Duration::from_millis(300)));
+    assert!(parser.screen().alternate_screen());
+    assert!(parser.screen().contents().contains("DETAIL_ONLY_MARKER"));
+    parser.process(&pty.collect_for(Duration::from_secs(5)));
+    assert!(
+        parser.screen().alternate_screen(),
+        "runtime completion must not close details"
+    );
+    assert!(!parser.screen().contents().contains("WHILE_DETAILS_DONE"));
+    pty.write(b"\x1b");
+    parser.process(&pty.collect_for(Duration::from_millis(700)));
+    assert!(!parser.screen().alternate_screen());
+    let text = all_terminal_rows(&mut parser);
+    assert_once_in_order(&text, &markers);
+    assert_eq!(text.matches("WHILE_DETAILS_DONE").count(), 1);
+    assert!(!text.contains("DETAIL_ONLY_MARKER"));
+    assert_idle_composer_at_bottom(&parser);
+    submit(&mut pty, &mut parser, "/quit");
+    assert!(pty.wait().1.success());
+}
+
+#[test]
+fn native_mouse_and_shell_prefix_survive_draft_growth_and_fullscreen_picker() {
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let server = FixtureServer::new(vec![]);
+    server.install(home.path());
+    let mut pty = PtyHarness::spawn_configured(home.path(), workspace.path(), 100, 20, true);
+    let mut parser = ScreenModel::new(20, 100);
+    parser.process(&pty.collect_until(b"Ask Golutra", Duration::from_secs(8)));
+    parser.process(&pty.collect_for(Duration::from_millis(300)));
+    assert_eq!(
+        parser.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None
+    );
+    assert!(!parser.screen().alternate_screen());
+    pty.write(format!("\x1b[200~{}\x1b[201~", "多行草稿\n".repeat(12)).as_bytes());
+    parser.process(&pty.collect_for(Duration::from_millis(300)));
+    pty.write(b"\x15");
+    parser.process(&pty.collect_for(Duration::from_millis(300)));
+    assert_once_in_order(&all_terminal_rows(&mut parser), &[]);
+    pty.resize(100, 36);
+    parser.screen_mut().set_size(36, 100);
+    parser.process(&pty.collect_for(Duration::from_millis(500)));
+    assert_once_in_order(&all_terminal_rows(&mut parser), &[]);
+    submit(&mut pty, &mut parser, "/help");
+    parser.process(&pty.collect_for(Duration::from_millis(400)));
+    assert!(parser.screen().alternate_screen());
+    assert_ne!(
+        parser.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None
+    );
+    pty.write(b"\x1b");
+    parser.process(&pty.collect_for(Duration::from_millis(400)));
+    assert!(!parser.screen().alternate_screen());
+    assert_eq!(
+        parser.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None
+    );
+    assert_once_in_order(&all_terminal_rows(&mut parser), &[]);
+    submit(&mut pty, &mut parser, "/terminal true");
+    parser.process(&pty.collect_for(Duration::from_millis(700)));
+    assert_eq!(
+        parser.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None
+    );
+    assert_once_in_order(&all_terminal_rows(&mut parser), &[]);
     submit(&mut pty, &mut parser, "/quit");
     assert!(pty.wait().1.success());
 }
