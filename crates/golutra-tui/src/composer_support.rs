@@ -346,7 +346,11 @@ pub(crate) fn queued_prompts(events: &[RuntimeEvent]) -> Vec<QueuedPrompt> {
                     .pointer("/payload/steer")
                     .or_else(|| event.payload.get("steer"))
                     .and_then(Value::as_bool)
-                    .unwrap_or(false);
+                    .unwrap_or_else(|| {
+                        positions
+                            .get(&turn_id)
+                            .is_some_and(|index| queued[*index].steer)
+                    });
                 let updated = QueuedPrompt {
                     turn_id,
                     prompt,

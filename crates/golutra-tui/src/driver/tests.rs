@@ -362,6 +362,14 @@ fn explicit_task_binding_is_read_only_for_prompts() {
         .expect_err("task-bound prompt must be rejected");
     assert_eq!(driver_error_code(&error), "task_binding_read_only");
 
+    let mut app = test_app(Some(TaskId::new()), None);
+    app.input.set_text("queued follow-up");
+    let error = ensure_driver_binding_allows_key(app.task_id, &app, &DriverKey::Tab)
+        .expect_err("Tab cannot bypass task-bound read-only access");
+    assert_eq!(driver_error_code(&error), "task_binding_read_only");
+    app.input.set_text("/sta");
+    assert!(ensure_driver_binding_allows_key(app.task_id, &app, &DriverKey::Tab).is_ok());
+
     let task_id = Some(TaskId::new());
     assert!(ensure_task_binding_allows_slash(task_id, "/status").is_ok());
     assert!(ensure_task_binding_allows_slash(task_id, "/debug").is_ok());

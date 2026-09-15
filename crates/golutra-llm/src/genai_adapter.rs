@@ -474,10 +474,7 @@ pub(crate) fn genai_chat_request(
     if !request.tools.is_empty() {
         chat_request = chat_request.with_tools(request.tools.iter().map(|contract| {
             let schema = provider_tool_schema_for_contract(contract);
-            // rust-genai reserves the literal `web_search` name for its native
-            // provider tool on several adapters. Golutra owns a regular
-            // function with that name, so use a stable wire alias and restore
-            // it at the provider response boundary.
+            // 统一 wire 命名也用于历史回放；旧搜索别名不能被 genai 误当成原生搜索工具。
             let tool = Tool::new(ToolName::Custom(wire_tool_name(&contract.tool_name)))
                 .with_description(tool_description(&contract.tool_name))
                 .with_schema(schema.clone());

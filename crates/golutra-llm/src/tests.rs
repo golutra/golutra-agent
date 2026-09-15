@@ -334,7 +334,6 @@ fn provider_tool_descriptions_own_file_and_question_usage_details() {
     let subagent = provider_tool_description("subagent");
     assert!(subagent.contains("isolated child task"));
     assert!(subagent.contains("cannot create another child"));
-    assert!(provider_tool_description("web_search").contains("network"));
     assert!(provider_tool_description("shell_session").contains("authoritative_pid"));
     assert!(provider_tool_description("shell_session").contains("cursor"));
     assert_ne!(
@@ -375,7 +374,6 @@ fn provider_surface_descriptions_are_bounded_without_dropping_capability_terms()
             ][..],
         ),
         ("shell", &["argv", "command", "heredoc", "background"][..]),
-        ("web_search", &["network"][..]),
         ("shell_session", &["authoritative_pid", "cursor"][..]),
         (
             "subagent",

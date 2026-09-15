@@ -67,6 +67,55 @@ loaded files. Allowed fields are `provider_profile`, `model`,
 JSON, secret-shaped fields and files larger than 64 KiB are rejected; API keys
 and tokens remain in the credential store or environment references.
 
+### Child-process environment and CLI results
+
+Child processes inherit the runtime host's environment by default. Third-party
+API keys, tokens, proxy settings and host CLI context such as
+`GOLUTRA_COMMAND_SCOPE_TOKEN`, `GOLUTRA_RUNTIME_PROFILE` and
+`GOLUTRA_COMMAND_IPC_ADDR` are inherited without special opt-in. In daemon mode,
+this is the daemon's environment, not a newly attached client's environment.
+
+The runtime always removes its internal `GOLUTRA_TRANSPORT_TOKEN`,
+`GOLUTRA_PROVIDER_API_KEY`, `GOLUTRA_PROVIDER_CUSTOM_HEADERS` and generated
+`GOLUTRA_CUSTOM_PROVIDER_API_KEY_*` variables. MCP declarations cannot restore
+these variables. Other names are not filtered merely for containing `TOKEN`,
+`KEY`, `SECRET` or the `GOLUTRA_` prefix.
+
+To restrict inheritance, set `GOLUTRA_SHELL_ENVIRONMENT_POLICY` before starting
+the runtime host:
+
+```bash
+export GOLUTRA_SHELL_ENVIRONMENT_POLICY='{"inherit":"all","exclude":["GITHUB_TOKEN","DATABASE_PASSWORD"]}'
+```
+
+`inherit` accepts `all` (default), `core` (basic shell/path/locale variables),
+or `none`. Optional `exclude` and `include_only` arrays match exact variable
+names case-insensitively; wildcards are not supported. Exclusions win, and
+`include_only` never restores an internal or non-inherited variable. Invalid
+configuration fails the launch rather than falling back to full inheritance.
+The existing terminal/pager/editor defaults and per-process temporary directory
+are applied afterward. Filesystem and network sandbox permissions remain
+separate from environment inheritance.
+
+Shell results describe process execution. Exit code zero does not establish
+application-level success: inspect the CLI's documented output. For
+`golutra-cli`, check outer `ok` and business `result.status`. An accepted request
+is not a completed operation; message delivery does not establish that the
+recipient has completed the downstream task.
+
+Use `shell(background=true)` for a long-running command and `shell_session`
+with its returned `process_id`, `authoritative_pid` and output cursor to wait
+on that same process. If a bounded wait returns a running state, wait again;
+do not relaunch the command. For an existing CLI `run --async` request, launch
+`golutra-cli wait <requestId>` once and manage that waiting process through
+`shell_session`. An external `requestId` is not a shell process ID. Follow
+command-specific restrictions, including synchronous-only integration commands.
+
+Process sessions belong to the runtime and do not survive its exit; output
+journals have retention and size limits. This mechanism does not persist an
+external service's request state. On an uncertain outcome, inspect existing
+evidence or query the service before resubmitting any mutation.
+
 ## 1. Headless Exec
 
 `exec` is the non-interactive equivalent of one agent turn. It does not open a

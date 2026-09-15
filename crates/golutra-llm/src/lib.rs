@@ -2445,9 +2445,8 @@ pub fn provider_tool_description(tool_name: &str) -> &'static str {
         "apply_patch" => {
             "Atomically apply one unified or Begin/Update/Add/Delete patch; batch related multi-file changes; returns status, digest, preview."
         }
-        "web_search" => "Search the network when enabled; return source-backed results.",
         "shell_session" => {
-            "Control a background shell; authoritative_pid must match. Reuse cursor; one bounded wait_for_terminal=true, or write/terminate."
+            "Control the same background shell using process_id and matching authoritative_pid. Reuse cursor; wait_for_terminal=true waits within wait_ms. If still running, wait again; do not restart. Or write/terminate."
         }
         "subagent" => {
             "Run one isolated child task; it cannot create another child; return a bounded result."
@@ -2484,10 +2483,8 @@ pub fn provider_tool_description(tool_name: &str) -> &'static str {
     }
 }
 
-/// Names used in provider tool payloads. `web_search` is an internal runtime
-/// capability name, while several OpenAI-compatible adapters reserve that
-/// literal for a native tool. Keeping the alias here makes projection,
-/// accounting, and every transport share one wire representation.
+/// 旧会话保留原有工具别名，以维持调用与结果的配对及 wire 表示稳定。
+/// 这里不注册搜索能力；内置 web_search 已移除，避免再次暴露未配置的工具。
 pub(crate) const WEB_SEARCH_WIRE_ALIAS: &str = "golutra_web_search";
 
 pub(crate) fn provider_tool_wire_name(name: &str) -> String {

@@ -1026,7 +1026,8 @@ pub(crate) fn system_prompt() -> String {
         "Before the first mutation, batch implementation, tests, and public exports in one read batch; use one bounded workspace discovery when a path is uncertain; use paths; never guess a root-level basename.",
         "Then batch independent checks and related edits; do not split known edits across turns. Use one atomic patch for coupled files. Never skip required reads or validation.",
         "Trust successful mutation status, changed paths, digest, count, and preview. Do not reread your own successful mutation unless external changes, truncated evidence, or failed validation require it.",
-        "Finish guarded changes before release or wait; never change them after terminal. Background starts return; one bounded wait for terminal state.",
+        "Finish guarded changes before release or wait; never change them after terminal. Wait on the same background process with its returned cursor until terminal; external request IDs are not process IDs. Do not restart commands to poll.",
+        "A zero exit code confirms process success only; inspect CLI output for business status. Accepted or queued is not completion; message delivery does not establish downstream task completion. Resolve uncertain outcomes before retrying mutations.",
         "Follow project conventions; verify by risk; report blockers concisely; ask on consequential ambiguity.",
         "Before each tool batch, write one short visible sentence; do not hide it in reasoning.",
     ]
@@ -1309,11 +1310,13 @@ mod tests {
         assert!(prompt.contains("never change them after terminal"));
         assert!(prompt.contains("Follow project conventions"));
         assert!(prompt.contains("verify by risk"));
-        assert!(prompt.contains("one bounded wait for terminal state"));
+        assert!(prompt.contains("same background process"));
+        assert!(prompt.contains("inspect CLI output for business status"));
+        assert!(prompt.contains("Resolve uncertain outcomes before retrying mutations"));
         assert!(prompt.contains("blockers concisely"));
         assert!(prompt.contains("consequential ambiguity"));
         assert!(prompt.contains("Before each tool batch, write one short visible sentence"));
-        assert!(prompt.chars().count() < 1_100);
+        assert!(prompt.chars().count() < 1_450);
         for tool_detail in [
             "read_file",
             "write_file",

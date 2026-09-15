@@ -17,6 +17,9 @@ use super::*;
 #[path = "history_test_backend.rs"]
 mod history_test_backend;
 
+#[path = "pending_input_tests.rs"]
+mod pending_input_tests;
+
 #[test]
 fn remote_subcommand_is_an_explicit_app_server_transport() {
     let args = Args::try_parse_from([
@@ -7233,7 +7236,7 @@ fn cancelling_an_earlier_turn_keeps_the_visible_projection_anchored() {
         .expect("post-cancellation anchor");
     assert_eq!(after.projection, anchor.projection);
     assert_eq!(after.visual_offset, anchor.visual_offset);
-    assert_eq!(after.original_index + 1, anchor.original_index);
+    assert_eq!(after.original_index, anchor.original_index);
 }
 
 #[test]

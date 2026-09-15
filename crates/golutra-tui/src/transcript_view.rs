@@ -639,6 +639,7 @@ impl EventOperationEntry {
 #[derive(Debug, Default)]
 struct ProjectionIndexes {
     visible_user_turns: HashMap<TurnId, usize>,
+    pending_user_turns: HashMap<TurnId, TranscriptItem>,
     streamed_assistant_items: HashMap<TurnId, usize>,
     active_tools: HashMap<OperationId, usize>,
 }
@@ -756,47 +757,40 @@ fn event_operation_entries_with_boundary(
                 }
             }
             RuntimeEventType::TurnQueued => {
-                let is_new_turn = event
-                    .turn_id
-                    .is_none_or(|turn_id| !indexes.visible_user_turns.contains_key(&turn_id));
-                if is_new_turn && let Some(item) = user_event_transcript_item(event) {
-                    if let Some(turn_id) = event.turn_id {
-                        indexes.visible_user_turns.insert(turn_id, items.len());
-                    }
-                    items.push(EventOperationEntry::new(
-                        event,
-                        message_projection(item),
-                        false,
-                    ));
+                if let Some(turn_id) = event.turn_id
+                    && !indexes.visible_user_turns.contains_key(&turn_id)
+                    && let Some(item) = user_event_transcript_item(event)
+                {
+                    indexes.pending_user_turns.insert(turn_id, item);
                 }
             }
             RuntimeEventType::TurnStarted => {
-                if let Some(index) = event
-                    .turn_id
-                    .and_then(|turn_id| indexes.visible_user_turns.get(&turn_id).copied())
-                    && let Some(record) = items.get_mut(index)
-                {
-                    record.task_id = event.task_id.or(record.task_id);
-                    record.stable = true;
+                if let Some(turn_id) = event.turn_id {
+                    let pending = indexes.pending_user_turns.remove(&turn_id);
+                    if !indexes.visible_user_turns.contains_key(&turn_id)
+                        && let Some(item) = pending.or_else(|| user_event_transcript_item(event))
+                    {
+                        indexes.visible_user_turns.insert(turn_id, items.len());
+                        items.push(EventOperationEntry::new(
+                            event,
+                            message_projection(item),
+                            true,
+                        ));
+                    }
                 }
             }
             RuntimeEventType::TurnUpdated => {
-                if let Some(index) = event
-                    .turn_id
-                    .and_then(|turn_id| indexes.visible_user_turns.get(&turn_id).copied())
+                if let Some(turn_id) = event.turn_id
+                    && !indexes.visible_user_turns.contains_key(&turn_id)
                     && let Some(item) = user_event_transcript_item(event)
                 {
-                    items[index].projection = message_projection(item);
+                    indexes.pending_user_turns.insert(turn_id, item);
                 }
             }
             RuntimeEventType::TurnCancelled => {
-                let Some(index) = event
-                    .turn_id
-                    .and_then(|turn_id| indexes.visible_user_turns.remove(&turn_id))
-                else {
-                    continue;
-                };
-                remove_projected_item(index, &mut items, &mut indexes);
+                if let Some(turn_id) = event.turn_id {
+                    indexes.pending_user_turns.remove(&turn_id);
+                }
             }
             RuntimeEventType::ProviderStreamed => {
                 let Some(delta) = provider_stream_text_delta(event) else {
@@ -1920,6 +1914,7 @@ pub(crate) fn user_event_transcript_item(event: &RuntimeEvent) -> Option<Transcr
         .payload
         .get("payload")
         .and_then(|payload| payload.get("prompt"))
+        .or_else(|| event.payload.get("prompt"))
         .and_then(Value::as_str)
         .filter(|prompt| !prompt.trim().is_empty())
         .map(|prompt| TranscriptItem {

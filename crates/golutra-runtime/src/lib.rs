@@ -1164,9 +1164,14 @@ impl PendingTurnQueue {
                 if !state.accepting {
                     return None;
                 }
-                match state.turns.front() {
+                let next = state
+                    .turns
+                    .iter()
+                    .position(|entry| entry.turn.turn.steer)
+                    .unwrap_or(0);
+                match state.turns.get(next) {
                     Some(entry) if entry.durable => {
-                        state.turns.pop_front().map(|entry| TakenPendingTurn {
+                        state.turns.remove(next).map(|entry| TakenPendingTurn {
                             turn: entry.turn,
                             execution_origin: entry.execution_origin,
                         })
@@ -1185,20 +1190,27 @@ impl PendingTurnQueue {
         }
     }
 
-    fn try_take_steer(&self) -> Option<TakenPendingTurn> {
+    fn take_ready_steers(&self) -> VecDeque<TakenPendingTurn> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match state.turns.front() {
-            Some(entry) if entry.durable && entry.turn.turn.steer => {
-                state.turns.pop_front().map(|entry| TakenPendingTurn {
+        let mut ready = VecDeque::new();
+        if !state.accepting {
+            return ready;
+        }
+        while let Some(index) = state.turns.iter().position(|entry| entry.turn.turn.steer) {
+            if !state.turns[index].durable {
+                break;
+            }
+            if let Some(entry) = state.turns.remove(index) {
+                ready.push_back(TakenPendingTurn {
                     turn: entry.turn,
                     execution_origin: entry.execution_origin,
-                })
+                });
             }
-            _ => None,
         }
+        ready
     }
 
     fn close(&self) {
@@ -1660,12 +1672,12 @@ where
         let compaction_limit = active_working_set_soft_limit(plan.budget_snapshot.budget_limit)
             .unwrap_or(plan.budget_snapshot.budget_limit);
         let mut turn_state = TurnState::new(current_turn_id);
-        let mut pending_turn_at_boundary: Option<TakenPendingTurn> = None;
+        let mut pending_turn_at_boundary = VecDeque::<TakenPendingTurn>::new();
 
         'completion_cycle: loop {
             let mut candidate_complete = false;
             'agent_loop: loop {
-                if let Some(taken_turn) = pending_turn_at_boundary.take() {
+                while let Some(taken_turn) = pending_turn_at_boundary.pop_front() {
                     let execution_origin = taken_turn.execution_origin;
                     let configured_turn = taken_turn.turn;
                     let pending_execution = configured_turn.execution;
@@ -2226,7 +2238,12 @@ where
                             elapsed_millis(current_turn_started_at),
                             &mut trace,
                         );
-                        pending_turn_at_boundary = Some(pending_turn);
+                        let is_steer = pending_turn.turn.turn.steer;
+                        pending_turn_at_boundary.push_back(pending_turn);
+                        if is_steer {
+                            pending_turn_at_boundary
+                                .extend(control.pending_turns.take_ready_steers());
+                        }
                         continue;
                     }
                     let step_completion = finish_runtime_step_with_material_progress(
@@ -3144,8 +3161,8 @@ where
                     elapsed_millis(current_turn_started_at),
                     &mut trace,
                 );
-                if let Some(pending_turn) = control.pending_turns.try_take_steer() {
-                    pending_turn_at_boundary = Some(pending_turn);
+                pending_turn_at_boundary = control.pending_turns.take_ready_steers();
+                if !pending_turn_at_boundary.is_empty() {
                     continue;
                 }
                 if !deadline_advisory_emitted

@@ -62,8 +62,7 @@ use golutra_runtime::{
 };
 use golutra_store::{CommandClaim, RuntimeRepositories, RuntimeStore, StoreError, ThreadRecord};
 use golutra_tools::{
-    FileBeforeImage, HttpWebSearchBackend, ProcessSupervisor, ToolRequest, ToolRuntime,
-    discover_project_verifiers,
+    FileBeforeImage, ProcessSupervisor, ToolRequest, ToolRuntime, discover_project_verifiers,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -435,7 +434,6 @@ struct RuntimeHostExecutionState {
     active_work_notify: Notify,
     rollout_threads: Mutex<HashMap<SessionId, Arc<ThreadRecord>>>,
     provider_auth_waiters: Mutex<HashMap<SessionId, PendingProviderAuth>>,
-    web_search_backend: std::sync::OnceLock<Result<Option<Arc<HttpWebSearchBackend>>, String>>,
     process_supervisor: ProcessSupervisor,
     workspace_change_tracker: Mutex<change_tracker::WorkspaceChangeTracker>,
     rollout_projection_failures: Mutex<HashMap<SessionId, String>>,
@@ -1789,7 +1787,6 @@ impl RuntimeHost {
                 active_work_notify: Notify::new(),
                 rollout_threads: Mutex::new(HashMap::new()),
                 provider_auth_waiters: Mutex::new(HashMap::new()),
-                web_search_backend: std::sync::OnceLock::new(),
                 process_supervisor: ProcessSupervisor::new(),
                 workspace_change_tracker: Mutex::new(
                     change_tracker::WorkspaceChangeTracker::default(),

@@ -3,12 +3,15 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
-    ffi::{OsStr, OsString},
+    ffi::OsString,
     path::{Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+mod environment;
+pub use environment::is_internal_environment_variable;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -47,6 +50,10 @@ pub struct SandboxLaunch {
 
 #[derive(Debug, Error)]
 pub enum SandboxError {
+    #[error(
+        "invalid GOLUTRA_SHELL_ENVIRONMENT_POLICY: expected inherit (all/core/none), exclude and include_only with exact environment names"
+    )]
+    InvalidEnvironmentPolicy,
     #[error("sandbox working directory is invalid: {0}")]
     InvalidWorkingDirectory(String),
     #[error("sandbox scratch directory is invalid: {0}")]
@@ -114,7 +121,7 @@ impl SystemSandbox {
             .iter()
             .map(|path| canonical_directory(path, false))
             .collect::<Result<Vec<_>, _>>()?;
-        let environment = sanitized_environment(&request.scratch_dir, request.allow_network);
+        let environment = sanitized_environment(&request.scratch_dir)?;
         match self.backend {
             SandboxBackendKind::MacOsSeatbelt => self.plan_macos(&request, environment),
             SandboxBackendKind::LinuxBubblewrap => self.plan_linux(&request, environment),
@@ -212,11 +219,6 @@ impl SystemSandbox {
         args.push(request.scratch_dir.clone().into_os_string());
         args.push("--chdir".into());
         args.push(request.cwd.clone().into_os_string());
-        for (key, value) in &environment {
-            args.push("--setenv".into());
-            args.push(key.clone());
-            args.push(value.clone());
-        }
         args.push("--".into());
         args.push(request.program.clone());
         args.extend(request.args.clone());
@@ -230,7 +232,7 @@ impl SystemSandbox {
                 .expect("detected launcher")
                 .into_os_string(),
             args,
-            environment: BTreeMap::new(),
+            environment,
         })
     }
 }
@@ -258,10 +260,8 @@ fn canonical_directory(path: &Path, working_directory: bool) -> Result<PathBuf, 
     }
 }
 
-fn sanitized_environment(scratch_dir: &Path, allow_network: bool) -> BTreeMap<OsString, OsString> {
-    let mut values = env::vars_os()
-        .filter(|(key, _)| environment_key_allowed_for_network(key, allow_network))
-        .collect::<BTreeMap<_, _>>();
+fn sanitized_environment(scratch_dir: &Path) -> Result<BTreeMap<OsString, OsString>, SandboxError> {
+    let mut values = environment::inherited_environment(env::vars_os())?;
     for (key, value) in [
         ("NO_COLOR", "1"),
         ("TERM", "dumb"),
@@ -277,60 +277,7 @@ fn sanitized_environment(scratch_dir: &Path, allow_network: bool) -> BTreeMap<Os
     values.insert(OsString::from("TMPDIR"), scratch_dir.as_os_str().to_owned());
     values.insert(OsString::from("TMP"), scratch_dir.as_os_str().to_owned());
     values.insert(OsString::from("TEMP"), scratch_dir.as_os_str().to_owned());
-    values
-}
-
-#[cfg(test)]
-fn environment_key_allowed(key: &OsStr) -> bool {
-    environment_key_allowed_for_network(key, false)
-}
-
-fn environment_key_allowed_for_network(key: &OsStr, allow_network: bool) -> bool {
-    let key = key.to_string_lossy().to_ascii_uppercase();
-    if [
-        "KEY",
-        "TOKEN",
-        "SECRET",
-        "PASSWORD",
-        "CREDENTIAL",
-        "AUTHORIZATION",
-    ]
-    .iter()
-    .any(|fragment| key.contains(fragment))
-    {
-        return false;
-    }
-    if allow_network
-        && matches!(
-            key.as_str(),
-            "HTTP_PROXY" | "HTTPS_PROXY" | "ALL_PROXY" | "NO_PROXY"
-        )
-    {
-        return true;
-    }
-    matches!(
-        key.as_str(),
-        "PATH"
-            | "HOME"
-            | "USER"
-            | "LOGNAME"
-            | "SHELL"
-            | "LANG"
-            | "LC_ALL"
-            | "LC_CTYPE"
-            | "TERM"
-            | "COLORTERM"
-            | "NO_COLOR"
-            | "CARGO_HOME"
-            | "RUSTUP_HOME"
-            | "RUSTC"
-            | "RUSTDOC"
-            | "CC"
-            | "CXX"
-            | "AR"
-            | "SDKROOT"
-            | "MACOSX_DEPLOYMENT_TARGET"
-    )
+    Ok(values)
 }
 
 fn readable_roots(cwd: &Path) -> Vec<PathBuf> {
@@ -442,6 +389,7 @@ fn find_on_path(program: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     #[cfg(target_os = "macos")]
     use std::process::{Command, Output};
 
@@ -457,20 +405,6 @@ mod tests {
             .envs(plan.environment)
             .output()
             .expect("sandboxed command")
-    }
-
-    #[test]
-    fn sensitive_environment_names_are_never_forwarded() {
-        assert!(!environment_key_allowed(OsStr::new("OPENAI_API_KEY")));
-        assert!(!environment_key_allowed(OsStr::new("GITHUB_TOKEN")));
-        assert!(!environment_key_allowed(OsStr::new("DATABASE_PASSWORD")));
-        assert!(environment_key_allowed(OsStr::new("PATH")));
-        assert!(environment_key_allowed(OsStr::new("RUSTUP_HOME")));
-        assert!(!environment_key_allowed(OsStr::new("HTTPS_PROXY")));
-        assert!(environment_key_allowed_for_network(
-            OsStr::new("HTTPS_PROXY"),
-            true
-        ));
     }
 
     #[test]
@@ -662,6 +596,42 @@ mod tests {
             .expect("network plan");
         assert!(!execute(network, workspace.path()).status.success());
         assert!(!server.join().expect("server thread"));
+    }
+
+    #[test]
+    fn linux_launch_passes_environment_without_copying_values_into_arguments() {
+        let workspace = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let sandbox = SystemSandbox {
+            backend: SandboxBackendKind::LinuxBubblewrap,
+            launcher: Some(PathBuf::from("/usr/bin/bwrap")),
+        };
+        let variables = BTreeMap::from([(
+            OsString::from("GOLUTRA_COMMAND_SCOPE_TOKEN"),
+            OsString::from("fixture-private-value"),
+        )]);
+        let plan = sandbox
+            .plan_linux(
+                &SandboxRequest {
+                    program: "/bin/echo".into(),
+                    args: vec!["ok".into()],
+                    cwd: workspace.path().to_path_buf(),
+                    workspace_root: workspace.path().to_path_buf(),
+                    scratch_dir: scratch.path().to_path_buf(),
+                    read_only_roots: Vec::new(),
+                    workspace_access: WorkspaceAccess::ReadOnly,
+                    allow_network: false,
+                },
+                variables.clone(),
+            )
+            .unwrap();
+        assert_eq!(plan.environment, variables);
+        assert!(
+            !plan
+                .args
+                .iter()
+                .any(|arg| arg == "fixture-private-value" || arg == "--setenv")
+        );
     }
 
     #[cfg(target_os = "linux")]

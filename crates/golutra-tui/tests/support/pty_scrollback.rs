@@ -58,6 +58,7 @@ struct FixtureServer {
     url: String,
     stopped: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
+    requests: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
 }
 
 impl FixtureServer {
@@ -76,6 +77,8 @@ impl FixtureServer {
         listener.set_nonblocking(true).unwrap();
         let stopped = Arc::new(AtomicBool::new(false));
         let flag = stopped.clone();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = requests.clone();
         let worker = thread::spawn(move || {
             let mut responses = responses.into_iter();
             while !flag.load(Ordering::Relaxed) {
@@ -115,6 +118,11 @@ impl FixtureServer {
                         }
                     }
                 }
+                if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                    && let Ok(body) = serde_json::from_slice(&request[end + 4..])
+                {
+                    captured.lock().unwrap().push(body);
+                }
                 let (content, calls) = responses
                     .next()
                     .unwrap_or_else(|| ("FIXTURE_DONE".to_owned(), Vec::new()));
@@ -151,6 +159,7 @@ impl FixtureServer {
             url,
             stopped,
             worker: Some(worker),
+            requests,
         }
     }
 
@@ -451,6 +460,71 @@ fn screen_row(parser: &ScreenModel, marker: &str) -> usize {
         .unwrap_or_else(|| panic!("missing {marker}:\n{}", parser.screen().contents()))
 }
 
+fn wait_for_visible(pty: &mut PtyHarness, parser: &mut ScreenModel, marker: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !parser.screen().contents().contains(marker) && Instant::now() < deadline {
+        parser.process(&pty.collect_for(Duration::from_millis(50)));
+    }
+    assert!(
+        parser.screen().contents().contains(marker),
+        "missing {marker}:\n{}",
+        parser.screen().contents()
+    );
+}
+
+#[test]
+fn pending_inputs_move_from_preview_to_history_for_tab_and_enter() {
+    for (key, preview) in [
+        (b'\t', "Queued follow-up inputs"),
+        (b'\r', "Pending current-turn inputs"),
+    ] {
+        let home = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let content = format!(
+            "FIRST_REPLY_BEGIN\n{}\nFIRST_REPLY_END",
+            "Streaming previous reply.\n".repeat(250)
+        );
+        let server = FixtureServer::new(vec![content, "SECOND_REPLY_DONE".to_owned()]);
+        server.install(home.path());
+        let mut pty = PtyHarness::spawn_configured(home.path(), workspace.path(), 100, 26, true);
+        let mut parser = ScreenModel::new(26, 100);
+        parser.process(&pty.collect_until(b"Ask Golutra", Duration::from_secs(8)));
+        submit(&mut pty, &mut parser, "first request");
+        wait_for_visible(&mut pty, &mut parser, "FIRST_REPLY_BEGIN");
+        pty.write(b"hi");
+        parser.process(&pty.collect_for(Duration::from_millis(150)));
+        pty.write(&[key]);
+        wait_for_visible(&mut pty, &mut parser, preview);
+        let screen = parser.screen().contents();
+        assert!(screen.contains("↳ hi"), "{screen}");
+        assert!(
+            screen.find("↳ hi").unwrap() < screen.find("› Ask Golutra").unwrap(),
+            "{screen}"
+        );
+        assert!(!all_terminal_rows(&mut parser).contains("› hi"));
+        wait_for_visible(&mut pty, &mut parser, "SECOND_REPLY_DONE");
+        parser.process(&pty.collect_for(Duration::from_millis(250)));
+        let text = all_terminal_rows(&mut parser);
+        assert_once_in_order(
+            &text,
+            &[
+                "› first request".into(),
+                "FIRST_REPLY_BEGIN".into(),
+                "FIRST_REPLY_END".into(),
+                "› hi".into(),
+                "SECOND_REPLY_DONE".into(),
+            ],
+        );
+        assert!(
+            !text.contains(preview),
+            "preview must not enter scrollback: {text}"
+        );
+        assert!(!parser.screen().alternate_screen());
+        submit(&mut pty, &mut parser, "/quit");
+        assert!(pty.wait().1.success());
+    }
+}
+
 fn visible_screen_rows(parser: &ScreenModel) -> Vec<String> {
     // VT 将显式写入的空格与擦除后的空格区别保存；比较显示内容和行位置，忽略行尾编码差异。
     parser
@@ -458,6 +532,120 @@ fn visible_screen_rows(parser: &ScreenModel) -> Vec<String> {
         .rows(0, parser.screen().size().1)
         .map(|line| line.trim_end().to_owned())
         .collect()
+}
+
+#[test]
+fn queued_tasks_and_current_turn_supplements_use_distinct_provider_batches() {
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let server = FixtureServer::new(vec![
+        format!(
+            "BATCH_START\n{}\nBATCH_END",
+            "Original response still streaming.\n".repeat(350)
+        ),
+        "STEERS_HANDLED".into(),
+        "FOLLOW_ONE_HANDLED".into(),
+        "FOLLOW_TWO_HANDLED".into(),
+    ]);
+    server.install(home.path());
+    let mut pty = PtyHarness::spawn_configured(home.path(), workspace.path(), 100, 26, true);
+    let mut parser = ScreenModel::new(26, 100);
+    parser.process(&pty.collect_until(b"Ask Golutra", Duration::from_secs(8)));
+    submit(&mut pty, &mut parser, "begin");
+    wait_for_visible(&mut pty, &mut parser, "BATCH_START");
+    for (text, key) in [
+        ("FOLLOW_ONE", b'\t'),
+        ("FOLLOW_TWO", b'\t'),
+        ("STEER_ONE", b'\r'),
+        ("STEER_TWO", b'\r'),
+    ] {
+        pty.write(text.as_bytes());
+        parser.process(&pty.collect_for(Duration::from_millis(150)));
+        pty.write(&[key]);
+        wait_for_visible(&mut pty, &mut parser, &format!("↳ {text}"));
+    }
+    wait_for_visible(&mut pty, &mut parser, "FOLLOW_TWO_HANDLED");
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    let markers = |index: usize| {
+        requests[index]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "user")
+            .filter_map(|message| message["content"].as_str())
+            .filter(|text| text.starts_with("STEER_") || text.starts_with("FOLLOW_"))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(markers(1), vec!["STEER_ONE", "STEER_TWO"]);
+    assert_eq!(markers(2), vec!["STEER_ONE", "STEER_TWO", "FOLLOW_ONE"]);
+    assert_eq!(
+        markers(3),
+        vec!["STEER_ONE", "STEER_TWO", "FOLLOW_ONE", "FOLLOW_TWO"]
+    );
+    drop(requests);
+    parser.process(&pty.collect_for(Duration::from_millis(250)));
+    let text = all_terminal_rows(&mut parser);
+    assert_once_in_order(
+        &text,
+        &[
+            "› STEER_ONE".into(),
+            "› STEER_TWO".into(),
+            "STEERS_HANDLED".into(),
+            "› FOLLOW_ONE".into(),
+            "FOLLOW_ONE_HANDLED".into(),
+            "› FOLLOW_TWO".into(),
+            "FOLLOW_TWO_HANDLED".into(),
+        ],
+    );
+    submit(&mut pty, &mut parser, "/quit");
+    assert!(pty.wait().1.success());
+}
+
+#[test]
+fn interrupt_sends_pending_supplements_once_as_one_message_and_preserves_draft() {
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let server = FixtureServer::new(vec![
+        format!(
+            "INTERRUPT_START\n{}",
+            "Waiting for a user correction.\n".repeat(500)
+        ),
+        "RECOVERY_DONE".into(),
+    ]);
+    server.install(home.path());
+    let mut pty = PtyHarness::spawn_configured(home.path(), workspace.path(), 100, 26, true);
+    let mut parser = ScreenModel::new(26, 100);
+    parser.process(&pty.collect_until(b"Ask Golutra", Duration::from_secs(8)));
+    submit(&mut pty, &mut parser, "begin");
+    wait_for_visible(&mut pty, &mut parser, "INTERRUPT_START");
+    for text in ["STEER_FIRST", "STEER_SECOND"] {
+        pty.write(text.as_bytes());
+        parser.process(&pty.collect_for(Duration::from_millis(150)));
+        pty.write(b"\r");
+        wait_for_visible(&mut pty, &mut parser, &format!("↳ {text}"));
+    }
+    pty.write(b"draft keep");
+    parser.process(&pty.collect_for(Duration::from_millis(150)));
+    pty.write(b"\x1b");
+    wait_for_visible(&mut pty, &mut parser, "RECOVERY_DONE");
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["role"] == "user"
+                && message["content"] == "STEER_FIRST\nSTEER_SECOND")
+    );
+    assert!(!requests[1].to_string().contains("draft keep"));
+    drop(requests);
+    assert!(parser.screen().contents().contains("› draft keep"));
+    pty.write(b"\x15");
+    parser.process(&pty.collect_for(Duration::from_millis(150)));
+    submit(&mut pty, &mut parser, "/quit");
+    assert!(pty.wait().1.success());
 }
 
 #[test]
@@ -484,11 +672,9 @@ fn streaming_with_suggestions_and_status_preserves_every_message_once() {
     }
     assert!(!all_terminal_rows(&mut parser).contains("POPUP_STREAM_DONE"));
     pty.write(b"/");
-    parser.process(&pty.collect_for(Duration::from_millis(200)));
-    assert!(parser.screen().contents().contains("/resume"));
+    wait_for_visible(&mut pty, &mut parser, "/resume");
     pty.write(b"st\t");
-    parser.process(&pty.collect_for(Duration::from_millis(150)));
-    assert!(parser.screen().contents().contains("› /status"));
+    wait_for_visible(&mut pty, &mut parser, "› /status");
     assert!(!all_terminal_rows(&mut parser).contains("• Status"));
     pty.write(b"\r");
     parser.process(&pty.collect_for(Duration::from_secs(7)));

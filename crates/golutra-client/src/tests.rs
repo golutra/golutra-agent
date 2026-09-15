@@ -735,7 +735,9 @@ fn system_prompt_preserves_general_autonomy_and_verification_principles() {
         "never change them after terminal",
         "Follow project conventions",
         "verify by risk",
-        "one bounded wait for terminal state",
+        "same background process",
+        "external request IDs are not process IDs",
+        "inspect CLI output for business status",
         "blockers concisely",
         "consequential ambiguity",
     ] {

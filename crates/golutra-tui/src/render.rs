@@ -177,11 +177,7 @@ fn bottom_pane_height_parts(app: &TuiApp, width: u16, include_popups: bool) -> u
         || app.history_search.is_some();
     let popup = completion_popup_layout(app, width);
     let popup_rows = if include_popups { popup.height() } else { 0 };
-    let queued_rows = if composer_suppressed {
-        0
-    } else {
-        queued_prompts(&app.events).len().min(3) as u16
-    };
+    let queued_rows = pending_input::preview_lines(app, width).len() as u16;
     let attachment_rows = u16::from(!composer_suppressed && !app.attachments.is_empty());
     let overlay_rows = u16::from(app.overlay_surface().is_some());
     let provider_rows = u16::from(!popup.active() && provider_footer_line(app).is_some());
@@ -2811,7 +2807,6 @@ pub(crate) fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
                 usize::from(area.width),
             ));
         }
-        lines.extend(queued_prompt_lines(app, usize::from(area.width)));
     }
     if let Some(provider_line) = provider_footer_line(app).filter(|_| !popup.active()) {
         lines.push(Line::from(Span::styled(
@@ -2854,6 +2849,31 @@ pub(crate) fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
     } else {
         area
     };
+    let preview_height = pending_input::visible_height(app, area.width, area.height);
+    if preview_height > 0 {
+        let mut preview = pending_input::preview_lines(app, area.width);
+        if preview.len() > usize::from(preview_height) {
+            preview.truncate(usize::from(preview_height));
+            if let Some(last) = preview.last_mut() {
+                *last = Line::from("  …");
+            }
+        }
+        frame.render_widget(
+            Paragraph::new(preview),
+            Rect::new(
+                composer_area.x,
+                composer_area.y,
+                composer_area.width,
+                preview_height,
+            ),
+        );
+    }
+    let composer_area = Rect::new(
+        composer_area.x,
+        composer_area.y.saturating_add(preview_height),
+        composer_area.width,
+        composer_area.height.saturating_sub(preview_height),
+    );
     let paragraph = Paragraph::new(lines).block(Block::default().borders(Borders::TOP));
     frame.render_widget(paragraph, composer_area);
     if let Some((x, y)) = composer_cursor_position(area, app) {
@@ -2905,6 +2925,7 @@ pub(crate) fn composer_cursor_position(area: Rect, app: &TuiApp) -> Option<(u16,
                 area.y
                     .saturating_add(1)
                     .saturating_add(activity_rows)
+                    .saturating_add(pending_input::visible_height(app, area.width, area.height))
                     .saturating_add(viewport.cursor.1)
                     .min(area.bottom().saturating_sub(1)),
             ));
@@ -3113,28 +3134,6 @@ fn attachment_line(
             Style::default().fg(palette.subtle),
         ),
     ])
-}
-
-fn queued_prompt_lines(app: &TuiApp, max_width: usize) -> Vec<Line<'static>> {
-    let palette = app.palette();
-    queued_prompts(&app.events)
-        .into_iter()
-        .take(3)
-        .enumerate()
-        .map(|(index, queued)| {
-            let mode = if queued.steer { "steer" } else { "queued" };
-            Line::from(vec![
-                Span::styled(
-                    format!("  {} {}  ", index + 1, mode),
-                    Style::default().fg(palette.warning),
-                ),
-                Span::styled(
-                    truncate_end_to_width(&queued.prompt, max_width.saturating_sub(14)),
-                    Style::default().fg(palette.subtle),
-                ),
-            ])
-        })
-        .collect()
 }
 
 pub(crate) fn auth_composer_line(dialog: &AuthDialogState) -> String {

@@ -114,10 +114,13 @@ pub(crate) fn help_lines(topic: HelpTopic, keymap: KeymapMode, context: &str) ->
             "Alt+C / Ctrl+C   copy selected text in tool details".to_owned(),
         ],
         HelpTopic::Runtime => vec![
-            "Ctrl+Enter       steer an active task".to_owned(),
-            "Esc              interrupt an active task".to_owned(),
+            "Enter            send or steer an active task".to_owned(),
+            "Tab              queue a follow-up (when no completion is open)".to_owned(),
+            "Ctrl+Enter       steer an active task (alias)".to_owned(),
+            "Esc              interrupt; send pending current-turn inputs now".to_owned(),
             "Ctrl+C twice     interrupt, then leave the TUI".to_owned(),
             "Alt+Q            edit or cancel queued prompts".to_owned(),
+            "Alt+Up           edit the last queued prompt from an empty composer".to_owned(),
             "Alt+P            runtime dashboard".to_owned(),
             "/pause           pause an active task".to_owned(),
             "/continue        resume a paused task".to_owned(),
@@ -141,13 +144,13 @@ pub(crate) fn help_lines(topic: HelpTopic, keymap: KeymapMode, context: &str) ->
 
 fn composer_help_lines(keymap: KeymapMode) -> Vec<String> {
     let mut lines = vec![
-        "Enter             submit prompt".to_owned(),
         "/                 show command suggestions".to_owned(),
         "Up/Down           select a command suggestion".to_owned(),
-        "Tab               complete selected command without running it".to_owned(),
+        "Tab               complete a suggestion, otherwise queue a follow-up".to_owned(),
         "Esc               close suggestions and keep the draft".to_owned(),
         "Shift+Enter       insert newline".to_owned(),
-        "Ctrl+Enter        steer active task".to_owned(),
+        "Enter             send or steer active task; Ctrl+Enter also steers".to_owned(),
+        "Alt+Up            edit last queued prompt from an empty composer".to_owned(),
         "Ctrl+A / Ctrl+E   start / end".to_owned(),
         "Alt+B / Alt+F     previous / next word".to_owned(),
         "Ctrl+W            delete previous word".to_owned(),

@@ -9,6 +9,9 @@ use std::{
     time::Duration,
 };
 
+#[path = "pending_batch_tests.rs"]
+mod pending_batch_tests;
+
 use golutra_context::{
     ContextBudgetPolicy, ContextBuilder, ContextContributor, ContextMessageSource,
     ContextWindowManager, estimate_message_tokens, estimate_tokens,
@@ -2643,7 +2646,7 @@ async fn pending_turn_queue_closes_atomically_when_the_loop_becomes_idle() {
 }
 
 #[tokio::test]
-async fn steering_take_is_non_closing_and_preserves_fifo_order() {
+async fn steering_take_bypasses_followups_and_keeps_queue_open() {
     let (handle, control) = agent_execution_channel(3);
     let follow_up = PendingAgentTurn {
         command_id: CommandId::new(),
@@ -2674,12 +2677,14 @@ async fn steering_take_is_non_closing_and_preserves_fifo_order() {
         .await
         .expect("steer queues");
 
-    assert!(control.pending_turns.try_take_steer().is_none());
+    let mut steers = control.pending_turns.take_ready_steers();
+    assert_eq!(steers.len(), 1);
+    assert_legacy_taken_turn(steers.pop_front(), steer);
     assert_legacy_taken_turn(
         control.pending_turns.take_or_close().await,
         follow_up.clone(),
     );
-    assert_legacy_taken_turn(control.pending_turns.try_take_steer(), steer);
+    assert!(control.pending_turns.take_ready_steers().is_empty());
 
     let late = PendingAgentTurn {
         command_id: CommandId::new(),
@@ -6221,7 +6226,7 @@ fn parallel_read_candidate_enforces_the_active_tool_profile() {
             .iter()
             .any(|tool| tool.tool_name == "external_hidden_read")
     );
-    assert_eq!(coding_tools.len(), 8);
+    assert_eq!(coding_tools.len(), 7);
 
     let none_tools = provider_tools_for_turn(
         &executor
@@ -6256,7 +6261,6 @@ fn coding_tool_surface_is_stable_across_objectives() {
         "write_file",
         "apply_patch",
         "shell_session",
-        "web_search",
         "subagent",
     ];
     let selected = provider_tools_for_turn(
@@ -6304,7 +6308,11 @@ fn coding_tool_surface_is_stable_across_objectives() {
         executor.registry(),
         "an ambiguous coding task",
     );
-    assert!(full.iter().any(|tool| tool.tool_name == "web_search"));
+    assert!(
+        !full
+            .iter()
+            .any(|tool| matches!(tool.tool_name.as_str(), "web_search" | "golutra_web_search"))
+    );
     assert!(full.iter().any(|tool| tool.tool_name == "subagent"));
     assert!(full.iter().any(|tool| tool.tool_name == "shell_session"));
 }
@@ -6328,7 +6336,7 @@ fn coding_tool_surface_retains_declared_capabilities_without_keyword_matching() 
         executor.registry(),
         "implement the task and keep the code maintainable",
     );
-    assert_eq!(generic.len(), 8);
+    assert_eq!(generic.len(), 7);
 
     let long_task = provider_tools_for_turn(
         &all_tools,
@@ -6337,7 +6345,7 @@ fn coding_tool_surface_retains_declared_capabilities_without_keyword_matching() 
         executor.registry(),
         "complete this long-running task and keep the code maintainable",
     );
-    assert_eq!(long_task.len(), 8);
+    assert_eq!(long_task.len(), 7);
 
     let explicit = provider_tools_for_turn(
         &all_tools,
@@ -6346,7 +6354,7 @@ fn coding_tool_surface_retains_declared_capabilities_without_keyword_matching() 
         executor.registry(),
         "run the test suite as a background process and wait for the process state",
     );
-    assert_eq!(explicit.len(), 8);
+    assert_eq!(explicit.len(), 7);
 
     let server = provider_tools_for_turn(
         &all_tools,
@@ -6355,7 +6363,7 @@ fn coding_tool_surface_retains_declared_capabilities_without_keyword_matching() 
         executor.registry(),
         "start a long-running server and wait for the process state",
     );
-    assert_eq!(server.len(), 8);
+    assert_eq!(server.len(), 7);
 
     let read_only = provider_tools_for_turn(
         &all_tools,
@@ -6390,7 +6398,7 @@ fn stable_tool_surface_expands_once_and_does_not_shrink_with_objective_text() {
         executor.registry(),
         "update the ledger files",
     );
-    assert_eq!(initial.len(), 8);
+    assert_eq!(initial.len(), 7);
 
     let expanded_candidate = provider_tools_for_turn(
         &all_tools,
@@ -6407,7 +6415,7 @@ fn stable_tool_surface_expands_once_and_does_not_shrink_with_objective_text() {
         executor.registry(),
         true,
     );
-    assert_eq!(expanded.len(), 8);
+    assert_eq!(expanded.len(), 7);
     let expanded_digest = provider_tool_snapshot(&expanded).2;
 
     let narrowed_candidate = provider_tools_for_turn(
@@ -6425,7 +6433,7 @@ fn stable_tool_surface_expands_once_and_does_not_shrink_with_objective_text() {
         executor.registry(),
         true,
     );
-    assert_eq!(retained.len(), 8);
+    assert_eq!(retained.len(), 7);
     assert_eq!(provider_tool_snapshot(&retained).2, expanded_digest);
 
     let forbidden = TaskContract {

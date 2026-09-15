@@ -1264,6 +1264,18 @@ fn ensure_driver_binding_allows_key(
     let Some(task_id) = task_id else {
         return Ok(());
     };
+    if matches!(key, DriverKey::Tab)
+        && driver_enter_reaches_composer(app)
+        && app.mention_completion.is_none()
+        && app.slash_candidates().is_empty()
+        && app.editing_queued_turn.is_none()
+        && matches!(
+            parse_slash_input(&app.input.trimmed()),
+            SlashInput::Prompt(_)
+        )
+    {
+        return ensure_task_binding_accepts_no_prompt(Some(task_id));
+    }
     if matches!(key, DriverKey::CtrlC) {
         return ensure_task_binding_accepts_no_control(Some(task_id), "key control");
     }

@@ -449,6 +449,11 @@ fn inject_declared_environment(
     plugin: &EnabledPlugin,
 ) -> Result<(), McpError> {
     for name in &plugin.manifest.server.env {
+        if golutra_sandbox::is_internal_environment_variable(name) {
+            return Err(McpError::Configuration(format!(
+                "internal environment variable `{name}` cannot be passed to plugins"
+            )));
+        }
         let value = env::var_os(name).ok_or_else(|| {
             McpError::Configuration(format!(
                 "required plugin environment variable `{name}` is not set"

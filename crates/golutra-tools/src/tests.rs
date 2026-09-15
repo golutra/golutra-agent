@@ -14,6 +14,10 @@ use tokio::process::Command;
 use super::*;
 use crate::builtin::contract;
 
+#[cfg(unix)]
+#[path = "shell_integration_tests.rs"]
+mod shell_integration_tests;
+
 #[test]
 fn shell_timeout_contract_honors_long_foreground_requests() {
     let requested = 120_000_u64;
@@ -235,6 +239,21 @@ impl TaskDelegationBackend for FakeTaskDelegationBackend {
 }
 
 #[tokio::test]
+async fn removed_web_search_is_unregistered_even_with_network_access() {
+    let workspace = tempdir().expect("workspace");
+    let executor = executor(workspace.path()).with_network_access(true);
+    for tool_name in ["web_search", "golutra_web_search"] {
+        let result = executor
+            .execute(
+                request(tool_name, json!({"query": "Rust documentation"})),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(result, Err(ToolError::UnknownTool(name)) if name == tool_name));
+    }
+}
+
+#[tokio::test]
 async fn registry_contains_p0_tools() {
     let registry = ToolRegistry::p0_default();
     let names = registry
@@ -252,11 +271,13 @@ async fn registry_contains_p0_tools() {
             "write_file",
             "apply_patch",
             "shell_session",
-            "web_search",
             "subagent",
         ]
     );
     assert!(registry.contract("list_dir").is_some());
+    assert!(registry.contract("web_search").is_none());
+    assert!(registry.contract("golutra_web_search").is_none());
+    assert!(BuiltinTool::from_name("web_search").is_none());
     assert!(registry.provider_contracts().iter().all(|contract| {
         !matches!(
             contract.tool_name.as_str(),

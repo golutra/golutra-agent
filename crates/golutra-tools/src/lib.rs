@@ -103,7 +103,6 @@ mod process;
 mod process_supervisor;
 mod project_verifier;
 mod text_search;
-mod web_search;
 mod workspace_scan;
 
 pub(crate) use process::{
@@ -119,19 +118,17 @@ pub(crate) use process_supervisor::{
     default_start_wait_ms, max_poll_wait_ms,
 };
 pub use project_verifier::{DiscoveredProjectVerifier, discover_project_verifiers};
-pub use web_search::HttpWebSearchBackend;
 
 use builtin::BuiltinTool;
 
 /// 面向 provider 的稳定契约，保持默认模型工具面足够小。
-pub const PI_PLUS_TOOL_NAMES: [&str; 8] = [
+pub const PI_PLUS_TOOL_NAMES: [&str; 7] = [
     "read_file",
     "shell",
     "edit_file",
     "write_file",
     "apply_patch",
     "shell_session",
-    "web_search",
     "subagent",
 ];
 
@@ -291,16 +288,6 @@ pub trait TaskDelegationBackend: std::fmt::Debug + Send + Sync {
         request: &ToolRequest,
         cancellation: CancellationToken,
     ) -> Result<TaskDelegationOutput, ToolError>;
-}
-
-/// 由宿主拥有的搜索适配器；替换具体 provider 时不改变 agent loop 的工具契约。
-#[async_trait]
-pub trait WebSearchBackend: std::fmt::Debug + Send + Sync {
-    async fn search(
-        &self,
-        request: &ToolRequest,
-        cancellation: CancellationToken,
-    ) -> Result<ExternalToolOutput, ToolError>;
 }
 
 #[async_trait]
@@ -528,7 +515,6 @@ pub struct ToolRuntime {
     sandbox: SystemSandbox,
     allow_network: bool,
     external_backend: Option<Arc<dyn ExternalToolBackend>>,
-    web_search_backend: Option<Arc<dyn WebSearchBackend>>,
     delegation_backend: Option<Arc<dyn TaskDelegationBackend>>,
     replay_backend: Option<Arc<dyn ToolReplayBackend>>,
     process_supervisor: ProcessSupervisor,
@@ -543,7 +529,6 @@ impl ToolRuntime {
             sandbox: (*DETECTED_SANDBOX).clone(),
             allow_network: false,
             external_backend: None,
-            web_search_backend: None,
             delegation_backend: None,
             replay_backend: None,
             process_supervisor: ProcessSupervisor::new(),
@@ -765,11 +750,6 @@ impl ToolRuntime {
     #[must_use]
     pub fn with_network_access(mut self, allow_network: bool) -> Self {
         self.allow_network = allow_network;
-        self
-    }
-
-    pub fn with_web_search_backend(mut self, backend: Arc<dyn WebSearchBackend>) -> Self {
-        self.web_search_backend = Some(backend);
         self
     }
 
@@ -1185,7 +1165,6 @@ impl ToolRuntime {
                     .filter(|workdir_policy| workdir_policy.decision != PolicyDecision::Allow)
                     .unwrap_or(shell_policy)
             }
-            Some(BuiltinTool::WebSearch) => web_search_policy(self.allow_network, request),
             Some(BuiltinTool::ShellSession) => process_control_policy(request),
             Some(BuiltinTool::ProcessList) => process_list_policy(request),
             Some(
@@ -1585,10 +1564,6 @@ impl ToolRuntime {
                             &mut progress,
                         )
                         .await
-                    }
-                    Some(BuiltinTool::WebSearch) => {
-                        self.web_search(request, policy, execution_cancellation.clone())
-                            .await
                     }
                     Some(BuiltinTool::ShellSession) => {
                         self.shell_session(
@@ -3334,46 +3309,6 @@ impl ToolRuntime {
             .await
     }
 
-    async fn web_search(
-        &self,
-        request: ToolRequest,
-        policy: PolicyEvaluation,
-        cancellation: CancellationToken,
-    ) -> Result<ToolExecutionReport, ToolError> {
-        let backend = self.web_search_backend.as_ref().ok_or_else(|| {
-            ToolError::Execution("web search backend is not configured".to_owned())
-        })?;
-        let result = tokio::select! {
-            () = cancellation.cancelled() => {
-                return Ok(cancelled_report_with_policy(
-                    request,
-                    policy,
-                    "web search cancelled",
-                ));
-            }
-            result = backend.search(&request, cancellation.clone()) => result,
-        }?;
-        let status = if result.is_error {
-            ToolResultStatus::Error
-        } else {
-            ToolResultStatus::Ok
-        };
-        let mut report = external_report(
-            request,
-            status,
-            &result.summary,
-            result.structured_facts,
-            result.content,
-            policy,
-        );
-        // 搜索结果已经在 structured_facts 中按字段保留，模型摘要不再重复回显原始 JSON。
-        report.envelope.model_visible_excerpt = Some(result.summary.clone());
-        report.envelope.risk = "web_search".to_owned();
-        report.envelope.verification_hint =
-            Some("web search output is external, time-sensitive evidence".to_owned());
-        Ok(report)
-    }
-
     async fn execute_external(
         &self,
         request: ToolRequest,
@@ -4609,22 +4544,6 @@ fn process_control_policy(request: &ToolRequest) -> PolicyEvaluation {
     policy
 }
 
-fn web_search_policy(allow_network: bool, request: &ToolRequest) -> PolicyEvaluation {
-    let decision = if allow_network {
-        PolicyDecision::Allow
-    } else {
-        PolicyDecision::Block
-    };
-    let reason = if allow_network {
-        "web search is enabled by the enclosing runtime"
-    } else {
-        "web search requires explicit network access"
-    };
-    let mut policy = execution_policy(request, decision, reason);
-    policy.resource = "web-search".to_owned();
-    policy
-}
-
 fn delegation_policy(request: &ToolRequest) -> PolicyEvaluation {
     let mut policy = execution_policy(
         request,
@@ -4992,6 +4911,7 @@ pub fn model_visible_tool_result_with_limit(
                 envelope.status != ToolResultStatus::Ok,
                 true,
             ),
+            // 已移除的内置搜索仍可存在于旧会话中；只保留结果投影，不重新注册执行能力。
             "web_search" => (
                 project_search_model_facts(&facts),
                 summary,

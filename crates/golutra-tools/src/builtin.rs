@@ -25,7 +25,6 @@ pub(super) enum BuiltinTool {
     FindReferences,
     AskUser,
     Shell,
-    WebSearch,
     ShellSession,
     Subagent,
     ProcessList,
@@ -38,13 +37,12 @@ pub(super) enum BuiltinTool {
 
 impl BuiltinTool {
     /// 稳定的 provider 工具面；其他变体仅供 runtime 内部或回放使用。
-    pub(super) const P0_DEFAULT: [Self; 8] = [
+    pub(super) const P0_DEFAULT: [Self; 7] = [
         Self::ReadFile,
         Self::WriteFile,
         Self::EditFile,
         Self::ApplyPatch,
         Self::Shell,
-        Self::WebSearch,
         Self::ShellSession,
         Self::Subagent,
     ];
@@ -75,7 +73,6 @@ impl BuiltinTool {
             "find_references" => Self::FindReferences,
             "ask_user" => Self::AskUser,
             "shell" => Self::Shell,
-            "web_search" => Self::WebSearch,
             "shell_session" => Self::ShellSession,
             "subagent" => Self::Subagent,
             "process_list" => Self::ProcessList,
@@ -100,7 +97,6 @@ impl BuiltinTool {
             Self::FindReferences => "find_references",
             Self::AskUser => "ask_user",
             Self::Shell => "shell",
-            Self::WebSearch => "web_search",
             Self::ShellSession => "shell_session",
             Self::Subagent => "subagent",
             Self::ProcessList => "process_list",
@@ -121,7 +117,6 @@ impl BuiltinTool {
             | Self::ProcessWrite
             | Self::ProcessTerminate
             | Self::DelegateTask => SideEffectType::Process,
-            Self::WebSearch => SideEffectType::Network,
             Self::ReadFile
             | Self::ListDir
             | Self::RgSearch
@@ -148,7 +143,6 @@ impl BuiltinTool {
                     | Self::EditFile
                     | Self::ApplyPatch
                     | Self::Shell
-                    | Self::WebSearch
                     | Self::ShellSession
                     | Self::Subagent
             ),
@@ -248,20 +242,6 @@ pub(super) fn contract(tool_name: &str, side_effect_type: SideEffectType) -> Too
                 }
             },
             "required": ["patch"]
-        }),
-        "web_search" => json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "query": {"type": "string", "minLength": 1, "maxLength": 2048},
-                "max_results": {"type": "integer", "minimum": 1, "maximum": 20},
-                "domains": {
-                    "type": "array",
-                    "maxItems": 10,
-                    "items": {"type": "string", "minLength": 1, "maxLength": 253}
-                }
-            },
-            "required": ["query"]
         }),
         "list_dir" => object_schema(&[("path", MAX_PATH_ARGUMENT_CHARS)], &[], &[]),
         "rg_search" => object_schema(

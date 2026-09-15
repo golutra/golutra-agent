@@ -13,6 +13,29 @@ use tempfile::tempdir;
 use super::*;
 
 #[test]
+fn plugin_declarations_cannot_reintroduce_internal_credentials() {
+    let home = tempdir().unwrap();
+    let package = fixture_package();
+    let mut plugin = enabled_store(home.path(), package.path())
+        .enabled()
+        .unwrap()
+        .pop()
+        .unwrap();
+    for name in [
+        "GOLUTRA_TRANSPORT_TOKEN",
+        "golutra_provider_api_key",
+        "GOLUTRA_PROVIDER_CUSTOM_HEADERS",
+        "GOLUTRA_CUSTOM_PROVIDER_API_KEY_TEST",
+    ] {
+        plugin.manifest.server.env = vec![name.into()];
+        let mut command = Command::new("unused");
+        let error = inject_declared_environment(&mut command, &plugin).unwrap_err();
+        assert!(error.to_string().contains("cannot be passed to plugins"));
+        assert_eq!(command.as_std().get_envs().count(), 0);
+    }
+}
+
+#[test]
 fn reviewed_enabled_plugins_are_visible_in_the_coding_profile() {
     let home = tempdir().expect("home");
     let workspace = tempdir().expect("workspace");

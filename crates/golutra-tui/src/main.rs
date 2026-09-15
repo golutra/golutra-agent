@@ -95,6 +95,8 @@ mod inline_history;
 mod interaction;
 mod live_status;
 mod managed_terminal;
+mod pending_input;
+mod pending_recovery;
 mod preferences;
 mod provider_status;
 mod question_dialog;
@@ -359,6 +361,7 @@ struct TuiApp {
     dashboard: Option<DashboardState>,
     settings_dialog: Option<SettingsDialogState>,
     editing_queued_turn: Option<TurnId>,
+    pending_recovery: Option<pending_recovery::PendingRecovery>,
     export_flow: Option<ExportFlowState>,
     export_operation: Option<PendingExportOperation>,
     auth_dialog: Option<AuthDialogState>,
@@ -681,6 +684,7 @@ impl TuiApp {
             dashboard: None,
             settings_dialog: None,
             editing_queued_turn: None,
+            pending_recovery: None,
             export_flow: None,
             export_operation: None,
             auth_dialog,
@@ -1165,6 +1169,13 @@ impl TuiApp {
         self.history_start_cursor = self.history_start_cursor.or(Some(event.sequence_no));
         self.cursor = Some(event.sequence_no);
         let event_type = event.event_type;
+        if event_type.is_task_terminal()
+            && self.pending_recovery.is_none()
+            && !queued_prompts(&self.events).is_empty()
+        {
+            self.capture_pending_recovery(false);
+        }
+        self.update_pending_recovery(&event);
         if let Some(turn_id) = event.turn_id {
             match event_type {
                 RuntimeEventType::ProviderStreamed
@@ -1254,8 +1265,8 @@ impl TuiApp {
         ) && self.editing_queued_turn == event_turn_id
         {
             self.editing_queued_turn = None;
-            self.input.reset();
-            self.status_message = "queued prompt is no longer pending".to_owned();
+            self.status_message =
+                "queued prompt is no longer pending; edits kept as a draft".to_owned();
         }
         if self.queue_picker.is_some()
             && matches!(
@@ -1361,6 +1372,15 @@ impl TuiApp {
     }
 
     async fn send_prompt(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
+        self.send_prompt_with_mode(transport, pending_input::SubmissionMode::Submit)
+            .await
+    }
+
+    async fn send_prompt_with_mode(
+        &mut self,
+        transport: &RuntimeTransport,
+        mode: pending_input::SubmissionMode,
+    ) -> miette::Result<()> {
         if self.auth_operation.is_some() {
             self.status_message = "finish or cancel the auth operation first".to_owned();
             self.input.clear();
@@ -1395,7 +1415,14 @@ impl TuiApp {
             };
         }
         match parse_slash_input(&input) {
-            SlashInput::Prompt(prompt) => self.send_runtime_prompt(transport, prompt).await,
+            SlashInput::Prompt(prompt) => match mode {
+                pending_input::SubmissionMode::Submit => {
+                    self.send_enter_prompt(transport, prompt).await
+                }
+                pending_input::SubmissionMode::Queue => {
+                    self.send_runtime_prompt(transport, prompt).await
+                }
+            },
             SlashInput::Command(command) => {
                 self.submit_slash_command(transport, &input, command).await
             }
@@ -3641,6 +3668,9 @@ impl TuiApp {
     }
 
     async fn abort(&mut self, transport: &RuntimeTransport) -> miette::Result<CommandAck> {
+        if self.pending_recovery.is_none() {
+            self.capture_pending_recovery(false);
+        }
         let ack = transport
             .send_command(session_command(
                 self.session_id,
@@ -3653,6 +3683,9 @@ impl TuiApp {
             .reason
             .clone()
             .unwrap_or_else(|| "abort accepted".to_owned());
+        if !ack.accepted {
+            self.pending_recovery = None;
+        }
         self.refresh(transport).await?;
         Ok(ack)
     }
@@ -4715,8 +4748,26 @@ async fn handle_key(
         KeyCode::Tab => {
             if app.accept_mention_completion() {
                 app.status_message = "reference completed".to_owned();
-            } else {
-                app.complete_slash_candidate();
+            } else if !app.complete_slash_candidate()
+                && app.editing_queued_turn.is_none()
+                && matches!(
+                    parse_slash_input(&app.input.trimmed()),
+                    SlashInput::Prompt(_)
+                )
+            {
+                app.send_prompt_with_mode(transport, pending_input::SubmissionMode::Queue)
+                    .await?;
+            }
+        }
+        KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
+            if app.input.is_empty() && app.editing_queued_turn.is_none() {
+                let items = queued_prompts(&app.events);
+                if !items.is_empty() {
+                    let mut picker = QueuePickerState { items, selected: 0 };
+                    picker.select_last();
+                    app.queue_picker = Some(picker);
+                    app.edit_selected_queued_prompt();
+                }
             }
         }
         KeyCode::Up => {
@@ -4839,6 +4890,7 @@ async fn handle_composer_escape(
         app.mention_completion = None;
         app.status_message = "queued prompt edit cancelled".to_owned();
     } else if has_active_task(app) {
+        app.capture_pending_recovery(true);
         let ack = app.abort(transport).await?;
         app.last_control_ack = Some(ack.clone());
         app.status_message = if ack.accepted {
