@@ -177,6 +177,7 @@ mod run_bundle;
 mod session;
 mod task_governance;
 mod task_mode;
+mod terminal;
 mod trace;
 mod trace_integrity;
 mod transport;
@@ -431,10 +432,13 @@ struct RuntimeHostExecutionState {
     provider_route_cache: Arc<StdMutex<ProviderRouteCache>>,
     delegation_admissions: Mutex<HashMap<SessionId, delegation::DelegationAdmission>>,
     delegation_operations: Mutex<HashMap<String, Arc<delegation::DelegationOperation>>>,
+    delegation_notification_lock: Mutex<()>,
+    delegation_notification_cache: Mutex<delegation::notifications::NotificationCache>,
     active_work_notify: Notify,
     rollout_threads: Mutex<HashMap<SessionId, Arc<ThreadRecord>>>,
     provider_auth_waiters: Mutex<HashMap<SessionId, PendingProviderAuth>>,
     process_supervisor: ProcessSupervisor,
+    process_event_worker: StdMutex<Option<tokio::task::JoinHandle<()>>>,
     workspace_change_tracker: Mutex<change_tracker::WorkspaceChangeTracker>,
     rollout_projection_failures: Mutex<HashMap<SessionId, String>>,
 }
@@ -883,6 +887,15 @@ fn delegation_recovery_from_metadata(
     let has_unsettled_reservation =
         active_children > 0 || reserved_tokens > 0 || reserved_cost_microusd > 0;
     let state = delegation_policy::DelegationRecoveryState {
+        max_active_children: match budget.get("max_active_children") {
+            None => delegation_policy::DEFAULT_DELEGATED_ACTIVE_CHILDREN,
+            Some(_) => usize::try_from(parse_budget("max_active_children")?)
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| {
+                    ClientError::TaskExecution("invalid recovered child concurrency".to_owned())
+                })?,
+        },
         root_session_id,
         parent_session_id: optional_id("parent_session_id")?.map(SessionId),
         parent_task_id: optional_id("parent_task_id")?.map(TaskId),
@@ -966,6 +979,7 @@ fn validate_canonical_delegation_checkpoint(
     };
     let previous = &previous.state;
     if previous.root_session_id != state.root_session_id
+        || previous.max_active_children != state.max_active_children
         || previous.max_tokens != state.max_tokens
         || previous.max_cost_microusd != state.max_cost_microusd
     {
@@ -1441,6 +1455,18 @@ impl RuntimeHost {
             .shutdown_and_wait()
             .await
             .map_err(|error| ClientError::TaskExecution(error.to_string()));
+        let worker = self
+            .execution
+            .process_event_worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(worker) = worker {
+            worker
+                .await
+                .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
+        }
+        terminal::flush_process_events(self).await?;
         match (work_result, process_result) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(work), Ok(())) | (Ok(()), Err(work)) => Err(work),
@@ -1784,10 +1810,13 @@ impl RuntimeHost {
                 provider_route_cache: Arc::new(StdMutex::new(ProviderRouteCache::default())),
                 delegation_admissions: Mutex::new(HashMap::new()),
                 delegation_operations: Mutex::new(HashMap::new()),
+                delegation_notification_lock: Mutex::new(()),
+                delegation_notification_cache: Mutex::new(Default::default()),
                 active_work_notify: Notify::new(),
                 rollout_threads: Mutex::new(HashMap::new()),
                 provider_auth_waiters: Mutex::new(HashMap::new()),
                 process_supervisor: ProcessSupervisor::new(),
+                process_event_worker: StdMutex::new(None),
                 workspace_change_tracker: Mutex::new(
                     change_tracker::WorkspaceChangeTracker::default(),
                 ),
@@ -1810,6 +1839,12 @@ impl RuntimeHost {
             .recover_expired(&host.workspace_id.to_string(), chrono::Utc::now())
             .await?;
         let post_task_worker = post_task::PostTaskCoordinator::start(&host, post_task_schedule_rx);
+        *host
+            .execution
+            .process_event_worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(terminal::start_process_events(&host));
         *host
             .execution
             .post_task_worker

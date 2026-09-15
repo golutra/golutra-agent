@@ -12,6 +12,9 @@ use tempfile::tempdir;
 use tokio::process::Command;
 
 use super::*;
+#[cfg(unix)]
+#[path = "terminal_tests.rs"]
+mod terminal_tests;
 use crate::builtin::contract;
 
 #[cfg(unix)]
@@ -507,7 +510,7 @@ fn shell_contract_explains_how_to_submit_compound_commands() {
     assert!(background.contains("while it is running"));
     let yield_time_lower = yield_time.to_ascii_lowercase();
     assert!(yield_time_lower.contains("initial"));
-    assert!(yield_time_lower.contains("default 0"));
+    assert!(yield_time_lower.contains("default 10000"));
     assert!(yield_time_lower.contains("does not set or extend"));
     assert!(workdir.contains("directory"));
     assert!(workdir.contains("workspace-relative"));
@@ -1056,6 +1059,33 @@ fn model_visible_read_output_keeps_raw_newlines_and_beats_json_embedding() {
     assert!(serialized.contains("line 0: value\nline 1: value"));
     assert!(!serialized.contains("line 0: value\\nline 1: value"));
     assert!(serialized.len() < legacy.len());
+}
+
+#[test]
+fn ten_child_wait_results_keep_handles_and_states_under_the_model_budget() {
+    let ids: Vec<_> = (0..10)
+        .map(|_| golutra_core::SessionId::new().to_string())
+        .collect();
+    let results:Vec<_> = ids.iter().map(|id| json!({"child_session_id":id,"summary":"running","content":"结果".repeat(2048),"facts":{"child_status":"running","child_session_id":id}})).collect();
+    let envelope = projection_envelope(
+        "subagent",
+        ToolResultStatus::Ok,
+        "10 subagent results; 10 still running",
+        json!({"child_results":results,"child_pending_ids":ids,"completed":false}),
+        None,
+    );
+    let visible = model_visible_tool_result_with_limit(&envelope, 2048);
+    assert!(visible.len() <= 2048);
+    let parsed: Value = serde_json::from_str(&visible).unwrap();
+    assert_eq!(parsed["structured_facts"]["child_pending_ids"], json!(ids));
+    let results = parsed["structured_facts"]["child_results"]
+        .as_array()
+        .unwrap();
+    assert_eq!(results.len(), 10);
+    for (result, id) in results.iter().zip(ids) {
+        assert_eq!(result["child_session_id"], id);
+        assert_eq!(result["child_status"], "running");
+    }
 }
 
 #[test]
@@ -3288,10 +3318,12 @@ fn shell_request_read_only_fast_path_is_conservative() {
     assert!(shell_request_is_strictly_read_only(
         &json!({"argv": ["rg", "token", "src"]})
     ));
+    assert!(shell_request_is_strictly_read_only(
+        &json!({"command": "cat README.md", "background": true})
+    ));
     for arguments in [
         json!({"command": "bash -lc 'cat README.md'"}),
         json!({"command": "printf ok | tr o O"}),
-        json!({"command": "cat README.md", "background": true}),
         json!({"command": "find . -exec cat {} +"}),
         json!({"command": "sort -o result.txt"}),
     ] {
@@ -3535,17 +3567,18 @@ async fn shell_direct_argv_preserves_newlines_without_shell_interpretation() {
 }
 
 #[tokio::test]
-async fn background_python_heredoc_is_rejected_before_launch() {
+async fn background_python_heredoc_receives_input_and_eof() {
     let workspace = tempdir().expect("workspace");
     let executor = executor(workspace.path());
-    let error = executor
+    let report = executor
         .invoke(
             ToolInvocation::new(
                 request(
                     "shell",
                     json!({
-                        "command": "python - <<'PY'\nprint('no background')\nPY",
-                        "background": true
+                        "command": "python3 - <<'PY'\nprint('background input')\nPY",
+                        "background": true,
+                        "yield_time_ms": 2000
                     }),
                 ),
                 PolicyEvaluation {
@@ -3564,9 +3597,11 @@ async fn background_python_heredoc_is_rejected_before_launch() {
             None,
         )
         .await
-        .expect_err("background heredoc must be rejected");
+        .expect("background heredoc runs");
 
-    assert!(error.to_string().contains("foreground commands"));
+    assert_eq!(report.envelope.status, ToolResultStatus::Ok);
+    assert_eq!(report.envelope.structured_facts["exit_code"], 0);
+    assert!(artifact_text(&report).contains("background input"));
 }
 
 #[tokio::test]
@@ -3625,7 +3660,7 @@ async fn shell_progress_and_terminal_metrics_share_one_tool_call() {
     assert_eq!(report.envelope.tool_call_id, tool_call_id);
     assert_eq!(report.metrics.exit_code, Some(0));
     assert_eq!(report.metrics.output_bytes, 11);
-    assert_eq!(report.metrics.output_lines, 2);
+    assert_eq!(report.metrics.output_lines, 1);
     assert!(!report.metrics.output_truncated);
     assert_eq!(
         progress.first().map(|event| event.phase),
@@ -4008,7 +4043,7 @@ async fn shell_session_unifies_event_wait_write_and_terminate() {
             CancellationToken::new(),
         )
         .await;
-    assert!(matches!(missing_pid, Err(ToolError::InvalidArguments(_))));
+    assert!(missing_pid.is_ok());
     let waited = executor
         .execute(
             request_for_session(
@@ -4668,6 +4703,15 @@ async fn process_supervisor_caps_retained_terminal_process_memory() {
             .expect("process reaches terminal")
         };
         assert!(terminal.state.is_terminal());
+        supervisor
+            .wait_for_scan(
+                session_id,
+                &process_id_for_poll,
+                terminal.output_cursor,
+                2000,
+            )
+            .await
+            .unwrap();
     }
     // list() prunes before reading, so the post-insert overflow from the final
     // start is trimmed before we assert the retention cap.

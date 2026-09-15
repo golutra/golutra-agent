@@ -49,6 +49,7 @@ const DEFAULT_READ_MAX_LINES: usize = 200;
 const MAX_READ_LINES: usize = 2_000;
 const MAX_FILE_EDITS: usize = 128;
 const MAX_BACKGROUND_PROCESS_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1_000;
+const DEFAULT_MANAGED_PROCESS_TIMEOUT_MS: u64 = 60 * 60 * 1_000;
 const MAX_TOOL_ERROR_CHARS: usize = 4 * 1024;
 const MAX_AUDIT_RESOURCE_CHARS: usize = 64 * 1024;
 pub const MAX_TOOL_ARGUMENT_DISPLAY_BYTES: usize = 8 * 1024;
@@ -102,6 +103,8 @@ mod model_patch;
 mod process;
 mod process_supervisor;
 mod project_verifier;
+#[cfg(unix)]
+mod terminal_io;
 mod text_search;
 mod workspace_scan;
 
@@ -110,13 +113,13 @@ pub(crate) use process::{
 };
 #[cfg(test)]
 pub(crate) use process::{MAX_PIPE_OUTPUT_BYTES, join_pipe_reader, run_process, spawn_pipe_reader};
-pub use process_supervisor::ProcessSupervisor;
 #[cfg(test)]
 pub(crate) use process_supervisor::max_terminal_processes;
 pub(crate) use process_supervisor::{
     ProcessSnapshot, ProcessStartRequest, ProcessState, ProcessSummary, default_poll_wait_ms,
     default_start_wait_ms, max_poll_wait_ms,
 };
+pub use process_supervisor::{ProcessSupervisor, ProcessUpdate};
 pub use project_verifier::{DiscoveredProjectVerifier, discover_project_verifiers};
 
 use builtin::BuiltinTool;
@@ -283,11 +286,26 @@ pub struct TaskDelegationOutput {
 
 #[async_trait]
 pub trait TaskDelegationBackend: std::fmt::Debug + Send + Sync {
+    async fn notifications(
+        &self,
+        _session_id: SessionId,
+    ) -> Result<Vec<DelegationNotification>, ToolError> {
+        Ok(Vec::new())
+    }
+
     async fn delegate(
         &self,
         request: &ToolRequest,
         cancellation: CancellationToken,
     ) -> Result<TaskDelegationOutput, ToolError>;
+}
+
+#[derive(Debug, Clone)]
+pub struct DelegationNotification {
+    pub id: String,
+    pub child_session_id: String,
+    pub child_task_id: Option<String>,
+    pub content: String,
 }
 
 #[async_trait]
@@ -2899,6 +2917,11 @@ impl ToolRuntime {
     ) -> Result<ToolExecutionReport, ToolError> {
         let command = shell_command_for_request(&request.arguments)?;
         let strictly_read_only = shell_request_is_strictly_read_only(&request.arguments);
+        let tty = request
+            .arguments
+            .get("tty")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let background = request
             .arguments
             .get("background")
@@ -2908,16 +2931,18 @@ impl ToolRuntime {
             .arguments
             .get("timeout_ms")
             .and_then(Value::as_u64)
-            .unwrap_or(if background {
-                60 * 60 * 1_000
-            } else {
-                DEFAULT_TIMEOUT_MS
-            });
+            .unwrap_or(DEFAULT_MANAGED_PROCESS_TIMEOUT_MS);
         let effective_timeout_ms = effective_shell_timeout(timeout_ms);
         let command_line = CommandLine::parse_for_execution(
             &command,
             self.policy.mode() == golutra_policy::WorkspacePolicyMode::Unrestricted,
         )?;
+        if tty && command_line.stdin.is_some() {
+            return Err(ToolError::InvalidArguments(
+                "direct heredoc input requires pipe mode; use bash -lc for a PTY heredoc"
+                    .to_owned(),
+            ));
+        }
         let cwd = match optional_string_arg(&request.arguments, "workdir") {
             Some(workdir) => self.resolve_tool_path("shell", workdir, true)?,
             None => self.policy.workspace_root().to_path_buf(),
@@ -2928,31 +2953,30 @@ impl ToolRuntime {
                 cwd.display()
             )));
         }
-        if background && command_line.stdin.is_some() {
-            return Err(ToolError::InvalidArguments(
-                "quoted Python heredocs are supported only for foreground commands".to_owned(),
-            ));
-        }
-        let workspace_before = if strictly_read_only {
-            None
+        let baseline = if strictly_read_only {
+            workspace_scan::WorkspaceSnapshot::default()
         } else {
-            Some(match workspace_before {
+            match workspace_before {
                 Some(snapshot) => snapshot,
                 None => workspace_scan::capture(self.policy.workspace_root()).await,
-            })
+            }
         };
-        if background {
-            let wait_ms = request
-                .arguments
-                .get("yield_time_ms")
-                .and_then(Value::as_u64)
-                .unwrap_or_else(default_start_wait_ms)
-                .min(max_poll_wait_ms());
-            let process_id = format!("proc-{}", request.tool_call_id);
-            let snapshot = self
-                .process_supervisor
-                .start(ProcessStartRequest {
-                    process_id,
+        let wait_ms = request
+            .arguments
+            .get("yield_time_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(if background {
+                default_start_wait_ms()
+            } else {
+                10_000
+            })
+            .min(max_poll_wait_ms());
+        let process_id = format!("proc-{}", request.tool_call_id);
+        let mut snapshot = self
+            .process_supervisor
+            .start_with_input(
+                ProcessStartRequest {
+                    process_id: process_id.clone(),
                     session_id: request.session_id,
                     program: &command_line.program,
                     args: &command_line.args,
@@ -2960,31 +2984,8 @@ impl ToolRuntime {
                     cwd: &cwd,
                     workspace_root: self.policy.workspace_root(),
                     timeout_ms: effective_timeout_ms,
-                    wait_ms,
-                    cancellation,
-                    sandbox: &self.sandbox,
-                    workspace_access: WorkspaceAccess::ReadWrite,
-                    allow_network: self.allow_network,
-                    workspace_before: workspace_before
-                        .expect("background shell calls have a workspace baseline"),
-                })
-                .await?;
-            return Ok(supervised_process_report(request, policy, snapshot));
-        }
-        let tool_call_id = request.tool_call_id;
-        let tool_name = request.tool_name.clone();
-        let shell_output = {
-            let mut process_progress = |process: ProcessProgress| {
-                emit_process_progress(progress, tool_call_id, &tool_name, started_at, process);
-            };
-            run_process_with_progress(
-                ProcessExecutionRequest {
-                    program: &command_line.program,
-                    args: &command_line.args,
-                    cwd: &cwd,
-                    workspace_root: self.policy.workspace_root(),
-                    timeout_ms: effective_timeout_ms,
-                    cancellation,
+                    wait_ms: 0,
+                    cancellation: cancellation.clone(),
                     sandbox: &self.sandbox,
                     workspace_access: if strictly_read_only {
                         WorkspaceAccess::ReadOnly
@@ -2992,65 +2993,65 @@ impl ToolRuntime {
                         WorkspaceAccess::ReadWrite
                     },
                     allow_network: self.allow_network,
-                    stdin: command_line.stdin.as_deref(),
-                    isolated_home: false,
+                    workspace_before: baseline,
                 },
-                Some(&mut process_progress),
+                command_line.stdin.as_deref(),
+                background || tty,
+                tty,
             )
-            .await?
-        };
-        let workspace_changes = if strictly_read_only {
-            workspace_scan::WorkspaceMutationScan {
-                complete: true,
-                ..workspace_scan::WorkspaceMutationScan::default()
+            .await?;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms);
+        let mut observed_cursor = 0;
+        while !snapshot.state.is_terminal() && tokio::time::Instant::now() < deadline {
+            let remaining = deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .as_millis()
+                .min(250) as u64;
+            snapshot = self
+                .process_supervisor
+                .poll(request.session_id, &process_id, observed_cursor, remaining)
+                .await?;
+            if snapshot.output_cursor > observed_cursor {
+                emit_tool_progress(
+                    progress,
+                    ToolProgress {
+                        tool_call_id: request.tool_call_id,
+                        tool_name: request.tool_name.clone(),
+                        phase: ToolProgressPhase::Output,
+                        detail: None,
+                        elapsed_ms: elapsed_millis(started_at),
+                        output_bytes: snapshot.output_bytes,
+                        output_lines: snapshot.output_lines,
+                        output_excerpt: Some(
+                            redact_sensitive_text(&bounded_text(&snapshot.output, 2048)).0,
+                        ),
+                    },
+                );
             }
+            observed_cursor = snapshot.output_cursor;
+        }
+        snapshot = if !background && snapshot.state.is_terminal() {
+            self.process_supervisor
+                .wait_for_scan(request.session_id, &process_id, 0, 30_000)
+                .await?
         } else {
-            workspace_scan::compare(
-                self.policy.workspace_root(),
-                workspace_before.expect("mutable shell calls have a workspace baseline"),
+            self.process_supervisor
+                .reconnect(request.session_id, &process_id, 0)
+                .await?
+        };
+        let session_id = request.session_id;
+        let mut report = supervised_process_report(request, policy, snapshot);
+        report.envelope.structured_facts["requested_timeout_ms"] = json!(timeout_ms);
+        report.envelope.structured_facts["effective_timeout_ms"] = json!(effective_timeout_ms);
+        self.process_supervisor
+            .acknowledge_output(
+                session_id,
+                &process_id,
+                report.envelope.structured_facts["output_cursor"]
+                    .as_u64()
+                    .unwrap_or(0),
             )
-            .await
-        };
-        let status = if shell_output.cancelled {
-            ToolResultStatus::Cancelled
-        } else if shell_output.timed_out {
-            ToolResultStatus::Timeout
-        } else if shell_output.exit_code == Some(0) {
-            ToolResultStatus::Ok
-        } else {
-            ToolResultStatus::Error
-        };
-        let redacted_command = redact_sensitive_text(&command).0;
-        let metrics = process_metrics(&shell_output);
-        let mut report = with_metrics(
-            report(
-                request,
-                status,
-                "shell command completed",
-                json!({
-                    "command": redacted_command,
-                    "requested_timeout_ms": timeout_ms,
-                    "effective_timeout_ms": effective_timeout_ms,
-                    "exit_code": shell_output.exit_code,
-                    "timed_out": shell_output.timed_out,
-                    "cancelled": shell_output.cancelled,
-                    "output_bytes": shell_output.output_bytes,
-                    "output_lines": shell_output.output_lines,
-                    "output_truncated": shell_output.output_truncated,
-                    "workspace_changes_known": workspace_changes.complete,
-                    "workspace_change_count": workspace_changes.changed_files.len(),
-                    "sandbox_backend": shell_output.sandbox_backend,
-                    "sandbox_os_enforced": shell_output.sandbox_os_enforced,
-                    "network_access": shell_output.network_access,
-                }),
-                shell_output.raw_output,
-                workspace_changes.changed_files.clone(),
-                policy,
-            ),
-            metrics,
-        );
-        report.before_images = workspace_changes.before_images;
-        report.after_images = workspace_changes.after_images;
+            .await?;
         Ok(report)
     }
 
@@ -3068,6 +3069,38 @@ impl ToolRuntime {
         let output = backend
             .delegate(&request, cancellation.child_token())
             .await?;
+        let action = request
+            .arguments
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("spawn");
+        if !matches!(action, "spawn" | "resume")
+            || request
+                .arguments
+                .get("run_in_background")
+                .and_then(Value::as_bool)
+                == Some(true)
+            || output
+                .structured_facts
+                .get("child_isolation")
+                .and_then(Value::as_str)
+                == Some("worktree")
+            || workspace_before.is_none()
+        {
+            let mut report = report(
+                request,
+                output.status,
+                &output.summary,
+                output.structured_facts,
+                output.content,
+                Vec::new(),
+                policy,
+            );
+            report.envelope.risk = "delegated_agent".to_owned();
+            report.envelope.verification_hint =
+                Some("child findings and verification are reported separately".to_owned());
+            return Ok(report);
+        }
         let workspace_changes = match workspace_before {
             Some(snapshot) => workspace_scan::compare(self.policy.workspace_root(), snapshot).await,
             None => {
@@ -3115,6 +3148,16 @@ impl ToolRuntime {
         Ok(report)
     }
 
+    pub async fn delegation_notifications(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<DelegationNotification>, ToolError> {
+        match &self.delegation_backend {
+            Some(backend) => backend.notifications(session_id).await,
+            None => Ok(Vec::new()),
+        }
+    }
+
     async fn process_list(
         &self,
         request: ToolRequest,
@@ -3125,8 +3168,27 @@ impl ToolRuntime {
             .iter()
             .filter(|summary| summary.state == ProcessState::Running)
             .count();
+        let total_count = summaries.len();
+        let offset = request
+            .arguments
+            .get("offset")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .min(total_count as u64) as usize;
+        let limit = request
+            .arguments
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(if request.tool_name == "shell_session" {
+                4
+            } else {
+                64
+            })
+            .clamp(1, 64) as usize;
         let processes = summaries
             .into_iter()
+            .skip(offset)
+            .take(limit)
             .map(process_summary_value)
             .collect::<Vec<_>>();
         let process_count = processes.len();
@@ -3138,6 +3200,9 @@ impl ToolRuntime {
                 "managed processes listed",
                 json!({
                     "process_count": process_count,
+                    "total_count": total_count,
+                    "has_more": offset + process_count < total_count,
+                    "next_offset": offset + process_count,
                     "running_count": running_count,
                     "processes": processes,
                 }),
@@ -3163,7 +3228,7 @@ impl ToolRuntime {
             .process_supervisor
             .poll(request.session_id, &process_id, cursor, wait_ms)
             .await?;
-        Ok(supervised_process_report(request, policy, snapshot))
+        self.legacy_process_report(request, policy, snapshot).await
     }
 
     async fn process_reconnect(
@@ -3179,7 +3244,7 @@ impl ToolRuntime {
             .process_supervisor
             .reconnect(request.session_id, &process_id, cursor)
             .await?;
-        Ok(supervised_process_report(request, policy, snapshot))
+        self.legacy_process_report(request, policy, snapshot).await
     }
 
     async fn process_write(
@@ -3197,7 +3262,7 @@ impl ToolRuntime {
             .process_supervisor
             .write(request.session_id, &process_id, &input, cursor, wait_ms)
             .await?;
-        Ok(supervised_process_report(request, policy, snapshot))
+        self.legacy_process_report(request, policy, snapshot).await
     }
 
     async fn process_terminate(
@@ -3213,6 +3278,27 @@ impl ToolRuntime {
             .process_supervisor
             .terminate(request.session_id, &process_id, cursor)
             .await?;
+        self.legacy_process_report(request, policy, snapshot).await
+    }
+
+    async fn legacy_process_report(
+        &self,
+        request: ToolRequest,
+        policy: PolicyEvaluation,
+        snapshot: ProcessSnapshot,
+    ) -> Result<ToolExecutionReport, ToolError> {
+        let snapshot = if snapshot.state.is_terminal() && snapshot.workspace_scan_pending {
+            self.process_supervisor
+                .wait_for_scan(
+                    request.session_id,
+                    &snapshot.process_id,
+                    snapshot.output_start_cursor,
+                    30_000,
+                )
+                .await?
+        } else {
+            snapshot
+        };
         Ok(supervised_process_report(request, policy, snapshot))
     }
 
@@ -3224,56 +3310,59 @@ impl ToolRuntime {
         execution_cancellation: CancellationToken,
     ) -> Result<ToolExecutionReport, ToolError> {
         let action = string_arg(&request.arguments, "action")?;
+        if action == "list" {
+            return self.process_list(request, policy).await;
+        }
         let process_id = string_arg(&request.arguments, "process_id")?;
-        let authoritative_pid =
-            process_authoritative_pid(&request.arguments)?.ok_or_else(|| {
-                ToolError::InvalidArguments(
-                    "shell_session requires authoritative_pid from the start response".to_owned(),
-                )
-            })?;
-        self.process_supervisor
-            .validate_authoritative_pid(request.session_id, &process_id, authoritative_pid)
+        self.validate_authoritative_pid(&request, &process_id)
             .await?;
-        let cursor = process_cursor(&request.arguments);
+        let _interaction = self
+            .process_supervisor
+            .lock_interaction(request.session_id, &process_id)
+            .await?;
+        let cursor = match request.arguments.get("cursor").and_then(Value::as_u64) {
+            Some(cursor) => cursor,
+            None => {
+                self.process_supervisor
+                    .delivered_cursor(request.session_id, &process_id)
+                    .await?
+            }
+        };
         let snapshot = match action.as_str() {
             "wait" => {
-                let wait_ms = process_wait_ms(&request.arguments, default_poll_wait_ms());
-                let wait_for_terminal = request
-                    .arguments
-                    .get("wait_for_terminal")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                if wait_for_terminal {
-                    let result = self
-                        .process_supervisor
-                        .wait_until_terminal(
-                            request.session_id,
-                            &process_id,
-                            cursor,
-                            wait_ms,
-                            &execution_cancellation,
-                        )
-                        .await?;
-                    if result.cancelled {
-                        if cancellation.is_cancelled() {
-                            return Ok(cancelled_report_with_policy(
-                                request,
-                                policy,
-                                "background terminal wait was cancelled",
-                            ));
-                        }
-                        return Ok(self.deadline_exceeded_report(
+                let result = self
+                    .process_supervisor
+                    .read_page(process_supervisor::ProcessReadRequest {
+                        session_id: request.session_id,
+                        process_id: &process_id,
+                        cursor,
+                        wait_ms: process_wait_ms(&request.arguments, default_poll_wait_ms()),
+                        until_terminal: request
+                            .arguments
+                            .get("wait_for_terminal")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        max_output_bytes: request
+                            .arguments
+                            .get("max_output_bytes")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(1024)
+                            .clamp(256, 4096) as usize,
+                        cancellation: &execution_cancellation,
+                    })
+                    .await?;
+                if result.cancelled {
+                    return Ok(if cancellation.is_cancelled() {
+                        cancelled_report_with_policy(
                             request,
                             policy,
-                            "background terminal wait",
-                        ));
-                    }
-                    result.snapshot
-                } else {
-                    self.process_supervisor
-                        .poll(request.session_id, &process_id, cursor, wait_ms)
-                        .await?
+                            "background terminal wait was cancelled",
+                        )
+                    } else {
+                        self.deadline_exceeded_report(request, policy, "background terminal wait")
+                    });
                 }
+                result.snapshot
             }
             "write" => {
                 let input = string_arg(&request.arguments, "input")?;
@@ -3289,11 +3378,22 @@ impl ToolRuntime {
             }
             _ => {
                 return Err(ToolError::InvalidArguments(
-                    "shell_session action must be wait, write, or terminate".to_owned(),
+                    "shell_session action must be wait, write, terminate, or list".to_owned(),
                 ));
             }
         };
-        Ok(supervised_process_report(request, policy, snapshot))
+        let session_id = request.session_id;
+        let report = supervised_process_report(request, policy, snapshot);
+        self.process_supervisor
+            .acknowledge_output(
+                session_id,
+                &process_id,
+                report.envelope.structured_facts["output_cursor"]
+                    .as_u64()
+                    .unwrap_or(cursor),
+            )
+            .await?;
+        Ok(report)
     }
 
     async fn validate_authoritative_pid(
@@ -4589,11 +4689,16 @@ fn process_wait_ms(arguments: &Value, default: u64) -> u64 {
 }
 
 fn process_summary_value(summary: ProcessSummary) -> Value {
+    let output_has_more = summary.delivered_cursor < summary.output_cursor;
     let next_action = process_next_action(
-        summary.state,
+        if output_has_more {
+            ProcessState::Running
+        } else {
+            summary.state
+        },
         &summary.process_id,
         summary.authoritative_pid,
-        summary.output_cursor,
+        summary.delivered_cursor,
         summary.terminal_event_id,
     );
     json!({
@@ -4606,6 +4711,8 @@ fn process_summary_value(summary: ProcessSummary) -> Value {
         "process_state": process_state_name(summary.state),
         "exit_code": summary.exit_code,
         "output_cursor": summary.output_cursor,
+        "delivered_cursor": summary.delivered_cursor,
+        "output_has_more": output_has_more,
         "output_bytes": summary.output_bytes,
         "output_lines": summary.output_lines,
         "output_truncated": summary.output_truncated,
@@ -4618,8 +4725,32 @@ fn process_summary_value(summary: ProcessSummary) -> Value {
 fn supervised_process_report(
     request: ToolRequest,
     policy: PolicyEvaluation,
-    snapshot: ProcessSnapshot,
+    mut snapshot: ProcessSnapshot,
 ) -> ToolExecutionReport {
+    let action = request.arguments.get("action").cloned();
+    let output_end_cursor = snapshot.output_end_cursor;
+    let full_output = snapshot.output.clone();
+    let page_output = matches!(request.tool_name.as_str(), "shell" | "shell_session");
+    if page_output {
+        let limit = request
+            .arguments
+            .get("max_output_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(1024)
+            .clamp(256, 4096) as usize;
+        let marker = "[earlier process output omitted]\n";
+        let skipped =
+            usize::from(snapshot.output_lost && snapshot.output.starts_with(marker)) * marker.len();
+        let mut end = snapshot.output.len().min(skipped + limit);
+        while !snapshot.output.is_char_boundary(end) {
+            end -= 1;
+        }
+        snapshot.output.truncate(end);
+        snapshot.output_cursor = snapshot
+            .output_start_cursor
+            .saturating_add(end.saturating_sub(skipped) as u64);
+    }
+    let output_has_more = snapshot.output_cursor < output_end_cursor;
     let state = process_state_name(snapshot.state);
     let requested_termination = request.tool_name == "process_terminate"
         || (request.tool_name == "shell_session"
@@ -4634,7 +4765,11 @@ fn supervised_process_report(
     let workspace_changes_known = snapshot.workspace_changes_known;
     let terminal = snapshot.state.is_terminal();
     let next_action = process_next_action(
-        snapshot.state,
+        if output_has_more {
+            ProcessState::Running
+        } else {
+            snapshot.state
+        },
         &snapshot.process_id,
         snapshot.authoritative_pid,
         snapshot.output_cursor,
@@ -4655,8 +4790,20 @@ fn supervised_process_report(
         },
         json!({
             "process_id": snapshot.process_id,
+            "action": action,
+            "command": snapshot.command,
+            "workdir": snapshot.workdir,
+            "elapsed_ms": snapshot.elapsed_ms,
+            "workspace_scan_pending": snapshot.workspace_scan_pending,
+            "workspace_overlap": snapshot.workspace_overlap,
+            "workspace_change_scope": "shared_workspace_observation",
+            "output_start_cursor": snapshot.output_start_cursor,
+            "output_end_cursor": output_end_cursor,
+            "output_has_more": output_has_more,
             "authoritative_pid": snapshot.authoritative_pid,
             "process_state": state,
+            "timed_out": snapshot.state == ProcessState::TimedOut,
+            "cancelled": snapshot.state == ProcessState::Cancelled,
             "exit_code": snapshot.exit_code,
             "output_cursor": snapshot.output_cursor,
             "output_bytes": snapshot.output_bytes,
@@ -4679,7 +4826,7 @@ fn supervised_process_report(
                     "sandbox_os_enforced": snapshot.sandbox_os_enforced,
                     "network_access": snapshot.network_access,
         }),
-        snapshot.output,
+        full_output,
         if workspace_changes_known {
             snapshot.changed_files.clone()
         } else {
@@ -4701,6 +4848,9 @@ fn supervised_process_report(
     result.metrics.output_lines = snapshot.output_lines;
     result.metrics.output_truncated = snapshot.output_truncated;
     result.metrics.exit_code = snapshot.exit_code;
+    if page_output {
+        result.envelope.model_visible_excerpt = Some(redact_sensitive_text(&snapshot.output).0);
+    }
     result
 }
 
@@ -4904,6 +5054,13 @@ pub fn model_visible_tool_result_with_limit(
                 true,
                 false,
             ),
+            "shell_session" if facts.get("processes").is_some() => (
+                model_process_list_facts(&facts),
+                summary,
+                None,
+                false,
+                false,
+            ),
             "shell" | "shell_session" => (
                 selected_model_facts(&facts, PROCESS_MODEL_FACTS),
                 summary,
@@ -4995,6 +5152,20 @@ pub fn model_visible_tool_result_with_limit(
             projection["structured_facts"] = json!({});
         }
         projection["structured_facts"][key] = Value::Bool(true);
+        if matches!(envelope.tool_name.as_str(), "shell" | "shell_session")
+            && let Some(cursor) = envelope
+                .structured_facts
+                .get("output_start_cursor")
+                .and_then(Value::as_u64)
+            && let Some(process_id) = envelope.structured_facts.get("process_id")
+        {
+            projection["structured_facts"]["output_cursor"] = json!(cursor);
+            projection["structured_facts"]["output_has_more"] = json!(true);
+            projection["structured_facts"]["next_action"] = json!({
+                "action":"wait", "process_id":process_id, "cursor":cursor,
+                "wait_ms":0, "max_output_bytes":256,
+            });
+        }
         header = serialize_model_tool_projection(
             projection,
             &envelope.tool_name,
@@ -5008,7 +5179,7 @@ pub fn model_visible_tool_result_with_limit(
 
 fn model_output_truncation_key(tool_name: &str) -> Option<&'static str> {
     match tool_name {
-        "read_file" => Some("model_visible_truncated"),
+        "read_file" | "subagent" => Some("model_visible_truncated"),
         "shell" | "shell_session" => Some("output_truncated"),
         _ => None,
     }
@@ -5082,8 +5253,52 @@ const MUTATION_MODEL_FACTS: &[&str] = &[
     "blocked",
 ];
 
+fn model_process_list_facts(facts: &Value) -> Value {
+    let mut projected = selected_model_facts(facts, PROCESS_MODEL_FACTS);
+    let Some(processes) = facts.get("processes").and_then(Value::as_array) else {
+        return projected;
+    };
+    let visible = processes
+        .iter()
+        .take(4)
+        .map(|process| {
+            json!({
+                "process_id": process["process_id"],
+                "process_state": process["process_state"],
+                "output_has_more": process["output_has_more"],
+                "command": bounded_text_bytes(process["command"].as_str().unwrap_or(""), 64),
+            })
+        })
+        .collect::<Vec<_>>();
+    let omitted = processes.len().saturating_sub(visible.len());
+    projected["process_count"] = json!(visible.len());
+    if omitted > 0 {
+        projected["has_more"] = json!(true);
+        projected["next_offset"] = json!(
+            facts["next_offset"]
+                .as_u64()
+                .unwrap_or(0)
+                .saturating_sub(omitted as u64)
+        );
+    }
+    projected["processes"] = json!(visible);
+    projected
+}
+
 const PROCESS_MODEL_FACTS: &[&str] = &[
     "process_id",
+    "process_count",
+    "running_count",
+    "total_count",
+    "has_more",
+    "next_offset",
+    "execution_mode",
+    "dispatch_batch_size",
+    "elapsed_ms",
+    "workspace_scan_pending",
+    "output_start_cursor",
+    "output_end_cursor",
+    "output_has_more",
     "authoritative_pid",
     "process_state",
     "exit_code",
@@ -5282,6 +5497,11 @@ fn project_subagent_model_facts(value: &Value) -> Value {
                     | "partial"
                     | "truncated"
                     | "continuation"
+                    | "wait_expired"
+                    | "model_visible_truncated"
+                    | "input_accepted"
+                    | "execution_mode"
+                    | "dispatch_batch_size"
             )
         {
             projected.insert(bounded_text(key, 96), project_model_tool_value(value, 0));
@@ -5411,6 +5631,20 @@ fn model_fact_priority(tool_name: &str) -> &'static [&'static str] {
         "shell" | "shell_session" => PROCESS_MODEL_FACTS,
         "web_search" => &["error", "reason", "query", "result_count", "cached"],
         "subagent" => &[
+            "child_pending_ids",
+            "child_results",
+            "child_terminal",
+            "child_task_id",
+            "child_result_has_more",
+            "child_result_next_offset",
+            "model_visible_truncated",
+            "child_session_id",
+            "child_verification_status",
+            "child_verification_issues",
+            "child_diagnostic",
+            "child_findings_available",
+            "wait_expired",
+            "input_accepted",
             "child_status",
             "completed",
             "success",
@@ -5469,7 +5703,11 @@ fn model_fact_mandatory(tool_name: &str) -> &'static [&'static str] {
             "blocked",
         ],
         "shell" | "shell_session" => &[
+            "processes",
+            "has_more",
+            "next_offset",
             "process_id",
+            "output_has_more",
             "authoritative_pid",
             "process_state",
             "exit_code",
@@ -5486,6 +5724,18 @@ fn model_fact_mandatory(tool_name: &str) -> &'static [&'static str] {
         ],
         "web_search" => &["error", "reason", "query", "result_count", "cached"],
         "subagent" => &[
+            "child_pending_ids",
+            "child_results",
+            "child_terminal",
+            "child_task_id",
+            "child_result_has_more",
+            "child_result_next_offset",
+            "model_visible_truncated",
+            "child_session_id",
+            "child_verification_status",
+            "child_findings_available",
+            "wait_expired",
+            "input_accepted",
             "child_status",
             "completed",
             "success",
@@ -5566,6 +5816,20 @@ fn minimal_model_tool_facts(tool_name: &str, value: &Value) -> Value {
 
 fn compact_model_fact_value(key: &str, value: &Value) -> Value {
     match key {
+        "child_results" => match value.as_array() {
+            Some(results) => {
+                let mut compact:Vec<Value> = results.iter().take(10).map(|result| json!({
+                    "child_session_id":result.get("child_session_id"),
+                    "child_status":result.pointer("/facts/child_status").or_else(|| result.get("error")),
+                })).collect();
+                if results.len() > 10 {
+                    compact.push(json!({"omitted_results":results.len()-10,"next_action":"read status for the remaining requested child handles"}));
+                }
+                Value::Array(compact)
+            }
+            None => compact_model_tool_value(value, 0),
+        },
+        "child_pending_ids" => value.clone(),
         "continuation" => match value {
             Value::Object(object) => compact_priority_model_object(
                 object,
@@ -5591,6 +5855,7 @@ fn compact_model_fact_value(key: &str, value: &Value) -> Value {
                     "cursor",
                     "wait_ms",
                     "wait_for_terminal",
+                    "max_output_bytes",
                 ],
                 8,
             ),
@@ -6297,13 +6562,6 @@ fn shell_command_for_request(arguments: &Value) -> Result<String, ToolError> {
 /// process path.
 #[must_use]
 pub fn shell_request_is_strictly_read_only(arguments: &Value) -> bool {
-    if arguments
-        .get("background")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return false;
-    }
     let Ok(command) = shell_command_for_request(arguments) else {
         return false;
     };

@@ -1,10 +1,3 @@
-//! Synchronous, host-owned delegation to one isolated child agent.
-//!
-//! The model-facing surface is deliberately small. The child gets a fresh
-//! session and the explicit task only; the host keeps the parent capability
-//! boundary, waits for a terminal projection, and returns bounded structured
-//! facts through the ordinary tool result contract.
-
 use std::collections::hash_map::Entry;
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::Duration;
@@ -29,6 +22,18 @@ use uuid::Uuid;
 
 use super::{ClientError, RuntimeHost, delegation_policy};
 
+#[path = "delegation_context.rs"]
+pub(crate) mod context_fork;
+#[path = "delegation_control.rs"]
+mod control;
+#[path = "delegation_notifications.rs"]
+pub(crate) mod notifications;
+#[cfg(test)]
+#[path = "delegation_parallel_tests.rs"]
+mod parallel_tests;
+#[path = "delegation_worktree.rs"]
+pub(crate) mod worktree;
+
 pub(crate) const DELEGATED_TASK_MARKER: &str = "_delegated_task";
 const DELEGATED_PARENT_THREAD_KEY: &str = "_parent_thread_id";
 pub(crate) const DELEGATED_ADMISSION_TOKEN_KEY: &str = "_delegation_admission_token";
@@ -48,8 +53,13 @@ pub(crate) struct DelegationOperation {
     parent_session_id: SessionId,
     result: watch::Receiver<Option<SharedDelegationResult>>,
     result_sender: watch::Sender<Option<SharedDelegationResult>>,
+    ready: watch::Receiver<bool>,
+    ready_sender: watch::Sender<bool>,
     cancellation: CancellationToken,
     lifecycle: StdMutex<DelegationOperationLifecycle>,
+    input_lock: tokio::sync::Mutex<()>,
+    created_at: tokio::time::Instant,
+    accepted_inputs: StdMutex<std::collections::HashMap<String, (String, TaskDelegationOutput)>>,
 }
 
 #[derive(Debug, Default)]
@@ -57,22 +67,47 @@ struct DelegationOperationLifecycle {
     completed: bool,
     force_stopped: bool,
     owner_abort: Option<AbortHandle>,
+    child_session_id: Option<SessionId>,
+    child_task_id: Option<golutra_core::TaskId>,
 }
 
 impl DelegationOperation {
     fn new(parent_session_id: SessionId, cancellation: CancellationToken) -> Self {
         let (sender, result) = watch::channel(None);
+        let (ready_sender, ready) = watch::channel(false);
         Self {
             parent_session_id,
             result,
             result_sender: sender,
+            ready,
+            ready_sender,
             cancellation,
             lifecycle: StdMutex::new(DelegationOperationLifecycle::default()),
+            input_lock: tokio::sync::Mutex::new(()),
+            created_at: tokio::time::Instant::now(),
+            accepted_inputs: StdMutex::new(std::collections::HashMap::new()),
         }
     }
 
     pub(crate) fn belongs_to(&self, session_id: SessionId) -> bool {
         self.parent_session_id == session_id
+    }
+
+    fn publish_result(&self, result: &Result<TaskDelegationOutput, ClientError>) {
+        let lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !lifecycle.completed {
+            self.result_sender.send_if_modified(|slot| {
+                if slot.is_some() {
+                    return false;
+                }
+                *slot = Some(result.as_ref().cloned().map_err(ToString::to_string));
+                true
+            });
+            self.ready_sender.send_replace(true);
+        }
     }
 
     fn complete(&self, result: &Result<TaskDelegationOutput, ClientError>) {
@@ -90,6 +125,7 @@ impl DelegationOperation {
                 .map_err(std::string::ToString::to_string),
         ));
         lifecycle.completed = true;
+        self.ready_sender.send_replace(true);
         lifecycle.owner_abort.take();
     }
 
@@ -100,8 +136,29 @@ impl DelegationOperation {
             .completed
     }
 
+    // 执行结果已在归档与预算结算之后发布；通知 owner 的收尾不能继续占用执行槽。
+    fn execution_finished(&self) -> bool {
+        self.result.borrow().is_some()
+    }
+
     fn cancellation(&self) -> CancellationToken {
         self.cancellation.clone()
+    }
+
+    async fn wait_until_ready(&self, cancellation: CancellationToken) -> Result<(), ClientError> {
+        let mut ready = self.ready.clone();
+        loop {
+            let child_ready = *ready.borrow();
+            if child_ready || self.is_complete() {
+                return Ok(());
+            }
+            tokio::select! {
+                _ = cancellation.cancelled() => return Err(ClientError::TaskCancelled),
+                changed = ready.changed() => {
+                    if changed.is_err() { return Err(ClientError::TaskExecution("child startup owner disappeared".to_owned())); }
+                }
+            }
+        }
     }
 
     pub(crate) fn cancel(&self) {
@@ -137,8 +194,16 @@ impl DelegationOperation {
                 return;
             }
             lifecycle.force_stopped = true;
-            self.result_sender.send_replace(Some(Err(stopped)));
+            // 通知清理仍受宿主管理，但不得把已经返回的真实终态改写为关闭错误。
+            self.result_sender.send_if_modified(|slot| {
+                if slot.is_some() {
+                    return false;
+                }
+                *slot = Some(Err(stopped));
+                true
+            });
             lifecycle.completed = true;
+            self.ready_sender.send_replace(true);
             lifecycle.owner_abort.take()
         };
         self.cancel();
@@ -263,6 +328,7 @@ pub(crate) fn contains_delegation_metadata(payload: &Value) -> bool {
         "_delegation_parent_session_id",
         "_delegation_parent_tool_call_id",
         "_delegation",
+        context_fork::SNAPSHOT_KEY,
     ]
     .into_iter()
     .any(|key| payload.get(key).is_some())
@@ -281,6 +347,19 @@ impl RuntimeTaskDelegationBackend {
 
 #[async_trait]
 impl TaskDelegationBackend for RuntimeTaskDelegationBackend {
+    async fn notifications(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<golutra_tools::DelegationNotification>, ToolError> {
+        let host = self
+            .host
+            .upgrade()
+            .ok_or_else(|| ToolError::Execution("runtime host is shutting down".to_owned()))?;
+        notifications::load(&host, session_id)
+            .await
+            .map_err(|error| ToolError::Execution(error.to_string()))
+    }
+
     async fn delegate(
         &self,
         request: &ToolRequest,
@@ -292,6 +371,7 @@ impl TaskDelegationBackend for RuntimeTaskDelegationBackend {
             .ok_or_else(|| ToolError::Execution("runtime host is shutting down".to_owned()))?;
         delegate_task(&host, request, cancellation)
             .await
+            .map(|output| control::page_output(output, &request.arguments))
             .map_err(|error| ToolError::Execution(error.to_string()))
     }
 }
@@ -301,6 +381,15 @@ async fn delegate_task(
     request: &ToolRequest,
     cancellation: CancellationToken,
 ) -> Result<TaskDelegationOutput, ClientError> {
+    if cancellation.is_cancelled() {
+        return Ok(cancelled_delegation_output("subagent request cancelled"));
+    }
+    let action = control::action(&request.arguments)?;
+    if matches!(action, "status" | "wait" | "send_input" | "cancel") {
+        return control::dispatch(host, request, cancellation, action).await;
+    }
+    control::validate_start(&request.arguments)?;
+    let fork_context = context_fork::capture(host, request).await?;
     let task = request
         .arguments
         .get("task")
@@ -331,6 +420,11 @@ async fn delegate_task(
             ))
         })?;
     host.ensure_thread_in_workspace(&parent_thread)?;
+    let resumed_child = if action == "resume" {
+        Some(control::resume_target(host, request).await?)
+    } else {
+        None
+    };
     let (parent_control, parent_context) = {
         let mut controls = host.execution.task_controls.lock().await;
         let control = controls.get_mut(&request.session_id).ok_or_else(|| {
@@ -364,7 +458,23 @@ async fn delegate_task(
         let mut operations = host.execution.delegation_operations.lock().await;
         match operations.entry(identity.clone()) {
             Entry::Occupied(entry) => (entry.get().clone(), None),
-            Entry::Vacant(entry) => {
+            Entry::Vacant(_) => {
+                let active_count = operations
+                    .values()
+                    .filter(|operation| {
+                        operation.belongs_to(request.session_id) && !operation.execution_finished()
+                    })
+                    .count();
+                if active_count >= parent_context.max_active_children() {
+                    let mut output = delegation_limit_output(
+                        delegation_policy::DelegationLimit::ActiveChildren,
+                        &parent_context,
+                    );
+                    output.structured_facts["child_active_count"] = json!(active_count);
+                    output.structured_facts["child_max_concurrent"] =
+                        json!(parent_context.max_active_children());
+                    return Ok(output);
+                }
                 if host.execution.shutdown.is_cancelled() {
                     return Err(ClientError::TaskExecution(
                         "runtime host is shutting down".to_owned(),
@@ -372,16 +482,45 @@ async fn delegate_task(
                 }
                 let operation = Arc::new(DelegationOperation::new(
                     request.session_id,
-                    host.execution.shutdown.child_token(),
+                    if request
+                        .arguments
+                        .get("run_in_background")
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                    {
+                        host.execution.shutdown.child_token()
+                    } else {
+                        parent_control.execution.cancellation_token().child_token()
+                    },
                 ));
-                entry.insert(operation.clone());
+                operation
+                    .lifecycle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .child_session_id = Some(
+                    resumed_child
+                        .as_ref()
+                        .map(|thread| thread.session_id)
+                        .unwrap_or_else(|| SessionId(deterministic_uuid(&identity, "session"))),
+                );
+                if resumed_child.as_ref().is_some_and(|thread| {
+                    control::has_active_operation_for(&operations, thread.session_id)
+                }) {
+                    return Err(ClientError::TaskExecution(
+                        "child is still finishing; wait before resuming".to_owned(),
+                    ));
+                }
+                if let Some(thread) = &resumed_child {
+                    control::ensure_resumable(host, thread.session_id).await?;
+                }
+                operations.insert(identity.clone(), operation.clone());
                 host.signal_active_work_change();
                 (operation, Some(()))
             }
         }
     };
     let Some(()) = result_sender else {
-        return operation.wait(cancellation).await;
+        return control::wait_after_start(&operation, &request.arguments, cancellation).await;
     };
 
     // The operation belongs to the host, not to whichever tool future created it. A parent
@@ -405,8 +544,17 @@ async fn delegate_task(
             parent_context,
             overrides,
             identity,
+            resumed_child,
+            fork_context,
         )
         .await;
+        // 先唤醒等待结果的调用方；通知持久化不应延迟结果交付，owner 此时仍被宿主追踪。
+        operation_for_cleanup.publish_result(&result);
+        if let Err(error) =
+            notifications::publish(&operation_host, &operation_request, &result).await
+        {
+            tracing::warn!(%error, "could not persist subagent completion");
+        }
         operation_for_cleanup.complete(&result);
         operation_host.signal_active_work_change();
         operation_host
@@ -418,7 +566,7 @@ async fn delegate_task(
             .await;
     });
     operation.set_owner_abort(owner.abort_handle());
-    operation.wait(cancellation).await
+    control::wait_after_start(&operation, &request.arguments, cancellation).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -432,6 +580,8 @@ async fn run_delegated_child(
     parent_context: delegation_policy::DelegationContext,
     overrides: DelegationOverrides,
     identity: String,
+    resumed_child: Option<golutra_store::ThreadRecord>,
+    fork_context: Option<Value>,
 ) -> Result<TaskDelegationOutput, ClientError> {
     let (requested_tokens, child_generation_config) = child_generation_config(&overrides)?;
     let checkpoint_lock = parent_context.checkpoint_lock();
@@ -460,8 +610,21 @@ async fn run_delegated_child(
     )
     .await?;
     drop(checkpoint_guard);
-    let child_session_id = SessionId(deterministic_uuid(&identity, "session"));
-    let child_thread_id = ThreadId(deterministic_uuid(&identity, "thread"));
+    let child_session_id = resumed_child
+        .as_ref()
+        .map(|thread| thread.session_id)
+        .unwrap_or_else(|| SessionId(deterministic_uuid(&identity, "session")));
+    let child_thread_id = resumed_child
+        .as_ref()
+        .map(|thread| thread.thread_id)
+        .unwrap_or_else(|| ThreadId(deterministic_uuid(&identity, "thread")));
+    let usage_before = if resumed_child.is_some() {
+        child_usage(host, child_session_id).await?
+    } else {
+        (Some(0), Some(0))
+    };
+    let worktree_path =
+        worktree::prepare(host, request, child_session_id, resumed_child.is_some()).await?;
     let actor = Actor {
         kind: ActorKind::Runtime,
         id: format!("delegate:parent:{}", request.session_id),
@@ -551,6 +714,7 @@ async fn run_delegated_child(
     }
 
     let mut prompt_payload = json!({
+        "_delegation_isolation": if worktree_path.is_some() { "worktree" } else { "shared" },
         "prompt": task,
         DELEGATED_TASK_MARKER: true,
         "allow_network": parent_control.allow_network,
@@ -563,11 +727,27 @@ async fn run_delegated_child(
         DELEGATED_ADMISSION_TOKEN_KEY: admission_token,
         "_delegation": child_context.metadata(),
     });
+    if let Some(binding) = fork_context {
+        prompt_payload[context_fork::SNAPSHOT_KEY] = binding;
+    }
     apply_inherited_execution_surface(
         &mut prompt_payload,
         overrides.execution_mode,
         overrides.tool_profile,
     )?;
+    if let Err(error) =
+        control::apply_agent_type(&mut prompt_payload, request, resumed_child.as_ref(), host).await
+    {
+        return fail_delegation(
+            host,
+            request.session_id,
+            child_session_id,
+            child_thread_id,
+            &actor,
+            error,
+        )
+        .await;
+    }
     if let Some(profile) = overrides.profile.clone() {
         prompt_payload["provider_profile"] = profile;
     }
@@ -633,6 +813,27 @@ async fn run_delegated_child(
         .lock()
         .await
         .remove(&child_session_id);
+
+    let started_state = host
+        .storage
+        .repositories
+        .projections
+        .state(child_session_id, None)
+        .await?;
+    if let Some(operation) = host
+        .execution
+        .delegation_operations
+        .lock()
+        .await
+        .get(&identity)
+    {
+        operation
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .child_task_id = started_state.active_task_id;
+        operation.ready_sender.send_replace(true);
+    }
 
     let child_state = match timeout(
         Duration::from_millis(child_context.remaining_elapsed_ms().max(1)),
@@ -721,6 +922,12 @@ async fn run_delegated_child(
         .await;
     }
     let (actual_tokens, actual_cost_microusd) = child_usage(host, child_session_id).await?;
+    let actual_tokens = actual_tokens
+        .zip(usage_before.0)
+        .map(|(after, before)| after.saturating_sub(before));
+    let actual_cost_microusd = actual_cost_microusd
+        .zip(usage_before.1)
+        .map(|(after, before)| after.saturating_sub(before));
     persist_delegation_usage_settlement(
         host,
         request,
@@ -740,44 +947,29 @@ async fn run_delegated_child(
     let effective_model = actual_model
         .map(Value::String)
         .unwrap_or_else(|| requested_model.clone());
-    let content = child_state
-        .final_message
-        .clone()
-        .or_else(|| {
-            child_state
-                .last_loop_decision
-                .as_ref()
-                .map(|decision| decision.reason.clone())
-        })
-        .unwrap_or_else(|| "delegated child produced no final response".to_owned());
-    let status = delegated_result_status(child_state.task_status);
-    let summary = match child_state.task_status {
-        TaskStatus::Completed => "delegated task completed",
-        TaskStatus::Partial => "delegated task produced a partial result",
-        TaskStatus::Cancelled | TaskStatus::Interrupted => "delegated task was cancelled",
-        TaskStatus::Blocked => "delegated task was blocked",
-        TaskStatus::Uncertain => "delegated task needs reconciliation",
-        _ => "delegated task failed",
-    };
-    Ok(TaskDelegationOutput {
-        status,
-        summary: summary.to_owned(),
-        content,
-        structured_facts: json!({
-            "child_session_id": child_session_id,
-            "child_thread_id": child_thread_id,
-            "child_status": child_state.task_status,
-            "requested_model": requested_model,
-            "effective_model": effective_model,
-            "effective_reasoning_effort": effective_reasoning_effort,
-            "verification": child_state.last_verification,
-            "delegation": child_context.metadata(),
-            "usage": {
-                "total_tokens": actual_tokens,
-                "estimated_cost_microusd": actual_cost_microusd,
-            },
-        }),
-    })
+    let mut output = control::state_output(host, &child_state).await?;
+    if let Some(facts) = output.structured_facts.as_object_mut() {
+        facts.extend(
+            json!({
+                "child_thread_id": child_thread_id,
+                "child_workspace_path": worktree_path,
+                "child_isolation": if worktree_path.is_some() { "worktree" } else { "shared" },
+                "requested_model": requested_model,
+                "effective_model": effective_model,
+                "effective_reasoning_effort": effective_reasoning_effort,
+                "verification": child_state.last_verification,
+                "delegation": child_context.metadata(),
+                "usage": {
+                    "total_tokens": actual_tokens,
+                    "estimated_cost_microusd": actual_cost_microusd,
+                },
+            })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+        );
+    }
+    Ok(output)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -894,28 +1086,44 @@ async fn cleanup_child_after_failure(
     }
 }
 
-async fn fail_delegation<T>(
+async fn fail_delegation(
     host: &Arc<RuntimeHost>,
     attached_session_id: SessionId,
     child_session_id: SessionId,
     child_thread_id: ThreadId,
     actor: &Actor,
     primary: ClientError,
-) -> Result<T, ClientError> {
-    match cleanup_child_after_failure(
+) -> Result<TaskDelegationOutput, ClientError> {
+    let cleanup = cleanup_child_after_failure(
         host,
         attached_session_id,
         child_session_id,
         child_thread_id,
         actor,
     )
-    .await
-    {
-        Ok(()) => Err(primary),
-        Err(cleanup) => Err(ClientError::TaskExecution(format!(
-            "{primary}; additionally, {cleanup}"
-        ))),
-    }
+    .await;
+    let reason = match cleanup {
+        Ok(()) => primary.to_string(),
+        Err(cleanup) => format!("{primary}; additionally, {cleanup}"),
+    };
+    let state = host
+        .storage
+        .repositories
+        .projections
+        .state(child_session_id, None)
+        .await?;
+    let mut output = control::state_output(host, &state).await?;
+    let timed_out = reason.contains("exceeded its maximum elapsed time");
+    output.status = if timed_out {
+        golutra_core::ToolResultStatus::Timeout
+    } else {
+        golutra_core::ToolResultStatus::Error
+    };
+    output.summary = reason.clone();
+    output.structured_facts["error"] = json!(reason);
+    output.structured_facts["timed_out"] = json!(timed_out);
+    output.structured_facts["completed"] = json!(false);
+    Ok(output)
 }
 
 #[derive(Debug, Clone)]
@@ -1029,6 +1237,27 @@ fn summarize_child_usage(events: &[RuntimeEvent]) -> (Option<u64>, Option<u64>) 
         return (None, None);
     }
 
+    // resume 后失败的请求可能没有 usage；累计值不变不能被解释为本轮实际消耗为零。
+    let mut pending_requests = std::collections::HashSet::new();
+    for event in events.iter().filter(|event| {
+        matches!(
+            event.event_type,
+            RuntimeEventType::ProviderStarted
+                | RuntimeEventType::ProviderCompleted
+                | RuntimeEventType::ProviderFailed
+        )
+    }) {
+        let Some(request_id) = event
+            .payload
+            .get("provider_request_id")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse::<golutra_core::ProviderRequestId>().ok())
+        else {
+            return (None, None);
+        };
+        pending_requests.insert(request_id);
+    }
+
     let mut total_tokens = 0_u64;
     let mut tokens_complete = true;
     let mut estimated_cost_microusd = 0_u64;
@@ -1044,6 +1273,7 @@ fn summarize_child_usage(events: &[RuntimeEvent]) -> (Option<u64>, Option<u64>) 
             cost_complete = false;
             continue;
         };
+        pending_requests.remove(&record.request_event_id);
         let tokens = record.provider_total_tokens;
         if let Some(tokens) = tokens {
             total_tokens = total_tokens.saturating_add(tokens);
@@ -1065,8 +1295,8 @@ fn summarize_child_usage(events: &[RuntimeEvent]) -> (Option<u64>, Option<u64>) 
         }
     }
     (
-        tokens_complete.then_some(total_tokens),
-        cost_complete.then_some(estimated_cost_microusd),
+        (tokens_complete && pending_requests.is_empty()).then_some(total_tokens),
+        (cost_complete && pending_requests.is_empty()).then_some(estimated_cost_microusd),
     )
 }
 
@@ -1279,15 +1509,14 @@ async fn wait_for_child(
                     Some(receiver) => receiver.changed().await.ok(),
                     None => None,
                 }
-            } => {
+            }, if completion.is_some() => {
                 if changed.is_none() {
                     completion = None;
                 }
             }
-            event = event_bus.recv(), if event_bus_open => {
+            event = wait_for_child_control_event(&mut event_bus, session_id), if event_bus_open => {
                 match event {
-                    Ok(event) if event.session_id == session_id => {}
-                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         // The durable projection remains authoritative if the
                         // in-process event bus is closed during host shutdown.
@@ -1295,6 +1524,21 @@ async fn wait_for_child(
                     }
                 }
             }
+        }
+    }
+}
+
+// 只用本子会话的控制事实触发存储查询；其他子任务的 token/工具输出不改变其生命周期。
+async fn wait_for_child_control_event(
+    events: &mut tokio::sync::broadcast::Receiver<RuntimeEvent>,
+    session: SessionId,
+) -> Result<(), tokio::sync::broadcast::error::RecvError> {
+    loop {
+        let event = events.recv().await?;
+        if event.session_id == session
+            && event.class() == golutra_protocol::RuntimeEventClass::Control
+        {
+            return Ok(());
         }
     }
 }
@@ -1500,6 +1744,11 @@ fn delegation_identity(
         "tool_profile": overrides.tool_profile,
         "allow_network": allow_network,
         "yolo": yolo,
+        "agent_type": request.arguments.get("agent_type"),
+        "context": request.arguments.get("context"),
+        "isolation": request.arguments.get("isolation"),
+        "run_in_background": request.arguments.get("run_in_background"),
+        "resume": request.arguments.get("child_session_id"),
     });
     let parameter_digest = Sha256::digest(serde_json::to_vec(&parameters)?);
     Ok(format!(
@@ -1970,6 +2219,33 @@ mod tests {
         ];
 
         assert_eq!(summarize_child_usage(&events), (Some(20), Some(10)));
+    }
+
+    #[test]
+    fn resumed_provider_failure_without_usage_keeps_the_session_totals_unknown() {
+        let session = SessionId::new();
+        let record = usage_record(Some(10), None, None, Some(0.000_003));
+        let mut events = vec![
+            host_event(
+                1,
+                session,
+                None,
+                RuntimeEventType::ProviderStarted,
+                RuntimeEventSource::Provider,
+                json!({"provider_request_id":record["request_event_id"]}),
+            ),
+            usage_event(session, Some(record)),
+        ];
+        assert_eq!(summarize_child_usage(&events), (Some(10), Some(3)));
+        events.push(host_event(
+            3,
+            session,
+            None,
+            RuntimeEventType::ProviderFailed,
+            RuntimeEventSource::Provider,
+            json!({"provider_request_id":ProviderRequestId::new()}),
+        ));
+        assert_eq!(summarize_child_usage(&events), (None, None));
     }
 
     #[test]

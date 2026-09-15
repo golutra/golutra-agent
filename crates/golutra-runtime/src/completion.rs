@@ -65,7 +65,15 @@ pub(crate) fn final_message(
             Some(format!("Completed: {summary}"))
         }
         VerificationResult::Partial | VerificationResult::Fail | VerificationResult::Unknown => {
-            Some(evidence_backed_failure_message(tool_reports, verification))
+            let diagnostic = evidence_backed_failure_message(tool_reports, verification);
+            Some(
+                match assistant_message.filter(|message| !message.trim().is_empty()) {
+                    Some(message) => {
+                        format!("{diagnostic}\n\nFindings (not verified as complete):\n{message}")
+                    }
+                    None => diagnostic,
+                },
+            )
         }
     }
 }
@@ -150,4 +158,39 @@ fn interaction_only_report(report: &ToolExecutionReport) -> bool {
         && report.envelope.evidence_refs.is_empty()
         && report.evidence.is_empty()
         && report.changed_files.is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unverified_completion_keeps_findings_and_failure_status() {
+        let (mut record, _) = crate::verification::RuntimeVerificationService::default()
+            .verify_runtime_failure(
+                TaskId::new(),
+                "inspect project",
+                Vec::new(),
+                false,
+                "missing evidence",
+            );
+        for result in [
+            VerificationResult::Partial,
+            VerificationResult::Fail,
+            VerificationResult::Unknown,
+        ] {
+            record.result = result;
+            let message =
+                final_message(Some("项目是 Golutra Agent。".to_owned()), &[], &record).unwrap();
+            assert!(message.contains("项目是 Golutra Agent。"));
+            assert!(message.contains("not verified as complete"));
+            assert!(message.contains("missing evidence"));
+            assert_eq!(record.result, result);
+        }
+        record.result = VerificationResult::Pass;
+        assert_eq!(
+            final_message(Some("answer".to_owned()), &[], &record).as_deref(),
+            Some("answer")
+        );
+    }
 }

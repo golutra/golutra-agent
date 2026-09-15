@@ -43,7 +43,7 @@ impl RuntimeVerificationService {
             plan.assertions.retain(|assertion| {
                 !matches!(
                     assertion.criterion_id.as_str(),
-                    "workspace_validation" | "tests_or_diagnostics"
+                    "workspace_validation" | "tests_or_diagnostics" | "effect_validation"
                 )
             });
         }
@@ -239,6 +239,65 @@ mod tests {
     use golutra_core::{TaskClass, VerificationDimensionStatus};
 
     use super::*;
+
+    #[test]
+    fn analysis_contract_does_not_infer_effects_from_prompt_words() {
+        for objective in [
+            "Inspect the current workspace. Read README and Cargo.toml. Do not modify any files.",
+            "查看当前项目是什么，不要修改任何文件。",
+            "Explain how to deploy, build and update this project.",
+            "Explain the example `write a file` without executing it.",
+        ] {
+            let evidence = golutra_core::EvidenceId::new();
+            let input = VerificationInput {
+                task_id: TaskId::new(),
+                objective: objective.to_owned(),
+                completion_criteria: Vec::new(),
+                evidence_refs: vec![evidence],
+                command_checks: vec![
+                    VerificationCheck {
+                        kind: VerificationCheckKind::ToolExecution,
+                        name: "tool:read_file".to_owned(),
+                        command: None,
+                        passed: true,
+                        evidence_refs: vec![evidence],
+                        message: "README read".to_owned(),
+                    },
+                    VerificationCheck {
+                        kind: VerificationCheckKind::AssistantResponse,
+                        name: "assistant_response".to_owned(),
+                        command: None,
+                        passed: true,
+                        evidence_refs: Vec::new(),
+                        message: "project summary".to_owned(),
+                    },
+                    VerificationCheck {
+                        kind: VerificationCheckKind::Policy,
+                        name: "policy:read_file".to_owned(),
+                        command: None,
+                        passed: true,
+                        evidence_refs: Vec::new(),
+                        message: "allowed".to_owned(),
+                    },
+                ],
+                requires_workspace_evidence: false,
+                code_files_changed: false,
+            };
+            let service = RuntimeVerificationService::default();
+            let contract = TaskContract::conversational(Vec::new());
+            let plan = service.plan_governed(&input, &contract);
+            let (record, _) =
+                service.verify_governed(input.clone(), plan, &contract, "test".to_owned());
+            assert_eq!(record.result, VerificationResult::Pass, "{objective}");
+            let strict = TaskContract {
+                require_objective_validation: true,
+                ..contract
+            };
+            let plan = service.plan_governed(&input, &strict);
+            let (record, _) = service.verify_governed(input, plan, &strict, "test".to_owned());
+            assert_eq!(record.result, VerificationResult::Fail);
+        }
+    }
 
     #[test]
     fn runtime_failure_produces_a_failed_record_and_fixed_plan() {

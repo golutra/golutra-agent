@@ -1,8 +1,5 @@
 //! Host-owned delegated-task limits and durable recovery snapshots.
 //!
-//! Live cancellation and leases remain process-local. Before a delegated child
-//! starts, the host persists a conservative snapshot so a recovered steering
-//! continuation cannot reset cumulative child, token, cost, or elapsed limits.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,8 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) const MAX_DELEGATION_DEPTH: u8 = 1;
 pub(crate) const DELEGATION_COST_BUDGET_KEY: &str = "_delegation_cost_budget_microusd";
-pub(crate) const MAX_DELEGATED_ACTIVE_CHILDREN: usize = 2;
-pub(crate) const MAX_DELEGATED_TOTAL_CHILDREN: usize = 8;
+pub(crate) const DEFAULT_DELEGATED_ACTIVE_CHILDREN: usize = 10;
 pub(crate) const DEFAULT_DELEGATED_ELAPSED_MS: u64 = 30 * 60 * 1_000;
 pub(crate) const DEFAULT_DELEGATED_CHILD_TOKEN_RESERVATION: u64 = 4_096;
 pub(crate) const MIN_DELEGATED_TOKEN_BUDGET: u64 = 8_192;
@@ -34,7 +30,6 @@ pub(crate) enum DelegationLimit {
     Elapsed,
     Depth,
     ActiveChildren,
-    TotalChildren,
     TokenBudget,
     CostBudget,
 }
@@ -46,7 +41,6 @@ impl DelegationLimit {
             Self::Elapsed => "elapsed_budget_exhausted",
             Self::Depth => "maximum_depth_exceeded",
             Self::ActiveChildren => "child_concurrency_exceeded",
-            Self::TotalChildren => "child_count_exceeded",
             Self::TokenBudget => "token_admission_budget_exceeded",
             Self::CostBudget => "cost_budget_exceeded",
         }
@@ -58,7 +52,6 @@ impl DelegationLimit {
             Self::Elapsed => "delegation elapsed-time budget is exhausted",
             Self::Depth => "delegated child reached the maximum delegation depth",
             Self::ActiveChildren => "delegated child concurrency limit is reached",
-            Self::TotalChildren => "delegated child count limit is reached",
             Self::TokenBudget => "delegated child output-token admission budget is exhausted",
             Self::CostBudget => "delegated child cost budget is exhausted",
         }
@@ -77,6 +70,8 @@ struct BudgetState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct DelegationRecoveryState {
+    #[serde(default = "default_max_active_children")]
+    pub(crate) max_active_children: usize,
     pub(crate) root_session_id: SessionId,
     pub(crate) parent_session_id: Option<SessionId>,
     pub(crate) parent_task_id: Option<TaskId>,
@@ -130,6 +125,7 @@ impl TimedDelegationRecoveryState {
 /// a strict total-token cancellation cap.
 #[derive(Debug)]
 pub(crate) struct DelegationBudget {
+    max_active_children: usize,
     deadline: Instant,
     max_tokens: u64,
     max_cost_microusd: Option<u64>,
@@ -139,11 +135,12 @@ pub(crate) struct DelegationBudget {
 }
 
 impl DelegationBudget {
-    pub(crate) fn root(
+    fn configured(
         max_elapsed_ms: Option<u64>,
         provider_max_tokens: Option<u64>,
         max_cost_microusd: Option<u64>,
         cancellation: CancellationToken,
+        max_active_children: usize,
     ) -> Arc<Self> {
         let elapsed_ms = max_elapsed_ms
             .unwrap_or(DEFAULT_DELEGATED_ELAPSED_MS)
@@ -152,9 +149,10 @@ impl DelegationBudget {
             .unwrap_or(DEFAULT_DELEGATED_CHILD_TOKEN_RESERVATION)
             .clamp(1, MAX_DELEGATED_TOKEN_BUDGET);
         let max_tokens = per_child
-            .saturating_mul(MAX_DELEGATED_TOTAL_CHILDREN as u64)
+            .saturating_mul(max_active_children as u64)
             .clamp(MIN_DELEGATED_TOKEN_BUDGET, MAX_DELEGATED_TOKEN_BUDGET);
         Arc::new(Self {
+            max_active_children: max_active_children.max(1),
             deadline: Instant::now() + Duration::from_millis(elapsed_ms),
             max_tokens,
             max_cost_microusd,
@@ -198,11 +196,8 @@ impl DelegationBudget {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.active_children >= MAX_DELEGATED_ACTIVE_CHILDREN {
+        if state.active_children >= self.max_active_children {
             return Err(DelegationLimit::ActiveChildren);
-        }
-        if state.started_children >= MAX_DELEGATED_TOTAL_CHILDREN {
-            return Err(DelegationLimit::TotalChildren);
         }
         if state
             .spent_tokens
@@ -258,8 +253,7 @@ impl DelegationBudget {
         json!({
             "remaining_elapsed_ms": self.remaining_elapsed_ms(),
             "max_depth": MAX_DELEGATION_DEPTH,
-            "max_active_children": MAX_DELEGATED_ACTIVE_CHILDREN,
-            "max_total_children": MAX_DELEGATED_TOTAL_CHILDREN,
+            "max_active_children": self.max_active_children,
             "active_children": state.active_children,
             "started_children": state.started_children,
             "max_tokens": self.max_tokens,
@@ -342,6 +336,11 @@ pub(crate) struct DelegationContext {
 }
 
 impl DelegationContext {
+    pub(crate) fn max_active_children(&self) -> usize {
+        self.budget.max_active_children
+    }
+
+    #[cfg(test)]
     pub(crate) fn root(
         session_id: SessionId,
         max_elapsed_ms: Option<u64>,
@@ -349,11 +348,30 @@ impl DelegationContext {
         max_cost_microusd: Option<u64>,
         cancellation: CancellationToken,
     ) -> Self {
-        let budget = DelegationBudget::root(
+        Self::configured(
+            session_id,
             max_elapsed_ms,
             provider_max_tokens,
             max_cost_microusd,
             cancellation,
+            DEFAULT_DELEGATED_ACTIVE_CHILDREN,
+        )
+    }
+
+    pub(crate) fn configured(
+        session_id: SessionId,
+        max_elapsed_ms: Option<u64>,
+        provider_max_tokens: Option<u64>,
+        max_cost_microusd: Option<u64>,
+        cancellation: CancellationToken,
+        max_active_children: usize,
+    ) -> Self {
+        let budget = DelegationBudget::configured(
+            max_elapsed_ms,
+            provider_max_tokens,
+            max_cost_microusd,
+            cancellation,
+            max_active_children,
         );
         let local_deadline = budget.deadline;
         Self {
@@ -380,8 +398,8 @@ impl DelegationContext {
         if recovered.max_tokens == 0 || recovered.max_tokens > MAX_DELEGATED_TOKEN_BUDGET {
             return Err("recovered delegation token budget is invalid");
         }
-        if recovered.started_children > MAX_DELEGATED_TOTAL_CHILDREN {
-            return Err("recovered delegated child count exceeds the supported maximum");
+        if recovered.max_active_children == 0 {
+            return Err("recovered delegated concurrency must be positive");
         }
         let now = Instant::now();
         let root_remaining_elapsed_ms = recovered
@@ -392,6 +410,7 @@ impl DelegationContext {
             .unwrap_or(root_remaining_elapsed_ms)
             .min(root_remaining_elapsed_ms);
         let budget = Arc::new(DelegationBudget {
+            max_active_children: recovered.max_active_children,
             deadline: now + Duration::from_millis(root_remaining_elapsed_ms),
             max_tokens: recovered.max_tokens,
             max_cost_microusd: recovered.max_cost_microusd,
@@ -579,6 +598,7 @@ impl DelegationContext {
         TimedDelegationRecoveryState {
             captured_at,
             state: DelegationRecoveryState {
+                max_active_children: self.budget.max_active_children,
                 root_session_id: self.root_session_id,
                 parent_session_id: None,
                 parent_task_id: None,
@@ -594,6 +614,10 @@ impl DelegationContext {
             },
         }
     }
+}
+
+fn default_max_active_children() -> usize {
+    DEFAULT_DELEGATED_ACTIVE_CHILDREN
 }
 
 fn delegated_child_elapsed_ms(parent_remaining_elapsed_ms: u64) -> u64 {
@@ -709,6 +733,7 @@ mod tests {
             TimedDelegationRecoveryState {
                 captured_at,
                 state: DelegationRecoveryState {
+                    max_active_children: DEFAULT_DELEGATED_ACTIVE_CHILDREN,
                     root_session_id: SessionId::new(),
                     parent_session_id: Some(SessionId::new()),
                     parent_task_id: Some(TaskId::new()),
@@ -747,6 +772,7 @@ mod tests {
         let refreshed = TimedDelegationRecoveryState {
             captured_at,
             state: DelegationRecoveryState {
+                max_active_children: DEFAULT_DELEGATED_ACTIVE_CHILDREN,
                 root_session_id: SessionId::new(),
                 parent_session_id: None,
                 parent_task_id: None,
@@ -774,6 +800,7 @@ mod tests {
             TimedDelegationRecoveryState {
                 captured_at: now + chrono::Duration::minutes(1),
                 state: DelegationRecoveryState {
+                    max_active_children: DEFAULT_DELEGATED_ACTIVE_CHILDREN,
                     root_session_id: SessionId::new(),
                     parent_session_id: None,
                     parent_task_id: None,
@@ -799,14 +826,15 @@ mod tests {
     }
 
     #[test]
-    fn budget_rejects_depth_concurrency_and_total_limits() {
+    fn budget_rejects_depth_and_configured_concurrency_limits() {
         let cancellation = CancellationToken::new();
-        let root = DelegationContext::root(
+        let root = DelegationContext::configured(
             SessionId::new(),
             Some(10_000),
             Some(1_024),
             None,
             cancellation.clone(),
+            2,
         );
         let parent_session = SessionId::new();
         let parent_task = TaskId::new();
@@ -910,12 +938,13 @@ mod tests {
     #[test]
     fn token_budget_exposes_output_reservation_semantics_without_clamping_usage() {
         let cancellation = CancellationToken::new();
-        let root = DelegationContext::root(
+        let root = DelegationContext::configured(
             SessionId::new(),
             Some(10_000),
             Some(1_024),
             None,
             cancellation.clone(),
+            2,
         );
         let child = root
             .child(
@@ -947,6 +976,7 @@ mod tests {
             TimedDelegationRecoveryState {
                 captured_at,
                 state: DelegationRecoveryState {
+                    max_active_children: DEFAULT_DELEGATED_ACTIVE_CHILDREN,
                     root_session_id: SessionId::new(),
                     parent_session_id: None,
                     parent_task_id: None,
@@ -990,6 +1020,7 @@ mod tests {
             TimedDelegationRecoveryState {
                 captured_at,
                 state: DelegationRecoveryState {
+                    max_active_children: DEFAULT_DELEGATED_ACTIVE_CHILDREN,
                     root_session_id: SessionId::new(),
                     parent_session_id: None,
                     parent_task_id: None,
@@ -1223,5 +1254,108 @@ mod tests {
         let after_finish = root.recovery_state(settlement.captured_at);
         assert_eq!(after_finish.state.spent_tokens, 5_000);
         assert_eq!(after_finish.state.spent_cost_microusd, 2_000);
+    }
+
+    #[test]
+    fn default_ten_slots_are_atomic_and_reusable_without_a_cumulative_limit() {
+        let root =
+            DelegationContext::root(SessionId::new(), None, None, None, CancellationToken::new());
+        let barrier = Arc::new(std::sync::Barrier::new(20));
+        let handles: Vec<_> = (0..20)
+            .map(|_| {
+                let root = root.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    root.child(
+                        SessionId::new(),
+                        TaskId::new(),
+                        ThreadId::new(),
+                        1,
+                        Some(0),
+                        &CancellationToken::new(),
+                    )
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 10);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(DelegationLimit::ActiveChildren)))
+                .count(),
+            10
+        );
+        for child in results.into_iter().flatten() {
+            child.finish(0, Some(0));
+        }
+        for _ in 0..60 {
+            let child = root
+                .child(
+                    SessionId::new(),
+                    TaskId::new(),
+                    ThreadId::new(),
+                    1,
+                    Some(0),
+                    &CancellationToken::new(),
+                )
+                .unwrap();
+            child.finish(0, Some(0));
+        }
+        let state = root.recovery_state(Utc::now());
+        assert_eq!(state.state.started_children, 70);
+        let recovered =
+            DelegationContext::recovered(state, Utc::now(), CancellationToken::new()).unwrap();
+        assert_eq!(recovered.max_active_children(), 10);
+        assert!(
+            recovered
+                .child(
+                    SessionId::new(),
+                    TaskId::new(),
+                    ThreadId::new(),
+                    1,
+                    Some(0),
+                    &CancellationToken::new()
+                )
+                .is_ok()
+        );
+        assert!(
+            recovered.metadata()["budget"]
+                .get("max_total_children")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn configured_concurrency_survives_recovery_and_legacy_defaults_to_ten() {
+        let root = DelegationContext::configured(
+            SessionId::new(),
+            None,
+            None,
+            None,
+            CancellationToken::new(),
+            3,
+        );
+        let snapshot = root.recovery_state(Utc::now());
+        let recovered =
+            DelegationContext::recovered(snapshot.clone(), Utc::now(), CancellationToken::new())
+                .unwrap();
+        assert_eq!(recovered.max_active_children(), 3);
+        let mut legacy = serde_json::to_value(snapshot).unwrap();
+        legacy["state"]
+            .as_object_mut()
+            .unwrap()
+            .remove("max_active_children");
+        let legacy = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            DelegationContext::recovered(legacy, Utc::now(), CancellationToken::new())
+                .unwrap()
+                .max_active_children(),
+            10
+        );
     }
 }

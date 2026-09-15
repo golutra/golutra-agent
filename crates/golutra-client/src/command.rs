@@ -633,6 +633,12 @@ impl RuntimeHost {
                 ),
             });
         }
+        if delegated_payload
+            && steer
+            && let Some(payload) = payload.as_object_mut()
+        {
+            payload.remove(crate::delegation::DELEGATED_ADMISSION_TOKEN_KEY);
+        }
         let execution_mode = execution_mode_from_payload(&payload)
             .map_err(|error| ClientError::TaskExecution(error.to_owned()))?;
         let tool_profile = tool_profile_from_payload(&payload)
@@ -722,7 +728,7 @@ impl RuntimeHost {
             && (task_contract.require_objective_validation
                 || task_contract.requires_workspace_evidence())
         {
-            let workspace_root = self.execution_workspace_root()?;
+            let workspace_root = delegation::worktree::workspace_root(&self, session_id).await?;
             let discovered = discover_project_verifiers(&workspace_root)
                 .into_iter()
                 .map(|verifier| ExternalVerificationSpec {
@@ -1652,7 +1658,23 @@ impl RuntimeHost {
                 ))
                 .await?;
                 match action {
-                    "abort" => task_control.execution.cancel(),
+                    "abort" => {
+                        if command
+                            .payload
+                            .get("cancel_children")
+                            .and_then(Value::as_bool)
+                            == Some(true)
+                        {
+                            let operations = self.execution.delegation_operations.lock().await;
+                            for operation in operations
+                                .values()
+                                .filter(|operation| operation.belongs_to(session_id))
+                            {
+                                operation.cancel();
+                            }
+                        }
+                        task_control.execution.cancel();
+                    }
                     "pause" => task_control.execution.pause(),
                     "resume" => task_control.execution.resume(),
                     _ => unreachable!("lane action is constrained by caller"),

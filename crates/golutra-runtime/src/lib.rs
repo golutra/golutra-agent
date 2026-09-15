@@ -79,6 +79,62 @@ where
     }));
 }
 
+fn append_child_notification(
+    plan: &mut ContextBuildPlan,
+    notification: golutra_tools::DelegationNotification,
+    reports: &[ToolExecutionReport],
+    message_token_total: &mut u64,
+) -> bool {
+    if reports.iter().any(|report| {
+        let facts = &report.envelope.structured_facts;
+        child_result_observes(facts, &notification)
+            || facts
+                .get("child_results")
+                .and_then(Value::as_array)
+                .is_some_and(|results| {
+                    results
+                        .iter()
+                        .any(|result| child_result_observes(&result["facts"], &notification))
+                })
+    }) {
+        return false;
+    }
+    append_plan_message(
+        plan,
+        ProviderMessage {
+            role: ProviderRole::User,
+            content: notification.content,
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+            metadata: Default::default(),
+        },
+        ContextMessageSource {
+            contributor: "runtime_context".to_owned(),
+            source_refs: vec![notification.id],
+            origin: "subagent_completion".to_owned(),
+            visibility: ModelInputVisibility::ModelVisible,
+        },
+        message_token_total,
+    );
+    true
+}
+
+fn child_result_observes(
+    facts: &Value,
+    notification: &golutra_tools::DelegationNotification,
+) -> bool {
+    facts
+        .get("child_terminal")
+        .or_else(|| facts.get("completed"))
+        .and_then(Value::as_bool)
+        == Some(true)
+        && facts.get("child_session_id").and_then(Value::as_str)
+            == Some(notification.child_session_id.as_str())
+        && facts.get("child_task_id").and_then(Value::as_str)
+            == notification.child_task_id.as_deref()
+}
+
 fn emit_tool_batch_user_step<F>(turn_id: TurnId, reports: &[ToolExecutionReport], trace: &mut F)
 where
     F: FnMut(AgentLoopTraceEvent) + Send,
@@ -334,6 +390,7 @@ pub struct AgentReplayContext {
     pub tools: Vec<ToolContract>,
     /// 确定性回放默认关闭并行读取；正常 resume 已校验 wire 完整性，可保留并行读取。
     pub(crate) allow_parallel_reads: bool,
+    pub(crate) inherit_parent_history: bool,
 }
 
 impl AgentReplayContext {
@@ -343,6 +400,7 @@ impl AgentReplayContext {
             initial_messages,
             tools,
             allow_parallel_reads: false,
+            inherit_parent_history: false,
         }
     }
 
@@ -352,6 +410,18 @@ impl AgentReplayContext {
             initial_messages,
             tools,
             allow_parallel_reads: true,
+            inherit_parent_history: false,
+        }
+    }
+
+    /// 父请求只提供完整历史；子任务的权限、工具和项目指令仍由当前运行面决定。
+    #[must_use]
+    pub fn for_fork(initial_messages: Vec<ProviderMessage>) -> Self {
+        Self {
+            initial_messages,
+            tools: Vec::new(),
+            allow_parallel_reads: true,
+            inherit_parent_history: true,
         }
     }
 
@@ -499,6 +569,10 @@ struct PreparedParallelCall {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ParallelBatchKind {
     SharedRead,
+    ProcessWait(BTreeSet<String>),
+    ProcessStart,
+    SubagentStart(BTreeSet<String>),
+    SubagentWait(BTreeSet<String>),
     KeyedWrite(BTreeSet<PathBuf>),
     Exclusive,
 }
@@ -1559,6 +1633,29 @@ where
         let (mut provider_tool_schema_digests, mut planned_tool_tokens, mut provider_tool_digest) =
             provider_tool_snapshot(&provider_tools);
         let base_plan_result = match replay_context.as_ref() {
+            Some(replay_context) if replay_context.inherit_parent_history => self
+                .context_builder
+                .build(
+                    request.task_id,
+                    current_turn_id,
+                    request.contributors.clone(),
+                )
+                .and_then(|normal_plan| {
+                    let prefix_len = self
+                        .context_builder
+                        .stable_prefix_len(&normal_plan.messages, &normal_plan.message_sources);
+                    let mut messages = normal_plan.messages[..prefix_len].to_vec();
+                    messages.extend(
+                        replay_context
+                            .initial_messages
+                            .iter()
+                            .skip_while(|message| message.role == ProviderRole::System)
+                            .cloned(),
+                    );
+                    self.context_builder
+                        .build_from_messages(request.task_id, current_turn_id, messages)
+                        .map(|plan| (plan, prefix_len))
+                }),
             Some(replay_context) if replay_context.allow_parallel_reads => {
                 // 正常 resume 同时保留当前任务的 contributor 计划，用它校验
                 // system/project 前缀；校验失败时直接回退到普通历史投影。
@@ -1662,6 +1759,11 @@ where
         // 计划只在任务开始时创建一次；后续回合原地更新消息和预算，避免先深拷贝
         // 初始消息再立即覆盖的无效分配。
         let mut plan = base_plan;
+        let mut seen_child_notifications: HashSet<String> = plan
+            .message_sources
+            .iter()
+            .flat_map(|source| source.source_refs.iter().cloned())
+            .collect();
         let mut message_token_total = plan.estimated_message_tokens();
         seed_seen_read_facts_from_plan(
             &plan.messages,
@@ -1846,6 +1948,20 @@ where
                         &primary_contract,
                     )
                 });
+                for notification in self
+                    .tool_executor
+                    .delegation_notifications(request.session_id)
+                    .await?
+                {
+                    if seen_child_notifications.insert(notification.id.clone()) {
+                        append_child_notification(
+                            &mut plan,
+                            notification,
+                            &tool_reports,
+                            &mut message_token_total,
+                        );
+                    }
+                }
                 plan.budget_snapshot.planned_input_tokens =
                     context_tokens_with_observed_prefix_and_total(
                         &plan.messages,
@@ -2229,6 +2345,32 @@ where
                         break;
                     }
 
+                    let mut child_updates = false;
+                    for notification in self
+                        .tool_executor
+                        .delegation_notifications(request.session_id)
+                        .await?
+                    {
+                        if seen_child_notifications.insert(notification.id.clone()) {
+                            child_updates |= append_child_notification(
+                                &mut plan,
+                                notification,
+                                &tool_reports,
+                                &mut message_token_total,
+                            );
+                        }
+                    }
+                    if child_updates {
+                        finish_runtime_step(
+                            &mut step_machine,
+                            step_snapshot.clone(),
+                            step_fingerprint.clone(),
+                            true,
+                            elapsed_millis(current_turn_started_at),
+                            &mut trace,
+                        );
+                        continue;
+                    }
                     if let Some(pending_turn) = control.pending_turns.take_or_close().await {
                         finish_runtime_step(
                             &mut step_machine,
@@ -2307,9 +2449,6 @@ where
                     },
                     &mut message_token_total,
                 );
-                // 只并行相邻且明确安全的共享读取或互不相交的文件写入。
-                // 进程、网络和其他副作用仍是严格顺序边界；结果按 provider
-                // 原顺序提交，执行并行只消除独立操作间可避免的等待。
                 let replay_context_active = replay_context
                     .as_ref()
                     .is_some_and(|context| !context.allow_parallel_reads);
@@ -2317,9 +2456,6 @@ where
                 let mut stop_after_parallel_batch = false;
                 while let Some(first_tool_call) = pending_tool_calls.next() {
                     let mut batch_tool_calls = vec![first_tool_call];
-                    // Shared reads and disjoint canonical-path writes are the
-                    // only batches eligible for concurrent execution. Every
-                    // other operation remains an explicit ordering boundary.
                     let mut batch_kind = if replay_context_active {
                         ParallelBatchKind::Exclusive
                     } else {
@@ -2331,9 +2467,25 @@ where
                         )
                         .await
                     };
+                    if current_task_contract.workspace_change
+                        == WorkspaceChangeRequirement::Forbidden
+                        && matches!(
+                            batch_kind,
+                            ParallelBatchKind::KeyedWrite(_)
+                                | ParallelBatchKind::ProcessStart
+                                | ParallelBatchKind::SubagentStart(_)
+                        )
+                    {
+                        batch_kind = ParallelBatchKind::Exclusive;
+                    }
                     if matches!(
                         batch_kind,
-                        ParallelBatchKind::SharedRead | ParallelBatchKind::KeyedWrite(_)
+                        ParallelBatchKind::SharedRead
+                            | ParallelBatchKind::KeyedWrite(_)
+                            | ParallelBatchKind::ProcessWait(_)
+                            | ParallelBatchKind::ProcessStart
+                            | ParallelBatchKind::SubagentStart(_)
+                            | ParallelBatchKind::SubagentWait(_)
                     ) {
                         loop {
                             if batch_tool_calls.len() >= PARALLEL_READ_CONCURRENCY_LIMIT {
@@ -2366,6 +2518,7 @@ where
                     {
                         control.wait_until_runnable().await?;
                         let mut prepared = Vec::with_capacity(batch_tool_calls.len());
+                        let mut process_preparation: Option<SideEffectPreparation> = None;
                         let mut parallel_failure_signatures = HashSet::new();
                         for (offset, tool_call) in batch_tool_calls.iter().enumerate() {
                             let provider_tool_call_id = tool_call.tool_call_id.clone();
@@ -2436,7 +2589,16 @@ where
                                 break;
                             }
                             let preparation =
-                                if matches!(&batch_kind, ParallelBatchKind::KeyedWrite(_)) {
+                                if matches!(&batch_kind, ParallelBatchKind::ProcessStart)
+                                    && process_preparation.is_some()
+                                {
+                                    process_preparation.clone()
+                                } else if matches!(
+                                    &batch_kind,
+                                    ParallelBatchKind::KeyedWrite(_)
+                                        | ParallelBatchKind::ProcessStart
+                                        | ParallelBatchKind::SubagentStart(_)
+                                ) {
                                     match await_runtime_operation(
                                         self.tool_executor.prepare_side_effect_snapshot(&request),
                                         &control.cancellation,
@@ -2455,6 +2617,11 @@ where
                                 } else {
                                     None
                                 };
+                            if matches!(&batch_kind, ParallelBatchKind::ProcessStart)
+                                && process_preparation.is_none()
+                            {
+                                process_preparation.clone_from(&preparation);
+                            }
                             prepared.push(PreparedParallelCall {
                                 provider_tool_call_id,
                                 failure_signature,
@@ -2508,6 +2675,11 @@ where
                         }
                     }
                     let parallel_batch = !parallel_call_outcomes.is_empty();
+                    let dispatched_batch_size = if parallel_batch {
+                        batch_tool_calls.len()
+                    } else {
+                        1
+                    };
                     for tool_call in batch_tool_calls {
                         let (
                             provider_tool_call_id,
@@ -2679,6 +2851,10 @@ where
                                         current_task_contract.workspace_change,
                                         WorkspaceChangeRequirement::Forbidden
                                     ) && contract.side_effect_type != SideEffectType::None
+                                        && !(tool_request.tool_name == "shell"
+                                            && golutra_tools::shell_request_is_strictly_read_only(
+                                                &tool_request.arguments,
+                                            ))
                                 })
                                 .map(|_| {
                                     self.tool_executor.invalid_request_report(
@@ -2990,6 +3166,24 @@ where
                             &mut report,
                             prepared_objective_validation,
                         );
+                        if matches!(
+                            report.envelope.tool_name.as_str(),
+                            "shell" | "shell_session" | "subagent"
+                        ) && let Some(facts) = report.envelope.structured_facts.as_object_mut()
+                        {
+                            facts.insert(
+                                "execution_mode".to_owned(),
+                                json!(if parallel_batch {
+                                    "parallel_tool_batch"
+                                } else {
+                                    "sequential_tool_call"
+                                }),
+                            );
+                            facts.insert(
+                                "dispatch_batch_size".to_owned(),
+                                json!(dispatched_batch_size),
+                            );
+                        }
                         trace(AgentLoopTraceEvent::ToolCompleted(report.clone()));
                         tool_attempts.push(ToolAttemptMetadata {
                             tool_call_id: report.envelope.tool_call_id,
@@ -4741,10 +4935,16 @@ fn provider_tools_for_turn(
                 && (!matches!(
                     contract.workspace_change,
                     WorkspaceChangeRequirement::Forbidden
-                ) || tool.side_effect_type == SideEffectType::None)
+                ) || tool.side_effect_type == SideEffectType::None || tool.tool_name == "shell")
         })
         .cloned()
         .map(|tool| project_tool_for_profile(tool, profile, registry))
+        .map(|mut tool| {
+            if contract.workspace_change == WorkspaceChangeRequirement::Forbidden && tool.tool_name == "shell" {
+                tool.input_schema["description"] = json!("Read-only task: use a single direct read command (ls, rg, find, git status); no scripts, pipelines, redirection, or background execution.");
+            }
+            tool
+        })
         .collect::<Vec<_>>();
     sort_provider_tools(&mut tools);
     tools
@@ -4951,6 +5151,16 @@ fn provider_tool_call_is_parallel_read_safe(
 fn extend_parallel_batch(current: &mut ParallelBatchKind, next: ParallelBatchKind) -> bool {
     match (current, next) {
         (ParallelBatchKind::SharedRead, ParallelBatchKind::SharedRead) => true,
+        (ParallelBatchKind::ProcessStart, ParallelBatchKind::ProcessStart) => true,
+        (ParallelBatchKind::ProcessWait(existing), ParallelBatchKind::ProcessWait(next))
+        | (ParallelBatchKind::SubagentStart(existing), ParallelBatchKind::SubagentStart(next))
+        | (ParallelBatchKind::SubagentWait(existing), ParallelBatchKind::SubagentWait(next)) => {
+            if !existing.is_disjoint(&next) {
+                return false;
+            }
+            existing.extend(next);
+            true
+        }
         (ParallelBatchKind::KeyedWrite(existing), ParallelBatchKind::KeyedWrite(next)) => {
             if existing.iter().any(|path| next.contains(path)) {
                 return false;
@@ -4968,8 +5178,71 @@ async fn provider_parallel_batch_kind(
     registry: &ToolRegistry,
     tool_executor: &ToolRuntime,
 ) -> ParallelBatchKind {
+    if tool_call.tool_name == "subagent"
+        && tool_allowed_for_profile(&tool_call.tool_name, profile, registry)
+    {
+        let action = tool_call
+            .arguments
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("spawn");
+        let mut targets = BTreeSet::new();
+        if let Some(id) = tool_call
+            .arguments
+            .get("child_session_id")
+            .and_then(Value::as_str)
+        {
+            targets.insert(id.to_owned());
+        }
+        if let Some(ids) = tool_call
+            .arguments
+            .get("child_session_ids")
+            .and_then(Value::as_array)
+        {
+            for id in ids {
+                let Some(id) = id.as_str() else {
+                    return ParallelBatchKind::Exclusive;
+                };
+                targets.insert(id.to_owned());
+            }
+        }
+        if action == "wait" && !targets.is_empty() {
+            return ParallelBatchKind::SubagentWait(targets);
+        }
+        if matches!(action, "spawn" | "resume")
+            && tool_call
+                .arguments
+                .get("run_in_background")
+                .and_then(Value::as_bool)
+                == Some(true)
+            && (action == "spawn" || !targets.is_empty())
+        {
+            return ParallelBatchKind::SubagentStart(targets);
+        }
+        return ParallelBatchKind::Exclusive;
+    }
+    if tool_call.tool_name == "shell_session"
+        && tool_call.arguments.get("action").and_then(Value::as_str) == Some("wait")
+        && tool_allowed_for_profile(&tool_call.tool_name, profile, registry)
+        && let Some(process_id) = tool_call
+            .arguments
+            .get("process_id")
+            .and_then(Value::as_str)
+    {
+        return ParallelBatchKind::ProcessWait(BTreeSet::from([process_id.to_owned()]));
+    }
     if provider_tool_call_is_parallel_read_safe(tool_call, profile, registry) {
         return ParallelBatchKind::SharedRead;
+    }
+    if tool_call.tool_name == "shell"
+        && tool_call
+            .arguments
+            .get("background")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && tool_allowed_for_profile(&tool_call.tool_name, profile, registry)
+    {
+        return ParallelBatchKind::ProcessStart;
     }
     if !matches!(
         tool_call.tool_name.as_str(),

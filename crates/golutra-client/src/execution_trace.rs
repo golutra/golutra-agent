@@ -278,7 +278,7 @@ impl RuntimeHost {
         before_images: &[FileBeforeImage],
         complete: bool,
     ) -> Result<(), ClientError> {
-        let workspace_root = self.execution_workspace_root()?;
+        let workspace_root = delegation::worktree::workspace_root(self, task.session_id).await?;
         let checkpoint_root = self
             .runtime_paths
             .as_ref()

@@ -288,7 +288,7 @@ fn openai_tool_parameters_come_from_the_runtime_tool_contract() {
 }
 
 #[test]
-fn shell_provider_description_distinguishes_lifetime_from_initial_wait() {
+fn shell_provider_description_explains_parallel_dispatch_and_continuation() {
     let description = provider_tool_description("shell");
 
     assert!(description.contains("argv"));
@@ -297,11 +297,13 @@ fn shell_provider_description_distinguishes_lifetime_from_initial_wait() {
     assert!(description.contains("heredoc"));
     assert!(description.contains("timeout_ms"));
     assert!(description.contains("background"));
-    assert!(description.contains("omit timeout_ms"));
-    assert!(description.contains("hard lifetime"));
     assert!(description.contains("prefer only one"));
-    assert!(description.contains("up to yield_time_ms"));
-    assert!(description.len() < 260);
+    assert!(description.contains("independent background=true calls"));
+    assert!(description.contains("one response for parallel execution"));
+    assert!(description.contains("sequence dependent commands"));
+    assert!(description.contains("shell_session"));
+    assert!(description.contains("yield_time_ms"));
+    assert!(description.len() < 256);
 }
 
 #[test]
@@ -332,9 +334,10 @@ fn provider_tool_descriptions_own_file_and_question_usage_details() {
         "Golutra workspace tool."
     );
     let subagent = provider_tool_description("subagent");
-    assert!(subagent.contains("isolated child task"));
-    assert!(subagent.contains("cannot create another child"));
-    assert!(provider_tool_description("shell_session").contains("authoritative_pid"));
+    assert!(subagent.contains("run_in_background"));
+    assert!(subagent.contains("Children cannot delegate"));
+    assert!(subagent.contains("child_session_ids"));
+    assert!(provider_tool_description("shell_session").contains("process_id"));
     assert!(provider_tool_description("shell_session").contains("cursor"));
     assert_ne!(
         provider_tool_description("process_list"),
@@ -374,10 +377,26 @@ fn provider_surface_descriptions_are_bounded_without_dropping_capability_terms()
             ][..],
         ),
         ("shell", &["argv", "command", "heredoc", "background"][..]),
-        ("shell_session", &["authoritative_pid", "cursor"][..]),
+        (
+            "shell_session",
+            &[
+                "process_id",
+                "cursor",
+                "output_has_more",
+                "different processes",
+                "one response",
+                "parallel",
+                "sequence same-process calls",
+                "next_action",
+            ][..],
+        ),
         (
             "subagent",
-            &["isolated child", "cannot create another child"][..],
+            &[
+                "run_in_background",
+                "child_session_ids",
+                "Children cannot delegate",
+            ][..],
         ),
     ];
     for (tool_name, terms) in required_terms {

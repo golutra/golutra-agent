@@ -300,7 +300,7 @@ mod tests {
             &json!({"path": "crates"}),
         );
         assert_eq!(
-            summarize_user_tool_batch(&[read_readme.clone()]),
+            summarize_user_tool_batch(std::slice::from_ref(&read_readme)),
             "read README.md"
         );
         assert_eq!(
@@ -318,7 +318,7 @@ mod tests {
             &json!({"command": "git status --short"}),
         );
         assert_eq!(ran.object.as_deref(), Some("git status --short"));
-        assert_eq!(summarize_user_tool_batch(&[ran.clone()]), "ran");
+        assert_eq!(summarize_user_tool_batch(std::slice::from_ref(&ran)), "ran");
         assert_eq!(
             user_step_tool_from_envelope(
                 ToolCallId::new(),

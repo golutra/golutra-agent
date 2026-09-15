@@ -291,6 +291,8 @@ artifact、durable job、thread 五类事实访问边界。`EmbeddedTransport`�
 
 ### 当前实现内部分层
 
+子代理的生命周期、只读探索和执行/验证结果边界见 [subagents.md](subagents.md)。
+
 为避免 crate 根文件重新承担全部职责，当前实现进一步固定以下内部边界：
 
 | Crate | 内部模块 | 约束 |
@@ -568,6 +570,7 @@ Evaluation / Improvement 模式使用 `Evaluation / Improvement Projection`：
 
 ## 关联文档
 
+- [background-terminals.md](background-terminals.md)：受管终端、并行调度、输出分页、生命周期事件与 TUI 展示。
 - `agent-runtime-technology-selection.md`：语言、crate、workspace 和库选型。
 - `runtime-contracts.md`：runtime 硬契约。
 - `artifact-evidence-ledger.md`：artifact / evidence 事实层规格。

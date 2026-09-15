@@ -296,11 +296,22 @@ pub(super) fn contract(tool_name: &str, side_effect_type: SideEffectType) -> Too
             "type": "object",
             "additionalProperties": false,
             "properties": {
+                "action": {"type": "string", "enum": ["spawn", "status", "wait", "send_input", "resume", "cancel"], "description": "Default spawn requires task. Reuse child_session_id: status/wait reads progress or result; send_input adds task text to active work; resume starts a new turn with task text in the same child history; cancel requests termination. Never respawn to retry a wait."},
+                "child_session_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                "child_session_ids": {"type": "array", "minItems": 1, "maxItems": 1024, "items": {"type":"string", "minLength":1, "maxLength":128}, "description": "For wait only, instead of child_session_id. Wait on multiple children concurrently; results remain readable."},
+                "wait_mode": {"type":"string", "enum":["any","all"], "description":"Multi-child wait defaults to any completed child; all waits for every target within the shared wait_ms deadline. Timeout never cancels children."},
+                "offset": {"type": "integer", "minimum": 0, "description": "0-based result character offset. When child_result_has_more, read action=status with child_result_next_offset."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 2048, "description": "Result characters per page; default 1024. Reduce if model_visible_truncated."},
+                "agent_type": {"type": "string", "enum": ["general", "explore"], "description": "Use explore for read-only repository questions; general inherits the parent execution surface."},
+                "context": {"type":"string", "enum":["independent","fork"], "description":"Spawn only. Default independent uses task and project instructions. fork inherits the parent's last complete provider request snapshot, then appends task; unfinished tool calls are excluded. Resume always uses the child's own history."},
+                "isolation": {"type":"string", "enum":["shared","worktree"], "description":"Default shared workspace. worktree creates a separate Git checkout of HEAD, excluding uncommitted parent changes. Retained for review/resume; no automatic merge. Resume preserves the original isolation."},
+                "run_in_background": {"type": "boolean", "description": "Return a child handle after startup; use wait for results."},
+                "wait_ms": {"type": "integer", "minimum": 0, "maximum": 60000, "description": "Maximum wait; expiration leaves the child running."},
                 "task": {
                     "type": "string",
                     "minLength": 1,
                     "maxLength": MAX_DELEGATED_TASK_CHARS,
-                    "description": "Self-contained child task; child has no parent history."
+                    "description": "Child task. Include needed context for the default independent mode; fork explicitly inherits the parent request snapshot."
                 },
                 "model": {
                     "type": "string",
@@ -314,7 +325,7 @@ pub(super) fn contract(tool_name: &str, side_effect_type: SideEffectType) -> Too
                     "description": "Optional reasoning override; omit to inherit."
                 }
             },
-            "required": ["task"]
+            "required": []
         }),
         "shell" => json!({
             "type": "object",
@@ -351,14 +362,16 @@ pub(super) fn contract(tool_name: &str, side_effect_type: SideEffectType) -> Too
                 },
                 "background": {
                     "type": "boolean",
-                    "description": "Start a runtime-owned process and return immediately after yield_time_ms. Normally omit timeout_ms; use shell_session while it is running."
+                    "description": "Start a runtime-owned process; return immediately by default, or wait up to yield_time_ms if set. Normally omit timeout_ms; use shell_session while it is running."
                 },
+                "tty": {"type":"boolean", "description":"Allocate a PTY for interactive commands on Unix; default false uses ordinary pipes."},
                 "yield_time_ms": {
                     "type": "integer",
                     "minimum": 0,
                     "maximum": max_poll_wait_ms(),
-                    "description": "Initial output/exit wait (default 0); does not set or extend process lifetime."
-                }
+                    "description": "Initial wait before returning a running process ID; default 10000, or 0 with background=true. Does not set or extend process lifetime."
+                },
+                "max_output_bytes": {"type": "integer", "minimum": 256, "maximum": 4096, "description": "Output page size; default 1024. Read remaining pages with shell_session."}
             },
             "required": []
         }),
@@ -412,15 +425,18 @@ fn shell_session_schema() -> Value {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "action": {"type": "string", "enum": ["wait", "write", "terminate"], "description": "Wait/read, write stdin, or terminate."},
-            "process_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "ID returned by shell(background=true)."},
-            "authoritative_pid": {"type": "integer", "minimum": 1, "maximum": u32::MAX, "description": "Required OS PID; must match start."},
-            "cursor": {"type": "integer", "minimum": 0, "description": "Last output cursor; reuse."},
+            "action": {"type": "string", "enum": ["wait", "write", "terminate", "list"], "description": "Wait/read, write stdin, terminate, or list this session's processes."},
+            "offset": {"type":"integer", "minimum":0, "description":"List offset; follow next_offset while has_more."},
+            "limit": {"type":"integer", "minimum":1, "maximum":64, "description":"Processes per list page; default 4."},
+            "process_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "ID returned by shell; required except for list."},
+            "authoritative_pid": {"type": "integer", "minimum": 1, "maximum": u32::MAX, "description": "Optional extra OS PID check; must match start if supplied."},
+            "cursor": {"type": "integer", "minimum": 0, "description": "Optional byte cursor for repeatable reads; omitted continues after the last delivered page."},
+            "max_output_bytes": {"type": "integer", "minimum": 256, "maximum": 4096, "description": "Output page size; default 1024. Continue reading while output_has_more is true."},
             "input": {"type": "string", "maxLength": MAX_PROCESS_INPUT_CHARS, "description": "Stdin text for write."},
-            "wait_ms": {"type": "integer", "minimum": 0, "maximum": max_poll_wait_ms(), "description": "Bounded event-driven wait in ms."},
+            "wait_ms": {"type": "integer", "minimum": 0, "maximum": max_poll_wait_ms(), "description": "Bounded event-driven wait in ms. Reaching this deadline does not stop the process."},
             "wait_for_terminal": {"type": "boolean", "description": "Wait for one terminal state or deadline."}
         },
-        "required": ["action", "process_id", "authoritative_pid"]
+        "required": ["action"]
     })
 }
 

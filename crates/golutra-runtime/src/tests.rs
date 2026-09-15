@@ -9,6 +9,9 @@ use std::{
     time::Duration,
 };
 
+#[path = "subagent_parallel_tests.rs"]
+mod subagent_parallel_tests;
+
 #[path = "pending_batch_tests.rs"]
 mod pending_batch_tests;
 
@@ -5698,6 +5701,116 @@ async fn agent_loop_blocks_without_evidence() {
 }
 
 #[tokio::test]
+async fn readonly_analysis_allows_reads_and_rejects_shell_mutations() {
+    for (tool, arguments, allowed) in [
+        ("read_file", json!({"path": "README.md"}), true),
+        ("shell", json!({"argv": ["ls", "-la"]}), true),
+        ("shell", json!({"command": "touch forbidden.txt"}), false),
+        (
+            "shell",
+            json!({"command": "sh -c 'touch forbidden.txt'"}),
+            false,
+        ),
+        (
+            "write_file",
+            json!({"path": "forbidden.txt", "content": "bad"}),
+            false,
+        ),
+    ] {
+        let workspace = tempdir().unwrap();
+        fs::write(workspace.path().join("README.md"), "Golutra Agent").unwrap();
+        let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).unwrap());
+        let agent_loop = AgentLoop::new(
+            MockProvider::tool_call(tool, arguments),
+            ContextBuilder::default(),
+            executor,
+        );
+        let (_handle, control) = agent_execution_channel(1);
+        let outcome = agent_loop
+            .run_with_task_contract_and_observation_sink(
+                AgentTaskRequest {
+                    session_id: SessionId::new(),
+                    task_id: TaskId::new(),
+                    turn_id: TurnId::new(),
+                    objective: "Inspect this project. Do not modify any files.".to_owned(),
+                    completion_criteria: Vec::new(),
+                    output_schema: None,
+                    touched_code: false,
+                    contributors: Vec::new(),
+                    tools: vec![tool.to_owned()],
+                },
+                TaskContract {
+                    workspace_change: WorkspaceChangeRequirement::Forbidden,
+                    max_correction_rounds: 0,
+                    ..TaskContract::default()
+                },
+                control,
+                |_| {},
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.tool_reports[0].envelope.status == ToolResultStatus::Ok,
+            allowed,
+            "{tool}"
+        );
+        assert!(!workspace.path().join("forbidden.txt").exists());
+        assert_eq!(
+            outcome.verification.result == VerificationResult::Pass,
+            allowed
+        );
+    }
+}
+
+#[tokio::test]
+async fn readonly_contract_blocks_parallel_write_batches_before_execution() {
+    let workspace = tempdir().unwrap();
+    let provider = ParallelWriteProvider {
+        calls: Arc::new(AtomicUsize::new(0)),
+        saw_source_order: Arc::new(AtomicBool::new(false)),
+        contract: MockProvider::text_response("unused").contract(),
+    };
+    let agent_loop = AgentLoop::new(
+        provider,
+        ContextBuilder::default(),
+        BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).unwrap()),
+    );
+    let (_handle, control) = agent_execution_channel(1);
+    let outcome = agent_loop
+        .run_with_task_contract_and_observation_sink(
+            AgentTaskRequest {
+                session_id: SessionId::new(),
+                task_id: TaskId::new(),
+                turn_id: TurnId::new(),
+                objective: "Inspect only".to_owned(),
+                completion_criteria: Vec::new(),
+                output_schema: None,
+                touched_code: false,
+                contributors: Vec::new(),
+                tools: vec!["write_file".to_owned()],
+            },
+            TaskContract {
+                workspace_change: WorkspaceChangeRequirement::Forbidden,
+                max_correction_rounds: 0,
+                ..TaskContract::default()
+            },
+            control,
+            |_| {},
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.tool_reports.len(), 2);
+    assert!(
+        outcome
+            .tool_reports
+            .iter()
+            .all(|report| report.envelope.status != ToolResultStatus::Ok)
+    );
+    assert!(!workspace.path().join("first.txt").exists());
+    assert!(!workspace.path().join("second.txt").exists());
+}
+
+#[tokio::test]
 async fn agent_loop_accepts_plain_conversation_response_without_tool_evidence() {
     let workspace = tempdir().expect("workspace");
     let provider = MockProvider::text_response("你好，我在。");
@@ -6121,7 +6234,6 @@ fn parallel_read_candidate_allows_only_strict_read_only_shell_requests() {
 
     for arguments in [
         json!({"command": "bash -lc 'cat README.md'"}),
-        json!({"command": "cat README.md", "background": true}),
         json!({"command": "git status --short"}),
         json!({"command": "sort -o result.txt"}),
     ] {
@@ -6131,6 +6243,148 @@ fn parallel_read_candidate_allows_only_strict_read_only_shell_requests() {
             AgentToolProfile::Coding,
             &registry,
         ));
+    }
+}
+
+#[tokio::test]
+async fn terminal_batches_keep_same_process_interactions_and_foreground_writes_ordered() {
+    let root = tempdir().unwrap();
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(root.path()).unwrap());
+    let call = |name: &str, arguments| ProviderToolCall {
+        tool_call_id: "test".to_owned(),
+        tool_name: name.to_owned(),
+        arguments,
+    };
+    let first = provider_parallel_batch_kind(
+        &call("shell_session", json!({"action":"wait","process_id":"one"})),
+        AgentToolProfile::Coding,
+        executor.registry(),
+        &executor,
+    )
+    .await;
+    let same = provider_parallel_batch_kind(
+        &call("shell_session", json!({"action":"wait","process_id":"one"})),
+        AgentToolProfile::Coding,
+        executor.registry(),
+        &executor,
+    )
+    .await;
+    let other = provider_parallel_batch_kind(
+        &call("shell_session", json!({"action":"wait","process_id":"two"})),
+        AgentToolProfile::Coding,
+        executor.registry(),
+        &executor,
+    )
+    .await;
+    assert!(!extend_parallel_batch(&mut first.clone(), same));
+    assert!(extend_parallel_batch(&mut first.clone(), other));
+    for action in ["write", "terminate"] {
+        let kind = provider_parallel_batch_kind(
+            &call("shell_session", json!({"action":action,"process_id":"one"})),
+            AgentToolProfile::Coding,
+            executor.registry(),
+            &executor,
+        )
+        .await;
+        assert_eq!(kind, ParallelBatchKind::Exclusive);
+    }
+    let background = provider_parallel_batch_kind(
+        &call("shell", json!({"command":"sh job.sh","background":true})),
+        AgentToolProfile::Coding,
+        executor.registry(),
+        &executor,
+    )
+    .await;
+    assert_eq!(background, ParallelBatchKind::ProcessStart);
+    assert!(extend_parallel_batch(&mut background.clone(), background));
+    let foreground = provider_parallel_batch_kind(
+        &call("shell", json!({"command":"sh job.sh"})),
+        AgentToolProfile::Coding,
+        executor.registry(),
+        &executor,
+    )
+    .await;
+    assert_eq!(foreground, ParallelBatchKind::Exclusive);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn background_terminal_batch_crosses_a_process_barrier_and_reports_actual_dispatch() {
+    #[derive(Debug)]
+    struct TerminalProvider(AtomicUsize);
+    #[async_trait]
+    impl LlmProvider for TerminalProvider {
+        async fn complete(
+            &self,
+            request: ProviderRequest,
+        ) -> Result<ProviderResponse, ProviderError> {
+            let mut response = MockProvider::text_response("Both commands completed.")
+                .complete(request)
+                .await?;
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                response.message = None;
+                response.finish_reason = ProviderFinishReason::ToolCalls;
+                response.tool_calls = [("a","b"), ("b","a")].into_iter().map(|(own, other)| ProviderToolCall {
+                    tool_call_id: own.to_owned(), tool_name:"shell".to_owned(),
+                    arguments: json!({"argv":["sh","barrier.sh",own,other],"background":true,"yield_time_ms":2000}),
+                }).collect();
+            }
+            Ok(response)
+        }
+        fn contract(&self) -> golutra_core::ProviderContract {
+            MockProvider::text_response("unused").contract()
+        }
+    }
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("barrier.sh"), "touch \"$1\"\ni=0\nwhile ! test -e \"$2\"; do\n  i=$((i + 1))\n  test \"$i\" -lt 100 || exit 42\n  sleep 0.01\ndone\nprintf '%s\\n' \"$1\"\n").unwrap();
+    let executor = BasicToolExecutor::new(
+        WorkspacePolicy::new(root.path())
+            .unwrap()
+            .with_unrestricted_access(true),
+    );
+    let agent = AgentLoop::new(
+        TerminalProvider(AtomicUsize::new(0)),
+        ContextBuilder::default(),
+        executor,
+    );
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(8),
+        agent.run_with_trace(
+            AgentTaskRequest {
+                session_id: SessionId::new(),
+                task_id: TaskId::new(),
+                turn_id: TurnId::new(),
+                objective: "Run two independent terminal jobs".to_owned(),
+                completion_criteria: Vec::new(),
+                output_schema: None,
+                touched_code: false,
+                contributors: Vec::new(),
+                tools: vec!["shell".to_owned(), "shell_session".to_owned()],
+            },
+            |_| {},
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let reports = outcome
+        .tool_reports
+        .iter()
+        .filter(|report| report.envelope.tool_name == "shell")
+        .collect::<Vec<_>>();
+    assert_eq!(reports.len(), 2);
+    for (report, expected) in reports.iter().zip(["a\n", "b\n"]) {
+        assert_eq!(report.envelope.status, ToolResultStatus::Ok);
+        assert_eq!(report.envelope.structured_facts["exit_code"], 0);
+        assert_eq!(
+            report.envelope.structured_facts["execution_mode"],
+            "parallel_tool_batch"
+        );
+        assert_eq!(report.envelope.structured_facts["dispatch_batch_size"], 2);
+        assert_eq!(
+            report.envelope.model_visible_excerpt.as_deref(),
+            Some(expected)
+        );
     }
 }
 
@@ -6375,7 +6629,7 @@ fn coding_tool_surface_retains_declared_capabilities_without_keyword_matching() 
         executor.registry(),
         "inspect the workspace without changing it",
     );
-    assert_eq!(read_only.len(), 1);
+    assert_eq!(read_only.len(), 2);
     assert_eq!(read_only[0].tool_name, "read_file");
 }
 
@@ -6454,12 +6708,10 @@ fn stable_tool_surface_expands_once_and_does_not_shrink_with_objective_text() {
         executor.registry(),
         true,
     );
-    assert!(
-        read_only
-            .iter()
-            .all(|tool| { tool.side_effect_type == SideEffectType::None })
-    );
-    assert!(!read_only.iter().any(|tool| tool.tool_name == "shell"));
+    assert!(read_only.iter().all(|tool| {
+        tool.side_effect_type == SideEffectType::None || tool.tool_name == "shell"
+    }));
+    assert!(read_only.iter().any(|tool| tool.tool_name == "shell"));
 }
 
 #[test]

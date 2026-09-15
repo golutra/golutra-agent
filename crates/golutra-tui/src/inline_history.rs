@@ -149,6 +149,7 @@ pub(crate) struct InlineHistoryState {
     committed_stream_lines: HashMap<EventId, usize>,
     // 只保留活动流已写入的渲染前缀；最终正文或后置 Markdown 定义可能修订它。
     committed_stream_prefixes: HashMap<EventId, Arc<[Line<'static>]>>,
+    committed_stream_sources: HashMap<EventId, String>,
     local_entries: Vec<LocalHistoryEntry>,
     last_anchor: Option<EventId>,
     last_source_prefix: Option<String>,
@@ -224,6 +225,7 @@ impl InlineHistoryState {
             committed_event_ids: HashSet::new(),
             committed_stream_lines: HashMap::new(),
             committed_stream_prefixes: HashMap::new(),
+            committed_stream_sources: HashMap::new(),
             local_entries: Vec::new(),
             last_anchor: None,
             last_source_prefix: None,
@@ -360,6 +362,7 @@ impl InlineHistoryState {
             self.committed_event_ids.clear();
             self.committed_stream_lines.clear();
             self.committed_stream_prefixes.clear();
+            self.committed_stream_sources.clear();
             app.set_inline_history_committed_event_ids(HashSet::new());
             app.set_inline_history_committed_stream_lines(HashMap::new());
         }
@@ -401,11 +404,10 @@ impl InlineHistoryState {
                 entry.commit_event && entry.is_partially_committed(&self.committed_event_ids)
             });
         let stream_prefix_changed = history_entries.iter().any(|entry| {
-            entry.event_ids.iter().any(|id| {
-                self.committed_stream_prefixes
-                    .get(id)
-                    .is_some_and(|prefix| !entry.lines.starts_with(prefix))
-            })
+            entry
+                .event_ids
+                .iter()
+                .any(|id| self.stream_prefix_revised(entry, id))
         });
         if !self.native_scrollback
             && ((!matches!(mode, InlineHistoryMode::Transcript)
@@ -427,6 +429,7 @@ impl InlineHistoryState {
             self.committed_event_ids.clear();
             self.committed_stream_lines.clear();
             self.committed_stream_prefixes.clear();
+            self.committed_stream_sources.clear();
             app.set_inline_history_committed_event_ids(HashSet::new());
             app.set_inline_history_committed_stream_lines(HashMap::new());
             // 取消旧提交边界后重新投影，不能沿用受旧分组边界影响的条目。
@@ -437,18 +440,17 @@ impl InlineHistoryState {
             // 已进入终端历史的流式正文不可擦除；真正的最终修订以明确标记追加，不能按旧行数截掉新答案。
             for entry in &history_entries {
                 for id in &entry.event_ids {
-                    if self
-                        .committed_stream_prefixes
-                        .get(id)
-                        .is_some_and(|prefix| !entry.lines.starts_with(prefix))
-                    {
+                    if self.stream_prefix_revised(entry, id) {
                         self.committed_stream_prefixes.remove(id);
+                        self.committed_stream_sources.remove(id);
                         self.committed_stream_lines.remove(id);
                     }
                 }
             }
         }
         self.committed_stream_prefixes
+            .retain(|id, _| committable_ids.contains(id));
+        self.committed_stream_sources
             .retain(|id, _| committable_ids.contains(id));
         if history_cleared || !self.header_emitted {
             self.display_rows = Arc::new(Vec::new());
@@ -534,6 +536,22 @@ impl InlineHistoryState {
         Ok(changed || history_cleared)
     }
 
+    fn stream_prefix_revised(&self, entry: &RenderedHistoryEntry, id: &EventId) -> bool {
+        self.committed_stream_sources.get(id).map_or_else(
+            || {
+                self.committed_stream_prefixes
+                    .get(id)
+                    .is_some_and(|prefix| !entry.lines.starts_with(prefix))
+            },
+            |prefix| {
+                entry
+                    .source_prefix
+                    .as_ref()
+                    .is_some_and(|source| !source.starts_with(prefix))
+            },
+        )
+    }
+
     fn append_event_lines(
         &mut self,
         app: &TuiApp,
@@ -610,6 +628,7 @@ impl InlineHistoryState {
                     self.committed_event_ids.insert(*event_id);
                     self.committed_stream_lines.remove(event_id);
                     self.committed_stream_prefixes.remove(event_id);
+                    self.committed_stream_sources.remove(event_id);
                 }
             } else if commit_until > already
                 && let Some(event_id) = entry.event_ids.first().copied()
@@ -617,6 +636,10 @@ impl InlineHistoryState {
                 self.committed_stream_lines.insert(event_id, commit_until);
                 self.committed_stream_prefixes
                     .insert(event_id, Arc::from(&entry.lines[..commit_until]));
+                if let Some(source) = &entry.source_prefix {
+                    self.committed_stream_sources
+                        .insert(event_id, source.clone());
+                }
             }
             // 后完成的工具不得越过尚未完成的前一个单元进入不可变历史。
             if !entry.commit_event {
@@ -725,9 +748,13 @@ fn history_entry_from_projection(
     width: u16,
 ) -> RenderedHistoryEntry {
     let tool_id = projection.id().cloned();
-    let source_prefix = (!stable && projection.is_assistant_message()).then(|| {
+    let source_prefix = projection.is_assistant_message().then(|| {
         let source = projection.item(false).body.join("\n");
-        source[..super::stream_commit::stable_source_end(&source)].to_owned()
+        if stable {
+            source
+        } else {
+            source[..super::stream_commit::stable_source_end(&source)].to_owned()
+        }
     });
     let stable_source = source_prefix
         .as_ref()
@@ -1365,6 +1392,90 @@ fn history_lines_height(lines: &[Line<'static>], width: u16) -> usize {
 #[cfg(test)]
 mod boundary_tests {
     use super::*;
+
+    #[test]
+    fn growing_stream_table_and_terminal_resize_do_not_duplicate_the_final_answer() {
+        let session_id = SessionId::new();
+        let turn_id = TurnId::new();
+        let mut app = TuiApp::new(
+            ThreadId::new(),
+            session_id,
+            None,
+            false,
+            "mock".into(),
+            None,
+        );
+        app.enable_inline_history();
+        let first = "后台任务已启动，接下来展示各个终端的运行结果。\n\n| Target | Result |\n| --- | --- |\n| one | ok |\n";
+        let second =
+            "| two | a much longer result that changes the column width |\n\n任务全部完成。";
+        let mut event = RuntimeEvent {
+            schema_version: golutra_core::RUNTIME_EVENT_SCHEMA_VERSION,
+            causal_context: Default::default(),
+            causal_links: vec![],
+            id: EventId::new(),
+            sequence_no: 1,
+            session_id,
+            turn_id: Some(turn_id),
+            task_id: None,
+            parent_event_id: None,
+            event_type: golutra_protocol::RuntimeEventType::ProviderStreamed,
+            timestamp: chrono::Utc::now(),
+            source: golutra_protocol::RuntimeEventSource::Provider,
+            payload: json!({"delta":{"kind":"text_delta","text":first}}),
+            payload_ref: None,
+            durable: false,
+        };
+        app.events.push(event.clone());
+        let mut terminal = Terminal::with_options(
+            ratatui::backend::TestBackend::new(100, 120),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Inline(3),
+            },
+        )
+        .unwrap();
+        let mut history = InlineHistoryState::new(session_id);
+        history.native_scrollback = true;
+        history
+            .flush_with_rebuild(&mut terminal, &mut app, |_| {
+                panic!("must preserve scrollback")
+            })
+            .unwrap();
+        terminal.backend_mut().resize(60, 120);
+        terminal.autoresize().unwrap();
+        event.id = EventId::new();
+        event.sequence_no = 2;
+        event.payload = json!({"delta":{"kind":"text_delta","text":second}});
+        app.events.push(event.clone());
+        history
+            .flush_with_rebuild(&mut terminal, &mut app, |_| {
+                panic!("must preserve scrollback")
+            })
+            .unwrap();
+        event.id = EventId::new();
+        event.sequence_no = 3;
+        event.event_type = golutra_protocol::RuntimeEventType::AssistantMessage;
+        event.payload = json!({"content":format!("{first}{second}")});
+        app.events.push(event);
+        history
+            .flush_with_rebuild(&mut terminal, &mut app, |_| {
+                panic!("must preserve scrollback")
+            })
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!text.contains("Updated response"), "{text}");
+        let compact = text
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>();
+        assert!(compact.contains("任务全部完成"), "{text}");
+    }
 
     #[test]
     fn native_history_preserves_commits_and_labels_a_revised_final_without_clearing() {

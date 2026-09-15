@@ -384,6 +384,9 @@ pub(crate) fn conversation_history_line(event: &RuntimeEvent) -> Option<String> 
             .filter(|message| !message.trim().is_empty())
             .map(|message| format!("Golutra: {}", compact_history_text(message, 360))),
         RuntimeEventType::ToolCompleted => historical_tool_result_line(event),
+        RuntimeEventType::SubagentUpdated => {
+            Some(crate::delegation::notifications::model_content(event))
+        }
         event_type if event_type.is_task_terminal() => task_terminal_history_line(event),
         RuntimeEventType::CandidateReady | RuntimeEventType::VerificationReady => event
             .payload
@@ -415,6 +418,10 @@ pub(crate) fn conversation_history_contributor(event: &RuntimeEvent) -> Option<C
         RuntimeEventType::ToolCompleted => {
             (ProviderRole::User, historical_tool_result_content(event)?)
         }
+        RuntimeEventType::SubagentUpdated => (
+            ProviderRole::User,
+            crate::delegation::notifications::model_content(event),
+        ),
         event_type if event_type.is_task_terminal() => {
             (ProviderRole::User, task_terminal_history_content(event)?)
         }

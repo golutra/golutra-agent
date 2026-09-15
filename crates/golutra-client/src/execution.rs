@@ -530,7 +530,7 @@ impl RuntimeHost {
         output_schema: Option<&Value>,
         context_budget: u64,
     ) -> Result<Vec<ContextContributor>, ClientError> {
-        let workspace_root = self.execution_workspace_root()?;
+        let workspace_root = delegation::worktree::workspace_root(self, session_id).await?;
         let mut contributors = vec![ContextContributor {
             name: "system".to_owned(),
             role: ProviderRole::System,
@@ -1043,7 +1043,7 @@ impl RuntimeHost {
                 let context = match delegation_policy::DelegationContext::recovered(
                     recovered,
                     chrono::Utc::now(),
-                    execution.cancellation_token(),
+                    self.execution.shutdown.child_token(),
                 ) {
                     Ok(context) => context,
                     Err(error) => {
@@ -1070,12 +1070,30 @@ impl RuntimeHost {
                                 .await;
                         }
                     };
-                let context = delegation_policy::DelegationContext::root(
+                let max_concurrent = match (&self.provider_config_paths, &self.workspace_root) {
+                    (Some(paths), Some(root)) => {
+                        match golutra_config::load_non_secret_runtime_settings(paths, root) {
+                            Ok(settings) => settings.subagent_max_concurrent,
+                            Err(error) => {
+                                return self
+                                    .fail_task_start(
+                                        &task,
+                                        ClientError::TaskExecution(error.to_string()),
+                                    )
+                                    .await;
+                            }
+                        }
+                    }
+                    _ => None,
+                }
+                .unwrap_or(delegation_policy::DEFAULT_DELEGATED_ACTIVE_CHILDREN);
+                let context = delegation_policy::DelegationContext::configured(
                     task.session_id,
                     task.payload.get("max_elapsed_ms").and_then(Value::as_u64),
                     provider_max_tokens(&provider_settings),
                     max_cost_microusd,
-                    execution.cancellation_token(),
+                    self.execution.shutdown.child_token(),
+                    max_concurrent,
                 );
                 (execution, control, context)
             }
@@ -1351,7 +1369,7 @@ impl RuntimeHost {
                 ClientError::TaskExecution(format!("invalid external verifier contract: {error}"))
             })?
             .unwrap_or_default();
-        let workspace_root = self.execution_workspace_root()?;
+        let workspace_root = delegation::worktree::workspace_root(&self, task.session_id).await?;
         let policy = WorkspacePolicy::new(workspace_root.clone())
             .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
         let delegated_task = task
@@ -1412,7 +1430,32 @@ impl RuntimeHost {
                 context_budget,
             ),
         );
-        let resume_context = resume_context_result?;
+        let mut resume_context = resume_context_result?;
+        if resume_context.is_none()
+            && task
+                .payload
+                .get(delegation::context_fork::SNAPSHOT_KEY)
+                .is_some()
+            && self
+                .storage
+                .repositories
+                .artifacts
+                .latest_context(task.session_id)
+                .await?
+                .is_none()
+        {
+            // 只在子会话尚无执行快照时继承父请求；恢复快照无效时走自身历史投影，
+            // 避免恢复到父快照而丢失已经发生的子任务工具调用。
+            resume_context = delegation::context_fork::replay(
+                &self,
+                task.session_id,
+                task.task_id,
+                &objective,
+                &task.payload,
+                &provider,
+            )
+            .await?;
+        }
         let legacy_task = LegacyTaskAdapter::new(&task.payload, &objective);
         if !has_explicit_task_contract && should_apply_legacy_adapter(&task.payload, execution_mode)
         {
@@ -1441,7 +1484,10 @@ impl RuntimeHost {
             Some(fallback) => harness.with_fallback(fallback),
             None => harness,
         };
-        let contributors = contributors_result?;
+        let mut contributors = contributors_result?;
+        if delegated_task {
+            delegation::context_fork::apply_child_role(&mut contributors);
+        }
         let trace_recorder = HostedObservationRecorder::spawn(self.clone(), task.clone());
         let trace_tx = trace_recorder.sender();
         let observation_send_error = Arc::new(StdMutex::new(None));

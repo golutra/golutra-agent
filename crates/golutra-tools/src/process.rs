@@ -582,7 +582,7 @@ impl LiveOutputBuffer {
     }
 }
 
-fn strip_terminal_controls(value: &str) -> String {
+pub(crate) fn strip_terminal_controls(value: &str) -> String {
     #[derive(Clone, Copy)]
     enum TerminalControlState {
         None,

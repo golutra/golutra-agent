@@ -2446,10 +2446,10 @@ pub fn provider_tool_description(tool_name: &str) -> &'static str {
             "Atomically apply one unified or Begin/Update/Add/Delete patch; batch related multi-file changes; returns status, digest, preview."
         }
         "shell_session" => {
-            "Control the same background shell using process_id and matching authoritative_pid. Reuse cursor; wait_for_terminal=true waits within wait_ms. If still running, wait again; do not restart. Or write/terminate."
+            "Wait/read, write, terminate, or list by process_id; automatic cursor. Send waits for different processes in one response in parallel; sequence same-process calls. Follow next_action; read while output_has_more, even after exit. Never restart to read."
         }
         "subagent" => {
-            "Run one isolated child task; it cannot create another child; return a bounded result."
+            "Delegate separate work; explore is read-only. Use run_in_background for concurrent children; completion is reported automatically. Reuse child_session_id for status/wait/send_input/resume/cancel; wait accepts child_session_ids. Children cannot delegate."
         }
         "list_dir" => "List entries in a workspace-relative directory.",
         "rg_search" => "Search workspace files with ripgrep.",
@@ -2462,7 +2462,7 @@ pub fn provider_tool_description(tool_name: &str) -> &'static str {
             "Delegate one complete, self-contained task to an isolated child agent and wait for its result. The child does not receive this conversation. Omit model and reasoning_effort to inherit the current agent settings; specify either field only when the task benefits from an explicit override."
         }
         "shell" => {
-            "Run with argv or command; prefer only one. Use bash -lc for pipes, redirects, heredoc, or compound commands. background=true returns after up to yield_time_ms; shell_session waits. timeout_ms is a hard lifetime; omit timeout_ms normally."
+            "Run argv or command; prefer only one. Use bash -lc for pipes/heredoc. Issue independent background=true calls together in one response for parallel execution; sequence dependent commands. Continue via shell_session. See yield_time_ms and timeout_ms."
         }
         "process_list" => {
             "List managed background processes owned by the current session, including redacted commands, states, exit codes, and output statistics. This does not consume process output or advance a cursor."

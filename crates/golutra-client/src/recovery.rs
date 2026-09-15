@@ -72,6 +72,7 @@ struct DurableTurnJournal {
     completed_provider_requests: BTreeSet<ProviderRequestId>,
     interrupted_turn_ids: BTreeSet<TurnId>,
     running_process_ids: BTreeSet<String>,
+    terminal_process_ids: BTreeSet<String>,
     checkpoint_event_refs: Vec<golutra_core::EventId>,
     previous_runtime_identity: Option<String>,
     unparseable_incomplete_tools: u32,
@@ -153,7 +154,18 @@ impl DurableTurnJournal {
                     self.completed_tools.insert(tool_call_id);
                     self.started_tools.remove(&tool_call_id);
                 }
-                update_running_processes(&mut self.running_process_ids, event);
+                update_running_processes(
+                    &mut self.running_process_ids,
+                    &mut self.terminal_process_ids,
+                    event,
+                );
+            }
+            ProtocolRuntimeEventType::ProcessUpdated => {
+                update_running_processes(
+                    &mut self.running_process_ids,
+                    &mut self.terminal_process_ids,
+                    event,
+                );
             }
             _ => {}
         }
@@ -217,8 +229,18 @@ fn tool_call_id_from_completed(event: &RuntimeEvent) -> Option<ToolCallId> {
         .and_then(|value| value.parse().ok())
 }
 
-fn update_running_processes(running: &mut BTreeSet<String>, event: &RuntimeEvent) {
-    let Some(facts) = event.payload.pointer("/envelope/structured_facts") else {
+fn update_running_processes(
+    running: &mut BTreeSet<String>,
+    terminal: &mut BTreeSet<String>,
+    event: &RuntimeEvent,
+) {
+    let Some(facts) = event
+        .payload
+        .pointer("/envelope/structured_facts")
+        .or_else(|| {
+            (event.event_type == ProtocolRuntimeEventType::ProcessUpdated).then_some(&event.payload)
+        })
+    else {
         return;
     };
     let Some(process_id) = facts.get("process_id").and_then(Value::as_str) else {
@@ -229,9 +251,12 @@ fn update_running_processes(running: &mut BTreeSet<String>, event: &RuntimeEvent
         .and_then(Value::as_str)
         .unwrap_or("unknown");
     if matches!(state, "running" | "unknown") {
-        running.insert(process_id.to_owned());
+        if !terminal.contains(process_id) {
+            running.insert(process_id.to_owned());
+        }
     } else {
         running.remove(process_id);
+        terminal.insert(process_id.to_owned());
     }
 }
 
@@ -274,6 +299,27 @@ mod tests {
             payload_ref: None,
             durable: true,
         }
+    }
+
+    #[test]
+    fn terminal_process_update_survives_a_late_running_tool_result() {
+        let terminal = event(
+            1,
+            RuntimeEventType::ProcessUpdated,
+            None,
+            json!({"process_id":"proc-completed","process_state":"exited","terminal":true}),
+        );
+        let delayed = event(
+            2,
+            RuntimeEventType::ToolCompleted,
+            None,
+            json!({"envelope":{"structured_facts":{"process_id":"proc-completed","process_state":"running"}}}),
+        );
+        assert!(
+            DurableTurnJournal::reduce(&[terminal, delayed])
+                .running_process_ids
+                .is_empty()
+        );
     }
 
     #[test]

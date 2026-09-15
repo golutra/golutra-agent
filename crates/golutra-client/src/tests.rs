@@ -1758,6 +1758,9 @@ async fn delegated_task_inherits_overrides_and_archives_an_isolated_child() {
         })
     );
 
+    assert_delegation_lifecycle(&host, &backend, parent_session_id).await;
+    assert_delegation_input_and_cancel(&host, &backend, parent_session_id).await;
+
     host.execution
         .task_controls
         .lock()
@@ -1765,6 +1768,211 @@ async fn delegated_task_inherits_overrides_and_archives_an_isolated_child() {
         .remove(&parent_session_id);
     drop(completion_sender);
     parent_worker.abort();
+}
+
+async fn assert_delegation_lifecycle(
+    host: &Arc<RuntimeHost>,
+    backend: &dyn golutra_tools::TaskDelegationBackend,
+    parent: SessionId,
+) {
+    // 固定结果已交付而通知尚未落盘的窗口，resume 不得把通知收尾误判为执行中。
+    let notice_lock = host.execution.delegation_notification_lock.lock().await;
+    let request = |arguments: Value| ToolRequest {
+        tool_call_id: ToolCallId::new(),
+        provider_tool_call_id: None,
+        session_id: parent,
+        turn_id: Some(TurnId::new()),
+        tool_name: "subagent".to_owned(),
+        arguments,
+    };
+    let started = backend.delegate(&request(json!({
+        "task": "Summarize the project purpose.", "agent_type": "explore", "run_in_background": true
+    })), CancellationToken::new()).await.expect("background child");
+    assert_eq!(started.status, golutra_core::ToolResultStatus::Ok);
+    let child = started.structured_facts["child_session_id"].clone();
+    let completed = backend
+        .delegate(
+            &request(json!({"action": "wait", "child_session_id": child})),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("wait child");
+    assert_eq!(
+        completed.structured_facts["child_status"], "completed",
+        "{completed:?}"
+    );
+    assert_eq!(
+        completed.structured_facts["child_verification_status"],
+        "pass"
+    );
+    assert_eq!(completed.structured_facts["child_findings_available"], true);
+    let resumed_request = request(json!({"action": "resume", "child_session_id": child,
+        "task": "Explain the project structure.", "agent_type": "general"}));
+    let resumed = backend
+        .delegate(&resumed_request, CancellationToken::new())
+        .await
+        .expect("resume child");
+    assert_eq!(resumed.structured_facts["child_session_id"], child);
+    assert_eq!(resumed.structured_facts["child_status"], "completed");
+    drop(notice_lock);
+    let retry = backend
+        .delegate(&resumed_request, CancellationToken::new())
+        .await
+        .expect("retry resume");
+    assert_eq!(resumed, retry);
+    let status = backend
+        .delegate(
+            &request(json!({"action": "status", "child_session_id": child})),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("latest status");
+    assert_eq!(status, resumed);
+    let child_id = child.as_str().unwrap().parse::<SessionId>().unwrap();
+    let events = host
+        .storage
+        .repositories
+        .events
+        .load(child_id, None, None)
+        .await
+        .unwrap();
+    let tasks = events
+        .iter()
+        .filter(|event| event.event_type == RuntimeEventType::TaskCreated)
+        .collect::<Vec<_>>();
+    assert_eq!(tasks.len(), 2);
+    for event in tasks {
+        assert_eq!(
+            event
+                .payload
+                .pointer("/payload/task_contract/workspace_change"),
+            Some(&json!("forbidden"))
+        );
+    }
+    let rejected = backend
+        .delegate(
+            &request(
+                json!({"action": "send_input", "child_session_id": child, "task": "late input"}),
+            ),
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(rejected.is_err());
+    host.execution
+        .delegation_operations
+        .lock()
+        .await
+        .retain(|_, operation| !operation.is_complete());
+    let restored = backend
+        .delegate(
+            &request(json!({"action": "status", "child_session_id": child})),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("durable status");
+    assert_eq!(restored.content, resumed.content);
+    assert_eq!(restored.structured_facts["child_status"], "completed");
+    let mut foreign = request(json!({"action": "status", "child_session_id": child}));
+    foreign.session_id = SessionId::new();
+    assert!(
+        backend
+            .delegate(&foreign, CancellationToken::new())
+            .await
+            .is_err()
+    );
+}
+
+async fn assert_delegation_input_and_cancel(
+    host: &Arc<RuntimeHost>,
+    backend: &dyn golutra_tools::TaskDelegationBackend,
+    parent: SessionId,
+) {
+    host.execution
+        .task_controls
+        .lock()
+        .await
+        .get_mut(&parent)
+        .unwrap()
+        .yolo = true;
+    let mut bus = host.execution.event_bus.subscribe();
+    let request = |arguments: Value| ToolRequest {
+        tool_call_id: ToolCallId::new(),
+        provider_tool_call_id: None,
+        session_id: parent,
+        turn_id: Some(TurnId::new()),
+        tool_name: "subagent".to_owned(),
+        arguments,
+    };
+    let started = backend
+        .delegate(
+            &request(json!({"task": "sleep before completing", "run_in_background": true})),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let child = started.structured_facts["child_session_id"].clone();
+    let child_id = child.as_str().unwrap().parse::<SessionId>().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let event = bus.recv().await.unwrap();
+            if event.session_id == child_id && event.event_type == RuntimeEventType::ToolStarted {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("child tool starts");
+    let input_request = request(
+        json!({"action": "send_input", "child_session_id": child, "task": "Include the observed result in your answer."}),
+    );
+    let accepted = backend
+        .delegate(&input_request, CancellationToken::new())
+        .await
+        .expect("input accepted");
+    assert_eq!(accepted.structured_facts["input_accepted"], true);
+    let repeated = backend
+        .delegate(&input_request, CancellationToken::new())
+        .await
+        .expect("input retry");
+    assert_eq!(accepted, repeated);
+    backend
+        .delegate(
+            &request(json!({"action": "cancel", "child_session_id": child})),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("cancel child");
+    let stopped = backend
+        .delegate(
+            &request(json!({"action": "wait", "child_session_id": child})),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("wait cancellation");
+    assert_eq!(
+        stopped.status,
+        golutra_core::ToolResultStatus::Cancelled,
+        "{stopped:?}"
+    );
+    assert_ne!(stopped.structured_facts["completed"], true);
+    let events = host
+        .storage
+        .repositories
+        .events
+        .load(child_id, None, None)
+        .await
+        .unwrap();
+    let queued = events
+        .iter()
+        .filter(|event| event.event_type == RuntimeEventType::TurnQueued)
+        .collect::<Vec<_>>();
+    assert_eq!(queued.len(), 1);
+    assert!(events.iter().all(|event| {
+        !event
+            .payload
+            .to_string()
+            .contains("_delegation_admission_token")
+    }));
 }
 
 #[tokio::test]
@@ -1804,8 +2012,20 @@ async fn cancelled_delegation_does_not_create_a_child_session() {
 
 #[tokio::test]
 async fn cancelling_a_parent_execution_stops_and_archives_a_running_child() {
+    assert_parent_interrupt_child(false).await;
+}
+
+#[tokio::test]
+async fn interrupting_parent_keeps_background_child_alive_until_explicit_cancel() {
+    assert_parent_interrupt_child(true).await;
+}
+
+async fn assert_parent_interrupt_child(background: bool) {
     let _provider = IsolatedGlobalMockProvider::install().await;
-    let host = RuntimeHost::in_memory().await.expect("host");
+    let workspace = tempdir().unwrap();
+    let host = RuntimeHost::ephemeral_for_cwd(workspace.path())
+        .await
+        .expect("host");
     let parent_session_id = host.default_session_id();
     host.upsert_current_thread(
         parent_session_id,
@@ -1817,10 +2037,10 @@ async fn cancelling_a_parent_execution_stops_and_archives_a_running_child() {
     let (parent_execution, _parent_control) = agent_execution_channel(1);
     let root_context = crate::delegation_policy::DelegationContext::root(
         parent_session_id,
-        Some(10_000),
+        Some(60_000),
         Some(1_024),
         None,
-        parent_execution.cancellation_token(),
+        host.execution.shutdown.child_token(),
     );
     let parent_worker = tokio::spawn(std::future::pending::<()>());
     let (completion_sender, completion) = watch::channel(false);
@@ -1829,7 +2049,7 @@ async fn cancelling_a_parent_execution_stops_and_archives_a_running_child() {
         HostedTaskControl {
             task_id: parent_task_id,
             allow_network: false,
-            yolo: false,
+            yolo: true,
             provider_settings: ProviderTurnSettings::default(),
             execution: parent_execution.clone(),
             abort_handle: parent_worker.abort_handle(),
@@ -1846,8 +2066,9 @@ async fn cancelling_a_parent_execution_stops_and_archives_a_running_child() {
         session_id: parent_session_id,
         turn_id: Some(TurnId::new()),
         tool_name: "delegate_task".to_owned(),
-        arguments: json!({"task": "sleep while the parent is cancelled"}),
+        arguments: json!({"task": "sleep while the parent is cancelled", "run_in_background":background}),
     };
+    let mut events = host.execution.event_bus.subscribe();
     let delegation = tokio::spawn(async move {
         golutra_tools::TaskDelegationBackend::delegate(&backend, &request, CancellationToken::new())
             .await
@@ -1873,8 +2094,58 @@ async fn cancelling_a_parent_execution_stops_and_archives_a_running_child() {
     .await
     .expect("child thread starts");
 
-    delegation.abort();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if event.session_id == child_session_id
+                && event.event_type == RuntimeEventType::ToolStarted
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("child tool started");
+    if background {
+        delegation.await.unwrap().unwrap();
+    } else {
+        delegation.abort();
+    }
     parent_execution.cancel();
+    if background {
+        let child_control = host
+            .execution
+            .task_controls
+            .lock()
+            .await
+            .get(&child_session_id)
+            .cloned()
+            .expect("background child remains active");
+        assert!(!child_control.execution.cancellation_token().is_cancelled());
+        assert!(
+            !child_control
+                .delegation
+                .as_ref()
+                .unwrap()
+                .cancellation()
+                .is_cancelled()
+        );
+        let backend = crate::delegation::RuntimeTaskDelegationBackend::new(Arc::downgrade(&host));
+        golutra_tools::TaskDelegationBackend::delegate(
+            &backend,
+            &ToolRequest {
+                tool_call_id: ToolCallId::new(),
+                provider_tool_call_id: None,
+                session_id: parent_session_id,
+                turn_id: None,
+                tool_name: "subagent".to_owned(),
+                arguments: json!({"action":"cancel","child_session_id":child_session_id}),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    }
 
     timeout(Duration::from_secs(10), async {
         loop {
@@ -9926,6 +10197,7 @@ async fn recovery_transfer_carries_cumulative_governor_and_delegation_state() {
     let delegation = delegation_policy::TimedDelegationRecoveryState {
         captured_at,
         state: delegation_policy::DelegationRecoveryState {
+            max_active_children: delegation_policy::DEFAULT_DELEGATED_ACTIVE_CHILDREN,
             root_session_id: session_id,
             parent_session_id: None,
             parent_task_id: None,
@@ -10455,6 +10727,7 @@ fn recovery_transfer_does_not_get_overwritten_by_stale_restarted_turn_metadata()
         delegation: Some(delegation_policy::TimedDelegationRecoveryState {
             captured_at,
             state: delegation_policy::DelegationRecoveryState {
+                max_active_children: delegation_policy::DEFAULT_DELEGATED_ACTIVE_CHILDREN,
                 root_session_id: session_id,
                 parent_session_id: None,
                 parent_task_id: None,
@@ -10529,6 +10802,7 @@ fn canonical_delegation_recovery_state(
     delegation_policy::TimedDelegationRecoveryState {
         captured_at: chrono::Utc::now(),
         state: delegation_policy::DelegationRecoveryState {
+            max_active_children: delegation_policy::DEFAULT_DELEGATED_ACTIVE_CHILDREN,
             root_session_id,
             parent_session_id: None,
             parent_task_id: None,

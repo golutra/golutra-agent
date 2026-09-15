@@ -1464,3 +1464,27 @@ fn non_secret_runtime_settings_reject_invalid_reasoning_effort() {
     .expect_err("unknown reasoning effort must be rejected");
     assert!(error.to_string().contains("reasoning_effort"));
 }
+
+#[test]
+fn subagent_concurrency_merges_and_rejects_zero() {
+    let settings = |count| NonSecretRuntimeSettings {
+        subagent_max_concurrent: count,
+        ..Default::default()
+    };
+    assert_eq!(
+        NonSecretRuntimeSettings::merged(&settings(Some(10)), &settings(Some(3)), &settings(None))
+            .subagent_max_concurrent,
+        Some(3)
+    );
+    assert_eq!(
+        NonSecretRuntimeSettings::merged(
+            &settings(Some(10)),
+            &settings(Some(3)),
+            &settings(Some(20))
+        )
+        .subagent_max_concurrent,
+        Some(20)
+    );
+    assert!(settings(Some(0)).validate().is_err());
+    assert!(settings(Some(20)).validate().is_ok());
+}

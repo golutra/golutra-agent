@@ -601,6 +601,8 @@ pub(crate) fn stable_event_operation_projection_count(events: &[RuntimeEvent]) -
 
 #[derive(Debug, Clone)]
 pub(crate) struct EventOperationEntry {
+    process_id: Option<String>,
+    terminal_wait: bool,
     tool_kind: ToolSummaryKind,
     pub(crate) id: EventId,
     pub(crate) event_ids: Vec<EventId>,
@@ -612,7 +614,23 @@ pub(crate) struct EventOperationEntry {
 
 impl EventOperationEntry {
     fn new(event: &RuntimeEvent, projection: OperationProjection, stable: bool) -> Self {
+        let facts = event
+            .payload
+            .get("arguments")
+            .or_else(|| event.payload.pointer("/envelope/structured_facts"))
+            .unwrap_or(&event.payload);
         Self {
+            process_id: facts
+                .get("process_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            terminal_wait: event
+                .payload
+                .get("tool_name")
+                .or_else(|| event.payload.pointer("/envelope/tool_name"))
+                .and_then(Value::as_str)
+                == Some("shell_session")
+                && facts.get("action").and_then(Value::as_str) == Some("wait"),
             tool_kind: ToolSummaryKind::from_tool_name(
                 event
                     .payload
@@ -726,6 +744,8 @@ fn event_operation_entries_with_boundary(
 
     let mut items: Vec<EventOperationEntry> = Vec::new();
     let mut indexes = ProjectionIndexes::default();
+    let mut process_updates = HashMap::new();
+    let mut subagent_updates = HashMap::new();
     let mut turns_with_user_steps = HashSet::<TurnId>::new();
     let mut covered_user_step_tools = HashSet::<OperationId>::new();
     for event in typed_events {
@@ -890,6 +910,18 @@ fn event_operation_entries_with_boundary(
                     update_tool_progress(&mut record.projection, event);
                 }
             }
+            RuntimeEventType::ProcessUpdated => {
+                if let Some(process_id) = event.payload.get("process_id").and_then(Value::as_str) {
+                    process_updates.insert(process_id, event);
+                }
+                project_process_update(&mut items, event, committed);
+            }
+            RuntimeEventType::SubagentUpdated => {
+                if let Some(id) = event.payload.get("tool_call_id").and_then(Value::as_str) {
+                    subagent_updates.insert(id, event);
+                }
+                project_subagent_update(&mut items, event, committed);
+            }
             RuntimeEventType::ToolCompleted => {
                 if let Some(id) = operation_id_from_event(event)
                     && covered_user_step_tools.contains(&id)
@@ -924,10 +956,26 @@ fn event_operation_entries_with_boundary(
                             }
                         }
                         items[index].projection = projection;
-                        items[index].stable = true;
+                        items[index].stable = !(items[index].terminal_wait
+                            && items[index].projection.item(false).role
+                                == TranscriptRole::Activity);
                     } else {
                         items.push(EventOperationEntry::new(event, projection, true));
                     }
+                }
+                if let Some(process_id) = event
+                    .payload
+                    .pointer("/envelope/structured_facts/process_id")
+                    .and_then(Value::as_str)
+                    && let Some(update) = process_updates.get(process_id)
+                    && update.payload.get("terminal") == Some(&Value::Bool(true))
+                {
+                    project_process_update(&mut items, update, committed);
+                }
+                if let Some(id) = operation_id_from_event(event)
+                    && let Some(update) = subagent_updates.get(id.0.as_str())
+                {
+                    project_subagent_update(&mut items, update, committed);
                 }
             }
             RuntimeEventType::UserStep => {
@@ -985,12 +1033,66 @@ fn event_operation_entries_with_boundary(
         }
     }
     coalesce_completed_tool_batches(
-        items,
+        coalesce_terminal_waits(items, committed, command_anchors, operation_boundaries),
         committed,
         command_anchors,
         semantic_groups,
         operation_boundaries,
     )
+}
+
+fn coalesce_terminal_waits(
+    items: Vec<EventOperationEntry>,
+    committed: &HashSet<EventId>,
+    anchors: &HashSet<EventId>,
+    boundaries: &HashSet<OperationId>,
+) -> Vec<EventOperationEntry> {
+    let mut result: Vec<EventOperationEntry> = Vec::with_capacity(items.len());
+    for mut item in items {
+        if let Some(previous) = result.last_mut()
+            && previous.terminal_wait
+            && item.terminal_wait
+            && previous.process_id.is_some()
+            && previous.process_id == item.process_id
+            && previous.turn_id == item.turn_id
+            && !previous
+                .event_ids
+                .iter()
+                .chain(&item.event_ids)
+                .any(|id| committed.contains(id) || anchors.contains(id))
+            && !previous
+                .projection
+                .id()
+                .into_iter()
+                .chain(item.projection.id())
+                .any(|id| boundaries.contains(id))
+            && matches!(
+                previous.projection.item(false).role,
+                TranscriptRole::Activity | TranscriptRole::Success
+            )
+            && matches!(
+                item.projection.item(false).role,
+                TranscriptRole::Activity | TranscriptRole::Success
+            )
+        {
+            if let OperationProjection::ToolActivity { id, .. } = &mut item.projection
+                && let Some(original_id) = previous.projection.id()
+            {
+                *id = original_id.clone();
+            }
+            previous.event_ids.extend(item.event_ids);
+            previous.projection = item.projection;
+            previous.stable = item.stable;
+        } else {
+            if let Some(previous) = result.last_mut()
+                && previous.terminal_wait
+            {
+                previous.stable = true;
+            }
+            result.push(item);
+        }
+    }
+    result
 }
 
 fn plain_projection(item: TranscriptItem) -> OperationProjection {
@@ -1313,28 +1415,134 @@ fn tool_operation_projection(event: &RuntimeEvent) -> Option<OperationProjection
         .or_else(|| event.payload.get("summary").and_then(Value::as_str))
         .unwrap_or("tool completed");
     let metrics = event.payload.get("metrics");
-    let title = completed_tool_title_with_object(
+    let mut title = completed_tool_title_with_object(
         tool_name,
         status,
         (!invocation.is_empty()).then_some(invocation.as_str()),
     );
+    let process_state = facts
+        .and_then(|facts| facts.get("process_state"))
+        .and_then(Value::as_str);
+    let running_process =
+        matches!(tool_name, "shell" | "shell_session") && process_state == Some("running");
+    if running_process {
+        title = if tool_name == "shell" {
+            "Background terminal running"
+        } else {
+            "Waiting for background terminal"
+        }
+        .to_owned();
+    } else if tool_name == "shell" && process_state == Some("exited") {
+        title = "ran".to_owned();
+    }
+    let delegated = matches!(tool_name, "subagent" | "delegate_task");
+    let child_status = facts
+        .and_then(|facts| facts.get("child_status"))
+        .and_then(Value::as_str);
+    let partial_child = delegated
+        && child_status == Some("partial")
+        && status == ToolResultStatus::Error
+        && facts.and_then(|facts| facts.get("error")).is_none();
+    let running_child = delegated
+        && status == ToolResultStatus::Ok
+        && matches!(child_status, Some("running" | "aborting"));
+    if partial_child {
+        title = "subagent · verification incomplete".to_owned();
+    } else if running_child {
+        title = if child_status == Some("aborting") {
+            "Stopping subagent"
+        } else {
+            "Subagent running"
+        }
+        .to_owned();
+    }
     let mut body = Vec::new();
     let mut details = Vec::new();
+    if delegated
+        && let Some(results) = facts
+            .and_then(|facts| facts.get("child_results"))
+            .and_then(Value::as_array)
+    {
+        let pending = facts
+            .and_then(|facts| facts.get("child_pending_ids"))
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        title = format!(
+            "Subagents · {} finished · {pending} running",
+            results.len().saturating_sub(pending)
+        );
+    }
+    if tool_name == "shell_session" && facts.and_then(|facts| facts.get("total_count")).is_some() {
+        title = "Background terminals".to_owned();
+        body.push(format!(
+            "{} running · {} total",
+            facts.unwrap()["running_count"],
+            facts.unwrap()["total_count"]
+        ));
+    }
     if !invocation.is_empty() {
         details.push(invocation);
     }
     if let Some(line) = tool_metrics_line(metrics, facts) {
         details.push(line);
     }
-    if facts
-        .and_then(|value| value.get("workspace_changes_known"))
-        .and_then(Value::as_bool)
-        == Some(false)
+    if !delegated
+        && !matches!(tool_name, "shell" | "shell_session")
+        && facts
+            .and_then(|value| value.get("workspace_changes_known"))
+            .and_then(Value::as_bool)
+            == Some(false)
     {
         details.push("workspace changes unknown".to_owned());
     }
-    if status != ToolResultStatus::Ok && !summary.trim().is_empty() {
+    if status != ToolResultStatus::Ok && !partial_child && !summary.trim().is_empty() {
         body.push(summary.to_owned());
+    }
+    if delegated {
+        if let Some(issues) = facts
+            .and_then(|facts| facts.get("child_verification_issues"))
+            .and_then(Value::as_array)
+        {
+            for issue in issues.iter().take(2) {
+                if let Some(reason) = issue.get("reason").and_then(Value::as_str) {
+                    body.push(bounded_text(reason, 240));
+                }
+            }
+        }
+        details.push("Child details".to_owned());
+        if facts
+            .and_then(|facts| facts.get("workspace_changes_known"))
+            .and_then(Value::as_bool)
+            == Some(false)
+        {
+            details.push("workspace changes unknown".to_owned());
+        }
+        for key in [
+            "child_session_id",
+            "child_results",
+            "child_pending_ids",
+            "child_workspace_path",
+            "child_isolation",
+            "child_execution_status",
+            "child_verification_status",
+            "child_diagnostic",
+            "child_verification_issues",
+            "child_result_has_more",
+            "child_result_next_offset",
+        ] {
+            if let Some(value) = facts
+                .and_then(|facts| facts.get(key))
+                .filter(|value| !value.is_null())
+            {
+                details.push(format!(
+                    "{key}: {}",
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| value.to_string())
+                ));
+            }
+        }
     }
 
     let excerpt = envelope
@@ -1344,7 +1552,18 @@ fn tool_operation_projection(event: &RuntimeEvent) -> Option<OperationProjection
     let output_lines = bounded_output_lines(excerpt, 40);
     let changes = operation_file_changes(event);
     if !changes.is_empty() {
-        let mut item = file_change_item(&changes, status);
+        let mut item = file_change_item(
+            &changes,
+            if partial_child {
+                ToolResultStatus::Ok
+            } else {
+                status
+            },
+        );
+        if partial_child {
+            item.title = format!("{title} · {}", item.title);
+            item.role = TranscriptRole::Warning;
+        }
         body.append(&mut item.body);
         item.body = body;
         if !output_lines.is_empty() {
@@ -1362,12 +1581,209 @@ fn tool_operation_projection(event: &RuntimeEvent) -> Option<OperationProjection
     Some(OperationProjection::ToolActivity {
         id,
         item: TranscriptItem {
-            role: tool_status_role(status),
+            role: if partial_child {
+                TranscriptRole::Warning
+            } else if running_child || running_process {
+                TranscriptRole::Activity
+            } else {
+                tool_status_role(status)
+            },
             title,
             body,
         },
         details,
     })
+}
+
+fn project_process_update(
+    items: &mut Vec<EventOperationEntry>,
+    event: &RuntimeEvent,
+    committed: &HashSet<EventId>,
+) {
+    let Some(process_id) = event.payload.get("process_id").and_then(Value::as_str) else {
+        return;
+    };
+    let call_id = process_id.strip_prefix("proc-").unwrap_or(process_id);
+    let terminal_id = format!("terminal:{process_id}");
+    let original = items
+        .iter()
+        .rposition(|record| record.projection.id().is_some_and(|id| id.0 == call_id));
+    let terminal = event.payload.get("terminal").and_then(Value::as_bool) == Some(true);
+    let existing_notice = items
+        .iter()
+        .rposition(|record| record.projection.id().is_some_and(|id| id.0 == terminal_id));
+    let target = existing_notice.or(original);
+    let Some(target) = target else {
+        return;
+    };
+    let archived = items[target]
+        .event_ids
+        .iter()
+        .any(|id| committed.contains(id));
+    let append_notice = archived
+        && terminal
+        && existing_notice.is_none()
+        && items[target].projection.item(false).role == TranscriptRole::Activity;
+    let state = event
+        .payload
+        .get("process_state")
+        .and_then(Value::as_str)
+        .unwrap_or("running");
+    let role = match state {
+        "running" => TranscriptRole::Activity,
+        "exited" => TranscriptRole::Success,
+        "cancelled" | "terminated" => TranscriptRole::System,
+        _ => TranscriptRole::Error,
+    };
+    let title = match state {
+        "running" => "Background terminal running",
+        "exited" => "Background terminal completed",
+        "cancelled" => "Background terminal cancelled",
+        "terminated" => "Background terminal stopped",
+        "timed_out" => "Background terminal timed out",
+        _ => "Background terminal failed",
+    };
+    let command = event
+        .payload
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or(process_id);
+    let mut details = vec![command.to_owned()];
+    if let Some(metrics) = tool_metrics_line(None, Some(&event.payload)) {
+        details.push(metrics);
+    }
+    details.push("Output".to_owned());
+    if let Some(output) = event.payload.get("output_excerpt").and_then(Value::as_str) {
+        details.extend(output.lines().map(str::to_owned));
+    }
+    details.push(format!("Process: {process_id}"));
+    details.push(format!("State: {state}"));
+    if event.payload.get("workspace_scan_pending") == Some(&Value::Bool(true)) && terminal {
+        details.push("Workspace change inspection is pending".to_owned());
+    }
+    let projection = OperationProjection::ToolActivity {
+        id: OperationId(if append_notice {
+            terminal_id
+        } else {
+            items[target]
+                .projection
+                .id()
+                .map(|id| id.0.clone())
+                .unwrap_or(terminal_id)
+        }),
+        item: TranscriptItem {
+            role,
+            title: title.to_owned(),
+            body: Vec::new(),
+        },
+        details,
+    };
+    if append_notice {
+        if let Some(original) = original
+            && let OperationProjection::ToolActivity {
+                details: original_details,
+                ..
+            } = &mut items[original].projection
+            && let OperationProjection::ToolActivity { details, .. } = &projection
+        {
+            original_details.clone_from(details);
+        }
+        items.push(EventOperationEntry::new(event, projection, true));
+    } else {
+        items[target].projection = projection;
+        if !archived && !items[target].event_ids.contains(&event.id) {
+            items[target].event_ids.push(event.id);
+        }
+    }
+}
+
+fn project_subagent_update(
+    items: &mut Vec<EventOperationEntry>,
+    event: &RuntimeEvent,
+    committed: &HashSet<EventId>,
+) {
+    let Some(call_id) = event.payload.get("tool_call_id").and_then(Value::as_str) else {
+        return;
+    };
+    let notice_id = format!("subagent:{call_id}");
+    let original = items
+        .iter()
+        .rposition(|entry| entry.projection.id().is_some_and(|id| id.0 == call_id));
+    let existing = items
+        .iter()
+        .rposition(|entry| entry.projection.id().is_some_and(|id| id.0 == notice_id));
+    let target = existing.or(original);
+    if target.is_none() {
+        return;
+    }
+    let archived = target.is_some_and(|index| {
+        items[index]
+            .event_ids
+            .iter()
+            .any(|id| committed.contains(id))
+    });
+    let append = target.is_none()
+        || (archived
+            && existing.is_none()
+            && target.is_some_and(|index| {
+                items[index].projection.item(false).role == TranscriptRole::Activity
+            }));
+    let facts = &event.payload["facts"];
+    let status = facts
+        .get("child_status")
+        .and_then(Value::as_str)
+        .unwrap_or("completed");
+    let role = match status {
+        "completed" => TranscriptRole::Success,
+        "failed" => TranscriptRole::Error,
+        "cancelled" | "interrupted" => TranscriptRole::System,
+        _ => TranscriptRole::Warning,
+    };
+    let mut details = vec![
+        event
+            .payload
+            .get("summary")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+    ];
+    if let Some(child) = facts.get("child_session_id").and_then(Value::as_str) {
+        details.push(format!("Child: {child}"));
+    }
+    if let Some(content) = event.payload.get("content").and_then(Value::as_str) {
+        details.extend(content.lines().map(str::to_owned));
+    }
+    let projection = OperationProjection::ToolActivity {
+        id: OperationId(if append || existing.is_some() {
+            notice_id
+        } else {
+            call_id.to_owned()
+        }),
+        item: TranscriptItem {
+            role,
+            title: format!("Subagent {status}"),
+            body: Vec::new(),
+        },
+        details,
+    };
+    if append {
+        if let Some(index) = original
+            && let OperationProjection::ToolActivity {
+                details: original_details,
+                ..
+            } = &mut items[index].projection
+            && let OperationProjection::ToolActivity { details, .. } = &projection
+        {
+            original_details.clone_from(details);
+        }
+        items.push(EventOperationEntry::new(event, projection, true));
+    } else if let Some(index) = target {
+        items[index].projection = projection;
+        items[index].stable = true;
+        if !archived && !items[index].event_ids.contains(&event.id) {
+            items[index].event_ids.push(event.id);
+        }
+    }
 }
 
 fn running_tool_title(tool_name: &str) -> String {
@@ -1389,7 +1805,12 @@ fn default_tool_preview(details: &[String]) -> Vec<String> {
     let preview = details
         .iter()
         // 默认工具卡只展示调用摘要；参数及原始输出由展开视图提供，不能靠 JSON 缩进猜测内容。
-        .take_while(|line| !matches!(line.as_str(), "Arguments" | "Output" | "Facts"))
+        .take_while(|line| {
+            !matches!(
+                line.as_str(),
+                "Arguments" | "Output" | "Facts" | "Child details"
+            )
+        })
         .filter(|line| {
             let line = line.as_str();
             !line.starts_with("exit ") && !line.contains(" · ")
@@ -1724,6 +2145,7 @@ fn tool_invocation(tool_name: &str, values: Option<&Value>) -> String {
             }
         }
         "subagent" | "delegate_task" => string("task")
+            .or_else(|| string("child_task"))
             .or_else(|| string("child_status"))
             .unwrap_or_default()
             .to_owned(),
@@ -1778,8 +2200,9 @@ fn tool_metrics_line(metrics: Option<&Value>, facts: Option<&Value>) -> Option<S
     {
         parts.push(format_bytes(bytes));
     }
-    if let Some(duration) = metrics
-        .and_then(|value| value.get("duration_ms"))
+    if let Some(duration) = facts
+        .and_then(|value| value.get("elapsed_ms"))
+        .or_else(|| metrics.and_then(|value| value.get("duration_ms")))
         .and_then(Value::as_u64)
     {
         parts.push(format_millis(duration));
@@ -2334,6 +2757,180 @@ mod tests {
 
     fn tool_event(sequence_no: u64, event_type: RuntimeEventType, payload: Value) -> RuntimeEvent {
         tool_event_on_turn(sequence_no, None, event_type, payload)
+    }
+
+    #[test]
+    fn terminal_completion_survives_a_late_running_tool_result() {
+        let call = ToolCallId::new();
+        let process = format!("proc-{call}");
+        let ended = tool_event(
+            1,
+            RuntimeEventType::ProcessUpdated,
+            json!({"process_id":process,"command":"sleep 1","process_state":"exited","terminal":true,"exit_code":0,"output_excerpt":"done"}),
+        );
+        let delayed = tool_event(
+            2,
+            RuntimeEventType::ToolCompleted,
+            json!({"envelope":{"tool_call_id":call,"tool_name":"shell","status":"ok","structured_facts":{"process_id":process,"command":"sleep 1","process_state":"running"}}}),
+        );
+        let entries = event_operation_entries(&[ended, delayed]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].projection.item(false).role,
+            TranscriptRole::Success
+        );
+        assert!(
+            entries[0]
+                .projection
+                .item(true)
+                .body
+                .iter()
+                .any(|line| line == "done")
+        );
+    }
+
+    #[test]
+    fn subagent_completion_survives_late_start_and_archival_without_duplicate_notices() {
+        let call = ToolCallId::new();
+        let child = SessionId::new();
+        let ended = tool_event(
+            1,
+            RuntimeEventType::SubagentUpdated,
+            json!({"tool_call_id":call,"summary":"done","content":"child findings","facts":{"child_session_id":child,"child_status":"completed"}}),
+        );
+        let start = tool_event(
+            2,
+            RuntimeEventType::ToolCompleted,
+            json!({"envelope":{"tool_call_id":call,"tool_name":"subagent","status":"ok","structured_facts":{"child_session_id":child,"child_status":"running","completed":false}}}),
+        );
+        let entries = event_operation_entries(&[ended.clone(), start.clone()]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].projection.item(false).title,
+            "Subagent completed"
+        );
+        let mut ended = ended;
+        ended.sequence_no = 3;
+        let mut repeated = ended.clone();
+        repeated.sequence_no = 4;
+        repeated.id = EventId::new();
+        let archived = HashSet::from([start.id]);
+        let entries = event_operation_entries_with_boundary(
+            &[start, ended, repeated],
+            &archived,
+            &HashSet::new(),
+            true,
+            &HashSet::new(),
+        );
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[1].projection.item(false).title,
+            "Subagent completed"
+        );
+    }
+
+    #[test]
+    fn batch_child_wait_displays_finished_and_pending_counts() {
+        let event = tool_event(
+            1,
+            RuntimeEventType::ToolCompleted,
+            json!({"envelope":{"tool_call_id":ToolCallId::new(),"tool_name":"subagent","status":"ok","structured_facts":{"child_results":[{},{}],"child_pending_ids":["one"]}}}),
+        );
+        let entries = event_operation_entries(&[event]);
+        assert_eq!(
+            entries[0].projection.item(false).title,
+            "Subagents · 1 finished · 1 running"
+        );
+    }
+
+    #[test]
+    fn terminal_updates_refresh_details_and_append_only_one_completion_after_archival() {
+        let call = ToolCallId::new();
+        let process = format!("proc-{call}");
+        let start = tool_event(
+            1,
+            RuntimeEventType::ToolCompleted,
+            json!({
+                "envelope":{"tool_call_id":call,"tool_name":"shell","status":"ok","structured_facts":{"process_id":process,"command":"curl example.test","process_state":"running","workspace_changes_known":false},"summary":"running"}
+            }),
+        );
+        let running = tool_event(
+            2,
+            RuntimeEventType::ProcessUpdated,
+            json!({"process_id":process,"command":"curl example.test","process_state":"running","terminal":false,"elapsed_ms":50,"output_excerpt":"live output"}),
+        );
+        let ended = tool_event(
+            3,
+            RuntimeEventType::ProcessUpdated,
+            json!({"process_id":process,"command":"curl example.test","process_state":"exited","terminal":true,"exit_code":0,"elapsed_ms":100,"output_excerpt":"final output"}),
+        );
+        let mut settled = ended.clone();
+        settled.id = EventId::new();
+        settled.sequence_no = 4;
+        settled.payload["workspace_scan_pending"] = json!(false);
+        let archived = HashSet::from([start.id]);
+        let entries = event_operation_entries_with_boundary(
+            &[start, running, ended, settled],
+            &archived,
+            &HashSet::new(),
+            true,
+            &HashSet::new(),
+        );
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[1].projection.item(false).title,
+            "Background terminal completed"
+        );
+        assert!(
+            entries[0]
+                .projection
+                .item(true)
+                .body
+                .iter()
+                .any(|line| line.contains("final output"))
+        );
+        assert!(
+            !entries[0]
+                .projection
+                .item(false)
+                .body
+                .iter()
+                .any(|line| line.contains("workspace changes unknown"))
+        );
+    }
+
+    #[test]
+    fn consecutive_terminal_waits_merge_without_crossing_messages_or_failures() {
+        let turn = TurnId::new();
+        let wait = |seq, state: &str| {
+            tool_event_on_turn(
+                seq,
+                Some(turn),
+                RuntimeEventType::ToolCompleted,
+                json!({"envelope":{"tool_call_id":ToolCallId::new(),"tool_name":"shell_session","status":"ok","summary":"wait","structured_facts":{"action":"wait","process_id":"one","command":"sleep 1","process_state":state}}}),
+            )
+        };
+        let message = tool_event_on_turn(
+            3,
+            Some(turn),
+            RuntimeEventType::AssistantMessage,
+            json!({"content":"Still working."}),
+        );
+        let entries = event_operation_entries_with_boundary(
+            &[
+                wait(1, "running"),
+                wait(2, "running"),
+                message,
+                wait(4, "exited"),
+            ],
+            &HashSet::new(),
+            &HashSet::new(),
+            true,
+            &HashSet::new(),
+        );
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].event_ids.len(), 2);
+        assert!(entries[1].projection.is_assistant_message());
     }
 
     fn fullscreen_app() -> TuiApp {
@@ -3577,5 +4174,63 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("completed"))
         );
+    }
+
+    #[test]
+    fn partial_subagent_shows_verification_issue_and_preserves_expandable_findings() {
+        let projections = event_operation_projections(&[tool_event(
+            1,
+            RuntimeEventType::ToolCompleted,
+            json!({
+                "envelope": {"tool_call_id": ToolCallId::new(), "tool_name": "subagent", "status": "error",
+                    "summary": "subagent returned findings with unresolved verification",
+                    "model_visible_excerpt": "项目名称：Golutra Agent",
+                    "structured_facts": {"child_status": "partial", "child_session_id": "child-id", "workspace_changes_known": false,
+                        "child_verification_status": "partial", "child_verification_issues": [{"reason": "required validation is missing"}]}}
+            }),
+        )]);
+        let collapsed = projections[0].item(false);
+        assert_eq!(collapsed.role, TranscriptRole::Warning);
+        assert_eq!(collapsed.title, "subagent · verification incomplete");
+        assert!(
+            collapsed
+                .body
+                .iter()
+                .any(|line| line.contains("required validation is missing"))
+        );
+        assert!(
+            !collapsed
+                .body
+                .iter()
+                .any(|line| line.contains("workspace changes unknown"))
+        );
+        let expanded = projections[0].item(true);
+        assert!(
+            expanded
+                .body
+                .iter()
+                .any(|line| line.contains("项目名称：Golutra Agent"))
+        );
+        assert!(expanded.body.iter().any(|line| line.contains("child-id")));
+        assert!(
+            expanded
+                .body
+                .iter()
+                .any(|line| line.contains("workspace changes unknown"))
+        );
+    }
+
+    #[test]
+    fn subagent_task_state_does_not_hide_runtime_timeout() {
+        let projections = event_operation_projections(&[tool_event(
+            1,
+            RuntimeEventType::ToolCompleted,
+            json!({
+                "envelope": {"tool_call_id": ToolCallId::new(), "tool_name": "subagent", "status": "timeout",
+                    "summary": "child exceeded its maximum elapsed time", "structured_facts": {"child_status": "partial", "timed_out": true}}
+            }),
+        )]);
+        assert_eq!(projections[0].item(false).title, "Timed out");
+        assert_eq!(projections[0].item(false).role, TranscriptRole::Warning);
     }
 }

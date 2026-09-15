@@ -70,6 +70,8 @@ pub enum RuntimeEventType {
     ToolStarted,
     ToolProgress,
     ToolCompleted,
+    ProcessUpdated,
+    SubagentUpdated,
     PolicyEvaluated,
     VerificationCompleted,
     LoopDecided,
@@ -257,6 +259,8 @@ impl RuntimeEventType {
             | Self::ToolStarted
             | Self::ToolProgress
             | Self::ToolCompleted
+            | Self::ProcessUpdated
+            | Self::SubagentUpdated
             | Self::PolicyEvaluated
             | Self::VerificationCompleted
             | Self::LoopDecided
@@ -289,6 +293,7 @@ impl RuntimeEventType {
                 | Self::TurnUpdated
                 | Self::AssistantMessage
                 | Self::ToolCompleted
+                | Self::SubagentUpdated
                 | Self::TaskCompleted
                 | Self::TaskAborted
                 | Self::TaskInterrupted
@@ -334,6 +339,8 @@ impl RuntimeEventType {
                 | Self::UserStep
                 | Self::ToolStarted
                 | Self::ToolProgress
+                | Self::ProcessUpdated
+                | Self::SubagentUpdated
                 | Self::ToolCompleted
                 | Self::VerificationCompleted
                 | Self::LoopDecided
@@ -494,6 +501,7 @@ mod tests {
             RuntimeEventClass::Governance
         );
         assert!(RuntimeEventType::AssistantMessage.is_model_history_fact());
+        assert!(RuntimeEventType::SubagentUpdated.is_model_history_fact());
         assert!(!RuntimeEventType::UserStep.is_model_history_fact());
         assert!(RuntimeEventType::UserStep.is_user_projection_fact());
         assert!(!RuntimeEventType::EvaluationCompleted.is_model_history_fact());

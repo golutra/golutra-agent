@@ -87,6 +87,7 @@ pub struct RuntimeConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NonSecretRuntimeSettings {
+    pub subagent_max_concurrent: Option<usize>,
     pub provider_profile: Option<String>,
     pub model: Option<String>,
     pub execution_mode: Option<String>,
@@ -97,6 +98,11 @@ pub struct NonSecretRuntimeSettings {
 
 impl NonSecretRuntimeSettings {
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.subagent_max_concurrent == Some(0) {
+            return Err(ConfigError::Validation(
+                "subagent_max_concurrent must be positive".to_owned(),
+            ));
+        }
         validate_optional_setting(&self.provider_profile, "provider_profile", 128)?;
         validate_optional_setting(&self.model, "model", 256)?;
         validate_optional_setting(&self.execution_mode, "execution_mode", 32)?;
@@ -147,6 +153,10 @@ impl NonSecretRuntimeSettings {
     #[must_use]
     pub fn merged(global: &Self, project: &Self, session: &Self) -> Self {
         Self {
+            subagent_max_concurrent: session
+                .subagent_max_concurrent
+                .or(project.subagent_max_concurrent)
+                .or(global.subagent_max_concurrent),
             provider_profile: session
                 .provider_profile
                 .clone()

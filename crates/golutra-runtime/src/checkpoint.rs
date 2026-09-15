@@ -19,6 +19,55 @@ use thiserror::Error;
 // cap durable before-images so checkpoint I/O cannot consume the task deadline.
 const MAX_PARTIAL_CHECKPOINT_FILES: usize = 128;
 
+#[cfg(test)]
+mod concurrent_object_tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn concurrent_creators_only_observe_complete_shared_objects() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = WorkspaceCheckpointManager::new(root.path(), root.path().join("checkpoints"));
+        let bytes = Arc::new(vec![b'x'; 2 * 1024 * 1024]);
+        let barrier = Arc::new(Barrier::new(16));
+        let workers = (0..16)
+            .map(|_| {
+                let manager = manager.clone();
+                let bytes = bytes.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    manager.store_checkpoint_object(&bytes)
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            let object = worker.join().unwrap().unwrap();
+            assert_eq!(fs::read(object).unwrap(), *bytes);
+        }
+        assert_eq!(
+            fs::read_dir(root.path().join("checkpoints/.objects"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn corrupt_existing_objects_still_fail_without_being_overwritten() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = WorkspaceCheckpointManager::new(root.path(), root.path().join("checkpoints"));
+        let content = b"real checkpoint content";
+        let object = manager.store_checkpoint_object(content).unwrap();
+        fs::write(&object, b"corrupt").unwrap();
+        assert!(matches!(
+            manager.store_checkpoint_object(content),
+            Err(CheckpointError::InvalidManifest(_))
+        ));
+        assert_eq!(fs::read(object).unwrap(), b"corrupt");
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum CheckpointError {
     #[error("checkpoint io failed: {0}")]
@@ -296,7 +345,31 @@ impl WorkspaceCheckpointManager {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(CheckpointError::Io(error.to_string())),
         }
-        write_checkpoint_file(&object_path, content)?;
+        // 对象以 checksum 共享：不能先暴露空文件再填充，否则并发创建者会把
+        // 半写入内容误判成碰撞。完整落盘后以 no-clobber 原子发布，失败者校验赢家。
+        let mut pending = tempfile::NamedTempFile::new_in(&object_root)
+            .map_err(|error| CheckpointError::Io(error.to_string()))?;
+        set_owner_only_checkpoint_file(pending.path())?;
+        pending
+            .write_all(content)
+            .map_err(|error| CheckpointError::Io(error.to_string()))?;
+        pending
+            .as_file()
+            .sync_all()
+            .map_err(|error| CheckpointError::Io(error.to_string()))?;
+        match pending.persist_noclobber(&object_path) {
+            Ok(_) => {}
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let existing = fs::read(&object_path)
+                    .map_err(|error| CheckpointError::Io(error.to_string()))?;
+                if existing != content {
+                    return Err(CheckpointError::InvalidManifest(format!(
+                        "checkpoint object checksum collision: {checksum}"
+                    )));
+                }
+            }
+            Err(error) => return Err(CheckpointError::Io(error.to_string())),
+        }
         sync_checkpoint_directory(&object_root)?;
         Ok(object_path)
     }
@@ -310,6 +383,13 @@ impl WorkspaceCheckpointManager {
         };
         for entry in entries {
             let entry = entry.map_err(|error| CheckpointError::Io(error.to_string()))?;
+            // 临时对象尚未发布，不能由对象回收删除。
+            let name = entry.file_name();
+            if !name.to_str().is_some_and(|name| {
+                name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }) {
+                continue;
+            }
             let metadata = entry
                 .metadata()
                 .map_err(|error| CheckpointError::Io(error.to_string()))?;
