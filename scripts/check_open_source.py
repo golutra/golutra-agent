@@ -17,7 +17,7 @@ REQUIRED_FILES = (
     "NOTICE",
     "README.md",
     "README_CN.md",
-    "assets/readme/golutra-logo.png",
+    "assets/readme/golutra-agent-logo.png",
     "assets/readme/publicity_EN.png",
     "assets/readme/publicity_CN.png",
     "Cargo.lock",
@@ -39,8 +39,8 @@ REQUIRED_FILES = (
     ".github/workflows/release.yml",
     "npm/agent/package.json",
     "npm/agent/README.md",
-    "npm/agent/bin/golutra.js",
-    "npm/agent/bin/golutra-tui.js",
+    "npm/agent/bin/golutra-agent.js",
+    "npm/agent/bin/golutra-agent-tui.js",
     "npm/agent/bin/run.js",
     "scripts/package_npm.py",
     "scripts/smoke_npm_package.py",
@@ -77,7 +77,10 @@ def _metadata_is_present(field: str, value: Any) -> bool:
 def _path_dependencies_without_versions(value: Any, prefix: str = "") -> list[str]:
     missing: list[str] = []
     if isinstance(value, dict):
-        if "path" in value and "version" not in value:
+        if "path" in value and "version" not in value and any(
+            part in {"dependencies", "dev-dependencies", "build-dependencies"}
+            for part in prefix.split(".")
+        ):
             missing.append(prefix or "dependency")
         for key, child in value.items():
             child_prefix = f"{prefix}.{key}" if prefix else str(key)
@@ -196,8 +199,8 @@ def check_repository(root: Path) -> list[str]:
         if not isinstance(publish_config, dict) or publish_config.get("access") != "public":
             errors.append("npm launcher package must publish with public access")
         if npm_package.get("bin") != {
-            "golutra": "bin/golutra.js",
-            "golutra-tui": "bin/golutra-tui.js",
+            "golutra-agent": "bin/golutra-agent.js",
+            "golutra-agent-tui": "bin/golutra-agent-tui.js",
         }:
             errors.append("npm launcher package bin map is incomplete")
         lifecycle_scripts = {
@@ -220,9 +223,9 @@ def check_repository(root: Path) -> list[str]:
             npm_readme_text = npm_readme.read_text(encoding="utf-8")
             for phrase in (
                 "npm install -g @golutra/agent",
-                "golutra\n",
-                "golutra exec",
-                "golutra-tui",
+                "golutra-agent\n",
+                "golutra-agent exec",
+                "golutra-agent-tui",
                 "does not run a network download script",
             ):
                 if phrase not in npm_readme_text:
@@ -310,7 +313,7 @@ def check_repository(root: Path) -> list[str]:
             "SECURITY.md",
             "docs/README.md",
             "README_CN.md",
-            "assets/readme/golutra-logo.png",
+            "assets/readme/golutra-agent-logo.png",
             "assets/readme/publicity_EN.png",
             "npm install -g @golutra/agent",
         ):
@@ -325,7 +328,7 @@ def check_repository(root: Path) -> list[str]:
         readme_cn_text = readme_cn.read_text(encoding="utf-8")
         for link in (
             "README.md",
-            "assets/readme/golutra-logo.png",
+            "assets/readme/golutra-agent-logo.png",
             "assets/readme/publicity_CN.png",
             "npm install -g @golutra/agent",
         ):

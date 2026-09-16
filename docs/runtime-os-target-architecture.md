@@ -95,7 +95,7 @@ Projection Plane                 Improvement Plane
 
 ### 2.2 Application Plane
 
-`golutra-client::RuntimeApplication` 是当前实现的 in-process facade，`GovernedRuntime` 是文档中的稳定别名。它组合以下服务：
+`golutra-agent-client::RuntimeApplication` 是当前实现的 in-process facade，`GovernedRuntime` 是文档中的稳定别名。它组合以下服务：
 
 | 服务 | 责任 | 不负责 |
 | --- | --- | --- |
@@ -118,13 +118,13 @@ Projection Plane                 Improvement Plane
 - 每个 queued turn 独立携带 `TaskContract` 和 external verifier 列表；普通 follow-up 不继承上一 turn 的写入或验证要求。没有显式 verifier 字段的代码任务会在 command 边界检查 workspace 根目录的受信 manifest；只有恰好一种 Cargo、Node、Python 或 Go 项目生态明确时才自动选择一个 verifier，混合或歧义根目录不隐式执行检查，要求调用方显式指定；显式空列表关闭发现。
 - 将每个 provider/tool/context/verification 阶段转成 `AgentLoopTraceEvent`，由 host adapter 写入 `RuntimeEvent` 和 artifact。
 - `ToolRuntime::invoke(ToolInvocation)` 统一 policy、approval、before-image、sandbox、progress 和 terminal report。`apply_patch` 通过隔离配置的 `git apply` 原子修改多文件；`/app`、`/workspace` 只映射到当前 workspace，其他绝对路径仍被拒绝。
-- `RuntimeVerificationService` 只接受结构化 `VerificationInput`，由 `golutra-verify` 产生 assertion status；模型不能直接写 Pass。
+- `RuntimeVerificationService` 只接受结构化 `VerificationInput`，由 `golutra-agent-verify` 产生 assertion status；模型不能直接写 Pass。
 - crash recovery 由 durable provider/tool lifecycle reducer 重建；`ToolStarted` 固化 `ToolRecoveryPolicy`，区分 replay-safe、reconcile-before-retry 和 replay-forbidden，并单独记录未闭合 provider request。工具名称启发式只用于读取旧事件。
-- context guard、completion policy、provider retry/fallback 和 trace adapter 在 `golutra-runtime` 的独立模块中，loop orchestration 只负责顺序和控制流。
+- context guard、completion policy、provider retry/fallback 和 trace adapter 在 `golutra-agent-runtime` 的独立模块中，loop orchestration 只负责顺序和控制流。
 
 ### 2.4 Canonical Fact Plane
 
-`golutra-store::RuntimeRepositories` 将 SQLite 逻辑边界明确为五个 repository：
+`golutra-agent-store::RuntimeRepositories` 将 SQLite 逻辑边界明确为五个 repository：
 
 - `EventRepository`：append、cursor page、integrity、sequence。
 - `ProjectionRepository`：state、user、debug projection。
@@ -209,7 +209,7 @@ TaskTraceBundle
 - promotion 比较质量、成本、延迟、失败率、资源和安全 gate；单个测试集通过不能晋升。
 - observation cluster 和 epoch 都绑定 source release；当前 stable pointer 已变化时，旧版本 opportunity 必须重新观察，不能直接在新版本上生成候选。
 - 每个候选保留 candidate digest、campaign、逐 case baseline/candidate trace ref、verification ref 和 decision ref；子 runtime 的完整 trace 与引用 blob 在 TempDir 回收前打包成父 workspace 的 content-addressed `regression_trace_bundle`，任一 case 缺 durable pair 只能 `NeedsReview`。
-- RuntimeHost 内的 `regression_trace_bundle` 用于 prompt/config/tool 等任务级候选；涉及 runtime 源码的版本候选不能复用同一个已编译 Host。Supervisor 必须从 stable release 和 candidate evaluation build 分别启动 sealed `golutra-eval-worker`，在独立 home/workspace 中执行相同 case，并把完整 trace、artifact blob、binary checksum、workspace digest 和外部 assertion 结果持久化为 `artifact://supervisor-evaluation/...`。
+- RuntimeHost 内的 `regression_trace_bundle` 用于 prompt/config/tool 等任务级候选；涉及 runtime 源码的版本候选不能复用同一个已编译 Host。Supervisor 必须从 stable release 和 candidate evaluation build 分别启动 sealed `golutra-agent-eval-worker`，在独立 home/workspace 中执行相同 case，并把完整 trace、artifact blob、binary checksum、workspace digest 和外部 assertion 结果持久化为 `artifact://supervisor-evaluation/...`。
 - memory 只从独立 evidence 进入 quarantine，不能把候选修改或单次成功直接写成 active memory。
 
 ### 4.1 观测不能反向污染模型
@@ -228,15 +228,15 @@ compaction summary 中也必须保持 hidden。
 
 | 层 | crate | 核心边界 |
 | --- | --- | --- |
-| domain facts | `golutra-core`, `golutra-protocol` | ID、event、command/query、verification/eval schema |
-| fact storage | `golutra-store` | SQLite migrations 和五类 repository |
-| execution | `golutra-runtime` | lane、AgentHarness/AgentRun、private AgentLoop、control、trace adapter、verification service |
-| application | `golutra-client` | RuntimeApplication、RuntimeHost 生命周期、post-task/evolution/regression use cases |
-| provider | `golutra-llm`, `golutra-auth`, `golutra-config` | protocol adapter、OAuth、disk SecretRef、probe/rollback |
-| tools/policy | `golutra-tools`, `golutra-policy`, `golutra-sandbox`, `golutra-mcp` | contract、approval、sandbox、artifact/evidence |
-| governance | `golutra-memory`, `golutra-eval`, `golutra-evolution`, `golutra-governor`, `golutra-verify` | memory lifecycle、review、regression、candidate、promotion |
-| control plane | `golutra-supervisor`, `golutra-release` | candidate freeze、trusted build、release pointer、canary、rollback |
-| interaction | `golutra-cli`, `golutra-tui`, `golutra-app-server`, SDKs | transport client、render、HTTP/SSE、generated protocol |
+| domain facts | `golutra-agent-core`, `golutra-agent-protocol` | ID、event、command/query、verification/eval schema |
+| fact storage | `golutra-agent-store` | SQLite migrations 和五类 repository |
+| execution | `golutra-agent-runtime` | lane、AgentHarness/AgentRun、private AgentLoop、control、trace adapter、verification service |
+| application | `golutra-agent-client` | RuntimeApplication、RuntimeHost 生命周期、post-task/evolution/regression use cases |
+| provider | `golutra-agent-llm`, `golutra-agent-auth`, `golutra-agent-config` | protocol adapter、OAuth、disk SecretRef、probe/rollback |
+| tools/policy | `golutra-agent-tools`, `golutra-agent-policy`, `golutra-agent-sandbox`, `golutra-agent-mcp` | contract、approval、sandbox、artifact/evidence |
+| governance | `golutra-agent-memory`, `golutra-agent-eval`, `golutra-agent-evolution`, `golutra-agent-governor`, `golutra-agent-verify` | memory lifecycle、review、regression、candidate、promotion |
+| control plane | `golutra-agent-supervisor`, `golutra-agent-release` | candidate freeze、trusted build、release pointer、canary、rollback |
+| interaction | `golutra-agent-cli`, `golutra-agent-tui`, `golutra-agent-app-server`, SDKs | transport client、render、HTTP/SSE、generated protocol |
 
 ## 6. 痛点与强制机制
 
@@ -264,8 +264,8 @@ compaction summary 中也必须保持 hidden。
 - Embedded transport 主路径迁移到 facade。
 - `TaskTraceService` 从 client 巨型 host 文件中独立出来，并通过 repository 读取事实。
 - `RuntimeRepositories` 五类逻辑边界，以及 post-task/trace 对 repository 的接入。
-- `golutra-runtime` 的 context guard、completion policy、provider retry、trace adapter、verification service 文件拆分。
-- `golutra-client` 已按 application、command、query、session、execution、execution trace、post-task、governance、regression 和 task trace 拆分；`RuntimeHost` 根模块只保留 owner 状态和共同基础设施。
+- `golutra-agent-runtime` 的 context guard、completion policy、provider retry、trace adapter、verification service 文件拆分。
+- `golutra-agent-client` 已按 application、command、query、session、execution、execution trace、post-task、governance、regression 和 task trace 拆分；`RuntimeHost` 根模块只保留 owner 状态和共同基础设施。
 - `ContextProjection`、`EvaluationProjection` 和 `TaskTracePage` 已进入 Rust protocol、schema、TypeScript/Python SDK。
 - `ModelInputEnvelope` 已成为 Runtime OS 到 provider 的唯一边界；`compile_model_input` 对 typed visibility 和 legacy hidden labels 双重拒绝，`ContextProjection` 只作为实际请求的审计投影，不是模型上下文。
 - `RuntimeEventClass` 由 `event_type` 派生并作为 control/execution/memory/evaluation/governance 的统计/路由分类；模型历史和普通用户投影仍使用更窄的显式 allowlist，不能用 event class 代替披露权限。

@@ -55,13 +55,13 @@ class CompareLongBenchmarkTest(unittest.TestCase):
         self.assertFalse(classification["strict_passed"])
 
     def test_terminal_event_success_ignores_nonzero_wrapper_status(self) -> None:
-        golutra_stdout = "".join(
+        golutra_agent_stdout = "".join(
             json.dumps(value) + "\n"
             for value in (
                 {"type": "turn.completed", "status": "completed"},
             )
         )
-        self.assertTrue(benchmark.terminal_event_success("golutra", golutra_stdout))
+        self.assertTrue(benchmark.terminal_event_success("golutra", golutra_agent_stdout))
         self.assertTrue(
             benchmark.terminal_event_success(
                 "pi", json.dumps({"type": "agent_end"}) + "\n"

@@ -4,8 +4,8 @@
   "description": "Simple local coding agent with background work and full observability",
   "license": "Apache-2.0",
   "bin": {
-    "golutra": "bin/golutra.js",
-    "golutra-tui": "bin/golutra-tui.js"
+    "golutra-agent": "bin/golutra-agent.js",
+    "golutra-agent-tui": "bin/golutra-agent-tui.js"
   },
   "files": [
     "bin",
@@ -28,7 +28,7 @@
     "url": "https://github.com/golutra/golutra-agent/issues"
   },
   "keywords": [
-    "golutra",
+    "golutra-agent",
     "coding-agent",
     "agent-runtime",
     "tui"

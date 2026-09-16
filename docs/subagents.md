@@ -60,7 +60,7 @@ Fork requires the parent's provider/model. For a different route, use independen
 
 ## Background concurrency
 
-The default limit is 10 active child operations per parent session, including startup and children left running by an earlier parent turn. Configure a positive `subagent_max_concurrent` in global `$GOLUTRA_HOME/runtime.json` or project `.golutra/runtime.json`; project settings take precedence. For example:
+The default limit is 10 active child operations per parent session, including startup and children left running by an earlier parent turn. Configure a positive `subagent_max_concurrent` in global `$GOLUTRA_AGENT_HOME/runtime.json` or project `.golutra-agent/runtime.json`; project settings take precedence. For example:
 
 ```json
 {"subagent_max_concurrent": 10}
@@ -130,7 +130,7 @@ private output directory, to avoid mixing resource contention into latency.
 
 The local reference review used Codex's shared agent control and multi-agent handlers, plus `claude-code-main`'s AgentTool/LocalAgentTask implementation. The latter is an unofficial source snapshot, not a guarantee about the current proprietary Claude Code release. Golutra keeps one lifecycle tool, durable events and strict execution outcomes; it does not copy synthetic tool-result placeholders or silently fall back from a missing worktree.
 
-`scripts/smoke_subagents.py --output /tmp/golutra-subagents.json` runs an opt-in real-provider functional check with isolated credentials/workspace: two background children, one explicit fork, bounded waits and a same-child resume. It verifies durable child execution records and returned sentinel facts, reports parent and whole-task usage separately, and retains owner-only CLI evidence beside the report. A single smoke does not establish performance superiority over Codex or Claude Code.
+`scripts/smoke_subagents.py --output /tmp/golutra-agent-subagents.json` runs an opt-in real-provider functional check with isolated credentials/workspace: two background children, one explicit fork, bounded waits and a same-child resume. It verifies durable child execution records and returned sentinel facts, reports parent and whole-task usage separately, and retains owner-only CLI evidence beside the report. A single smoke does not establish performance superiority over Codex or Claude Code.
 
 The real-provider acceptance passed two overlapping background children, explicit fork findings, same-child resume and three unique execution-bound completion notices. The final run took 30.02 seconds, with 7 tools and 34,349 provider tokens across parent and children. The [acceptance report](benchmarks/subagents-20260915.md) retains all five attempts, including the preceding failures and the fixes they motivated. These are functional smoke measurements, not a statistical performance comparison.
 

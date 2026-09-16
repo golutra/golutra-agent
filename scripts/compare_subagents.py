@@ -53,7 +53,7 @@ not start a new task. Keep task names a and b.""",
 def prepare_home(args, home: Path, engine: str) -> dict[str, str]:
     env = os.environ.copy()
     # 同一凭据供两个隔离客户端使用，不打印密钥，也不改用户配置。
-    source = args.golutra_home_source
+    source = args.golutra_agent_home_source
     provider = json.loads((source / "provider.json").read_text())
     profile = next(p for p in provider["profiles"] if p["name"] == provider["active_profile"])
     credentials = json.loads((source / "credentials.json").read_text())
@@ -61,11 +61,11 @@ def prepare_home(args, home: Path, engine: str) -> dict[str, str]:
     if engine == "golutra":
         long_bench.prepare_golutra_home(args, home)
         long_bench.write_private_text(home / "runtime.json", '{"subagent_max_concurrent":10}\n')
-        env["GOLUTRA_HOME"] = str(home)
+        env["GOLUTRA_AGENT_HOME"] = str(home)
     else:
         long_bench.private_directory(home)
         env["CODEX_HOME"] = str(home)
-        env["GOLUTRA_BENCHMARK_API_KEY"] = secret
+        env["GOLUTRA_AGENT_BENCHMARK_API_KEY"] = secret
     return env
 
 
@@ -81,7 +81,7 @@ def command(args, engine: str, workspace: Path, run: Path, prompt: str) -> list[
         "model_providers.benchmark.name": '"same-upstream-benchmark"',
         "model_providers.benchmark.base_url": json.dumps(args.base_url.rstrip("/") + "/v1"),
         "model_providers.benchmark.wire_api": '"responses"',
-        "model_providers.benchmark.env_key": '"GOLUTRA_BENCHMARK_API_KEY"',
+        "model_providers.benchmark.env_key": '"GOLUTRA_AGENT_BENCHMARK_API_KEY"',
         "agents.max_concurrent_threads_per_session": "10",
         "features.multi_agent": "true",
         "features.multi_agent_v2": str(engine == "codex-v2").lower(),
@@ -129,7 +129,7 @@ def scenario_prompt(scenario: str, engine: str) -> str:
 
 def run_sample(args, engine: str, index: int) -> dict:
     stem = args.output / f"{index:02d}-{engine}-{args.scenario}"
-    with tempfile.TemporaryDirectory(prefix="golutra-subagent-compare-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="golutra-agent-subagent-compare-") as temporary:
         root = Path(temporary)
         root.chmod(0o700)
         home, workspace, run = root / "home", root / "workspace", root / "run"
@@ -145,7 +145,7 @@ def run_sample(args, engine: str, index: int) -> dict:
             metrics = paired.parse_golutra(capture.stdout, capture.elapsed_ms,
                 capture.return_code, run, capture.stdout_line_times_ms)
             # 通用指标解析器只保留 512 字符展示摘要；验收必须读取原任务的完整回答。
-            metrics["final_message"] = evidence.golutra_parent_answer(events)
+            metrics["final_message"] = evidence.golutra_agent_parent_answer(events)
             report = smoke.summarize(events, metrics)
             report["tool_names"] = dict(Counter(e["payload"]["tool_name"] for e in events if e.get("event_type") == "tool_started"))
             usage = [paired.normalize_golutra_usage(event["payload"]["record"])
@@ -193,9 +193,9 @@ def run_sample(args, engine: str, index: int) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--golutra", type=Path, default=Path("target/debug/golutra-cli"))
+    parser.add_argument("--golutra", type=Path, default=Path("target/debug/golutra-agent"))
     parser.add_argument("--codex", default="codex")
-    parser.add_argument("--golutra-home-source", type=Path, default=Path.home() / ".golutra")
+    parser.add_argument("--golutra-agent-home-source", type=Path, default=Path.home() / ".golutra-agent")
     parser.add_argument("--model", default="gpt-5.5")
     parser.add_argument("--reasoning-effort", default="medium")
     parser.add_argument("--base-url", default="https://api.golutra.cn")

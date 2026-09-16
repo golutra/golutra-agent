@@ -2,7 +2,7 @@
 
 ## 目标
 
-`golutra-tui inspect` 和 `golutra-tui driver` 让测试程序、SDK 和 coding agent 直接驱动 Golutra 的真实 TUI，而不是抓取 PTY ANSI 输出或维护第二套 headless UI。
+`golutra-agent-tui inspect` 和 `golutra-agent-tui driver` 让测试程序、SDK 和 coding agent 直接驱动 Golutra 的真实 TUI，而不是抓取 PTY ANSI 输出或维护第二套 headless UI。
 
 Driver 复用交互 TUI 的 `TuiApp`、`TuiRuntimeController` 和 `draw_ui`。每个快照都由 `ratatui::TestBackend` 离屏渲染，因此文字、折行、CJK 宽字符、Developer runtime、滚动状态和鼠标命中区域与正常 TUI 使用同一份实现。任务、事件和治理事实仍只来自 `RuntimeHost`；Driver 只拥有输入框、选择、滚动、布局和冻结帧缓存等 UI 状态。
 
@@ -22,7 +22,7 @@ TuiRuntimeController -> RuntimeTransport -> RuntimeHost
 一次性运行 prompt，等待治理作业结束，返回本轮回复和 Developer runtime：
 
 ```bash
-golutra-tui --cwd /absolute/workspace inspect \
+golutra-agent-tui --cwd /absolute/workspace inspect \
   --resume review-run \
   --prompt "inspect this workspace" \
   --view response+developer \
@@ -34,7 +34,7 @@ golutra-tui --cwd /absolute/workspace inspect \
 长期 stdio Driver：
 
 ```bash
-golutra-tui --cwd /absolute/workspace driver \
+golutra-agent-tui --cwd /absolute/workspace driver \
   --stdio \
   --resume coding-run \
   --width 160 \
@@ -44,13 +44,13 @@ golutra-tui --cwd /absolute/workspace driver \
 可断线重连的 Unix socket Driver：
 
 ```bash
-install -d -m 700 "$HOME/.golutra/tui-driver"
-golutra-tui --cwd /absolute/workspace driver \
-  --socket "$HOME/.golutra/tui-driver/session.sock" \
+install -d -m 700 "$HOME/.golutra-agent/tui-driver"
+golutra-agent-tui --cwd /absolute/workspace driver \
+  --socket "$HOME/.golutra-agent/tui-driver/session.sock" \
   --resume socket-run
 ```
 
-Driver 默认连接用户级 `golutra-app-server`。`--embedded` 创建仅供隔离测试使用的进程内 RuntimeHost；`--connect URL` 使用经过认证的 HTTP/SSE runtime。daemon transport 下，Driver 退出或 socket 断开不会取消 runtime task。embedded transport 的 runtime 生命周期属于 Driver 进程，进程退出后不能继续执行任务。
+Driver 默认连接用户级 `golutra-agent-app-server`。`--embedded` 创建仅供隔离测试使用的进程内 RuntimeHost；`--connect URL` 使用经过认证的 HTTP/SSE runtime。daemon transport 下，Driver 退出或 socket 断开不会取消 runtime task。embedded transport 的 runtime 生命周期属于 Driver 进程，进程退出后不能继续执行任务。
 
 ## Workspace、Session 和 Task 绑定
 
@@ -84,7 +84,7 @@ Driver 默认连接用户级 `golutra-app-server`。`--embedded` 创建仅供隔
 
 ## NDJSON 协议
 
-权威 Rust contract 位于 `golutra-protocol::tui_driver`，当前协议版本为 `1`。每个请求是一行 JSON，必须带 1 到 128 bytes 的 `request_id`。Driver 启动或 socket 客户端每次连接后，先主动发送 `request_id="ready"` 的 `ready` 响应。
+权威 Rust contract 位于 `golutra-agent-protocol::tui_driver`，当前协议版本为 `1`。每个请求是一行 JSON，必须带 1 到 128 bytes 的 `request_id`。Driver 启动或 socket 客户端每次连接后，先主动发送 `request_id="ready"` 的 `ready` 响应。
 
 ```json
 {"request_id":"hello-1","type":"hello","protocol_version":1}
@@ -205,7 +205,7 @@ await driver.close();
 Python 提供线程安全的同步接口；多个业务线程可同时挂起 `wait`：
 
 ```python
-from golutra_sdk import TuiDriverClient
+from golutra_agent_sdk import TuiDriverClient
 
 driver = TuiDriverClient.spawn(
     "/absolute/workspace", session="new", embedded=True, debug=True
@@ -229,7 +229,7 @@ just ts-check
 just py-check
 ```
 
-进程级验收位于 `crates/golutra-tui/tests/tui_driver_process.rs`，覆盖：
+进程级验收位于 `crates/golutra-agent-tui/tests/tui_driver_process.rs`，覆盖：
 
 - one-shot complete Developer frame 和 secret redaction。
 - 多轮 stdio prompt、按键提交、CJK cells、冻结分页、resize 和 close。
@@ -243,24 +243,24 @@ just py-check
 - app-server 停机时 cached ready/frozen frame、重启后 transport reattach、prompt/event replay 和 Driver instance 保持。
 
 ```bash
-cargo test -p golutra-tui --test tui_driver_process -- --test-threads=1
+cargo test -p golutra-agent-tui --test tui_driver_process -- --test-threads=1
 ```
 
 真实 provider smoke 默认 ignored，并且只读取独立测试变量；它不会读取普通 provider env、用户
 `provider.json`、`credentials.json` 或 OS keychain：
 
 ```bash
-export GOLUTRA_TUI_DRIVER_LIVE=1
-export GOLUTRA_TUI_DRIVER_LIVE_API_KEY="...dedicated test key..."
-export GOLUTRA_TUI_DRIVER_LIVE_BASE_URL="https://provider.example/v1"
-export GOLUTRA_TUI_DRIVER_LIVE_MODEL="model-id"
+export GOLUTRA_AGENT_TUI_DRIVER_LIVE=1
+export GOLUTRA_AGENT_TUI_DRIVER_LIVE_API_KEY="...dedicated test key..."
+export GOLUTRA_AGENT_TUI_DRIVER_LIVE_BASE_URL="https://provider.example/v1"
+export GOLUTRA_AGENT_TUI_DRIVER_LIVE_MODEL="model-id"
 # Optional; defaults to openai-compatible.
-export GOLUTRA_TUI_DRIVER_LIVE_PROTOCOL="openai-responses"
+export GOLUTRA_AGENT_TUI_DRIVER_LIVE_PROTOCOL="openai-responses"
 just tui-driver-live-smoke
 ```
 
-缺少开关或任一专用变量时测试明确 skip。启用后它在临时 `GOLUTRA_HOME` 和 workspace 中写入只引用
-`GOLUTRA_TUI_DRIVER_LIVE_API_KEY` 的 profile，执行真实 prompt，等待 task 与 evaluation 终态，拉取
+缺少开关或任一专用变量时测试明确 skip。启用后它在临时 `GOLUTRA_AGENT_HOME` 和 workspace 中写入只引用
+`GOLUTRA_AGENT_TUI_DRIVER_LIVE_API_KEY` 的 profile，执行真实 prompt，等待 task 与 evaluation 终态，拉取
 complete `response_and_developer` frame，并检查模型回复、Developer pane、API key/合成 credential 脱敏和
 未生成 disk credential。普通 CI 永远不会注入或读取这些变量。
 

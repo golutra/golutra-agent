@@ -84,7 +84,7 @@ cargo check --workspace --all-targets
 真实进程崩溃场景：
 
 ```bash
-cargo test -p golutra-app-server --test cross_process \
+cargo test -p golutra-agent-app-server --test cross_process \
   daemon_crash_holds_pending_turn_until_uncertain_task_is_reconciled \
   -- --test-threads=1
 ```
@@ -94,9 +94,9 @@ cargo test -p golutra-app-server --test cross_process \
 可配置 restart soak 默认 ignored，避免拖慢普通 CI：
 
 ```bash
-GOLUTRA_SOAK_ROUNDS=100 \
-GOLUTRA_SOAK_RESTART_EVERY=5 \
-cargo test -p golutra-app-server --test cross_process \
+GOLUTRA_AGENT_SOAK_ROUNDS=100 \
+GOLUTRA_AGENT_SOAK_RESTART_EVERY=5 \
+cargo test -p golutra-agent-app-server --test cross_process \
   daemon_restart_soak_preserves_event_invariants \
   -- --ignored --nocapture --test-threads=1
 ```

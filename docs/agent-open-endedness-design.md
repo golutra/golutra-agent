@@ -32,9 +32,9 @@ Open-Endedness 不等于让 agent 无限乱跑，也不等于让模型自己改�
 
 截至 2026-07-15，Golutra 已完成受控的本地 Evolution/Skill 闭环：
 
-- `golutra-evolution` 从 durable evaluation state 读取 GeneratedTask，计算 lexical novelty、difficulty、CapabilityFrontier 和 CurriculumItem；只有 fixture-only、no-external-side-effects 且位于配置难度区间的任务可被选择。
+- `golutra-agent-evolution` 从 durable evaluation state 读取 GeneratedTask，计算 lexical novelty、difficulty、CapabilityFrontier 和 CurriculumItem；只有 fixture-only、no-external-side-effects 且位于配置难度区间的任务可被选择。
 - OpenEndedBudget 限制生成数、选中数、每任务工具数和 wall-clock；越界计划被拒绝，不会无界探索。
-- 每个选中任务在 `$GOLUTRA_HOME/state/workspaces/<cwd-hash>/evolution-runs` 的隔离目录中启动独立 RuntimeHost，强制 deterministic mock provider、内置工具和无网络环境，不触碰用户主 workspace。
+- 每个选中任务在 `$GOLUTRA_AGENT_HOME/state/workspaces/<cwd-hash>/evolution-runs` 的隔离目录中启动独立 RuntimeHost，强制 deterministic mock provider、内置工具和无网络环境，不触碰用户主 workspace。
 - run、plan、novelty、curriculum、environment recipe、frontier、execution 和 verification ref 持久化到 owner-only `evolution.json`，CLI/transport/TypeScript/Python SDK 可查询与驱动。
 - SkillCandidate 必须经过 stage、regression-backed human review、checksum install，安装后只对匹配目标注入最多 3 条 context contributor，并支持 rollback。
 - Evolution 不会自动修改 prompt、policy、provider route、runtime code 或主 workspace；网络探索、environment mutation 和自动二进制部署不在当前范围。
@@ -106,7 +106,7 @@ Artifact Store
 Replay
 ```
 
-当前 `golutra-evolution` 已承载：
+当前 `golutra-agent-evolution` 已承载：
 
 ```text
 Open-Endedness System
@@ -442,12 +442,12 @@ Open-Endedness System
 
 Open-Endedness System 不直接拥有执行能力，而是调用：
 
-- `golutra-runtime` 执行任务
-- `golutra-verify` 验证结果
-- `golutra-eval` 做 replay 和 benchmark
-- `golutra-memory` 管理 memory 晋升
-- `golutra-policy` 管理策略晋升
-- `golutra-store` 保存 event、artifact、fixture
+- `golutra-agent-runtime` 执行任务
+- `golutra-agent-verify` 验证结果
+- `golutra-agent-eval` 做 replay 和 benchmark
+- `golutra-agent-memory` 管理 memory 晋升
+- `golutra-agent-policy` 管理策略晋升
+- `golutra-agent-store` 保存 event、artifact、fixture
 - `agent-improvement-loop` 管理候选改进、回归结果和晋升决策
 
 ### Promotion Gate 与主系统隔离

@@ -92,29 +92,29 @@ Python 和 TypeScript 的优势主要在生态和开发速度，但它们更适�
 推荐先按 runtime 能力拆分，而不是按入口拆分。
 
 ```text
-golutra-core
-golutra-runtime
-golutra-protocol
-golutra-protocol-fixtures
-golutra-context
-golutra-tools
-golutra-policy
-golutra-sandbox
-golutra-store
-golutra-memory
-golutra-file-search
-golutra-code-intelligence
-golutra-llm
-golutra-verify
-golutra-eval
-golutra-evolution
-golutra-plugin
-golutra-mcp
-golutra-test-client
-golutra-cli
-golutra-tui
-golutra-vis
-golutra-app-server
+golutra-agent-core
+golutra-agent-runtime
+golutra-agent-protocol
+golutra-agent-protocol-fixtures
+golutra-agent-context
+golutra-agent-tools
+golutra-agent-policy
+golutra-agent-sandbox
+golutra-agent-store
+golutra-agent-memory
+golutra-agent-file-search
+golutra-agent-code-intelligence
+golutra-agent-llm
+golutra-agent-verify
+golutra-agent-eval
+golutra-agent-evolution
+golutra-agent-plugin
+golutra-agent-mcp
+golutra-agent-test-client
+golutra-agent-cli
+golutra-agent-tui
+golutra-agent-vis
+golutra-agent-app-server
 sdk/typescript
 sdk/python
 ```
@@ -123,30 +123,30 @@ sdk/python
 
 | 模块 | 职责 |
 | --- | --- |
-| `golutra-core` | Message、SessionState、GoalState、RuntimeLane、BusyPolicyDecision、LoopGuard、LoopDecision、ToolResultEnvelope、TaskRecord、Policy 等核心类型 |
-| `golutra-runtime` | query loop、RuntimeLane、turn 状态机、LoopGuard、LoopDecision 生成、tool/model 回流、resume/compact 调度 |
-| `golutra-protocol` | `SessionCommand`、`RuntimeQuery`、`RuntimeEvent`、app-server transport contract、SDK 共享类型 |
-| `golutra-protocol-fixtures` | schema 产物、协议 fixture、跨语言契约测试输入 |
-| `golutra-context` | ContextBuilder、TokenBudgetTracker、WorkingSummary、CompactManager、history 分层、context projection |
-| `golutra-tools` | ToolSchema、ToolAccesses、tool registry、schema validation、tool execution、ToolResultEnvelope |
-| `golutra-policy` | PermissionPolicy、`allow/ask/deny`、workspace isolation、路径/网络/命令策略 |
-| `golutra-sandbox` | macOS Seatbelt、Linux bubblewrap、process-only fallback 与受控 launch environment |
-| `golutra-store` | SQLite state、durable event log、artifact store、workspace checkpoint ref、migration |
-| `golutra-memory` | MemoryRetriever、MemoryGovernance、项目索引、代码片段召回、memory promotion/rollback |
-| `golutra-file-search` | ignore-aware 文件枚举、rg 搜索和 SQLite metadata |
-| `golutra-code-intelligence` | tree-sitter symbol/reference/import graph 与 owner-only code index |
-| `golutra-llm` | ProviderConfig、ModelCatalog、CapabilityMatrix、ModelRouteDecision、adapter、usage 解析 |
-| `golutra-verify` | verification runner、PASS/FAIL/PARTIAL、证据记录 |
-| `golutra-eval` | eval_runner、trajectory_recorder、post_task_reviewer、vcr/golden fixture |
-| `golutra-evolution` | GeneratedTask curriculum/frontier、隔离执行和 Skill 生命周期 |
-| `golutra-plugin` | reviewed plugin package、checksum、enable/disable/rollback |
-| `golutra-mcp` | 官方 rmcp stdio client、schema 对照、sandbox 与 ToolRegistry bridge |
-| `golutra-test-client` | app-server 协议 smoke、transport 对拍、fixture replay、SDK 集成验证 |
-| `golutra-client` | `RuntimeClient`、`RuntimeQuery`、event subscription、transport abstraction |
-| `golutra-cli` | 薄 CLI 入口 |
-| `golutra-tui` | TUI 入口，只展示 runtime projection，支持 normal/debug panel |
-| `golutra-vis` | replay、audit、event 和 OpenTelemetry JSON 投影 |
-| `golutra-app-server` | Unix IPC 与 HTTP/SSE 入口，共用同一个 Axum Router |
+| `golutra-agent-core` | Message、SessionState、GoalState、RuntimeLane、BusyPolicyDecision、LoopGuard、LoopDecision、ToolResultEnvelope、TaskRecord、Policy 等核心类型 |
+| `golutra-agent-runtime` | query loop、RuntimeLane、turn 状态机、LoopGuard、LoopDecision 生成、tool/model 回流、resume/compact 调度 |
+| `golutra-agent-protocol` | `SessionCommand`、`RuntimeQuery`、`RuntimeEvent`、app-server transport contract、SDK 共享类型 |
+| `golutra-agent-protocol-fixtures` | schema 产物、协议 fixture、跨语言契约测试输入 |
+| `golutra-agent-context` | ContextBuilder、TokenBudgetTracker、WorkingSummary、CompactManager、history 分层、context projection |
+| `golutra-agent-tools` | ToolSchema、ToolAccesses、tool registry、schema validation、tool execution、ToolResultEnvelope |
+| `golutra-agent-policy` | PermissionPolicy、`allow/ask/deny`、workspace isolation、路径/网络/命令策略 |
+| `golutra-agent-sandbox` | macOS Seatbelt、Linux bubblewrap、process-only fallback 与受控 launch environment |
+| `golutra-agent-store` | SQLite state、durable event log、artifact store、workspace checkpoint ref、migration |
+| `golutra-agent-memory` | MemoryRetriever、MemoryGovernance、项目索引、代码片段召回、memory promotion/rollback |
+| `golutra-agent-file-search` | ignore-aware 文件枚举、rg 搜索和 SQLite metadata |
+| `golutra-agent-code-intelligence` | tree-sitter symbol/reference/import graph 与 owner-only code index |
+| `golutra-agent-llm` | ProviderConfig、ModelCatalog、CapabilityMatrix、ModelRouteDecision、adapter、usage 解析 |
+| `golutra-agent-verify` | verification runner、PASS/FAIL/PARTIAL、证据记录 |
+| `golutra-agent-eval` | eval_runner、trajectory_recorder、post_task_reviewer、vcr/golden fixture |
+| `golutra-agent-evolution` | GeneratedTask curriculum/frontier、隔离执行和 Skill 生命周期 |
+| `golutra-agent-plugin` | reviewed plugin package、checksum、enable/disable/rollback |
+| `golutra-agent-mcp` | 官方 rmcp stdio client、schema 对照、sandbox 与 ToolRegistry bridge |
+| `golutra-agent-test-client` | app-server 协议 smoke、transport 对拍、fixture replay、SDK 集成验证 |
+| `golutra-agent-client` | `RuntimeClient`、`RuntimeQuery`、event subscription、transport abstraction |
+| `golutra-agent-cli` | 薄 CLI 入口 |
+| `golutra-agent-tui` | TUI 入口，只展示 runtime projection，支持 normal/debug panel |
+| `golutra-agent-vis` | replay、audit、event 和 OpenTelemetry JSON 投影 |
+| `golutra-agent-app-server` | Unix IPC 与 HTTP/SSE 入口，共用同一个 Axum Router |
 | `sdk/typescript` | Web/插件/外部集成 SDK |
 | `sdk/python` | schema 生成的 Python SDK，不承载核心逻辑 |
 
@@ -163,16 +163,16 @@ Governance
 
 模块落地时遵守以下边界：
 
-- `golutra-runtime` 只产生 loop 状态和 `LoopDecision`，不直接拥有长期 memory。
-- `golutra-runtime` 负责 `RuntimeLane` 和 busy policy；CLI/TUI/SDK 不能各自实现排队、注入或中断。
-- `golutra-context` 只负责模型可见输入投影、token 预算和 compaction，不把完整 transcript 当 prompt 回灌。
-- `golutra-memory` 只负责可解释召回和长期 memory 晋升治理，不直接改写当前任务状态。
-- `golutra-store` 保存 raw event、artifact 和 projection，避免 UI、provider adapter 或 tool 层维护自己的任务真相。
-- `golutra-eval` 和 `golutra-verify` 基于 durable event/replay 做验证，不另建一套不可回放的评估输入。
-- `golutra-client` 只暴露统一 runtime 语义，不携带前端私有状态机。
-- `golutra-protocol` 负责跨 crate、跨 transport、跨语言的契约定义；协议升级必须先过 fixture 和 SDK 契约测试。
-- `golutra-event` 仅作为旧 workspace 依赖的兼容 re-export 保留；新实现不得把事件类型放回独立协议副本。
-- `golutra-test-client` 不承载业务逻辑，只用于 app-server、SDK、transport 和 schema 对拍。
+- `golutra-agent-runtime` 只产生 loop 状态和 `LoopDecision`，不直接拥有长期 memory。
+- `golutra-agent-runtime` 负责 `RuntimeLane` 和 busy policy；CLI/TUI/SDK 不能各自实现排队、注入或中断。
+- `golutra-agent-context` 只负责模型可见输入投影、token 预算和 compaction，不把完整 transcript 当 prompt 回灌。
+- `golutra-agent-memory` 只负责可解释召回和长期 memory 晋升治理，不直接改写当前任务状态。
+- `golutra-agent-store` 保存 raw event、artifact 和 projection，避免 UI、provider adapter 或 tool 层维护自己的任务真相。
+- `golutra-agent-eval` 和 `golutra-agent-verify` 基于 durable event/replay 做验证，不另建一套不可回放的评估输入。
+- `golutra-agent-client` 只暴露统一 runtime 语义，不携带前端私有状态机。
+- `golutra-agent-protocol` 负责跨 crate、跨 transport、跨语言的契约定义；协议升级必须先过 fixture 和 SDK 契约测试。
+- `golutra-agent-event` 仅作为旧 workspace 依赖的兼容 re-export 保留；新实现不得把事件类型放回独立协议副本。
+- `golutra-agent-test-client` 不承载业务逻辑，只用于 app-server、SDK、transport 和 schema 对拍。
 
 判断一个新能力是否进入主架构时，必须回答：它产生什么 runtime fact、改变什么 state projection、是否影响 context projection、是否参与 LoopDecision 或 PromotionGate。如果回答不清楚，就先作为插件或实验能力，不进入核心。
 
@@ -198,7 +198,7 @@ trait RuntimeClient {
 
 推荐 transport 分层：
 
-- `EmbeddedTransport`：TUI / CLI 默认入口。和 `RuntimeHost / RuntimeCore` 同进程，但连接 `$GOLUTRA_HOME/state/runtime.sqlite`，不是临时 store。
+- `EmbeddedTransport`：TUI / CLI 默认入口。和 `RuntimeHost / RuntimeCore` 同进程，但连接 `$GOLUTRA_AGENT_HOME/state/runtime.sqlite`，不是临时 store。
 - `UnixIpcTransport`：Unix 本地 `--daemon` 默认入口，通过 owner-only socket 发送受限 HTTP-like frame，直接复用 app-server Router；不会形成第二套业务 API。
 - `HttpSseTransport`：Windows 本地 daemon、Web、TypeScript/Python SDK 和显式 remote 模式入口。先用 `/runtime/attach` 绑定 canonical cwd，HTTP 发 command/query，SSE 接 event stream。
 
@@ -279,7 +279,7 @@ schema validation -> pre hook -> permission -> sandbox -> execute -> post hook -
 协议层再补两条：
 
 - app-server contract 要有 fixture 产物，供 Rust、TypeScript、Python SDK 共用。
-- 协议升级要先跑 `golutra-test-client` 和 SDK 契约测试，避免 runtime 与 SDK 版本语义偏移。
+- 协议升级要先跑 `golutra-agent-test-client` 和 SDK 契约测试，避免 runtime 与 SDK 版本语义偏移。
 
 ### LLM Provider
 
@@ -441,7 +441,7 @@ Memory 优先使用可解释、可回放的检索链路：
 | 权限决策 | 自研 policy engine | `allow/ask/deny` 必须可解释 |
 | 路径隔离 | `PathBuf` + canonicalize + policy matcher | 防路径穿越、symlink 逃逸 |
 | 进程执行 | `tokio::process` | 统一封装 stdout/stderr/exit code |
-| OS sandbox | `golutra-sandbox` | macOS Seatbelt、Linux bubblewrap；未检测到 OS sandbox 时外部插件拒绝执行 |
+| OS sandbox | `golutra-agent-sandbox` | macOS Seatbelt、Linux bubblewrap；未检测到 OS sandbox 时外部插件拒绝执行 |
 | MCP | 官方 Rust SDK `rmcp 2.2.0` | 一次性 stdio client 放在 adapter 层，不进入 core |
 
 平台边界建议明确：
@@ -464,7 +464,7 @@ Wasm plugin runtime、签名分发和 marketplace 是独立产品方向，不作
 | --- | --- | --- |
 | 结构化日志 | `tracing` | runtime event、tool event、decision event |
 | 日志订阅 | `tracing-subscriber` | CLI/TUI/App Server 不同输出 |
-| OpenTelemetry 投影 | `golutra-vis` | 从 durable RuntimeEvent 生成脱敏 trace/span JSON；不引入第二份观测真相 |
+| OpenTelemetry 投影 | `golutra-agent-vis` | 从 durable RuntimeEvent 生成脱敏 trace/span JSON；不引入第二份观测真相 |
 | Snapshot/Golden test | `insta` | message、tool envelope、trace 输出测试 |
 | 临时目录 | `tempfile` | tool/sandbox/store 测试 |
 | Mock HTTP | `wiremock` 或 `httpmock` | LLM provider 测试 |
@@ -500,7 +500,7 @@ tool
 - trace view 变成 `DebugProjection`
 - dataset / scorer 变成 `EvaluationProjection`
 - red team case 变成 `PolicyEvaluation` 和 `VerificationRecord`
-- regression 对比变成 `golutra-eval`
+- regression 对比变成 `golutra-agent-eval`
 
 但不要把外部平台的 UI 或实验管理逻辑直接搬进 runtime core。
 
@@ -522,7 +522,7 @@ tool
 - 主分发物是 Rust 原生二进制。
 - TypeScript/Python 包只承载 SDK 和生成类型，不承载 runtime 实现本体。
 - 当前 SDK 连接已运行 app-server；CLI/TUI 负责 Embedded 或 local daemon 生命周期，避免 SDK 私自复制进程管理状态机。
-- Unix 与 PowerShell 安装脚本构建并安装 `golutra`、`golutra-tui`、`golutra-app-server`、`golutra-vis`；CI 在 Linux/macOS/Windows 编译全 workspace/all targets，并在 Linux 执行完整 Rust 与双 SDK 门禁。
+- Unix 与 PowerShell 安装脚本构建并安装 `golutra-agent`、`golutra-agent-tui`、`golutra-agent-app-server`、`golutra-agent-vis`；CI 在 Linux/macOS/Windows 编译全 workspace/all targets，并在 Linux 执行完整 Rust 与双 SDK 门禁。
 
 ## 完整目标技术栈
 
@@ -628,25 +628,25 @@ Extension
 
 工程落地以 `implementation-blueprint.md` 的第一阶段为准。下面是技术模块顺序：
 
-1. 建 `golutra-core`：定义 Message、SessionState、GoalState、LoopGuard、LoopDecision、TaskRecord、ArtifactRef、DecisionRecord、EvidenceRecord。
-2. 建 `golutra-store`：SQLite metadata、event log、artifact store、migration。
-3. 在 `golutra-protocol` 中定义 ProviderRawEvent、RuntimeEvent、UiSdkEvent，明确 durable 与 live-only。
-4. 建 `golutra-llm`：ProviderConfig、ModelCatalog、CapabilityMatrix、GenaiProviderAdapter、ModelRouteDecision、FallbackPolicy。
-5. 建 `golutra-tools`：ToolSchema、ToolAccesses、ToolResultEnvelope、tool registry。
-6. 建 `golutra-policy`：PermissionPolicy、permission `allow/ask/deny`、workspace isolation、sandbox policy。
-7. 建 `golutra-runtime`：turn flow、LoopGuard、LoopDecision 生成、recorded events、resume、compact、replay、tool/model 回流。
-8. 建 `golutra-context`：working summary、history 分层、compact boundary、token budget。
-9. 建 `golutra-verify`：验证结果结构化。
-10. 建 `golutra-protocol`：协议类型、schema、TS 类型生成。
-11. 建 `golutra-client`：`RuntimeClient`、`EmbeddedTransport`、`HttpSseTransport`、query / subscribe 语义。
-12. 建 `golutra-cli`：薄 CLI 命令面。
-13. 建 `golutra-tui`：`crossterm + ratatui + Golutra 业务组件`，默认通过 `EmbeddedTransport` 访问 runtime。
-14. 建 `golutra-app-server`：Unix IPC 与 HTTP/SSE 入口，复用同一 Axum Router 和 runtime facts。
-15. 建 `golutra-test-client`：协议 fixture、transport 对拍、app-server smoke。
-16. 建 `golutra-vis`：承载 audit、event replay 与 OpenTelemetry JSON 投影，不另建事实库。
-17. 建 `golutra-sandbox`、`golutra-code-intelligence`：固化 OS 执行边界和结构化代码检索。
-18. 建 `golutra-eval`：eval_runner、trajectory_recorder、deep post_task_reviewer、vcr/golden fixture。
-19. 建 `golutra-evolution`、`golutra-plugin`、`golutra-mcp` 和 TypeScript/Python SDK；Web/IDE 产品入口不在当前范围。
+1. 建 `golutra-agent-core`：定义 Message、SessionState、GoalState、LoopGuard、LoopDecision、TaskRecord、ArtifactRef、DecisionRecord、EvidenceRecord。
+2. 建 `golutra-agent-store`：SQLite metadata、event log、artifact store、migration。
+3. 在 `golutra-agent-protocol` 中定义 ProviderRawEvent、RuntimeEvent、UiSdkEvent，明确 durable 与 live-only。
+4. 建 `golutra-agent-llm`：ProviderConfig、ModelCatalog、CapabilityMatrix、GenaiProviderAdapter、ModelRouteDecision、FallbackPolicy。
+5. 建 `golutra-agent-tools`：ToolSchema、ToolAccesses、ToolResultEnvelope、tool registry。
+6. 建 `golutra-agent-policy`：PermissionPolicy、permission `allow/ask/deny`、workspace isolation、sandbox policy。
+7. 建 `golutra-agent-runtime`：turn flow、LoopGuard、LoopDecision 生成、recorded events、resume、compact、replay、tool/model 回流。
+8. 建 `golutra-agent-context`：working summary、history 分层、compact boundary、token budget。
+9. 建 `golutra-agent-verify`：验证结果结构化。
+10. 建 `golutra-agent-protocol`：协议类型、schema、TS 类型生成。
+11. 建 `golutra-agent-client`：`RuntimeClient`、`EmbeddedTransport`、`HttpSseTransport`、query / subscribe 语义。
+12. 建 `golutra-agent-cli`：薄 CLI 命令面。
+13. 建 `golutra-agent-tui`：`crossterm + ratatui + Golutra 业务组件`，默认通过 `EmbeddedTransport` 访问 runtime。
+14. 建 `golutra-agent-app-server`：Unix IPC 与 HTTP/SSE 入口，复用同一 Axum Router 和 runtime facts。
+15. 建 `golutra-agent-test-client`：协议 fixture、transport 对拍、app-server smoke。
+16. 建 `golutra-agent-vis`：承载 audit、event replay 与 OpenTelemetry JSON 投影，不另建事实库。
+17. 建 `golutra-agent-sandbox`、`golutra-agent-code-intelligence`：固化 OS 执行边界和结构化代码检索。
+18. 建 `golutra-agent-eval`：eval_runner、trajectory_recorder、deep post_task_reviewer、vcr/golden fixture。
+19. 建 `golutra-agent-evolution`、`golutra-agent-plugin`、`golutra-agent-mcp` 和 TypeScript/Python SDK；Web/IDE 产品入口不在当前范围。
 
 ## 结合 Codex 的实施加权
 
@@ -654,10 +654,10 @@ Extension
 
 ### 第一优先级
 
-1. `golutra-protocol`
-2. `golutra-client`
-3. `golutra-app-server`
-4. `golutra-test-client`
+1. `golutra-agent-protocol`
+2. `golutra-agent-client`
+3. `golutra-agent-app-server`
+4. `golutra-agent-test-client`
 
 原因：
 
@@ -666,9 +666,9 @@ Extension
 
 ### 第二优先级
 
-1. `golutra-store`
-2. `golutra-file-search`
-3. `golutra-policy`
+1. `golutra-agent-store`
+2. `golutra-agent-file-search`
+3. `golutra-agent-policy`
 
 原因：
 
@@ -677,9 +677,9 @@ Extension
 
 ### 第三优先级
 
-1. `golutra-vis`
-2. `golutra-eval`
-3. `golutra-evolution`
+1. `golutra-agent-vis`
+2. `golutra-agent-eval`
+3. `golutra-agent-evolution`
 
 原因：
 
@@ -690,10 +690,10 @@ Extension
 
 结合 Codex 的实际工程结构，下列能力已经从“隐含能力”升级为显式模块：
 
-- `golutra-file-search` 与 `golutra-code-intelligence`：分别承载 rg/ignore metadata 和 tree-sitter symbol/reference graph。
-- `golutra-app-server`：作为 `RuntimeHost` 的用户级 daemon 承载方式，不新增语义，只提供 IPC/HTTP attach、query、command 和 subscribe。
-- `golutra-sandbox`：统一生成 macOS Seatbelt、Linux bubblewrap 或 process-only launch plan，并显式暴露 `os_enforced`。
-- `golutra-plugin` 与 `golutra-mcp`：把 package review/lifecycle 与外部工具 transport 分开，最终汇入同一 ToolContract/policy/artifact/evidence 链。
+- `golutra-agent-file-search` 与 `golutra-agent-code-intelligence`：分别承载 rg/ignore metadata 和 tree-sitter symbol/reference graph。
+- `golutra-agent-app-server`：作为 `RuntimeHost` 的用户级 daemon 承载方式，不新增语义，只提供 IPC/HTTP attach、query、command 和 subscribe。
+- `golutra-agent-sandbox`：统一生成 macOS Seatbelt、Linux bubblewrap 或 process-only launch plan，并显式暴露 `os_enforced`。
+- `golutra-agent-plugin` 与 `golutra-agent-mcp`：把 package review/lifecycle 与外部工具 transport 分开，最终汇入同一 ToolContract/policy/artifact/evidence 链。
 
 约束：
 

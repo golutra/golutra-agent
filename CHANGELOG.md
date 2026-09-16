@@ -15,8 +15,13 @@ follow [Semantic Versioning](https://semver.org/) where applicable.
 
 ### Changed
 
+- Breaking: Agent commands, crates, environment variables and data directories
+  use `golutra-agent`, `golutra-agent-*`, `GOLUTRA_AGENT_*` and `.golutra-agent`.
+  No old-name aliases or automatic data migration are installed. Native desktop
+  launch contract v2 uses the same payload as npm; desktop-owned IPC names stay
+  unchanged. See `docs/agent-namespace.md`.
 - Child processes now inherit the host environment by default, with optional
-  `GOLUTRA_SHELL_ENVIRONMENT_POLICY` restrictions and a mandatory exclusion of
+  `GOLUTRA_AGENT_SHELL_ENVIRONMENT_POLICY` restrictions and a mandatory exclusion of
   Golutra Agent internal credentials. Host CLI scope tokens and third-party
   credentials are inherited normally; Linux sandbox launches no longer place
   inherited values in command arguments. MCP declarations cannot reintroduce
@@ -42,9 +47,9 @@ follow [Semantic Versioning](https://semver.org/) where applicable.
 ### Removed
 
 - Temporarily removed the built-in `web_search` tool (provider alias
-  `golutra_web_search`) from both coding and full tool profiles, including its
-  HTTP backend and host configuration wiring. `GOLUTRA_WEB_SEARCH_ENDPOINT`
-  and `GOLUTRA_WEB_SEARCH_API_KEY` are no longer read. Legacy search-result
+  `golutra_agent_web_search`) from both coding and full tool profiles, including its
+  HTTP backend and host configuration wiring. `GOLUTRA_AGENT_WEB_SEARCH_ENDPOINT`
+  and `GOLUTRA_AGENT_WEB_SEARCH_API_KEY` are no longer read. Legacy search-result
   projection and wire aliases remain compatible with stored conversations;
   generic plugin/MCP integration remains available.
 

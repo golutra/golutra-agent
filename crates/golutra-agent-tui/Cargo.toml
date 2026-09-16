@@ -1,0 +1,48 @@
+[package]
+name = "golutra-agent-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description.workspace = true
+readme.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+base64.workspace = true
+chrono.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+fs2.workspace = true
+futures-util.workspace = true
+golutra-agent-auth = { path = "../golutra-agent-auth", version = "0.2.0" }
+golutra-agent-client = { path = "../golutra-agent-client", version = "0.2.0" }
+golutra-agent-config = { path = "../golutra-agent-config", version = "0.2.0" }
+golutra-agent-core.workspace = true
+golutra-agent-llm = { path = "../golutra-agent-llm", version = "0.2.0" }
+golutra-agent-protocol.workspace = true
+ignore.workspace = true
+miette.workspace = true
+nix = { workspace = true, features = ["process", "user"] }
+pulldown-cmark.workspace = true
+ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
+serde.workspace = true
+serde_json.workspace = true
+secrecy.workspace = true
+sha2.workspace = true
+shlex.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+golutra-agent-app-server = { path = "../golutra-agent-app-server", version = "0.2.0" }
+portable-pty = "0.9"
+vt100 = "0.16"

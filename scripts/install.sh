@@ -19,21 +19,21 @@ done
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 cargo build --locked --release \
-  -p golutra-cli \
-  -p golutra-tui \
-  -p golutra-app-server \
-  -p golutra-vis \
-  -p golutra-supervisor \
-  -p golutra-release \
-  -p golutra-eval-worker
+  -p golutra-agent-cli \
+  -p golutra-agent-tui \
+  -p golutra-agent-app-server \
+  -p golutra-agent-vis \
+  -p golutra-agent-supervisor \
+  -p golutra-agent-release \
+  -p golutra-agent-eval-worker
 
 install -d -m 755 "$prefix/bin"
-install -m 755 target/release/golutra-cli "$prefix/bin/golutra"
-install -m 755 target/release/golutra-tui "$prefix/bin/golutra-tui"
-install -m 755 target/release/golutra-app-server "$prefix/bin/golutra-app-server"
-install -m 755 target/release/golutra-vis "$prefix/bin/golutra-vis"
-install -m 755 target/release/golutra-supervisor "$prefix/bin/golutra-supervisor"
-install -m 755 target/release/golutra-launcher "$prefix/bin/golutra-launcher"
-install -m 755 target/release/golutra-eval-worker "$prefix/bin/golutra-eval-worker"
+install -m 755 target/release/golutra-agent "$prefix/bin/golutra-agent"
+install -m 755 target/release/golutra-agent-tui "$prefix/bin/golutra-agent-tui"
+install -m 755 target/release/golutra-agent-app-server "$prefix/bin/golutra-agent-app-server"
+install -m 755 target/release/golutra-agent-vis "$prefix/bin/golutra-agent-vis"
+install -m 755 target/release/golutra-agent-supervisor "$prefix/bin/golutra-agent-supervisor"
+install -m 755 target/release/golutra-agent-launcher "$prefix/bin/golutra-agent-launcher"
+install -m 755 target/release/golutra-agent-eval-worker "$prefix/bin/golutra-agent-eval-worker"
 
-printf 'Golutra installed in %s/bin\n' "$prefix"
+printf 'Golutra Agent installed in %s/bin\n' "$prefix"

@@ -1,0 +1,30 @@
+[package]
+name = "golutra-agent-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description.workspace = true
+readme.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+chrono.workspace = true
+fs2.workspace = true
+golutra-agent-core.workspace = true
+golutra-agent-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tempfile.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

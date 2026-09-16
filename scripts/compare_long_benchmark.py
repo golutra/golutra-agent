@@ -52,7 +52,7 @@ class EngineState:
     env: dict[str, str]
     thread_id: str | None = None
     codex_cumulative_usage: dict[str, int] | None = None
-    golutra_cache_context: dict[str, Any] | None = None
+    golutra_agent_cache_context: dict[str, Any] | None = None
     turns: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -64,7 +64,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="rebuild status fields from an existing report and retained stdout artifacts",
     )
-    parser.add_argument("--golutra", type=Path, default=Path("target/debug/golutra-cli"))
+    parser.add_argument("--golutra", type=Path, default=Path("target/debug/golutra-agent"))
     parser.add_argument(
         "--pi-root",
         type=Path,
@@ -84,7 +84,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--work-root", type=Path)
     parser.add_argument("--keep-work-root", action="store_true")
-    parser.add_argument("--golutra-home-source", type=Path, default=Path.home() / ".golutra")
+    parser.add_argument("--golutra-agent-home-source", type=Path, default=Path.home() / ".golutra-agent")
     parser.add_argument("--pi-agent-source", type=Path, default=Path.home() / ".pi" / "agent")
     parser.add_argument("--codex-home-source", type=Path, default=Path.home() / ".codex")
     return parser.parse_args()
@@ -136,7 +136,7 @@ def copy_private(source: Path, destination: Path) -> None:
 
 def prepare_golutra_home(args: argparse.Namespace, destination: Path) -> None:
     private_directory(destination)
-    source = args.golutra_home_source.resolve(strict=True)
+    source = args.golutra_agent_home_source.resolve(strict=True)
     payload = json.loads((source / "provider.json").read_text(encoding="utf-8"))
     active = payload.get("active_profile")
     found = False
@@ -287,7 +287,7 @@ def prompt_metadata(prompt: str) -> dict[str, Any]:
     }
 
 
-def golutra_command(
+def golutra_agent_command(
     args: argparse.Namespace,
     state: EngineState,
     prompt: str,
@@ -1001,7 +1001,7 @@ def command_for(
     resume: bool = False,
 ) -> list[str]:
     if state.name == "golutra":
-        return golutra_command(args, state, prompt, stage, resume=resume)
+        return golutra_agent_command(args, state, prompt, stage, resume=resume)
     if state.name == "pi":
         return pi_command(args, state, prompt, stage, resume=resume)
     return codex_command(args, state, prompt, stage, resume=resume)
@@ -1598,11 +1598,11 @@ def parse_metrics(
             capture.return_code,
             state.artifact_root / "run",
             capture.stdout_line_times_ms,
-            previous_cache_context=state.golutra_cache_context,
+            previous_cache_context=state.golutra_agent_cache_context,
             track_cache_context=True,
         )
-        state.golutra_cache_context = metrics.pop(
-            "_last_cache_context", state.golutra_cache_context
+        state.golutra_agent_cache_context = metrics.pop(
+            "_last_cache_context", state.golutra_agent_cache_context
         )
     elif state.name == "pi":
         metrics = paired.parse_pi(
@@ -2469,21 +2469,21 @@ def main() -> int:
     prompts = turn_prompts()
 
     external_work_root = args.work_root.resolve() if args.work_root else None
-    work_context = None if external_work_root else tempfile.TemporaryDirectory(prefix="golutra-long-threeway-")
+    work_context = None if external_work_root else tempfile.TemporaryDirectory(prefix="golutra-agent-long-threeway-")
     work_root = external_work_root or Path(work_context.name)
     private_directory(work_root)
-    sensitive_context = tempfile.TemporaryDirectory(prefix="golutra-long-credentials-")
+    sensitive_context = tempfile.TemporaryDirectory(prefix="golutra-agent-long-credentials-")
     sensitive_root = Path(sensitive_context.name)
     try:
-        golutra_home = sensitive_root / "golutra"
+        golutra_agent_home = sensitive_root / "golutra"
         pi_home = sensitive_root / "pi"
         codex_home = sensitive_root / "codex"
-        prepare_golutra_home(args, golutra_home)
+        prepare_golutra_home(args, golutra_agent_home)
         prepare_pi_home(args, pi_home)
         prepare_codex_home(args, codex_home)
 
         homes = {
-            "golutra": ("GOLUTRA_HOME", golutra_home),
+            "golutra": ("GOLUTRA_AGENT_HOME", golutra_agent_home),
             "pi": ("PI_CODING_AGENT_DIR", pi_home),
             "codex": ("CODEX_HOME", codex_home),
         }
@@ -2553,7 +2553,7 @@ def main() -> int:
                 "measurement_mode": "live_provider",
                 "status_note": "provider calls executed under isolated temporary homes",
                 "stop_on_strict_failure": args.stop_on_strict_failure,
-                "golutra_version": version([str(args.golutra), "--version"], repository_root),
+                "golutra_agent_version": version([str(args.golutra), "--version"], repository_root),
                 "pi_version": version(
                     ["node", "packages/coding-agent/dist/cli.js", "--version"],
                     args.pi_root,

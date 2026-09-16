@@ -104,8 +104,8 @@ def summarize(events: list[dict], metrics: dict) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--golutra", type=Path, default=Path("target/debug/golutra-cli"))
-    parser.add_argument("--golutra-home-source", type=Path, default=Path.home() / ".golutra")
+    parser.add_argument("--golutra", type=Path, default=Path("target/debug/golutra-agent"))
+    parser.add_argument("--golutra-agent-home-source", type=Path, default=Path.home() / ".golutra-agent")
     parser.add_argument("--model", default="gpt-5.5")
     parser.add_argument("--reasoning-effort", default="medium")
     parser.add_argument("--base-url", default="https://api.golutra.cn")
@@ -113,7 +113,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     binary = args.golutra.resolve(strict=True)
-    with tempfile.TemporaryDirectory(prefix="golutra-subagent-smoke-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="golutra-agent-subagent-smoke-") as temporary:
         root = Path(temporary)
         home, workspace, run = root / "home", root / "workspace", root / "run"
         long_bench.prepare_golutra_home(args, home)
@@ -121,7 +121,7 @@ def main() -> int:
         (workspace / "left.txt").write_text("LEFT_SENTINEL_42\n", encoding="utf-8")
         (workspace / "right.txt").write_text("RIGHT_SENTINEL_84\n", encoding="utf-8")
         env = os.environ.copy()
-        env["GOLUTRA_HOME"] = str(home)
+        env["GOLUTRA_AGENT_HOME"] = str(home)
         capture = paired.run_process([str(binary), "--cwd", str(workspace), "exec", "--json",
             "--approval-mode", "auto", "--yolo", "--no-project-verifier-discovery",
             "--max-elapsed-ms", str(int(args.timeout * 1000) - 5000), "--run-dir", str(run), PROMPT],

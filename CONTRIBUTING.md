@@ -28,7 +28,7 @@ Install:
 Build and run the TUI:
 
 ```bash
-cargo run -p golutra-tui
+cargo run -p golutra-agent-tui
 ```
 
 The TUI may ask for provider configuration on first launch. Tests that need a
@@ -51,7 +51,7 @@ personal credentials or network access.
 
 Avoid mixing formatting-only changes, generated output, and unrelated
 refactors into a behavioral pull request. Preserve existing user changes in
-your working tree and do not commit credentials or local `.golutra` state.
+your working tree and do not commit credentials or local `.golutra-agent` state.
 
 ## Required Checks
 
@@ -75,7 +75,7 @@ Generated files that are expected to change are:
 
 - `schemas/sdk-protocol.schema.json`
 - `sdk/typescript/src/generated.ts`
-- `sdk/python/src/golutra_sdk/generated.py`
+- `sdk/python/src/golutra_agent_sdk/generated.py`
 
 Do not hand-edit generated protocol output. Review the diff after generation.
 

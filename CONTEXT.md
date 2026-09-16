@@ -11,15 +11,15 @@ invent a second task state machine or infer completion from rendered text.
 
 ## Ownership
 
-- `golutra-client::RuntimeHostStorageState` owns canonical SQLite repositories,
+- `golutra-agent-client::RuntimeHostStorageState` owns canonical SQLite repositories,
   governance stores, artifacts, and thread/session facts.
-- `golutra-client::RuntimeHostExecutionState` owns the lane manager, event bus,
+- `golutra-agent-client::RuntimeHostExecutionState` owns the lane manager, event bus,
   sequence allocation, task supervision, cancellation, and managed processes.
-- `golutra-runtime::AgentHarness` is the provider/tool execution seam.
-- `golutra-tools::ToolRuntime` is the policy, preparation, sandbox, and tool-result
+- `golutra-agent-runtime::AgentHarness` is the provider/tool execution seam.
+- `golutra-agent-tools::ToolRuntime` is the policy, preparation, sandbox, and tool-result
   seam.
-- `golutra-protocol` owns shared command/query/event and typed transport data.
-- `golutra-tui` renders `UserProjection` and `DebugProjection`; transcript state,
+- `golutra-agent-protocol` owns shared command/query/event and typed transport data.
+- `golutra-agent-tui` renders `UserProjection` and `DebugProjection`; transcript state,
   layout, history replay, and scroll anchoring are kept in `TranscriptState`.
 
 ## Invariants

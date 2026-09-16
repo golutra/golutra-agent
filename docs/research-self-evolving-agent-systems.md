@@ -369,9 +369,9 @@ L4  Canary / green runtime
 面向本地 Golutra daemon，可以复刻 blue-green 语义，而不要求先引入 Kubernetes：
 
 ```text
-$GOLUTRA_HOME/releases/<digest>/golutra-*
-$GOLUTRA_HOME/releases/stable -> <old digest>
-$GOLUTRA_HOME/releases/preview -> <candidate digest>
+$GOLUTRA_AGENT_HOME/releases/<digest>/golutra-agent-*
+$GOLUTRA_AGENT_HOME/releases/stable -> <old digest>
+$GOLUTRA_AGENT_HOME/releases/preview -> <candidate digest>
 ```
 
 推荐流程：

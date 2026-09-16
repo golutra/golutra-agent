@@ -194,7 +194,7 @@ export class TuiDriverClient {
       args.push("--heartbeat-secs", String(options.heartbeatSeconds));
     }
     return TuiDriverClient.spawnCommand(
-      options.binaryPath ?? "golutra-tui",
+      options.binaryPath ?? "golutra-agent-tui",
       args,
       {
         ...options,

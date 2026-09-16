@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="assets/readme/golutra-logo.png" alt="Golutra logo" width="128" />
+  <img src="assets/readme/golutra-agent-logo.png" alt="Golutra logo" width="128" />
   <h1>Golutra Agent</h1>
   <p><strong>Simple coding agent. Reliable background work. Full observability.</strong></p>
 
@@ -26,7 +26,7 @@
 </p>
 
 Golutra Agent is a simple, local-first coding agent for moving from intent to
-working code. Install it, run `golutra`, and describe the result you want; the
+working code. Install it, run `golutra-agent`, and describe the result you want; the
 agent inspects the current workspace, changes files, runs checks, and reports
 what actually happened. You do not need to learn a command catalog before
 getting useful work done.
@@ -37,7 +37,7 @@ result backed by real workspace evidence.
 
 The everyday path is deliberately short:
 
-- **Two primary entry points:** `golutra` opens the interactive TUI; `golutra exec`
+- **Two primary entry points:** `golutra-agent` opens the interactive TUI; `golutra-agent exec`
   is the headless path for scripts and CI.
 - **Less repeated context:** the default coding profile exposes a compact tool
   surface, bounded context, and stable provider prefixes, reducing unnecessary
@@ -139,18 +139,18 @@ or automation:
 
 ```bash
 npm install -g @golutra/agent
-golutra
-golutra exec "inspect this workspace and run the checks"
+golutra-agent
+golutra-agent exec "inspect this workspace and run the checks"
 ```
 
-`golutra` with no arguments opens the TUI. Describe the goal in plain language;
+`golutra-agent` with no arguments opens the TUI. Describe the goal in plain language;
 the agent decides which reads, edits, commands, and checks are needed. A
 background shell session can keep running while the agent continues other work,
-and the TUI reports its real state when it finishes. Use `golutra exec` when a
+and the TUI reports its real state when it finishes. Use `golutra-agent exec` when a
 caller needs a non-interactive turn or JSON output:
 
 ```bash
-golutra exec --json "summarize the current changes"
+golutra-agent exec --json "summarize the current changes"
 ```
 
 The default interactive `coding` profile keeps the model-facing tool surface
@@ -161,10 +161,16 @@ explicit JSON/debug/run-bundle views provide detailed token, tool, event, and
 verification facts for troubleshooting or automation.
 
 The TUI can guide first-time provider setup. Non-secret defaults may be kept in
-`$GOLUTRA_HOME/runtime.json` (global) or `<workspace>/.golutra/runtime.json`
+`$GOLUTRA_AGENT_HOME/runtime.json` (global) or `<workspace>/.golutra-agent/runtime.json`
 (project); project values override global values, session controls are in
 memory, and explicit `--execution-mode`/`--tool-profile` flags win. Credentials
 stay in the owner-only credential store or environment references.
+
+Agent uses `~/.golutra-agent` by default (`GOLUTRA_AGENT_HOME` overrides it),
+separate from Golutra desktop's `.golutra` data and `golutra` command. Desktop-
+bundled and npm Agent installations can share this Agent home. Old command,
+environment and directory names are not aliases; see the
+[namespace contract](docs/agent-namespace.md).
 
 #### Build from source
 
@@ -175,32 +181,32 @@ TypeScript SDK.
 ```bash
 git clone https://github.com/golutra/golutra-agent.git
 cd golutra-agent
-cargo run -p golutra-tui
+cargo run -p golutra-agent-tui
 ```
 
 For a one-shot source build or the local app-server:
 
 ```bash
-cargo run -p golutra-cli -- chat "inspect this workspace"
-cargo run -p golutra-cli -- --cwd "$PWD" exec "run the checks"
-cargo run -p golutra-app-server -- --addr 127.0.0.1:47831
+cargo run -p golutra-agent-cli -- chat "inspect this workspace"
+cargo run -p golutra-agent-cli -- --cwd "$PWD" exec "run the checks"
+cargo run -p golutra-agent-app-server -- --addr 127.0.0.1:47831
 ```
 
 If you pass TUI flags through Cargo, put the separator before the program
 arguments:
 
 ```bash
-cargo run -p golutra-tui -- --yolo
+cargo run -p golutra-agent-tui -- --yolo
 ```
 
-`cargo run -p golutra-tui --yolo` is parsed by Cargo itself and fails with
+`cargo run -p golutra-agent-tui --yolo` is parsed by Cargo itself and fails with
 `unexpected argument '--yolo'`.
 
 #### Maintainer package work
 
 The published npm package is a lightweight launcher. npm resolves the matching
 native package for the host platform, and installation does not run a network
-download script. `golutra-tui` remains available as an explicit TUI alias.
+download script. `golutra-agent-tui` remains available as an explicit TUI alias.
 
 The current release workflow publishes Linux x64/arm64, macOS x64/arm64, and
 Windows x64/arm64 native packages. The npm distribution contains the
@@ -241,8 +247,9 @@ Useful entry points:
 
 | Surface | Start here |
 | --- | --- |
-| Interactive terminal | `cargo run -p golutra-tui` |
-| Scriptable CLI | `cargo run -p golutra-cli -- --help` |
+| Interactive terminal | `cargo run -p golutra-agent-tui` |
+| Scriptable CLI | `cargo run -p golutra-agent-cli -- --help` |
+| Offline desktop bundling (native, no Node.js) | [`docs/desktop-integration.md`](docs/desktop-integration.md) |
 | Local/remote service | [`docs/runtime-entrypoints.md`](docs/runtime-entrypoints.md) |
 | TUI driver | [`docs/tui-driver.md`](docs/tui-driver.md) |
 | Python SDK | [`sdk/python`](sdk/python) |

@@ -18,7 +18,7 @@ def main() -> int:
     # 外层进程期限由基准 harness 管理；这里的宽松保护只避免异常 agent 永久阻塞，且可为慢速 CI 调整。
     try:
         timeout_seconds = float(
-            os.environ.get("GOLUTRA_LONG_BENCH_PROBE_TIMEOUT", PROBE_TIMEOUT_SECONDS)
+            os.environ.get("GOLUTRA_AGENT_LONG_BENCH_PROBE_TIMEOUT", PROBE_TIMEOUT_SECONDS)
         )
     except ValueError:
         timeout_seconds = PROBE_TIMEOUT_SECONDS

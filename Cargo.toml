@@ -1,38 +1,38 @@
 [workspace]
 members = [
-  "crates/golutra-app-server",
-  "crates/golutra-auth",
-  "crates/golutra-cli",
-  "crates/golutra-client",
-  "crates/golutra-code-intelligence",
-  "crates/golutra-config",
-  "crates/golutra-context",
-  "crates/golutra-core",
-  "crates/golutra-eval",
-  "crates/golutra-eval-model",
-  "crates/golutra-eval-worker",
-  "crates/golutra-evolution",
-  "crates/golutra-event",
-  "crates/golutra-file-search",
-  "crates/golutra-governor",
-  "crates/golutra-llm",
-  "crates/golutra-memory",
-  "crates/golutra-mcp",
-  "crates/golutra-policy",
-  "crates/golutra-plugin",
-  "crates/golutra-protocol",
-  "crates/golutra-protocol-fixtures",
-  "crates/golutra-project-service",
-  "crates/golutra-runtime",
-  "crates/golutra-release",
-  "crates/golutra-sandbox",
-  "crates/golutra-store",
-  "crates/golutra-supervisor",
-  "crates/golutra-test-client",
-  "crates/golutra-tools",
-  "crates/golutra-tui",
-  "crates/golutra-verify",
-  "crates/golutra-vis",
+  "crates/golutra-agent-app-server",
+  "crates/golutra-agent-auth",
+  "crates/golutra-agent-cli",
+  "crates/golutra-agent-client",
+  "crates/golutra-agent-code-intelligence",
+  "crates/golutra-agent-config",
+  "crates/golutra-agent-context",
+  "crates/golutra-agent-core",
+  "crates/golutra-agent-eval",
+  "crates/golutra-agent-eval-model",
+  "crates/golutra-agent-eval-worker",
+  "crates/golutra-agent-evolution",
+  "crates/golutra-agent-event",
+  "crates/golutra-agent-file-search",
+  "crates/golutra-agent-governor",
+  "crates/golutra-agent-llm",
+  "crates/golutra-agent-memory",
+  "crates/golutra-agent-mcp",
+  "crates/golutra-agent-policy",
+  "crates/golutra-agent-plugin",
+  "crates/golutra-agent-protocol",
+  "crates/golutra-agent-protocol-fixtures",
+  "crates/golutra-agent-project-service",
+  "crates/golutra-agent-runtime",
+  "crates/golutra-agent-release",
+  "crates/golutra-agent-sandbox",
+  "crates/golutra-agent-store",
+  "crates/golutra-agent-supervisor",
+  "crates/golutra-agent-test-client",
+  "crates/golutra-agent-tools",
+  "crates/golutra-agent-tui",
+  "crates/golutra-agent-verify",
+  "crates/golutra-agent-vis",
 ]
 resolver = "3"
 
@@ -101,11 +101,11 @@ unicode-width = "0.1.14"
 webbrowser = "1.0"
 walkdir = "2.5"
 
-golutra-release = { path = "crates/golutra-release", version = "0.2.0" }
-golutra-supervisor = { path = "crates/golutra-supervisor", version = "0.2.0" }
+golutra-agent-release = { path = "crates/golutra-agent-release", version = "0.2.0" }
+golutra-agent-supervisor = { path = "crates/golutra-agent-supervisor", version = "0.2.0" }
 
-golutra-core = { path = "crates/golutra-core", version = "0.2.0" }
-golutra-protocol = { path = "crates/golutra-protocol", version = "0.2.0" }
-golutra-protocol-fixtures = { path = "crates/golutra-protocol-fixtures", version = "0.2.0" }
-golutra-project-service = { path = "crates/golutra-project-service", version = "0.2.0" }
-golutra-sandbox = { path = "crates/golutra-sandbox", version = "0.2.0" }
+golutra-agent-core = { path = "crates/golutra-agent-core", version = "0.2.0" }
+golutra-agent-protocol = { path = "crates/golutra-agent-protocol", version = "0.2.0" }
+golutra-agent-protocol-fixtures = { path = "crates/golutra-agent-protocol-fixtures", version = "0.2.0" }
+golutra-agent-project-service = { path = "crates/golutra-agent-project-service", version = "0.2.0" }
+golutra-agent-sandbox = { path = "crates/golutra-agent-sandbox", version = "0.2.0" }

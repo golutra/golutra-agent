@@ -78,7 +78,7 @@ def run_command(command: list[str], cwd: Path) -> str:
     return result.stdout
 
 
-def run_unix_pty_command(command: list[str], cwd: Path) -> str:
+def run_unix_pty_command(command: list[str], cwd: Path, *, env: dict | None = None) -> str:
     """通过真实 PTY 启动入口并返回捕获的终端字节。
 
     npm 包必须走用户实际调用的交互入口；普通管道无法覆盖 TUI 根据 PTY
@@ -100,8 +100,8 @@ def run_unix_pty_command(command: list[str], cwd: Path) -> str:
         termios.TIOCSWINSZ,
         struct.pack("HHHH", 24, 80, 0, 0),
     )
-    environment = os.environ.copy()
-    environment["GOLUTRA_HOME"] = str(cwd / ".smoke-home")
+    environment = os.environ.copy() if env is None else env.copy()
+    environment["GOLUTRA_AGENT_HOME"] = str(cwd / ".smoke-home")
     environment.setdefault("TERM", "xterm-256color")
     try:
         child = subprocess.Popen(
@@ -195,7 +195,7 @@ def smoke(
     node_bin: str,
     require_pty: bool,
 ) -> None:
-    with tempfile.TemporaryDirectory(prefix="golutra-npm-smoke-") as temp_dir:
+    with tempfile.TemporaryDirectory(prefix="golutra-agent-npm-smoke-") as temp_dir:
         root_dir = extract_package(root_archive.resolve(), Path(temp_dir) / "root")
         platform_dir = extract_package(
             platform_archive.resolve(), Path(temp_dir) / "platform"
@@ -213,7 +213,7 @@ def smoke(
         shutil.copytree(platform_dir, dependency_dir)
 
         version = root_package["version"]
-        for entrypoint in ("golutra.js", "golutra-tui.js"):
+        for entrypoint in ("golutra-agent.js", "golutra-agent-tui.js"):
             output = run_command(
                 [node_bin, str(root_dir / "bin" / entrypoint), "--version"],
                 root_dir,
@@ -224,17 +224,17 @@ def smoke(
                     f"unexpected version output for {entrypoint}: {output!r}"
                 )
 
-        run_command([node_bin, str(root_dir / "bin" / "golutra.js"), "--help"], root_dir)
+        run_command([node_bin, str(root_dir / "bin" / "golutra-agent.js"), "--help"], root_dir)
         # 静态检查避免在无真实终端时启动交互 TUI 并阻塞 smoke。
-        root_launcher = (root_dir / "bin" / "golutra.js").read_text(encoding="utf-8")
-        if 'process.argv.length === 2 ? "golutra-tui" : "golutra"' not in root_launcher:
-            raise SmokeError("golutra launcher does not route no-argument use to the TUI")
+        root_launcher = (root_dir / "bin" / "golutra-agent.js").read_text(encoding="utf-8")
+        if 'runNative("golutra-agent")' not in root_launcher:
+            raise SmokeError("npm launcher must use the same native entry as desktop")
         run_command(
-            [node_bin, str(root_dir / "bin" / "golutra-tui.js"), "--help"], root_dir
+            [node_bin, str(root_dir / "bin" / "golutra-agent-tui.js"), "--help"], root_dir
         )
         if require_pty:
             transcript = run_unix_pty_command(
-                [node_bin, str(root_dir / "bin" / "golutra.js")], root_dir
+                [node_bin, str(root_dir / "bin" / "golutra-agent.js")], root_dir
             )
             if "GOLUTRA" not in transcript and "golutra" not in transcript.lower():
                 raise SmokeError("PTY launcher output did not contain the TUI header")

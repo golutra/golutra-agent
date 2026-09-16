@@ -60,8 +60,8 @@ export async function runNative(binaryName) {
   const child = spawn(executable, process.argv.slice(2), {
     env: {
       ...process.env,
-      GOLUTRA_MANAGED_PACKAGE_ROOT: packageRoot,
-      GOLUTRA_PACKAGE_TARGET: platformKey,
+      GOLUTRA_AGENT_MANAGED_PACKAGE_ROOT: packageRoot,
+      GOLUTRA_AGENT_PACKAGE_TARGET: platformKey,
     },
     stdio: "inherit",
   });

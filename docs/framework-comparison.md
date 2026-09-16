@@ -55,7 +55,7 @@ Codex 最值得吸收的不是某个单库，而是一组已经被工程化验�
 
 吸收点：
 
-- 独立 `golutra-protocol`
+- 独立 `golutra-agent-protocol`
 - 独立 schema 产物
 - TypeScript/Python 类型生成
 - 协议 fixture
@@ -69,8 +69,8 @@ Codex 最值得吸收的不是某个单库，而是一组已经被工程化验�
 
 吸收点：
 
-- `golutra-app-server`
-- `golutra-client`
+- `golutra-agent-app-server`
+- `golutra-agent-client`
 - daemon 形态
 - transport 层和 test client
 
@@ -97,10 +97,10 @@ Codex 最值得吸收的不是某个单库，而是一组已经被工程化验�
 
 吸收点：
 
-- 独立 `golutra-file-search`
+- 独立 `golutra-agent-file-search`
 - SQLite 元数据检索
 - rg 文件内容搜索
-- 独立 `golutra-code-intelligence` tree-sitter symbol/reference/import graph
+- 独立 `golutra-agent-code-intelligence` tree-sitter symbol/reference/import graph
 
 影响：
 
@@ -124,7 +124,7 @@ Codex 最值得吸收的不是某个单库，而是一组已经被工程化验�
 
 吸收点：
 
-- `golutra-vis` 的 Audit / Events / OpenTelemetry JSON 投影
+- `golutra-agent-vis` 的 Audit / Events / OpenTelemetry JSON 投影
 - debug context / replay 访问层
 
 影响：
@@ -161,7 +161,7 @@ LangSmith、Braintrust、Promptfoo 不是这里六个框架的一部分，但它
 | --- | --- | --- |
 | LangSmith | trace、span、debug view、run 回看 | `RuntimeEvent`、`DebugProjection`、`replay` |
 | Braintrust | dataset、experiment、scorer、对比实验 | `EvaluationProjection`、`RegressionResult` |
-| Promptfoo | 配置式 eval、red team、CI 检查、安全测试 | `PolicyEvaluation`、`VerificationRecord`、`golutra-eval` |
+| Promptfoo | 配置式 eval、red team、CI 检查、安全测试 | `PolicyEvaluation`、`VerificationRecord`、`golutra-agent-eval` |
 
 这些能力的价值不在于“架构更先进”，而在于它们已经证明：
 

@@ -28,10 +28,10 @@ CLI / TUI / SDK / MCP adapter
 
 | Surface | Default process | Workspace behavior | Primary use |
 | --- | --- | --- | --- |
-| `golutra exec` | One short-lived client process; embedded host by default | `--cwd` is the host cwd and permission boundary | scripts, CI, other agents |
+| `golutra-agent exec` | One short-lived client process; embedded host by default | `--cwd` is the host cwd and permission boundary | scripts, CI, other agents |
 | App Server | One explicit long-lived user-level process | one server attaches many canonical cwd values; each attachment has its own session/workspace routing | IDEs, multiple clients, durable service |
 | Python/TypeScript SDK | Library process; connects to an App Server | each client creates an authenticated cwd attachment | application integration |
-| `golutra mcp-server` | MCP stdio process; connects to the local daemon by default | tool calls may select a workspace; clients are cached per cwd | expose Golutra to another agent |
+| `golutra-agent mcp-server` | MCP stdio process; connects to the local daemon by default | tool calls may select a workspace; clients are cached per cwd | expose Golutra to another agent |
 | Remote TUI | TUI process separate from the App Server | TUI attaches to the selected remote cwd | interactive UI over a remote/shared runtime |
 
 Therefore, a workspace does not require its own daemon. In shared mode one
@@ -39,22 +39,22 @@ App Server owns multiple workspace attachments. The workspace still controls
 cwd, file policy, state partition, default session resolution and history
 visibility. It is not a process boundary.
 
-The ordinary no-daemon path remains intentionally simple: `golutra` without
-arguments and the compatibility alias `golutra-tui` construct an
+The ordinary no-daemon path remains intentionally simple: `golutra-agent` without
+arguments and the compatibility alias `golutra-agent-tui` construct an
 `EmbeddedTransport`, so a single invocation owns its local `RuntimeHost`. Use
-`golutra exec` for a headless turn, and use the daemon or App Server surfaces when another
+`golutra-agent exec` for a headless turn, and use the daemon or App Server surfaces when another
 process must observe or control the same running task.
 
 ### Interactive defaults and runtime settings
 
-After npm installation, `golutra` with no arguments opens the TUI. The
-explicit `golutra exec ...` subcommand remains headless and is suitable for
+After npm installation, `golutra-agent` with no arguments opens the TUI. The
+explicit `golutra-agent exec ...` subcommand remains headless and is suitable for
 scripts and CI. TUI runtime defaults are read once at startup from two
 non-secret JSON layers:
 
 ```text
-$GOLUTRA_HOME/runtime.json       # global defaults
-<workspace>/.golutra/runtime.json # project overrides
+$GOLUTRA_AGENT_HOME/runtime.json       # global defaults
+<workspace>/.golutra-agent/runtime.json # project overrides
 session controls                  # in-memory overrides for this TUI session
 ```
 
@@ -75,17 +75,17 @@ API keys, tokens, proxy settings and host CLI context such as
 `GOLUTRA_COMMAND_IPC_ADDR` are inherited without special opt-in. In daemon mode,
 this is the daemon's environment, not a newly attached client's environment.
 
-The runtime always removes its internal `GOLUTRA_TRANSPORT_TOKEN`,
-`GOLUTRA_PROVIDER_API_KEY`, `GOLUTRA_PROVIDER_CUSTOM_HEADERS` and generated
-`GOLUTRA_CUSTOM_PROVIDER_API_KEY_*` variables. MCP declarations cannot restore
+The runtime always removes its internal `GOLUTRA_AGENT_TRANSPORT_TOKEN`,
+`GOLUTRA_AGENT_PROVIDER_API_KEY`, `GOLUTRA_AGENT_PROVIDER_CUSTOM_HEADERS` and generated
+`GOLUTRA_AGENT_CUSTOM_PROVIDER_API_KEY_*` variables. MCP declarations cannot restore
 these variables. Other names are not filtered merely for containing `TOKEN`,
 `KEY`, `SECRET` or the `GOLUTRA_` prefix.
 
-To restrict inheritance, set `GOLUTRA_SHELL_ENVIRONMENT_POLICY` before starting
+To restrict inheritance, set `GOLUTRA_AGENT_SHELL_ENVIRONMENT_POLICY` before starting
 the runtime host:
 
 ```bash
-export GOLUTRA_SHELL_ENVIRONMENT_POLICY='{"inherit":"all","exclude":["GITHUB_TOKEN","DATABASE_PASSWORD"]}'
+export GOLUTRA_AGENT_SHELL_ENVIRONMENT_POLICY='{"inherit":"all","exclude":["GITHUB_TOKEN","DATABASE_PASSWORD"]}'
 ```
 
 `inherit` accepts `all` (default), `core` (basic shell/path/locale variables),
@@ -99,7 +99,7 @@ separate from environment inheritance.
 
 Shell results describe process execution. Exit code zero does not establish
 application-level success: inspect the CLI's documented output. For
-`golutra-cli`, check outer `ok` and business `result.status`. An accepted request
+`golutra-cli` (the desktop IPC client), check outer `ok` and business `result.status`. An accepted request
 is not a completed operation; message delivery does not establish that the
 recipient has completed the downstream task.
 
@@ -122,30 +122,30 @@ evidence or query the service before resubmitting any mutation.
 TUI and can be used from a shell or an automation runner:
 
 ```bash
-golutra --cwd "$PWD" exec "inspect the workspace"
-golutra --cwd "$PWD" exec - < prompt.txt
-golutra --cwd "$PWD" exec --json "run the checks"
-golutra --cwd "$PWD" exec --output-last-message /tmp/answer.txt "summarize the change"
-golutra --cwd "$PWD" exec resume <thread-id> "continue the same task"
-golutra --cwd "$PWD" exec \
-  --run-dir /absolute/path/to/golutra-run \
+golutra-agent --cwd "$PWD" exec "inspect the workspace"
+golutra-agent --cwd "$PWD" exec - < prompt.txt
+golutra-agent --cwd "$PWD" exec --json "run the checks"
+golutra-agent --cwd "$PWD" exec --output-last-message /tmp/answer.txt "summarize the change"
+golutra-agent --cwd "$PWD" exec resume <thread-id> "continue the same task"
+golutra-agent --cwd "$PWD" exec \
+  --run-dir /absolute/path/to/golutra-agent-run \
   --approval-mode auto "run the benchmark task"
-golutra --cwd "$PWD" exec \
+golutra-agent --cwd "$PWD" exec \
   --yolo "run in unrestricted modification mode"
-golutra --cwd "$PWD" exec \
-  --run-dir /absolute/path/to/golutra-run \
+golutra-agent --cwd "$PWD" exec \
+  --run-dir /absolute/path/to/golutra-agent-run \
   --allow-network --approval-mode auto "run a task that needs a configured proxy"
-golutra --cwd "$PWD" exec \
+golutra-agent --cwd "$PWD" exec \
   --completion-criterion "tests pass" \
   --verify-program cargo --verify-arg test --verify-arg --workspace \
   "implement the requested change"
-golutra --cwd "$PWD" exec \
+golutra-agent --cwd "$PWD" exec \
   --no-project-verifier-discovery \
   "make the requested change without running a discovered project check"
-golutra --cwd "$PWD" exec \
+golutra-agent --cwd "$PWD" exec \
   --task-contract /absolute/path/to/task-contract.json \
   "implement the requested change"
-golutra --cwd "$PWD" exec \
+golutra-agent --cwd "$PWD" exec \
   --execution-mode strict --tool-profile full \
   "run a contract-driven task with managed tools"
 ```
@@ -170,8 +170,8 @@ audit facts. The `full` profile exposes every registered extension; use
 extension tools. Use
 `--execution-mode strict` when an unstructured prompt must be translated into a
 deterministic completion contract. The interactive TUI accepts both switches,
-for example `golutra-tui --execution-mode strict --tool-profile coding`.
-Use `golutra-tui --resume <value>` to start or resume the workspace session
+for example `golutra-agent-tui --execution-mode strict --tool-profile coding`.
+Use `golutra-agent-tui --resume <value>` to start or resume the workspace session
 identified by a string key. Leading and trailing whitespace is ignored;
 internal whitespace is rejected. A new key is persisted immediately with a
 stable session ID, so later invocations resume the same session.
@@ -198,7 +198,7 @@ runtime boundary.
 
 `--yolo` is an explicit per-task full-access mode. It is
 available to embedded, `--daemon` and `--connect` exec transports, including
-`exec resume`. `golutra-tui --yolo` applies the same capability to prompts from
+`exec resume`. `golutra-agent-tui --yolo` applies the same capability to prompts from
 the interactive, `remote`, `inspect` and `driver` TUI entrypoints. It bypasses
 workspace and sensitive-path checks, shell/P0 blocks, approval requests and
 child-tool OS sandboxing. In an embedded runtime it also requests and enables
@@ -276,7 +276,7 @@ raw state needed for recovery. The normal terminal export replaces it with a
 `result` or `error` outcome. The terminal path writes only the raw state and
 owner-only observations needed by callers, so a large redacted debug export or
 post-task evaluation cannot delay the user-visible result. Use an explicit
-bundle refresh (for example, `golutra --run-bundle <DIR> eval ingest ...`) when
+bundle refresh (for example, `golutra-agent --run-bundle <DIR> eval ingest ...`) when
 the portable debug projection is needed. If a supervisor or benchmark harness
 kills the CLI before the terminal export, the checkpoint remains reopenable
 through `--run-bundle`; runtime recovery may append interruption facts, and a
@@ -285,7 +285,7 @@ terminal result. Such a bundle remains explicitly non-terminal until its
 manifest is refreshed.
 
 Golutra continues to read the active provider profile and credentials from
-the configured global `GOLUTRA_HOME`, and never copies them into the run
+the configured global `GOLUTRA_AGENT_HOME`, and never copies them into the run
 directory. Raw state and `observations/` may contain workspace content,
 prompts and tool output, so keep the whole run directory owner-only and treat
 it as sensitive.
@@ -372,15 +372,15 @@ The final exit status is non-zero unless the runtime returns a verified
 Start the long-lived server explicitly:
 
 ```bash
-golutra app-server --addr 127.0.0.1:47831
+golutra-agent app-server --addr 127.0.0.1:47831
 # or
-cargo run -p golutra-app-server -- --addr 127.0.0.1:47831
+cargo run -p golutra-agent-app-server -- --addr 127.0.0.1:47831
 # stdio JSON-RPC supervisor mode
-golutra app-server --stdio
+golutra-agent app-server --stdio
 ```
 
 The server publishes endpoint metadata and an owner-only transport token under
-`$GOLUTRA_HOME/app-server/`. It provides:
+`$GOLUTRA_AGENT_HOME/app-server/`. It provides:
 
 - authenticated HTTP command/query and cursor-based SSE;
 - owner-only Unix IPC for local clients, including `/rpc` through the shared
@@ -401,15 +401,15 @@ task/reconcile     approval/resolve    turn/status       runtime/events/replay
 ```
 
 HTTP and WebSocket clients must send the bearer token and the negotiated
-`x-golutra-protocol-version`. Remote HTTP connections use
-`GOLUTRA_TRANSPORT_TOKEN`; local daemon discovery reads the owner-only token
+`x-golutra-agent-protocol-version`. Remote HTTP connections use
+`GOLUTRA_AGENT_TRANSPORT_TOKEN`; local daemon discovery reads the owner-only token
 file. The server binds loopback by default and validates local Host/Origin
 headers.
 
 `runtime/attach` creates a server-issued attachment capability and binds one
 runtime actor to it. That binding, rather than a caller-provided HTTP header,
 is authoritative for steer, interrupt, approval and takeover checks.
-`x-golutra-actor-id` may be sent as client metadata, but changing or spoofing
+`x-golutra-agent-actor-id` may be sent as client metadata, but changing or spoofing
 it cannot change control ownership. WebSocket, stdio, HTTP and Unix IPC all
 resolve commands through the attachment actor, so a second client must call
 `turn/takeover` before controlling an active lane.
@@ -514,23 +514,23 @@ terminal event fails promptly instead of waiting forever.
 
 ## 4. MCP Server
 
-`golutra mcp-server` is a stdio MCP adapter. It translates MCP framing into
+`golutra-agent mcp-server` is a stdio MCP adapter. It translates MCP framing into
 the shared `AgentClient` API and exposes two tools:
 
-- `golutra`: create or resume a durable thread and execute one turn;
-- `golutra-reply`: continue a supplied `thread_id`.
+- `golutra-agent`: create or resume a durable thread and execute one turn;
+- `golutra-agent-reply`: continue a supplied `thread_id`.
 
 Examples:
 
 ```bash
 # default: connect to the user-level daemon
-golutra --cwd "$PWD" mcp-server
+golutra-agent --cwd "$PWD" mcp-server
 
 # connect to an explicit App Server
-golutra --cwd "$PWD" --connect http://127.0.0.1:47831 mcp-server
+golutra-agent --cwd "$PWD" --connect http://127.0.0.1:47831 mcp-server
 
 # deliberately isolate the adapter in its own embedded runtime
-golutra --cwd "$PWD" mcp-server --embedded
+golutra-agent --cwd "$PWD" mcp-server --embedded
 ```
 
 The default is daemon-backed so an MCP caller can share state with TUI, CLI
@@ -544,8 +544,8 @@ bounded event sample.
 Remote TUI separates rendering from execution:
 
 ```bash
-export GOLUTRA_TRANSPORT_TOKEN="$(<\"$GOLUTRA_HOME/app-server/transport.token\")"
-golutra-tui --cwd "$PWD" remote --url http://127.0.0.1:47831
+export GOLUTRA_AGENT_TRANSPORT_TOKEN="$(<\"$GOLUTRA_AGENT_HOME/app-server/transport.token\")"
+golutra-agent-tui --cwd "$PWD" remote --url http://127.0.0.1:47831
 ```
 
 The TUI process owns terminal input, scrolling and rendering only. The remote
@@ -553,7 +553,7 @@ App Server owns sessions, tools, cancellation, approvals and durable events.
 The existing compatibility form remains available:
 
 ```bash
-golutra-tui --cwd "$PWD" --connect http://127.0.0.1:47831
+golutra-agent-tui --cwd "$PWD" --connect http://127.0.0.1:47831
 ```
 
 `remote` cannot be combined with `--daemon` or `--connect`; this keeps the
@@ -580,9 +580,9 @@ credentials must be configured on the App Server host.
 评估器把结果写成 `ExternalEvaluationRecord`，然后在同一个 bundle 上执行：
 
 ```bash
-golutra --run-bundle /absolute/run-dir eval ingest /absolute/evaluation.json
+golutra-agent --run-bundle /absolute/run-dir eval ingest /absolute/evaluation.json
 # When evidence lives outside the evaluation JSON directory:
-golutra --run-bundle /absolute/run-dir eval ingest \
+golutra-agent --run-bundle /absolute/run-dir eval ingest \
   --artifact-base /absolute/evaluator-output /absolute/evaluation.json
 ```
 
@@ -602,19 +602,19 @@ evaluator 只完成一部分时，bundle 会保留 `*.pending.json` 和具体缺
 
 ## 7. Terminal-Bench 适配边界
 
-Terminal-Bench 只通过 `tools/terminal_bench/golutra_tbench_adapter.py`
+Terminal-Bench 只通过 `tools/terminal_bench/golutra_agent_tbench_adapter.py`
 适配，不修改上游 harness。每个 trial 的 Golutra invocation 都使用独立
-`--run-dir /logs/golutra-runtime`；适配器优先读取 `<trial>/golutra-runtime`，
-兼容旧的 `sessions/golutra-runtime`，并把
+`--run-dir /logs/golutra-agent-runtime`；适配器优先读取 `<trial>/golutra-agent-runtime`，
+兼容旧的 `sessions/golutra-agent-runtime`，并把
 `terminal-bench-evaluation.json` 交给 `eval ingest`，并以 trial 根目录作为
 `--artifact-base`，使结果、pane 和命令记录可以被导入为不可变 evidence。找不到结果、manifest、
-collector 或 trace 时，保留 `golutra-evaluation.pending.json`，而不是丢掉
+collector 或 trace 时，保留 `golutra-agent-evaluation.pending.json`，而不是丢掉
 原始 observation。
 
-当 adapter 配置 `proxy_url` 或 `GOLUTRA_TBENCH_PROXY` 时，它会把代理变量传入
+当 adapter 配置 `proxy_url` 或 `GOLUTRA_AGENT_TBENCH_PROXY` 时，它会把代理变量传入
 容器，并给嵌入式 `exec` 加上 `--allow-network`；没有代理配置时保持默认无网络。
 collector 的显式路径优先，自动选择时只考虑仓库内最新且不早于当前 Rust 源码的
-可执行 `golutra-cli`，避免用旧二进制解释新 observation。
+可执行 `golutra-agent`，避免用旧二进制解释新 observation。
 
 适配器在等待 agent 命令之前就启动 host-side collector。这样即使
 Terminal-Bench 的外部 timeout 放弃了正在运行的线程，后续写入
@@ -646,11 +646,11 @@ bounded adapter contract for clients.
 The implementation is exercised at each boundary:
 
 ```bash
-cargo test -p golutra-client agent_projection::tests
-cargo test -p golutra-app-server --test rpc_process
-cargo test -p golutra-cli --test mcp_server_process
-cargo test -p golutra-cli --test exec_process
-cargo test -p golutra-tui remote_transport_attaches_to_the_real_app_server
+cargo test -p golutra-agent-client agent_projection::tests
+cargo test -p golutra-agent-app-server --test rpc_process
+cargo test -p golutra-agent-cli --test mcp_server_process
+cargo test -p golutra-agent-cli --test exec_process
+cargo test -p golutra-agent-tui remote_transport_attaches_to_the_real_app_server
 python3 -m unittest discover -s sdk/python/tests -v
 cd sdk/typescript && npm test
 ```

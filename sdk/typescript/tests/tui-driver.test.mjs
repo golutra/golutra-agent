@@ -96,7 +96,7 @@ test("Unix socket reconnect is explicit and never replays input", async (t) => {
     t.skip("Unix sockets are unavailable on Windows");
     return;
   }
-  const directory = await mkdtemp(join(tmpdir(), "golutra-driver-sdk-"));
+  const directory = await mkdtemp(join(tmpdir(), "golutra-agent-driver-sdk-"));
   const socketPath = join(directory, "driver.sock");
   let promptCount = 0;
   const server = createServer((socket) => {

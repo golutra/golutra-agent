@@ -56,7 +56,7 @@ class EvidenceTest(unittest.TestCase):
             {"event_type":"assistant_message", "session_id":"p", "task_id":"p1", "payload":{"content":answer}},
             {"event_type":"assistant_message", "session_id":"child", "task_id":"child1", "payload":{"content":"wrong answer"}},
         ]
-        self.assertEqual(evidence.golutra_parent_answer(events), answer)
+        self.assertEqual(evidence.golutra_agent_parent_answer(events), answer)
         self.assertNotIn("LAST_REQUIRED_FACT", answer[:512])
 
     def test_runner_keeps_remaining_samples_but_exits_nonzero_on_failure(self):

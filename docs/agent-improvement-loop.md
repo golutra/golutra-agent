@@ -11,7 +11,7 @@ execution-backed regression 和可信晋升输入的 P2.5 实施记录见 `runti
 
 - 本文档描述当前改进闭环和仍保留的 P3 目标态。
 - 当前已做到 `PostTaskReview -> candidate -> isolated baseline/candidate execution -> paired RegressionResult -> PromotionDecision -> 受限 benchmark apply/rollback` 的受控状态机。
-- projection replay 仍只复用 event/artifact facts；需要晋升的候选由 `golutra-client` 启动独立 baseline/candidate RuntimeHost，二者不共享 workspace、home 或 trace。
+- projection replay 仍只复用 event/artifact facts；需要晋升的候选由 `golutra-agent-client` 启动独立 baseline/candidate RuntimeHost，二者不共享 workspace、home 或 trace。
 - “可自动晋升”是长期能力预留，不代表当前默认实现会自动 redeploy 或自动替换线上执行版本。
 
 ## 当前实现边界

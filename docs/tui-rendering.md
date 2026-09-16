@@ -1,6 +1,6 @@
 # Inline 聊天与全屏工具详情
 
-交互入口 `golutra` / `golutra-tui` 默认使用普通终端上的 inline 聊天。Logo、用户问题、助手叙述、工具摘要和本地命令结果依次进入终端历史；活动输出与输入框留在 inline viewport。启动时不进入 alternate screen，旧 `--inline` 参数仅为兼容保留。
+交互入口 `golutra-agent` / `golutra-agent-tui` 默认使用普通终端上的 inline 聊天。Logo、用户问题、助手叙述、工具摘要和本地命令结果依次进入终端历史；活动输出与输入框留在 inline viewport。启动时不进入 alternate screen，旧 `--inline` 参数仅为兼容保留。
 
 普通聊天关闭鼠标捕获，滚轮滚动、拖选和系统复制快捷键由终端处理。按 Ctrl+O 进入独立全屏工具详情；详情内支持鼠标操作，Back 或 Esc 返回后立即释放鼠标，保留草稿与主屏位置。已有 /resume 等选择器继续使用临时全屏交互。
 
@@ -64,13 +64,13 @@
 旧的强制贴底断言已按顶部锚定语义调整；长块完成仍断言最后一行紧邻输入边框，无整屏间隔。详情返回比较逐行可见正文与光标，只忽略 VT 对显式行尾空格和擦除空格的编码差异，消息完整性和行位置断言保持有效。
 
 ```sh
-cargo test --locked -p golutra-tui
-cargo clippy --locked -p golutra-tui --all-targets -- -D warnings
+cargo test --locked -p golutra-agent-tui
+cargo clippy --locked -p golutra-agent-tui --all-targets -- -D warnings
 cargo fmt --all -- --check
 git diff --check
 ```
 
-真实 PTY 使用隔离 GOLUTRA_HOME、临时工作区、localhost SSE provider 和真实文件读取驱动实际二进制。启动前先输出 shell 历史与启动命令标记，并响应 DSR，让 TUI 从非零光标开始。VT 模拟器检查主屏、备用屏、鼠标捕获模式与滚动历史，不能把原始 ANSI 输出中出现过文字当作可见性证明。
+真实 PTY 使用隔离 GOLUTRA_AGENT_HOME、临时工作区、localhost SSE provider 和真实文件读取驱动实际二进制。启动前先输出 shell 历史与启动命令标记，并响应 DSR，让 TUI 从非零光标开始。VT 模拟器检查主屏、备用屏、鼠标捕获模式与滚动历史，不能把原始 ANSI 输出中出现过文字当作可见性证明。
 
 验收覆盖默认 inline、长中文流式中间帧、40 段空行正文、400 行代码、/status 插入位置、6–112 行缩放、选择器退出、新进程 resume、Ctrl+O 进入详情与工具切换、Esc/Back 返回、草稿隔离、详情页缩放，以及查看详情期间继续生成的回复完整归档。各阶段同时断言 shell 标记保留一次；额外检查多行草稿收缩、鼠标模式恢复与 /terminal 挂起。单元回归覆盖运行中工具身份、失败详情、极小视口、宽字符复制，以及最终正文修订时不清空原生历史。
 

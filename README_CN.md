@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="assets/readme/golutra-logo.png" alt="Golutra 标志" width="128" />
+  <img src="assets/readme/golutra-agent-logo.png" alt="Golutra 标志" width="128" />
   <h1>Golutra Agent</h1>
   <p><strong>简单操作、可靠后台、完整可观测的 Coding Agent。</strong></p>
 
@@ -28,7 +28,7 @@
 ## 中文
 
 Golutra Agent 是一个让目标直接变成可用代码的简单、local-first Coding Agent。安装后运行
-`golutra`，用自然语言说明结果；Agent 会查看当前工作区、修改文件、运行检查，并如实反馈
+`golutra-agent`，用自然语言说明结果；Agent 会查看当前工作区、修改文件、运行检查，并如实反馈
 发生了什么，不要求用户先学习命令目录。
 
 它让人的操作保持简单，也让模型上下文保持聚焦：只需说明一次目标，由 Agent 自己选择必要
@@ -36,7 +36,7 @@ Golutra Agent 是一个让目标直接变成可用代码的简单、local-first 
 
 日常路径保持短小：
 
-- **两个主要入口**：`golutra` 打开交互式 TUI；`golutra exec` 用于脚本和 CI 的无界面执行。
+- **两个主要入口**：`golutra-agent` 打开交互式 TUI；`golutra-agent exec` 用于脚本和 CI 的无界面执行。
 - **减少重复上下文**：默认 `coding` 工具面、有限上下文和稳定的 provider 前缀，减少无效往返，让 token 用在任务本身。
 - **后台继续工作**：后台 shell session 和相互独立的 session 可以并行，受主机资源与策略限制；同一 session 内仍按顺序推进任务。
 - **需要时完整可观测**：普通界面只展示进度和结果；显式 debug、JSON、run bundle 视图提供事件、token、工具和验证事实。
@@ -100,14 +100,14 @@ observation/governance plane 保存事实、artifact 和完整性结果，再按
 
 ```bash
 npm install -g @golutra/agent
-golutra
-golutra exec "检查当前工作区并运行测试"
+golutra-agent
+golutra-agent exec "检查当前工作区并运行测试"
 ```
 
-无参数执行 `golutra` 会进入 TUI。直接描述目标即可，Agent 自己判断需要哪些读取、修改、命令和检查；后台 shell session 会持续运行，TUI 在终态时展示真实结果。脚本或 CI 使用 `golutra exec`，需要结构化输出时加 `--json`：
+无参数执行 `golutra-agent` 会进入 TUI。直接描述目标即可，Agent 自己判断需要哪些读取、修改、命令和检查；后台 shell session 会持续运行，TUI 在终态时展示真实结果。脚本或 CI 使用 `golutra-agent exec`，需要结构化输出时加 `--json`：
 
 ```bash
-golutra exec --json "总结当前改动"
+golutra-agent exec --json "总结当前改动"
 ```
 
 默认交互使用紧凑的 `coding` 工具面和有界上下文；只有任务确实需要低频扩展时才使用
@@ -115,7 +115,9 @@ golutra exec --json "总结当前改动"
 和 run bundle 视图可用于查看 token、工具、事件和验证详情。
 
 TUI 可以引导首次 provider 配置。非敏感默认值可存放在
-`$GOLUTRA_HOME/runtime.json`（全局）或 `<workspace>/.golutra/runtime.json`（项目）；项目值覆盖全局值，session 控制只在内存中生效，显式参数优先。凭据只保存在 owner-only 凭据存储或环境引用中。
+`$GOLUTRA_AGENT_HOME/runtime.json`（全局）或 `<workspace>/.golutra-agent/runtime.json`（项目）；项目值覆盖全局值，session 控制只在内存中生效，显式参数优先。凭据只保存在 owner-only 凭据存储或环境引用中。
+
+Agent 默认使用 `~/.golutra-agent`，可通过 `GOLUTRA_AGENT_HOME` 指定；与 Golutra 桌面的 `.golutra` 数据和 `golutra` 命令分离。桌面内置 Agent 与 npm Agent 可共用这个 Agent home，不提供旧命令、旧环境变量和旧目录回退。详见[命名空间合同](docs/agent-namespace.md)。
 
 #### 从源码构建
 
@@ -124,29 +126,29 @@ TUI 可以引导首次 provider 配置。非敏感默认值可存放在
 ```bash
 git clone https://github.com/golutra/golutra-agent.git
 cd golutra-agent
-cargo run -p golutra-tui
+cargo run -p golutra-agent-tui
 ```
 
 也可以运行一次性任务或本地 app-server：
 
 ```bash
-cargo run -p golutra-cli -- chat "检查当前工作区"
-cargo run -p golutra-cli -- --cwd "$PWD" exec "运行测试"
-cargo run -p golutra-app-server -- --addr 127.0.0.1:47831
+cargo run -p golutra-agent-cli -- chat "检查当前工作区"
+cargo run -p golutra-agent-cli -- --cwd "$PWD" exec "运行测试"
+cargo run -p golutra-agent-app-server -- --addr 127.0.0.1:47831
 ```
 
 通过 Cargo 传递 TUI 参数时，需要在程序参数前加分隔符：
 
 ```bash
-cargo run -p golutra-tui -- --yolo
+cargo run -p golutra-agent-tui -- --yolo
 ```
 
-`cargo run -p golutra-tui --yolo` 会被 Cargo 自己解析，因此会报
+`cargo run -p golutra-agent-tui --yolo` 会被 Cargo 自己解析，因此会报
 `unexpected argument '--yolo'`。
 
 #### 发布与维护
 
-根 npm 包只负责选择当前平台的原生包，安装过程不运行联网下载脚本；`golutra-tui` 仍是显式 TUI 别名。
+根 npm 包只负责选择当前平台的原生包，安装过程不运行联网下载脚本；`golutra-agent-tui` 仍是显式 TUI 别名。
 
 当前 release workflow 发布 Linux x64/arm64、macOS x64/arm64 和 Windows x64/arm64。app-server、观测、supervisor 与 evaluation 入口仍随下面的完整平台归档分发。
 
@@ -157,6 +159,7 @@ cargo run -p golutra-tui -- --yolo
 - 改进闭环：[docs/agent-improvement-loop.md](docs/agent-improvement-loop.md)
 - 文档索引：[docs/README.md](docs/README.md)
 - 运行入口：[docs/runtime-entrypoints.md](docs/runtime-entrypoints.md)
+- 桌面离线原生集成：[docs/desktop-integration.md](docs/desktop-integration.md)
 - 贡献指南：[CONTRIBUTING.md](CONTRIBUTING.md)
 - 安全策略：[SECURITY.md](SECURITY.md)
 - 变更记录：[CHANGELOG.md](CHANGELOG.md)

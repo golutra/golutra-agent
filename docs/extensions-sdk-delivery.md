@@ -4,8 +4,8 @@
 
 截至 2026-07-23，Golutra 的扩展和交付层已经进入可运行主链：
 
-- `golutra-plugin` 管理 owner-only 本地插件包，生命周期为 `stage -> review -> enable -> disable/rollback`。
-- `golutra-mcp` 使用官方 `rmcp 2.2.0` 适配 stdio MCP server；外部工具进入统一 `ToolRegistry`、PolicyEvaluation、approval、timeout/cancel、artifact/evidence 链路。
+- `golutra-agent-plugin` 管理 owner-only 本地插件包，生命周期为 `stage -> review -> enable -> disable/rollback`。
+- `golutra-agent-mcp` 使用官方 `rmcp 2.2.0` 适配 stdio MCP server；外部工具进入统一 `ToolRegistry`、PolicyEvaluation、approval、timeout/cancel、artifact/evidence 链路。
 - Unix 本地 daemon 默认通过 owner-only Unix socket 连接；socket 请求复用同一个 Axum Router，HTTP/SSE 继续用于 Windows 和远端。
 - TypeScript 与 Python SDK 都从 Rust 协议 schema 生成类型，并实现 cwd attachment、command/query、event replay/live stream、thread 与治理 API。
 - Agent 高层 SDK 还提供统一的 `Thread`/`TurnHandle` 生命周期；`exec`、MCP 和 Remote TUI 复用同一个 App Server/Agent event projector，不形成第二套执行状态机。SDK 可发送 actor 元数据，但控制权由 App Server 为 attachment 分配的 server-side actor 决定，不能通过伪造 header 提权。
@@ -22,11 +22,11 @@
 插件属于用户级扩展，不写入 workspace：
 
 ```text
-$GOLUTRA_HOME/plugins/
+$GOLUTRA_AGENT_HOME/plugins/
   registry.json
   registry.lock
   packages/<plugin-id>/<revision-id>/
-    golutra-plugin.json
+    golutra-agent-plugin.json
     ... package files
 ```
 
@@ -35,12 +35,12 @@ $GOLUTRA_HOME/plugins/
 CLI 生命周期：
 
 ```bash
-golutra plugin stage ./my-plugin
-golutra plugin review <plugin-id> <revision-id>
-golutra plugin enable <plugin-id> <revision-id>
-golutra plugin list
-golutra plugin disable <plugin-id>
-golutra plugin rollback <plugin-id>
+golutra-agent plugin stage ./my-plugin
+golutra-agent plugin review <plugin-id> <revision-id>
+golutra-agent plugin enable <plugin-id> <revision-id>
+golutra-agent plugin list
+golutra-agent plugin disable <plugin-id>
+golutra-agent plugin rollback <plugin-id>
 ```
 
 manifest 只保存命令、参数、所需环境变量名称、workspace/network 权限和经过人工审查的工具 schema，不保存 secret：
@@ -110,7 +110,7 @@ IPC 不是第二套业务协议。它把受限 HTTP-like request 交给同一个
 `just schema` 从 Rust 类型生成 `schemas/sdk-protocol.schema.json`，再生成：
 
 - `sdk/typescript/src/generated.ts`
-- `sdk/python/src/golutra_sdk/generated.py`
+- `sdk/python/src/golutra_agent_sdk/generated.py`
 
 两个 HTTP SDK 都要求绝对 cwd 和 transport token，先读取认证后的 `/runtime/info` 验证 runtime protocol range，再执行 `/runtime/attach`，之后访问 command/query/thread/event API；attachment 失效时只在服务端明确返回 `410 Gone` 后重新 attach。JSON response、SSE frame、timeout 和 cursor 去重都有固定上限。
 
@@ -152,19 +152,19 @@ just py-check
 
 Unix 使用 `scripts/install.sh`，Windows 使用 `scripts/install.ps1`。脚本从固定 Rust toolchain 构建 release binary，并安装：
 
-- `golutra`
-- `golutra-tui`
-- `golutra-app-server`
-- `golutra-vis`
-- `golutra-supervisor`
-- `golutra-launcher`
-- `golutra-eval-worker`
+- `golutra-agent`
+- `golutra-agent-tui`
+- `golutra-agent-app-server`
+- `golutra-agent-vis`
+- `golutra-agent-supervisor`
+- `golutra-agent-launcher`
+- `golutra-agent-eval-worker`
 
 如果只需要交互式 TUI 或脚本 CLI，可以使用 npm 分发：
 
 ```bash
 npm install -g @golutra/agent
-golutra-tui
+golutra-agent-tui
 ```
 
 `@golutra/agent` 是无状态 JavaScript wrapper，平台原生包通过 npm
@@ -178,7 +178,7 @@ app-server、观测、supervisor 和 evaluation 入口仍使用下面的 release
 
 升级不会写项目目录。SQLite 使用幂等 migration 和 legacy column backfill；provider v1 明文 env map 只在 provider settings lock 内迁移到 disk SecretRef。rollout 可从 SQLite 重建，未开始 pending turn 可在 owner 重启后恢复，已开始 turn 不做不安全重放。
 
-升级前仍建议停止 daemon 并备份整个 `$GOLUTRA_HOME`。恢复时以 `runtime.sqlite`、credentials/provider 配置和 artifact/checkpoint 文件共同作为一个备份单元，不应只恢复派生 rollout。
+升级前仍建议停止 daemon 并备份整个 `$GOLUTRA_AGENT_HOME`。恢复时以 `runtime.sqlite`、credentials/provider 配置和 artifact/checkpoint 文件共同作为一个备份单元，不应只恢复派生 rollout。
 
 ## 交付门禁
 

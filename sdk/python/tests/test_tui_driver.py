@@ -14,7 +14,7 @@ from pathlib import Path
 SDK_SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SDK_SRC))
 
-from golutra_sdk import (
+from golutra_agent_sdk import (
     TuiDriverClient,
     TuiDriverDisconnectedError,
     TuiDriverError,

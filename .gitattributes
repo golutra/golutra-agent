@@ -11,4 +11,4 @@
 # These files are generated from the Rust protocol source of truth.
 schemas/sdk-protocol.schema.json linguist-generated=true
 sdk/typescript/src/generated.ts linguist-generated=true
-sdk/python/src/golutra_sdk/generated.py linguist-generated=true
+sdk/python/src/golutra_agent_sdk/generated.py linguist-generated=true

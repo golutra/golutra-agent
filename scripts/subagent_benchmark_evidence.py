@@ -4,7 +4,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 
 
-def golutra_parent_answer(events: list[dict]) -> str:
+def golutra_agent_parent_answer(events: list[dict]) -> str:
     parents = [e for e in events if e.get("event_type") == "task_created"
                and not e.get("payload", {}).get("payload", {}).get("_delegated_task")]
     if len(parents) != 1:

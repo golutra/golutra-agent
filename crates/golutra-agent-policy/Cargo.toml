@@ -1,0 +1,23 @@
+[package]
+name = "golutra-agent-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description.workspace = true
+readme.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+golutra-agent-core.workspace = true
+shlex.workspace = true
+thiserror.workspace = true
+tree-sitter.workspace = true
+tree-sitter-bash.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1238,7 +1238,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-app-server"
+name = "golutra-agent-app-server"
 version = "0.2.0"
 dependencies = [
  "async-stream",
@@ -1248,10 +1248,11 @@ dependencies = [
  "clap",
  "fs2",
  "futures-util",
- "golutra-client",
- "golutra-core",
- "golutra-protocol",
- "golutra-store",
+ "golutra-agent-client",
+ "golutra-agent-config",
+ "golutra-agent-core",
+ "golutra-agent-protocol",
+ "golutra-agent-store",
  "miette",
  "reqwest 0.12.28",
  "secrecy",
@@ -1268,7 +1269,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-auth"
+name = "golutra-agent-auth"
 version = "0.2.0"
 dependencies = [
  "async-trait",
@@ -1290,22 +1291,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-cli"
+name = "golutra-agent-cli"
 version = "0.2.0"
 dependencies = [
  "chrono",
  "clap",
- "golutra-app-server",
- "golutra-auth",
- "golutra-client",
- "golutra-code-intelligence",
- "golutra-config",
- "golutra-core",
- "golutra-eval",
- "golutra-llm",
- "golutra-plugin",
- "golutra-project-service",
- "golutra-protocol",
+ "golutra-agent-app-server",
+ "golutra-agent-auth",
+ "golutra-agent-client",
+ "golutra-agent-code-intelligence",
+ "golutra-agent-config",
+ "golutra-agent-core",
+ "golutra-agent-eval",
+ "golutra-agent-llm",
+ "golutra-agent-plugin",
+ "golutra-agent-project-service",
+ "golutra-agent-protocol",
  "miette",
  "rmcp",
  "schemars 1.2.1",
@@ -1318,7 +1319,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-client"
+name = "golutra-agent-client"
 version = "0.2.0"
 dependencies = [
  "async-trait",
@@ -1326,21 +1327,21 @@ dependencies = [
  "chrono",
  "fs2",
  "futures-util",
- "golutra-auth",
- "golutra-config",
- "golutra-context",
- "golutra-core",
- "golutra-eval",
- "golutra-evolution",
- "golutra-llm",
- "golutra-mcp",
- "golutra-memory",
- "golutra-plugin",
- "golutra-policy",
- "golutra-protocol",
- "golutra-runtime",
- "golutra-store",
- "golutra-tools",
+ "golutra-agent-auth",
+ "golutra-agent-config",
+ "golutra-agent-context",
+ "golutra-agent-core",
+ "golutra-agent-eval",
+ "golutra-agent-evolution",
+ "golutra-agent-llm",
+ "golutra-agent-mcp",
+ "golutra-agent-memory",
+ "golutra-agent-plugin",
+ "golutra-agent-policy",
+ "golutra-agent-protocol",
+ "golutra-agent-runtime",
+ "golutra-agent-store",
+ "golutra-agent-tools",
  "jsonschema",
  "reqwest 0.12.28",
  "ring",
@@ -1359,7 +1360,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-code-intelligence"
+name = "golutra-agent-code-intelligence"
 version = "0.2.0"
 dependencies = [
  "chrono",
@@ -1378,12 +1379,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-config"
+name = "golutra-agent-config"
 version = "0.2.0"
 dependencies = [
  "fs2",
- "golutra-auth",
- "golutra-llm",
+ "golutra-agent-auth",
+ "golutra-agent-llm",
  "secrecy",
  "serde",
  "serde_json",
@@ -1394,12 +1395,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-context"
+name = "golutra-agent-context"
 version = "0.2.0"
 dependencies = [
  "chrono",
- "golutra-core",
- "golutra-llm",
+ "golutra-agent-core",
+ "golutra-agent-llm",
  "serde",
  "serde_json",
  "sha2",
@@ -1407,7 +1408,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-core"
+name = "golutra-agent-core"
 version = "0.2.0"
 dependencies = [
  "chrono",
@@ -1419,13 +1420,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-eval"
+name = "golutra-agent-eval"
 version = "0.2.0"
 dependencies = [
  "chrono",
  "fs2",
- "golutra-core",
- "golutra-eval-model",
+ "golutra-agent-core",
+ "golutra-agent-eval-model",
  "schemars 1.2.1",
  "serde",
  "serde_json",
@@ -1436,11 +1437,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-eval-model"
+name = "golutra-agent-eval-model"
 version = "0.2.0"
 dependencies = [
  "chrono",
- "golutra-core",
+ "golutra-agent-core",
  "schemars 1.2.1",
  "serde",
  "serde_json",
@@ -1448,14 +1449,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-eval-worker"
+name = "golutra-agent-eval-worker"
 version = "0.2.0"
 dependencies = [
  "chrono",
  "clap",
- "golutra-client",
- "golutra-core",
- "golutra-protocol",
+ "golutra-agent-client",
+ "golutra-agent-core",
+ "golutra-agent-protocol",
  "serde_json",
  "tempfile",
  "tokio",
@@ -1463,20 +1464,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-event"
+name = "golutra-agent-event"
 version = "0.2.0"
 dependencies = [
- "golutra-protocol",
+ "golutra-agent-protocol",
 ]
 
 [[package]]
-name = "golutra-evolution"
+name = "golutra-agent-evolution"
 version = "0.2.0"
 dependencies = [
  "chrono",
  "fs2",
- "golutra-core",
- "golutra-eval",
+ "golutra-agent-core",
+ "golutra-agent-eval",
  "schemars 1.2.1",
  "serde",
  "serde_json",
@@ -1487,11 +1488,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-file-search"
+name = "golutra-agent-file-search"
 version = "0.2.0"
 dependencies = [
- "golutra-core",
- "golutra-policy",
+ "golutra-agent-core",
+ "golutra-agent-policy",
  "regex",
  "serde",
  "serde_json",
@@ -1502,16 +1503,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-governor"
+name = "golutra-agent-governor"
 version = "0.2.0"
 dependencies = [
- "golutra-core",
+ "golutra-agent-core",
  "schemars 1.2.1",
  "serde",
 ]
 
 [[package]]
-name = "golutra-llm"
+name = "golutra-agent-llm"
 version = "0.2.0"
 dependencies = [
  "async-trait",
@@ -1519,8 +1520,8 @@ dependencies = [
  "eventsource-stream",
  "futures-util",
  "genai",
- "golutra-auth",
- "golutra-core",
+ "golutra-agent-auth",
+ "golutra-agent-core",
  "reqwest 0.12.28",
  "reqwest 0.13.4",
  "rustls",
@@ -1533,15 +1534,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-mcp"
+name = "golutra-agent-mcp"
 version = "0.2.0"
 dependencies = [
  "async-trait",
- "golutra-core",
- "golutra-plugin",
- "golutra-policy",
- "golutra-sandbox",
- "golutra-tools",
+ "golutra-agent-core",
+ "golutra-agent-plugin",
+ "golutra-agent-policy",
+ "golutra-agent-sandbox",
+ "golutra-agent-tools",
  "rmcp",
  "serde_json",
  "tempfile",
@@ -1551,12 +1552,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-memory"
+name = "golutra-agent-memory"
 version = "0.2.0"
 dependencies = [
  "chrono",
  "fs2",
- "golutra-core",
+ "golutra-agent-core",
  "regex",
  "schemars 1.2.1",
  "serde",
@@ -1566,12 +1567,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-plugin"
+name = "golutra-agent-plugin"
 version = "0.2.0"
 dependencies = [
  "chrono",
  "fs2",
- "golutra-core",
+ "golutra-agent-core",
  "jsonschema",
  "serde",
  "serde_json",
@@ -1583,10 +1584,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-policy"
+name = "golutra-agent-policy"
 version = "0.2.0"
 dependencies = [
- "golutra-core",
+ "golutra-agent-core",
  "shlex 1.3.0",
  "tempfile",
  "thiserror 2.0.18",
@@ -1595,7 +1596,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-project-service"
+name = "golutra-agent-project-service"
 version = "0.2.0"
 dependencies = [
  "async-trait",
@@ -1613,12 +1614,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-protocol"
+name = "golutra-agent-protocol"
 version = "0.2.0"
 dependencies = [
  "chrono",
- "golutra-core",
- "golutra-eval-model",
+ "golutra-agent-core",
+ "golutra-agent-eval-model",
  "schemars 1.2.1",
  "serde",
  "serde_json",
@@ -1626,28 +1627,28 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-protocol-fixtures"
+name = "golutra-agent-protocol-fixtures"
 version = "0.2.0"
 dependencies = [
  "chrono",
- "golutra-core",
- "golutra-eval",
- "golutra-evolution",
- "golutra-governor",
- "golutra-memory",
- "golutra-protocol",
+ "golutra-agent-core",
+ "golutra-agent-eval",
+ "golutra-agent-evolution",
+ "golutra-agent-governor",
+ "golutra-agent-memory",
+ "golutra-agent-protocol",
  "schemars 1.2.1",
  "serde",
  "serde_json",
 ]
 
 [[package]]
-name = "golutra-release"
+name = "golutra-agent-release"
 version = "0.2.0"
 dependencies = [
  "chrono",
  "fs2",
- "golutra-sandbox",
+ "golutra-agent-sandbox",
  "nix 0.30.1",
  "schemars 1.2.1",
  "serde",
@@ -1661,21 +1662,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-runtime"
+name = "golutra-agent-runtime"
 version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
  "futures-util",
- "golutra-context",
- "golutra-core",
- "golutra-governor",
- "golutra-llm",
- "golutra-policy",
- "golutra-protocol",
- "golutra-sandbox",
- "golutra-tools",
- "golutra-verify",
+ "golutra-agent-context",
+ "golutra-agent-core",
+ "golutra-agent-governor",
+ "golutra-agent-llm",
+ "golutra-agent-policy",
+ "golutra-agent-protocol",
+ "golutra-agent-sandbox",
+ "golutra-agent-tools",
+ "golutra-agent-verify",
  "ignore",
  "jsonschema",
  "regex",
@@ -1694,7 +1695,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-sandbox"
+name = "golutra-agent-sandbox"
 version = "0.2.0"
 dependencies = [
  "serde",
@@ -1704,13 +1705,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-store"
+name = "golutra-agent-store"
 version = "0.2.0"
 dependencies = [
  "chrono",
  "fs2",
- "golutra-core",
- "golutra-protocol",
+ "golutra-agent-core",
+ "golutra-agent-protocol",
  "serde",
  "serde_json",
  "sha2",
@@ -1722,7 +1723,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-supervisor"
+name = "golutra-agent-supervisor"
 version = "0.2.0"
 dependencies = [
  "async-trait",
@@ -1730,10 +1731,10 @@ dependencies = [
  "chrono",
  "clap",
  "fs2",
- "golutra-core",
- "golutra-protocol",
- "golutra-release",
- "golutra-sandbox",
+ "golutra-agent-core",
+ "golutra-agent-protocol",
+ "golutra-agent-release",
+ "golutra-agent-sandbox",
  "miette",
  "nix 0.30.1",
  "schemars 1.2.1",
@@ -1748,13 +1749,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-test-client"
+name = "golutra-agent-test-client"
 version = "0.2.0"
 dependencies = [
  "chrono",
- "golutra-client",
- "golutra-core",
- "golutra-protocol",
+ "golutra-agent-client",
+ "golutra-agent-core",
+ "golutra-agent-protocol",
  "miette",
  "serde_json",
  "tempfile",
@@ -1762,16 +1763,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-tools"
+name = "golutra-agent-tools"
 version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
  "futures-util",
- "golutra-code-intelligence",
- "golutra-core",
- "golutra-policy",
- "golutra-sandbox",
+ "golutra-agent-code-intelligence",
+ "golutra-agent-core",
+ "golutra-agent-policy",
+ "golutra-agent-sandbox",
  "jsonschema",
  "nix 0.30.1",
  "regex",
@@ -1787,7 +1788,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-tui"
+name = "golutra-agent-tui"
 version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
@@ -1796,13 +1797,13 @@ dependencies = [
  "crossterm",
  "fs2",
  "futures-util",
- "golutra-app-server",
- "golutra-auth",
- "golutra-client",
- "golutra-config",
- "golutra-core",
- "golutra-llm",
- "golutra-protocol",
+ "golutra-agent-app-server",
+ "golutra-agent-auth",
+ "golutra-agent-client",
+ "golutra-agent-config",
+ "golutra-agent-core",
+ "golutra-agent-llm",
+ "golutra-agent-protocol",
  "ignore",
  "miette",
  "nix 0.30.1",
@@ -1824,23 +1825,23 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-verify"
+name = "golutra-agent-verify"
 version = "0.2.0"
 dependencies = [
  "chrono",
- "golutra-core",
+ "golutra-agent-core",
 ]
 
 [[package]]
-name = "golutra-vis"
+name = "golutra-agent-vis"
 version = "0.2.0"
 dependencies = [
  "chrono",
  "clap",
- "golutra-client",
- "golutra-core",
- "golutra-protocol",
- "golutra-tools",
+ "golutra-agent-client",
+ "golutra-agent-core",
+ "golutra-agent-protocol",
+ "golutra-agent-tools",
  "miette",
  "schemars 1.2.1",
  "serde",

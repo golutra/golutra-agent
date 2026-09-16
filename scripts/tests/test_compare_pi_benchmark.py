@@ -37,11 +37,11 @@ class CompareBenchmarkTest(unittest.TestCase):
         self.assertIsNone(golutra["total_tokens"])
         self.assertEqual(golutra["total_tokens_partial"], 12)
         self.assertEqual(golutra["field_sources"]["total_tokens"], "derived")
-        golutra_billing = benchmark.normalize_golutra_usage(
+        golutra_agent_billing = benchmark.normalize_golutra_usage(
             {"input_tokens": 10, "output_tokens": 2, "cache_write_tokens": 3}
         )
-        self.assertEqual(golutra_billing["total_tokens"], 15)
-        self.assertIsNone(golutra_billing["total_tokens_partial"])
+        self.assertEqual(golutra_agent_billing["total_tokens"], 15)
+        self.assertIsNone(golutra_agent_billing["total_tokens_partial"])
         incomplete = benchmark.normalize_golutra_usage(
             {
                 "input_tokens": 10,
