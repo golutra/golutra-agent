@@ -56,6 +56,7 @@ impl std::ops::DerefMut for ScreenModel {
 
 struct FixtureServer {
     url: String,
+    protocol: ProviderProtocol,
     stopped: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
     requests: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
@@ -72,6 +73,21 @@ impl FixtureServer {
     }
 
     fn with_rounds(responses: Vec<(String, Vec<serde_json::Value>)>) -> Self {
+        Self::with_stream_error(responses, None)
+    }
+
+    fn with_stream_error(
+        responses: Vec<(String, Vec<serde_json::Value>)>,
+        error: Option<serde_json::Value>,
+    ) -> Self {
+        Self::with_protocol_stream_error(responses, error, ProviderProtocol::OpenAiCompatible)
+    }
+
+    fn with_protocol_stream_error(
+        responses: Vec<(String, Vec<serde_json::Value>)>,
+        error: Option<serde_json::Value>,
+        protocol: ProviderProtocol,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/v1", listener.local_addr().unwrap());
         listener.set_nonblocking(true).unwrap();
@@ -128,6 +144,12 @@ impl FixtureServer {
                     .unwrap_or_else(|| ("FIXTURE_DONE".to_owned(), Vec::new()));
                 let mut frames = Vec::new();
                 for chunk in content.chars().collect::<Vec<_>>().chunks(17) {
+                    if protocol == ProviderProtocol::OpenAiResponses {
+                        frames.push(format!("data: {}\n\n", json!({
+                            "type":"response.output_text.delta", "delta":chunk.iter().collect::<String>()
+                        })));
+                        continue;
+                    }
                     frames.push(format!("data: {}\n\n", json!({
                         "id": "pty", "object": "chat.completion.chunk", "created": 0,
                         "model": "pty-model", "choices": [{"index":0,"delta":{"content":chunk.iter().collect::<String>()},"finish_reason":null}]
@@ -139,11 +161,27 @@ impl FixtureServer {
                         "choices":[{"index":0,"delta":{"tool_calls":calls},"finish_reason":null}]
                     })));
                 }
-                frames.push(format!("data: {}\n\ndata: [DONE]\n\n", json!({
+                if let Some(error) = &error {
+                    if protocol == ProviderProtocol::OpenAiResponses {
+                        frames.push(format!(
+                            "data: {}\n\n",
+                            json!({
+                                "type":"response.failed", "response":{
+                                    "id":"resp-pty-failure", "status":"failed", "model":"pty-model",
+                                    "error":error["error"], "output":[]
+                                }
+                            })
+                        ));
+                    } else {
+                        frames.push(format!("data: {error}\n\n"));
+                    }
+                } else {
+                    frames.push(format!("data: {}\n\ndata: [DONE]\n\n", json!({
                     "id":"pty", "object":"chat.completion.chunk", "created":0,"model":"pty-model",
                     "choices":[{"index":0,"delta":{},"finish_reason":if calls.is_empty() {"stop"} else {"tool_calls"}}],
                     "usage":{"prompt_tokens":100,"completion_tokens":100,"total_tokens":200}
                 })));
+                }
                 let length: usize = frames.iter().map(String::len).sum();
                 if write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n").is_err() { continue; }
                 for frame in frames {
@@ -157,6 +195,7 @@ impl FixtureServer {
         });
         Self {
             url,
+            protocol,
             stopped,
             worker: Some(worker),
             requests,
@@ -168,7 +207,7 @@ impl FixtureServer {
             CredentialRef::environment("GOLUTRA_AGENT_PTY_TEST_KEY", SecretKind::ApiKey).unwrap();
         let profile = ProviderProfile::live_profile(
             "pty-local",
-            ProviderProtocol::OpenAiCompatible,
+            self.protocol,
             self.url.clone(),
             "pty-model".to_owned(),
             credential,
@@ -204,6 +243,84 @@ fn all_terminal_rows(parser: &mut ScreenModel) -> String {
         .map(|row| row.trim_end())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[test]
+fn partial_stream_failure_is_visible_once_with_diagnostics_in_real_pty() {
+    let server = FixtureServer::with_stream_error(
+        vec![("Hi! 你好。".to_owned(), Vec::new())],
+        Some(json!({"error":{"status":400,"code":"invalid_request",
+            "message":"请求参数错误", "request_id":"pty-error-400"}})),
+    );
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    server.install(home.path());
+    let mut pty = PtyHarness::spawn_configured(home.path(), workspace.path(), 110, 32, true);
+    let mut parser = ScreenModel::new(32, 110);
+    wait_for_visible(&mut pty, &mut parser, "pty-model");
+    submit(&mut pty, &mut parser, "hi");
+    wait_for_visible(&mut pty, &mut parser, "Request ID: pty-error-400");
+    parser.process(&pty.collect_for(Duration::from_millis(500)));
+    let text = all_terminal_rows(&mut parser);
+    assert_eq!(text.matches("Hi! 你好。").count(), 1, "{text}");
+    assert_eq!(text.matches("Task failed").count(), 1, "{text}");
+    assert_eq!(text.matches("请求参数错误").count(), 1, "{text}");
+    assert!(text.contains("HTTP response: 200"), "{text}");
+    assert!(text.contains("Error status: 400"), "{text}");
+    assert!(!text.contains("Loop Decided"), "{text}");
+    assert!(!text.contains("Task Completed"), "{text}");
+    assert!(
+        !text.contains("verification evidence is insufficient"),
+        "{text}"
+    );
+    assert_eq!(
+        server.requests.lock().unwrap().len(),
+        1,
+        "no replay after partial output"
+    );
+}
+
+#[test]
+fn responses_failure_displays_full_cause_after_compact_runtime_summary() {
+    let cause = "Invalid prompt: your prompt was flagged as potentially violating our usage policy. Please try again with a different prompt. 完整错误末尾。";
+    let server = FixtureServer::with_protocol_stream_error(
+        vec![("Hi! 你好。".to_owned(), Vec::new())],
+        Some(json!({"error":{"code":"invalid_prompt","message":cause}})),
+        ProviderProtocol::OpenAiResponses,
+    );
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    server.install(home.path());
+    let mut pty = PtyHarness::spawn_configured(home.path(), workspace.path(), 70, 20, true);
+    let mut parser = ScreenModel::new(20, 70);
+    wait_for_visible(&mut pty, &mut parser, "pty-model");
+    submit(&mut pty, &mut parser, "hi");
+    let expected = cause.split_whitespace().collect::<String>();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !parser
+        .screen()
+        .contents()
+        .split_whitespace()
+        .collect::<String>()
+        .contains(&expected)
+        && Instant::now() < deadline
+    {
+        parser.process(&pty.collect_for(Duration::from_millis(50)));
+    }
+    parser.process(&pty.collect_for(Duration::from_millis(500)));
+    let text = all_terminal_rows(&mut parser);
+    let compact = text.split_whitespace().collect::<String>();
+    assert!(compact.contains(&expected), "{text}");
+    assert_eq!(text.matches("Task failed").count(), 1, "{text}");
+    assert!(text.contains("Hi! 你好。"), "{text}");
+    assert!(!text.contains("Failed to parse stream"), "{text}");
+    assert!(!text.contains("runtime task execution failed"), "{text}");
+    assert!(!text.contains("Task Completed"), "{text}");
+    assert_eq!(
+        server.requests.lock().unwrap().len(),
+        1,
+        "no retry after partial output"
+    );
 }
 
 fn assert_once_in_order(text: &str, needles: &[String]) {
@@ -976,6 +1093,143 @@ fn status_during_stream_stays_between_the_same_paragraphs_after_resize() {
 }
 
 #[test]
+fn shell_soft_output_budget_reaches_provider_without_rejection_or_paging() {
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let content = format!(
+        "PREVIEW_BEGIN\n{}PREVIEW_END\n",
+        "中文🙂 information\n".repeat(400)
+    );
+    assert!(content.len() > 4096 && content.len() < 12000);
+    std::fs::write(workspace.path().join("output.txt"), &content).unwrap();
+    let calls = [12000, 20000].into_iter().enumerate().map(|(index, size)| json!({
+        "index":index,"id":format!("soft-budget-{index}"),"type":"function","function":{
+            "name":"shell","arguments":json!({"argv":["cat","output.txt"],"max_output_bytes":size}).to_string()
+        }
+    })).collect();
+    let server = FixtureServer::with_rounds(vec![
+        ("读取测试输出。".into(), calls),
+        ("SOFT_BUDGET_DONE".into(), vec![]),
+    ]);
+    server.install(home.path());
+    let mut pty = PtyHarness::spawn_configured(home.path(), workspace.path(), 100, 28, true);
+    let mut parser = ScreenModel::new(28, 100);
+    wait_for_visible(&mut pty, &mut parser, "pty-model");
+    submit(&mut pty, &mut parser, "检查输出");
+    // This fixture runs in guarded mode: explicitly approve the local read
+    // commands instead of weakening the production execution policy.
+    wait_for_visible(&mut pty, &mut parser, "Approval required");
+    pty.write(b"3");
+    wait_for_visible(&mut pty, &mut parser, "SOFT_BUDGET_DONE");
+    parser.process(&pty.collect_for(Duration::from_millis(500)));
+    let text = all_terminal_rows(&mut parser);
+    assert!(!text.contains("Failed"), "{text}");
+    assert!(!text.contains("Waited for background terminal"), "{text}");
+    assert!(!text.contains("Background terminal completed"), "{text}");
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    let outputs = requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .map(|message| message["content"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(outputs.len(), 2);
+    for output in outputs {
+        assert!(
+            output.contains(&content),
+            "provider lost preview text: {output}"
+        );
+        assert!(output.contains("\"output_has_more\":false"), "{output}");
+        assert!(output.contains("\"process_state\":\"exited\""), "{output}");
+    }
+    drop(requests);
+    submit(&mut pty, &mut parser, "/quit");
+    assert!(pty.wait().1.success());
+}
+
+#[test]
+fn invalid_shell_arguments_are_visible_and_returned_to_the_provider_before_correction() {
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    std::fs::write(workspace.path().join("PAGE_SIZE_EXECUTED"), "fixture").unwrap();
+    let shell = |id: &str, size: u64| {
+        json!({
+            "index":0, "id":id, "type":"function", "function": {
+                "name":"shell", "arguments":json!({
+                "argv":["ls"], "max_output_bytes":size
+                }).to_string()
+            }
+        })
+    };
+    let server = FixtureServer::with_rounds(vec![
+        ("检查工作区。".into(), vec![shell("invalid-size", 255)]),
+        (
+            "按错误提示修正分页大小。".into(),
+            vec![shell("correct-size", 4096)],
+        ),
+        ("PAGE_SIZE_RECOVERY_DONE".into(), vec![]),
+    ]);
+    server.install(home.path());
+    let mut pty = PtyHarness::spawn_configured(home.path(), workspace.path(), 100, 28, true);
+    let mut parser = ScreenModel::new(28, 100);
+    wait_for_visible(&mut pty, &mut parser, "pty-model");
+    submit(&mut pty, &mut parser, "检查工作区");
+    wait_for_visible(&mut pty, &mut parser, "PAGE_SIZE_RECOVERY_DONE");
+    parser.process(&pty.collect_for(Duration::from_millis(500)));
+    let text = all_terminal_rows(&mut parser);
+    let cause = "max_output_bytes: 255 is less than the minimum of 256";
+    assert!(text.contains("Failed · shell"), "{text}");
+    assert!(text.contains(cause), "{text}");
+    assert!(!text.contains("tool request is invalid"), "{text}");
+    assert!(!text.contains("Task failed"), "{text}");
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    for name in ["shell", "shell_session"] {
+        let tool = requests[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["function"]["name"] == name)
+            .unwrap();
+        let description =
+            tool["function"]["parameters"]["properties"]["max_output_bytes"]["description"]
+                .as_str()
+                .unwrap();
+        assert!(description.contains("minimum 256"), "{description}");
+        assert!(description.contains("Default 12288"), "{description}");
+        assert!(
+            description.contains("capped by runtime/context policy"),
+            "{description}"
+        );
+    }
+    let tool_results = |index: usize| {
+        requests[index]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .map(|message| message["content"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let rejected = tool_results(1);
+    assert_eq!(rejected.len(), 1);
+    assert!(rejected[0].contains(cause), "{:?}", rejected);
+    assert!(!rejected[0].contains("PAGE_SIZE_EXECUTED"));
+    let corrected = tool_results(2);
+    assert_eq!(corrected.len(), 2);
+    assert!(
+        corrected[1].contains("PAGE_SIZE_EXECUTED"),
+        "{:?}",
+        corrected
+    );
+    drop(requests);
+    submit(&mut pty, &mut parser, "/quit");
+    assert!(pty.wait().1.success());
+}
+
+#[test]
 fn narration_and_real_tool_results_remain_in_order_without_raw_file_previews() {
     let home = tempdir().unwrap();
     let workspace = tempdir().unwrap();
@@ -1193,6 +1447,145 @@ fn output_arriving_in_tool_details_is_archived_once_after_return() {
     assert_eq!(text.matches("WHILE_DETAILS_DONE").count(), 1);
     assert!(!text.contains("DETAIL_ONLY_MARKER"));
     assert_idle_composer_at_bottom(&parser);
+    submit(&mut pty, &mut parser, "/quit");
+    assert!(pty.wait().1.success());
+}
+
+#[test]
+fn model_editor_uses_native_mouse_and_enter_applies_to_next_provider_request() {
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let server = FixtureServer::new(vec![
+        "MODEL_SAVE_CONFIRMED".to_owned(),
+        "MODEL_ESC_SAVE_CONFIRMED".to_owned(),
+        "MODEL_RESTART_CONFIRMED".to_owned(),
+    ]);
+    server.install(home.path());
+    let mut pty = PtyHarness::spawn_configured(home.path(), workspace.path(), 110, 32, true);
+    let mut parser = ScreenModel::new(32, 110);
+    wait_for_visible(&mut pty, &mut parser, "pty-model");
+    submit(&mut pty, &mut parser, "/model");
+    wait_for_visible(&mut pty, &mut parser, "Ctrl+U clear");
+    assert!(parser.screen().alternate_screen());
+    assert_eq!(
+        parser.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None
+    );
+    // Help temporarily owns mouse navigation; returning restores native selection.
+    pty.write(b"\x1bOP");
+    parser.process(&pty.collect_for(Duration::from_millis(400)));
+    assert_ne!(
+        parser.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None
+    );
+    pty.write(b"\x1b");
+    wait_for_visible(&mut pty, &mut parser, "Ctrl+U clear");
+    assert_eq!(
+        parser.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None
+    );
+    pty.write(b"\x15\x1b[200~gpt-5.6-sol\x1b[201~\r");
+    wait_for_visible(&mut pty, &mut parser, "Ask Golutra");
+    assert!(!parser.screen().alternate_screen());
+    assert!(parser.screen().contents().contains("gpt-5.6-sol"));
+    submit(&mut pty, &mut parser, "hi");
+    wait_for_visible(&mut pty, &mut parser, "MODEL_SAVE_CONFIRMED");
+    assert_eq!(server.requests.lock().unwrap()[0]["model"], "gpt-5.6-sol");
+    submit(&mut pty, &mut parser, "/model");
+    wait_for_visible(&mut pty, &mut parser, "Ctrl+U clear");
+    pty.write(b"\x1b");
+    wait_for_visible(&mut pty, &mut parser, "Enter edit/change");
+    pty.write(b"\x1b[B\x1b[A\r");
+    wait_for_visible(&mut pty, &mut parser, "Ctrl+U clear");
+    pty.write(b"\x15\x1b[200~gpt-6-astra\x1b[201~");
+    pty.write(b"\x1b");
+    wait_for_visible(&mut pty, &mut parser, "Enter edit/change");
+    assert!(parser.screen().alternate_screen());
+    pty.write(b"\x1b");
+    wait_for_visible(&mut pty, &mut parser, "Ask Golutra");
+    assert!(!parser.screen().alternate_screen());
+    assert!(parser.screen().contents().contains("gpt-6-astra"));
+    submit(&mut pty, &mut parser, "hi again");
+    wait_for_visible(&mut pty, &mut parser, "MODEL_ESC_SAVE_CONFIRMED");
+    assert_eq!(server.requests.lock().unwrap()[1]["model"], "gpt-6-astra");
+    submit(&mut pty, &mut parser, "/quit");
+    assert!(pty.wait().1.success());
+
+    // A fresh process must load the saved selection before its first request,
+    // including when the editor is reopened and accepted without further edits.
+    let mut pty = PtyHarness::spawn_configured(home.path(), workspace.path(), 110, 32, true);
+    let mut parser = ScreenModel::new(32, 110);
+    wait_for_visible(&mut pty, &mut parser, "gpt-6-astra");
+    submit(&mut pty, &mut parser, "/model");
+    wait_for_visible(&mut pty, &mut parser, "Ctrl+U clear");
+    assert!(parser.screen().contents().contains("gpt-6-astra"));
+    pty.write(b"\r");
+    wait_for_visible(&mut pty, &mut parser, "Ask Golutra");
+    submit(&mut pty, &mut parser, "hi after restart");
+    wait_for_visible(&mut pty, &mut parser, "MODEL_RESTART_CONFIRMED");
+    assert_eq!(server.requests.lock().unwrap()[2]["model"], "gpt-6-astra");
+    submit(&mut pty, &mut parser, "/quit");
+    assert!(pty.wait().1.success());
+}
+
+#[test]
+fn auth_keeps_fullscreen_keyboard_navigation_and_native_mouse_selection() {
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    install_mock_provider(home.path());
+    let mut pty = PtyHarness::spawn(home.path(), workspace.path(), 110, 32);
+    let mut parser = ScreenModel::new(32, 110);
+    wait_for_visible(&mut pty, &mut parser, "Ask Golutra");
+    submit(&mut pty, &mut parser, "/auth");
+    wait_for_visible(&mut pty, &mut parser, "Connect a Provider");
+    assert!(parser.screen().alternate_screen());
+    assert_eq!(
+        parser.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None
+    );
+    pty.resize(100, 30);
+    parser.screen_mut().set_size(30, 100);
+    parser.process(&pty.collect_for(Duration::from_millis(300)));
+    assert_eq!(
+        parser.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None
+    );
+    // 两个全屏页面之间切换不离开 alternate screen，仍需分别恢复鼠标策略。
+    pty.write(b"\x1bOP");
+    parser.process(&pty.collect_for(Duration::from_millis(400)));
+    assert!(parser.screen().alternate_screen());
+    assert_ne!(
+        parser.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None
+    );
+    pty.write(b"\x1b");
+    wait_for_visible(&mut pty, &mut parser, "Connect a Provider");
+    assert!(parser.screen().alternate_screen());
+    assert_eq!(
+        parser.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None
+    );
+    // 用键盘选择 mock 完成认证，不访问网络；回到主屏后鼠标仍由终端处理。
+    pty.write(b"\x1b[B\x1b[B\x1b[B\r");
+    wait_for_visible(&mut pty, &mut parser, "Ask Golutra");
+    assert!(!parser.screen().alternate_screen());
+    assert_eq!(
+        parser.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None
+    );
+    submit(&mut pty, &mut parser, "/help");
+    parser.process(&pty.collect_for(Duration::from_millis(400)));
+    assert!(parser.screen().alternate_screen());
+    assert_ne!(
+        parser.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None
+    );
+    pty.write(b"\x1b");
+    parser.process(&pty.collect_for(Duration::from_millis(300)));
+    assert_eq!(
+        parser.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None
+    );
     submit(&mut pty, &mut parser, "/quit");
     assert!(pty.wait().1.success());
 }

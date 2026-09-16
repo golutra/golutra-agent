@@ -441,8 +441,26 @@ impl ToolRegistry {
         let errors = validator
             .iter_errors(arguments)
             .map(|error| {
+                // Only expose declared top-level field names. Dynamic object keys and
+                // argument values may contain user content or credentials.
+                let path = error.instance_path().to_string();
+                let field = path.strip_prefix('/').filter(|field| {
+                    !field.contains('/')
+                        && contract.input_schema["properties"].get(*field).is_some()
+                });
+                // This built-in page-size control is safe and useful to quote when
+                // correcting a rejected request; arbitrary values stay masked.
+                let page_size = matches!(contract.tool_name.as_str(), "shell" | "shell_session")
+                    .then_some(field)
+                    .flatten()
+                    .filter(|field| *field == "max_output_bytes")
+                    .and_then(|_| error.instance().as_u64());
+                let placeholder = page_size
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "<redacted-value>".to_owned());
+                let diagnostic = error.masked_with(placeholder).to_string();
                 bounded_text(
-                    &error.masked_with("<redacted-value>").to_string(),
+                    &format!("{}: {diagnostic}", field.unwrap_or("arguments")),
                     MAX_TOOL_ERROR_CHARS,
                 )
             })
@@ -3329,25 +3347,25 @@ impl ToolRuntime {
             }
         };
         let snapshot = match action.as_str() {
-            "wait" => {
+            "wait" | "read" => {
                 let result = self
                     .process_supervisor
                     .read_page(process_supervisor::ProcessReadRequest {
                         session_id: request.session_id,
                         process_id: &process_id,
                         cursor,
-                        wait_ms: process_wait_ms(&request.arguments, default_poll_wait_ms()),
-                        until_terminal: request
-                            .arguments
-                            .get("wait_for_terminal")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false),
-                        max_output_bytes: request
-                            .arguments
-                            .get("max_output_bytes")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(1024)
-                            .clamp(256, 4096) as usize,
+                        wait_ms: if action == "read" {
+                            0
+                        } else {
+                            process_wait_ms(&request.arguments, default_poll_wait_ms())
+                        },
+                        until_terminal: action != "read"
+                            && request
+                                .arguments
+                                .get("wait_for_terminal")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                        max_output_bytes: process_output_budget(&request.arguments),
                         cancellation: &execution_cancellation,
                     })
                     .await?;
@@ -3378,7 +3396,7 @@ impl ToolRuntime {
             }
             _ => {
                 return Err(ToolError::InvalidArguments(
-                    "shell_session action must be wait, write, terminate, or list".to_owned(),
+                    "shell_session action must be wait, read, write, terminate, or list".to_owned(),
                 ));
             }
         };
@@ -4688,18 +4706,26 @@ fn process_wait_ms(arguments: &Value, default: u64) -> u64 {
         .min(max_poll_wait_ms())
 }
 
+const DEFAULT_PROCESS_OUTPUT_BYTES: u64 = 12 * 1024;
+
+// This is a requested preview budget, never a process execution limit.
+fn process_output_budget(arguments: &Value) -> usize {
+    arguments
+        .get("max_output_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_PROCESS_OUTPUT_BYTES)
+        .clamp(256, DEFAULT_PROCESS_OUTPUT_BYTES) as usize
+}
+
 fn process_summary_value(summary: ProcessSummary) -> Value {
     let output_has_more = summary.delivered_cursor < summary.output_cursor;
     let next_action = process_next_action(
-        if output_has_more {
-            ProcessState::Running
-        } else {
-            summary.state
-        },
+        summary.state,
         &summary.process_id,
         summary.authoritative_pid,
         summary.delivered_cursor,
         summary.terminal_event_id,
+        output_has_more,
     );
     json!({
         "process_id": summary.process_id,
@@ -4732,12 +4758,7 @@ fn supervised_process_report(
     let full_output = snapshot.output.clone();
     let page_output = matches!(request.tool_name.as_str(), "shell" | "shell_session");
     if page_output {
-        let limit = request
-            .arguments
-            .get("max_output_bytes")
-            .and_then(Value::as_u64)
-            .unwrap_or(1024)
-            .clamp(256, 4096) as usize;
+        let limit = process_output_budget(&request.arguments);
         let marker = "[earlier process output omitted]\n";
         let skipped =
             usize::from(snapshot.output_lost && snapshot.output.starts_with(marker)) * marker.len();
@@ -4765,15 +4786,12 @@ fn supervised_process_report(
     let workspace_changes_known = snapshot.workspace_changes_known;
     let terminal = snapshot.state.is_terminal();
     let next_action = process_next_action(
-        if output_has_more {
-            ProcessState::Running
-        } else {
-            snapshot.state
-        },
+        snapshot.state,
         &snapshot.process_id,
         snapshot.authoritative_pid,
         snapshot.output_cursor,
         snapshot.terminal_event_id,
+        output_has_more,
     );
     let mut result = report(
         request,
@@ -4782,11 +4800,11 @@ fn supervised_process_report(
             ProcessState::Running => {
                 "background process is running, but it is runtime-scoped and will stop when the runtime exits; post-runtime consumers require a detached process"
             }
-            ProcessState::Exited => "background process exited successfully",
-            ProcessState::Failed => "background process exited with an error",
-            ProcessState::TimedOut => "background process timed out",
-            ProcessState::Cancelled => "background process was cancelled",
-            ProcessState::Terminated => "background process was terminated",
+            ProcessState::Exited => "process exited successfully",
+            ProcessState::Failed => "process exited with an error",
+            ProcessState::TimedOut => "process timed out",
+            ProcessState::Cancelled => "process was cancelled",
+            ProcessState::Terminated => "process was terminated",
         },
         json!({
             "process_id": snapshot.process_id,
@@ -4871,6 +4889,7 @@ fn process_next_action(
     authoritative_pid: u32,
     cursor: u64,
     terminal_event_id: Option<u64>,
+    output_has_more: bool,
 ) -> Value {
     if state == ProcessState::Running {
         // 把下一步所需的最小参数直接交给模型，避免它重复读取或重置 cursor。
@@ -4883,6 +4902,12 @@ fn process_next_action(
             "cursor": cursor,
             "wait_ms": default_poll_wait_ms(),
             "wait_for_terminal": true,
+        })
+    } else if output_has_more {
+        json!({
+            "kind": "read", "tool": "shell_session", "action": "read",
+            "process_id": process_id, "authoritative_pid": authoritative_pid,
+            "cursor": cursor, "optional": true,
         })
     } else {
         json!({
@@ -5162,8 +5187,8 @@ pub fn model_visible_tool_result_with_limit(
             projection["structured_facts"]["output_cursor"] = json!(cursor);
             projection["structured_facts"]["output_has_more"] = json!(true);
             projection["structured_facts"]["next_action"] = json!({
-                "action":"wait", "process_id":process_id, "cursor":cursor,
-                "wait_ms":0, "max_output_bytes":256,
+                "action":"read", "process_id":process_id, "cursor":cursor,
+                "max_output_bytes":256,
             });
         }
         header = serialize_model_tool_projection(

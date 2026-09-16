@@ -667,11 +667,16 @@ pub(crate) fn genai_chat_options(
     let effort = config
         .reasoning_effort
         .map(|effort| match effort {
-            super::ProviderReasoningEffort::Low => ReasoningEffort::Low,
-            super::ProviderReasoningEffort::Medium => ReasoningEffort::Medium,
-            super::ProviderReasoningEffort::High => ReasoningEffort::High,
-            super::ProviderReasoningEffort::Xhigh => ReasoningEffort::XHigh,
+            super::ProviderReasoningEffort::Low => Ok(ReasoningEffort::Low),
+            super::ProviderReasoningEffort::Medium => Ok(ReasoningEffort::Medium),
+            super::ProviderReasoningEffort::High => Ok(ReasoningEffort::High),
+            super::ProviderReasoningEffort::Xhigh => Ok(ReasoningEffort::XHigh),
+            super::ProviderReasoningEffort::Max => Ok(ReasoningEffort::Max),
+            super::ProviderReasoningEffort::Ultra => Err(ProviderError::NotConfigured {
+                message: "reasoning effort ultra requires an OpenAI-compatible or Responses endpoint that supports ultra".to_owned(),
+            }),
         })
+        .transpose()?
         .or(config.enable_thinking.then_some(ReasoningEffort::Medium));
     if let Some(effort) = effort {
         options = options.with_reasoning_effort(effort);
@@ -992,6 +997,8 @@ pub(crate) fn map_genai_error(error: genai::Error) -> ProviderError {
         ProviderError::RateLimited { message }
     } else if status.is_some_and(|status| (500..600).contains(&status)) {
         ProviderError::Unavailable { message }
+    } else if status.is_some() {
+        ProviderError::Failed { message }
     } else {
         match error {
             genai::Error::RequiresApiKey { .. }
@@ -1025,14 +1032,10 @@ pub(crate) fn map_genai_error(error: genai::Error) -> ProviderError {
             _ => ProviderError::Failed { message },
         }
     };
-    if status.is_some_and(|status| status == 429 || (500..600).contains(&status)) {
-        mapped.with_metadata(ProviderErrorMetadata {
-            http_status: status.or(metadata.http_status),
-            ..metadata
-        })
-    } else {
-        mapped
-    }
+    mapped.with_metadata(ProviderErrorMetadata {
+        http_status: status.or(metadata.http_status),
+        ..metadata
+    })
 }
 
 pub(crate) fn genai_error_requires_auth_refresh(error: &genai::Error) -> bool {
@@ -1063,7 +1066,7 @@ pub(crate) fn genai_error_http_status(error: &genai::Error) -> Option<u16> {
     }
 }
 
-/// 从 rust-genai 的错误包装层提取可重试请求的脱敏元数据。
+/// 从 rust-genai 的错误包装层提取所有失败请求的脱敏元数据。
 pub(crate) fn genai_error_metadata(error: &genai::Error) -> ProviderErrorMetadata {
     match error {
         genai::Error::WebStream { error, .. } => error
@@ -1094,12 +1097,14 @@ fn webc_error_metadata(error: &genai::webc::Error) -> ProviderErrorMetadata {
         genai::webc::Error::ResponseFailedStatus {
             status, headers, ..
         } => ProviderErrorMetadata {
+            response_http_status: Some(status.as_u16()),
             http_status: Some(status.as_u16()),
             retry_after: retry_after_from_headers(headers),
             request_id: request_id_from_headers(headers),
             ..ProviderErrorMetadata::default()
         },
         genai::webc::Error::Reqwest(error) => ProviderErrorMetadata {
+            response_http_status: error.status().map(|status| status.as_u16()),
             http_status: error.status().map(|status| status.as_u16()),
             ..ProviderErrorMetadata::default()
         },
@@ -1180,6 +1185,32 @@ mod tests {
 
         assert!(!debug.contains("secret-provider-key"));
         assert!(debug.contains(crate::GOLUTRA_AGENT_PROVIDER_API_KEY));
+    }
+
+    #[test]
+    fn native_reasoning_max_is_mapped_and_ultra_is_not_silently_downgraded() {
+        let options = |effort| {
+            genai_chat_options(
+                &ProviderGenerationConfig {
+                    reasoning_effort: Some(effort),
+                    ..Default::default()
+                },
+                None,
+                false,
+                None,
+                PromptCachePolicy::Auto,
+                ProviderCacheProfile::for_provider(ProviderProtocol::Genai, "genai"),
+            )
+        };
+        assert!(matches!(
+            options(super::super::ProviderReasoningEffort::Max)
+                .unwrap()
+                .reasoning_effort,
+            Some(ReasoningEffort::Max)
+        ));
+        let error = options(super::super::ProviderReasoningEffort::Ultra).unwrap_err();
+        assert!(matches!(error, ProviderError::NotConfigured { .. }));
+        assert!(error.to_string().contains("ultra requires"));
     }
 
     #[test]
@@ -1335,6 +1366,25 @@ mod tests {
                 }
             } if matches!(*error, ProviderError::Unavailable { .. })
         ));
+    }
+
+    #[test]
+    fn genai_stream_bad_request_is_hard_failure_with_metadata() {
+        let webc_error = genai::webc::Error::ResponseFailedStatus {
+            status: reqwest::StatusCode::BAD_REQUEST,
+            body: "invalid stream parameter".to_owned(),
+            headers: Box::new(reqwest::header::HeaderMap::new()),
+        };
+        let error = genai::Error::WebStream {
+            model_iden: genai::ModelIden::new(AdapterKind::OpenAIResp, "fixture"),
+            cause: webc_error.to_string(),
+            error: Box::new(webc_error),
+        };
+        let mapped = map_genai_error(error);
+        assert_eq!(mapped.http_status(), Some(400));
+        assert_eq!(mapped.metadata().unwrap().response_http_status, Some(400));
+        assert!(matches!(mapped, ProviderError::WithMetadata { error, .. }
+            if matches!(*error, ProviderError::Failed { .. })));
     }
 
     #[test]

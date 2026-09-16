@@ -251,7 +251,9 @@ impl AuthDialogState {
 
     pub(crate) fn default_base_url_for_protocol(protocol: ProviderProtocol) -> &'static str {
         match protocol {
-            ProviderProtocol::OpenAiCompatible => "https://api.openai.com/v1",
+            ProviderProtocol::OpenAiCompatible | ProviderProtocol::OpenAiResponses => {
+                "https://api.openai.com/v1"
+            }
             ProviderProtocol::Anthropic => "https://api.anthropic.com/v1",
             ProviderProtocol::Gemini => "https://generativelanguage.googleapis.com/v1beta",
             _ => "",
@@ -448,6 +450,7 @@ pub(crate) const AUTH_ADVANCED_ITEMS: usize = 5;
 pub(crate) const OPENAI_PROTOCOL_ONLY: &[ProviderProtocol] = &[ProviderProtocol::OpenAiCompatible];
 pub(crate) const CUSTOM_PROTOCOL_OPTIONS: &[ProviderProtocol] = &[
     ProviderProtocol::OpenAiCompatible,
+    ProviderProtocol::OpenAiResponses,
     ProviderProtocol::Anthropic,
     ProviderProtocol::Gemini,
     ProviderProtocol::VertexAi,
@@ -606,7 +609,9 @@ pub(crate) fn next_reasoning_effort(
         Some(ProviderReasoningEffort::Low) => Some(ProviderReasoningEffort::Medium),
         Some(ProviderReasoningEffort::Medium) => Some(ProviderReasoningEffort::High),
         Some(ProviderReasoningEffort::High) => Some(ProviderReasoningEffort::Xhigh),
-        Some(ProviderReasoningEffort::Xhigh) => None,
+        Some(ProviderReasoningEffort::Xhigh) => Some(ProviderReasoningEffort::Max),
+        Some(ProviderReasoningEffort::Max) => Some(ProviderReasoningEffort::Ultra),
+        Some(ProviderReasoningEffort::Ultra) => None,
     }
 }
 
@@ -617,6 +622,8 @@ pub(crate) fn reasoning_effort_label(value: Option<ProviderReasoningEffort>) -> 
         Some(ProviderReasoningEffort::Medium) => "medium",
         Some(ProviderReasoningEffort::High) => "high",
         Some(ProviderReasoningEffort::Xhigh) => "xhigh",
+        Some(ProviderReasoningEffort::Max) => "max",
+        Some(ProviderReasoningEffort::Ultra) => "ultra",
     }
 }
 

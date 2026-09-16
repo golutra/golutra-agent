@@ -619,7 +619,8 @@ fn estimate_observation_bytes(observation: &RuntimeObservation) -> usize {
             provider_id,
             model_id,
             error,
-        } => structured_bytes(&(request_id, provider_id, model_id, error)),
+            metadata,
+        } => structured_bytes(&(request_id, provider_id, model_id, error, metadata)),
         RuntimeObservation::TokenUsageRecorded(record) => structured_bytes(record),
         RuntimeObservation::ToolStarted {
             tool_call_id,
@@ -1210,6 +1211,7 @@ mod tests {
                 provider_id: "provider".to_owned(),
                 model_id: "model".to_owned(),
                 error: "terminal provider error".to_owned(),
+                metadata: None,
             })
             .expect("lossless terminal event");
         sender.close().expect("close");

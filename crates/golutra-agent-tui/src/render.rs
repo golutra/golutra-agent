@@ -672,8 +672,12 @@ pub(crate) fn auth_credential_store_lines(dialog: &AuthDialogState) -> Vec<Line<
 pub(crate) fn protocol_option_text(protocol: ProviderProtocol) -> (&'static str, &'static str) {
     match protocol {
         ProviderProtocol::OpenAiCompatible => (
-            "OpenAI-compatible",
-            "Standard OpenAI API format (most common)",
+            "OpenAI Chat Completions",
+            "OpenAI-compatible /chat/completions API",
+        ),
+        ProviderProtocol::OpenAiResponses => (
+            "OpenAI Responses",
+            "OpenAI /responses API (separate from Chat Completions)",
         ),
         ProviderProtocol::Anthropic => ("Anthropic-compatible", "Anthropic Messages API format"),
         ProviderProtocol::Gemini => ("Gemini-compatible", "Google Gemini API format"),
@@ -1949,7 +1953,7 @@ pub(crate) fn draw_settings_dialog(
     if dialog.unrestricted_confirmation {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "Press Ctrl+S again to confirm unrestricted execution.",
+            "Press Enter to confirm unrestricted execution.",
             Style::default().fg(palette.warning),
         )));
     }
@@ -2041,13 +2045,13 @@ fn settings_display_rows(dialog: &SettingsDialogState) -> Vec<SettingsDisplayRow
             row: SettingsRow::Model,
             label: "Model",
             value: model,
-            detail: "Enter or e edits a per-session model id",
+            detail: "Enter edits a per-session model id; Esc keeps edits and returns",
         },
         SettingsDisplayRow {
             row: SettingsRow::Reasoning,
             label: "Reasoning effort",
             value: effort_label(dialog.draft.reasoning_effort).to_owned(),
-            detail: "default, low, medium, high, xhigh",
+            detail: "default, low, medium, high, xhigh, max, ultra",
         },
         SettingsDisplayRow {
             row: SettingsRow::Permissions,
@@ -2702,7 +2706,16 @@ pub(crate) fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
             Some("1 Plan   2 Tasks   3 Usage   Tab switch   Up/Down scroll   Esc close")
         }
         Some(OverlaySurface::Settings) => {
-            Some("Arrows change   Enter edit   Ctrl+S apply   Esc discard")
+            let dialog = app.settings_dialog.as_ref().expect("settings surface");
+            Some(if let Some(error) = dialog.error.as_deref() {
+                error
+            } else if dialog.unrestricted_confirmation {
+                "Enter confirm unrestricted   Esc save without permission change"
+            } else if dialog.editing_model {
+                "Enter save and close   Esc keep edit and back   Ctrl+U clear"
+            } else {
+                "Up/Down select   Enter edit/change   Esc save and close   Ctrl+S save"
+            })
         }
         Some(OverlaySurface::Export) => Some("Enter continue   Esc cancel   Ctrl+C twice quit"),
         None => None,

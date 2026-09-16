@@ -289,19 +289,17 @@ fn active_tool_result_token_budget(
     plan: &ContextBuildPlan,
     message_token_total: u64,
     planned_tool_tokens: u64,
+    cap: u64,
 ) -> u64 {
     let limit = plan.budget_snapshot.budget_limit;
     if limit == u64::MAX {
-        return DEFAULT_ACTIVE_TOOL_RESULT_TOKENS;
+        return cap;
     }
     let used = message_token_total.saturating_add(planned_tool_tokens);
     let available = limit.saturating_sub(used);
     available
         .saturating_sub(MIN_ACTIVE_TOOL_RESULT_TOKENS)
-        .clamp(
-            MIN_ACTIVE_TOOL_RESULT_TOKENS,
-            DEFAULT_ACTIVE_TOOL_RESULT_TOKENS,
-        )
+        .clamp(MIN_ACTIVE_TOOL_RESULT_TOKENS, cap)
 }
 
 /// 保留下一步决策需要的事实，同时限制后续 provider 回合重复携带的输出量。
@@ -315,13 +313,12 @@ fn active_tool_result_token_budget_for_tool(
 ) -> u64 {
     let cap = match tool_name {
         "write_file" | "edit_file" | "apply_patch" => MUTATION_ACTIVE_TOOL_RESULT_TOKENS,
-        "shell" | "shell_session" => 1_536,
+        "shell" | "shell_session" => 4_096,
         "web_search" => 1_024,
         "read_file" | "subagent" => 2_048,
         _ => DEFAULT_ACTIVE_TOOL_RESULT_TOKENS,
     };
-    active_tool_result_token_budget(plan, message_token_total, planned_tool_tokens)
-        .clamp(MIN_ACTIVE_TOOL_RESULT_TOKENS, cap)
+    active_tool_result_token_budget(plan, message_token_total, planned_tool_tokens, cap)
 }
 
 #[derive(Debug, Error)]
@@ -2171,6 +2168,7 @@ where
                             provider_id,
                             model_id,
                             error: error.to_string(),
+                            metadata: error.metadata().cloned(),
                         });
                         finish_runtime_step(
                             &mut step_machine,
@@ -4129,6 +4127,7 @@ where
                     provider_id: contract.provider_id,
                     model_id: contract.model_id,
                     error: error.to_string(),
+                    metadata: error.metadata().cloned(),
                 });
                 return None;
             }
@@ -4275,6 +4274,7 @@ where
                 provider_id: active_provider_id,
                 model_id: active_model_id,
                 error: reason.clone(),
+                metadata: None,
             });
             trace(AgentLoopTraceEvent::LoopGuardTriggered {
                 trigger: golutra_agent_core::LoopGuardTrigger::RuntimeDeadline,
@@ -5224,7 +5224,10 @@ async fn provider_parallel_batch_kind(
         return ParallelBatchKind::Exclusive;
     }
     if tool_call.tool_name == "shell_session"
-        && tool_call.arguments.get("action").and_then(Value::as_str) == Some("wait")
+        && matches!(
+            tool_call.arguments.get("action").and_then(Value::as_str),
+            Some("wait" | "read")
+        )
         && tool_allowed_for_profile(&tool_call.tool_name, profile, registry)
         && let Some(process_id) = tool_call
             .arguments

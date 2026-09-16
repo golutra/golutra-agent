@@ -8,6 +8,13 @@ const BASE_BACKOFF_MS: u64 = 250;
 const MAX_BACKOFF_MS: u64 = 30_000;
 
 pub(crate) fn is_retryable(error: &ProviderError) -> bool {
+    // 明确的请求错误优先于消息关键词；不能因为 400 正文包含 stream 就重试。
+    if error
+        .http_status()
+        .is_some_and(|status| (400..500).contains(&status) && status != 429)
+    {
+        return false;
+    }
     match error {
         ProviderError::Unavailable { .. }
         | ProviderError::RateLimited { .. }
@@ -93,6 +100,22 @@ mod tests {
     use golutra_agent_llm::{ProviderError, ProviderErrorMetadata};
 
     use super::*;
+
+    #[test]
+    fn explicit_bad_request_is_not_retried_or_fallen_back_by_message_keywords() {
+        for message in ["invalid stream parameter", "upstream connection error"] {
+            let error = ProviderError::Failed {
+                message: message.to_owned(),
+            }
+            .with_metadata(ProviderErrorMetadata {
+                response_http_status: Some(200),
+                http_status: Some(400),
+                ..ProviderErrorMetadata::default()
+            });
+            assert!(!is_retryable(&error));
+            assert!(!fallback_eligible(&error));
+        }
+    }
 
     #[test]
     fn server_retry_after_is_bounded_and_preferred() {

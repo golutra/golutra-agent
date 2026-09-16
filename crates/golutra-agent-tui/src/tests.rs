@@ -3580,6 +3580,373 @@ fn structured_question_free_text_owns_focus_and_renders_a_unicode_cursor() {
 }
 
 #[test]
+fn reasoning_effort_order_and_saved_payload_include_lowercase_max_and_ultra() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    let mut auth_effort = None;
+    for expected in ["low", "medium", "high", "xhigh", "max", "ultra", "default"] {
+        app.runtime_controls.cycle_effort(true);
+        auth_effort = next_reasoning_effort(auth_effort);
+        assert_eq!(
+            effort_label(app.runtime_controls.reasoning_effort),
+            expected
+        );
+        assert_eq!(reasoning_effort_label(auth_effort), expected);
+    }
+    app.runtime_controls.cycle_effort(false);
+    assert_eq!(effort_label(app.runtime_controls.reasoning_effort), "ultra");
+    for (wire, effort) in [
+        ("max", ProviderReasoningEffort::Max),
+        ("ultra", ProviderReasoningEffort::Ultra),
+    ] {
+        assert_eq!(parse_runtime_reasoning_effort(wire), Some(effort));
+        assert!(
+            matches!(parse_slash_input(&format!("/effort {wire}")), SlashInput::Command(SlashCommand::Effort { effort: Some(ReasoningEffortSelection::Effort(value)) }) if value == effort)
+        );
+        app.open_settings_dialog();
+        let dialog = app.settings_dialog.as_mut().unwrap();
+        dialog.draft.reasoning_effort = Some(effort);
+        dialog.draft.reasoning_overridden = true;
+        handle_settings_dialog_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut app);
+        assert_eq!(
+            app.runtime_prompt_payload("hi".to_owned())["provider_generation_config"]["reasoning_effort"],
+            wire
+        );
+    }
+}
+
+#[test]
+fn model_editor_saves_with_enter_or_ctrl_s_including_existing_yolo() {
+    for permission in [PermissionMode::Guarded, PermissionMode::Unrestricted] {
+        for key in [
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        ] {
+            let mut app = TuiApp::new(
+                ThreadId::new(),
+                SessionId::new(),
+                None,
+                false,
+                "ready (mock)".to_owned(),
+                None,
+            );
+            app.runtime_controls.permission_mode = permission;
+            app.open_model_dialog();
+            assert!(overlay_uses_native_mouse(&app));
+            let dialog = app.settings_dialog.as_mut().expect("model editor");
+            assert!(dialog.editing_model);
+            dialog.model_input.set_text("gpt-5.6-sol");
+            handle_settings_dialog_key(key, &mut app);
+            assert!(
+                app.settings_dialog.is_none(),
+                "one save must close the editor"
+            );
+            assert_eq!(app.runtime_controls.effective_model(), "gpt-5.6-sol");
+            assert_eq!(app.runtime_controls.permission_mode, permission);
+            assert_eq!(
+                app.runtime_prompt_payload("hi".to_owned())["provider_model"],
+                "gpt-5.6-sol"
+            );
+        }
+    }
+}
+
+#[test]
+fn model_editor_persists_across_reopening_and_restart_in_the_effective_config_layer() {
+    for project_override in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let paths = ProviderConfigPaths::from_home(home.path()).unwrap();
+        let target = if project_override {
+            ProviderConfigPaths::from_home(workspace.path().join(".golutra-agent")).unwrap()
+        } else {
+            paths.clone()
+        };
+        let snapshot = golutra_agent_config::read_runtime_settings(&target).unwrap();
+        golutra_agent_config::patch_runtime_settings(
+            &target,
+            &snapshot.revision,
+            json!({"model":"original-model", "subagent_max_concurrent":7})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .unwrap();
+        let new_app = || {
+            TuiApp::new(
+                ThreadId::new(),
+                SessionId::new(),
+                None,
+                false,
+                "ready (mock)".to_owned(),
+                None,
+            )
+            .with_footer_context(workspace.path(), "provider-default")
+            .with_loaded_runtime_settings_from_paths(paths.clone())
+            .unwrap()
+        };
+        let mut app = new_app();
+        app.open_model_dialog();
+        let concurrent = golutra_agent_config::read_runtime_settings(&target).unwrap();
+        golutra_agent_config::patch_runtime_settings(
+            &target,
+            &concurrent.revision,
+            json!({"subagent_max_concurrent":9})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .unwrap();
+        app.settings_dialog
+            .as_mut()
+            .unwrap()
+            .model_input
+            .set_text("saved-model");
+        handle_settings_dialog_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app);
+        assert!(app.settings_dialog.is_none());
+        app.open_model_dialog();
+        assert_eq!(
+            app.settings_dialog.as_ref().unwrap().model_input.text(),
+            "saved-model"
+        );
+        let saved = golutra_agent_config::read_runtime_settings(&target)
+            .unwrap()
+            .settings;
+        assert_eq!(saved.model.as_deref(), Some("saved-model"));
+        assert_eq!(saved.subagent_max_concurrent, Some(9));
+        let mut restarted = new_app();
+        restarted.open_model_dialog();
+        assert_eq!(
+            restarted
+                .settings_dialog
+                .as_ref()
+                .unwrap()
+                .model_input
+                .text(),
+            "saved-model"
+        );
+        assert_eq!(
+            restarted.runtime_prompt_payload("hi".into())["provider_model"],
+            "saved-model"
+        );
+        assert!(
+            !paths.user_config.exists(),
+            "must not rewrite provider or credentials"
+        );
+        if project_override {
+            assert!(
+                !paths.home.join("runtime.json").exists(),
+                "project override stays in its layer"
+            );
+        }
+    }
+}
+
+#[test]
+fn model_selection_persists_direct_commands_and_profile_switches() {
+    let home = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let paths = ProviderConfigPaths::from_home(home.path()).unwrap();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    )
+    .with_footer_context(workspace.path(), "original-model")
+    .with_loaded_runtime_settings_from_paths(paths.clone())
+    .unwrap();
+    app.set_session_model("direct-model".into());
+    assert_eq!(
+        golutra_agent_config::read_runtime_settings(&paths)
+            .unwrap()
+            .settings
+            .model
+            .as_deref(),
+        Some("direct-model")
+    );
+    app.open_model_dialog();
+    let dialog = app.settings_dialog.as_mut().unwrap();
+    dialog.editing_model = false;
+    dialog.draft.select_profile(&ProviderChoice {
+        profile_name: "other-profile".into(),
+        model_id: "other-model".into(),
+        generation_config: None,
+    });
+    handle_settings_dialog_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut app);
+    let saved = golutra_agent_config::read_runtime_settings(&paths)
+        .unwrap()
+        .settings;
+    assert_eq!(saved.provider_profile.as_deref(), Some("other-profile"));
+    assert_eq!(saved.model.as_deref(), Some("other-model"));
+}
+
+#[test]
+fn model_editor_save_error_preserves_draft_and_does_not_claim_success() {
+    let home = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let paths = ProviderConfigPaths::from_home(home.path()).unwrap();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    )
+    .with_footer_context(workspace.path(), "original-model")
+    .with_loaded_runtime_settings_from_paths(paths.clone())
+    .unwrap();
+    app.open_model_dialog();
+    app.settings_dialog
+        .as_mut()
+        .unwrap()
+        .model_input
+        .set_text("new-model");
+    std::fs::write(paths.home.join("runtime.json"), "invalid settings").unwrap();
+    handle_settings_dialog_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app);
+    let dialog = app
+        .settings_dialog
+        .as_ref()
+        .expect("save failure stays visible");
+    assert_eq!(dialog.model_input.text(), "new-model");
+    assert!(dialog.error.as_deref().unwrap().contains("not saved"));
+    assert_eq!(app.runtime_controls.effective_model(), "original-model");
+    assert_eq!(
+        std::fs::read_to_string(paths.home.join("runtime.json")).unwrap(),
+        "invalid settings"
+    );
+}
+
+#[test]
+fn model_editor_escape_keeps_edits_and_list_enter_reopens_editor() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    let original = app.runtime_controls.effective_model().to_owned();
+    app.open_model_dialog();
+    for invalid in [" ".to_owned(), "x".repeat(257)] {
+        app.settings_dialog
+            .as_mut()
+            .unwrap()
+            .model_input
+            .set_text(invalid);
+        for key in [KeyCode::Enter, KeyCode::Esc] {
+            handle_settings_dialog_key(KeyEvent::new(key, KeyModifiers::NONE), &mut app);
+            let dialog = app
+                .settings_dialog
+                .as_ref()
+                .expect("invalid input stays open");
+            assert!(dialog.editing_model);
+            assert!(dialog.error.as_deref().unwrap().contains("1 and 256"));
+            assert_eq!(app.runtime_controls.effective_model(), original);
+        }
+    }
+    app.settings_dialog
+        .as_mut()
+        .unwrap()
+        .model_input
+        .set_text("gpt-5.6-sol");
+    handle_settings_dialog_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut app);
+    assert_eq!(
+        app.settings_dialog.as_ref().unwrap().model_input.text(),
+        "gpt-5.6-sol"
+    );
+    assert!(!app.settings_dialog.as_ref().unwrap().editing_model);
+    assert_eq!(
+        app.runtime_controls.effective_model(),
+        original,
+        "list holds a draft until saved"
+    );
+    handle_settings_dialog_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut app);
+    assert_eq!(
+        app.settings_dialog.as_ref().unwrap().selected_row,
+        SettingsRow::Reasoning
+    );
+    handle_settings_dialog_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &mut app);
+    handle_settings_dialog_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app);
+    assert!(app.settings_dialog.as_ref().unwrap().editing_model);
+    handle_settings_dialog_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut app);
+    handle_settings_dialog_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut app);
+    assert!(app.settings_dialog.is_none());
+    assert_eq!(app.runtime_controls.effective_model(), "gpt-5.6-sol");
+}
+
+#[test]
+fn settings_escape_save_still_requires_enter_to_confirm_unrestricted_permission() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.open_settings_dialog();
+    app.settings_dialog.as_mut().unwrap().draft.permission_mode = PermissionMode::Unrestricted;
+    handle_settings_dialog_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut app);
+    assert!(
+        app.settings_dialog
+            .as_ref()
+            .unwrap()
+            .unrestricted_confirmation
+    );
+    assert_eq!(
+        app.runtime_controls.permission_mode,
+        PermissionMode::Guarded
+    );
+    handle_settings_dialog_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut app);
+    assert!(app.settings_dialog.is_none());
+    assert_eq!(
+        app.runtime_controls.permission_mode,
+        PermissionMode::Unrestricted
+    );
+}
+
+#[test]
+fn settings_escape_at_permission_confirmation_saves_without_escalating() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.open_settings_dialog();
+    let dialog = app.settings_dialog.as_mut().unwrap();
+    dialog.draft.permission_mode = PermissionMode::Unrestricted;
+    dialog.draft.set_custom_model("gpt-5.6-sol").unwrap();
+    handle_settings_dialog_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut app);
+    assert!(
+        app.settings_dialog
+            .as_ref()
+            .unwrap()
+            .unrestricted_confirmation
+    );
+    handle_settings_dialog_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut app);
+    assert!(app.settings_dialog.is_none());
+    assert_eq!(
+        app.runtime_controls.permission_mode,
+        PermissionMode::Guarded
+    );
+    assert_eq!(app.runtime_controls.effective_model(), "gpt-5.6-sol");
+}
+
+#[test]
 fn settings_model_editor_renders_the_real_unicode_cursor() {
     let mut app = TuiApp::new(
         ThreadId::new(),
@@ -4348,7 +4715,7 @@ fn bottom_pane_renders_context_instead_of_task_status() {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/home/test"));
     let workspace = home.join("Desktop/project/open/golutra-agent/golutra-agent");
-    let app = TuiApp::new(
+    let mut app = TuiApp::new(
         ThreadId::new(),
         SessionId::new(),
         None,
@@ -4356,7 +4723,8 @@ fn bottom_pane_renders_context_instead_of_task_status() {
         "ready (custom)".to_owned(),
         None,
     )
-    .with_footer_context(workspace, "gpt-5.6-sol ultra");
+    .with_footer_context(workspace, "gpt-5.6-sol");
+    app.runtime_controls.reasoning_effort = Some(ProviderReasoningEffort::Ultra);
     let mut terminal = Terminal::new(TestBackend::new(100, 3)).expect("terminal");
 
     terminal
@@ -5247,6 +5615,22 @@ async fn slash_auth_login_persists_native_anthropic_protocol_after_probe() {
     apply_auth_login(&transport, login)
         .await
         .expect("native protocol installed");
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    )
+    .with_footer_context(dir.path(), "mock-model");
+    app.refresh_provider_status();
+    assert_eq!(app.runtime_controls.effective_model(), "claude-test");
+    assert_eq!(
+        app.runtime_controls.profile_name.as_deref(),
+        Some("anthropic")
+    );
+    assert!(footer_context_text(&app, 150).contains("claude-test"));
     let paths = provider_paths_for_tui().expect("paths");
     let settings = ProviderSettings::load(&paths.user_config).expect("settings");
 
@@ -5484,9 +5868,201 @@ fn auth_dialog_custom_provider_exposes_protocol_step() {
         .join("\n");
 
     assert!(lines.contains("Custom Provider · Step 1/7 · Protocol"));
-    assert!(lines.contains("OpenAI-compatible"));
+    assert!(lines.contains("OpenAI Chat Completions"));
+    assert!(lines.contains("OpenAI Responses"));
+    assert!(lines.contains("/chat/completions"));
+    assert!(lines.contains("/responses"));
     assert!(lines.contains("Anthropic-compatible"));
     assert!(lines.contains("Gemini-compatible"));
+}
+
+#[tokio::test]
+async fn auth_custom_responses_selection_persists_and_uses_responses_wire() {
+    use golutra_agent_core::{ProviderRequestId, TurnId};
+    use golutra_agent_llm::{
+        ConfiguredProvider, LlmProvider, MockProvider, ProviderMessage, ProviderRequest,
+        ProviderRole,
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let base_url = format!("http://{}/v1", listener.local_addr().expect("address"));
+    let server = tokio::spawn(async move {
+        for is_generation in [false, true] {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = Vec::new();
+            let (header_end, content_length) = loop {
+                let mut chunk = [0; 4096];
+                let count = socket.read(&mut chunk).await.expect("read headers");
+                assert!(count > 0, "request ended before headers");
+                request.extend_from_slice(&chunk[..count]);
+                if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().expect("content length"))
+                        })
+                        .unwrap_or(0);
+                    break (end + 4, length);
+                }
+            };
+            while request.len() < header_end + content_length {
+                let mut chunk = [0; 4096];
+                let count = socket.read(&mut chunk).await.expect("read body");
+                assert!(count > 0, "request ended before body");
+                request.extend_from_slice(&chunk[..count]);
+            }
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let (content_type, body) = if is_generation {
+                assert!(headers.starts_with("POST /v1/responses HTTP/1.1\r\n"));
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request[header_end..header_end + content_length])
+                        .expect("request JSON");
+                assert_eq!(body["model"], "gpt-golden");
+                assert!(body.get("input").is_some());
+                assert!(body.get("messages").is_none());
+                (
+                    "text/event-stream",
+                    include_str!(
+                        "../../golutra-agent-llm/tests/fixtures/openai-responses/text-response.sse"
+                    ),
+                )
+            } else {
+                assert!(headers.starts_with("GET /v1/models?client_version="));
+                ("application/json", r#"{"data":[{"id":"gpt-golden"}]}"#)
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("response");
+        }
+    });
+
+    let dir = tempfile::tempdir().expect("workspace");
+    let home = tempfile::tempdir().expect("home");
+    let _guard = env_lock_guard().await;
+    let previous_home = std::env::var_os("GOLUTRA_AGENT_HOME");
+    unsafe {
+        std::env::set_var("GOLUTRA_AGENT_HOME", home.path());
+    }
+    let result = tokio::time::timeout(Duration::from_secs(30), async {
+        let transport = RuntimeTransport::for_cwd(dir.path())
+            .await
+            .expect("transport");
+        let mut app = TuiApp::new(
+            ThreadId::new(),
+            SessionId::new(),
+            None,
+            false,
+            "ready (mock)".to_owned(),
+            Some(AuthDialogState::new()),
+        );
+        app.auth_dialog
+            .as_mut()
+            .expect("dialog")
+            .select_provider(CUSTOM_PROVIDER_PRESET);
+        handle_auth_dialog_key(
+            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE),
+            &mut app,
+            &transport,
+        )
+        .await
+        .expect("select Responses with keyboard");
+        let dialog = app.auth_dialog.as_mut().expect("dialog");
+        assert_eq!(dialog.protocol, ProviderProtocol::OpenAiResponses);
+        assert_eq!(dialog.step, AuthDialogStep::BaseUrl);
+        assert!(dialog.base_url.is_empty());
+        dialog.base_url = base_url;
+        dialog.api_key = "test-responses-key".to_owned();
+        dialog.model = "gpt-golden".to_owned();
+        advance_auth_dialog(&mut app, &transport)
+            .await
+            .expect("base URL");
+        advance_auth_dialog(&mut app, &transport)
+            .await
+            .expect("API key");
+        let dialog = app.auth_dialog.as_mut().expect("dialog");
+        dialog.selected = dialog.custom_model_index();
+        advance_auth_dialog(&mut app, &transport)
+            .await
+            .expect("model");
+        advance_auth_dialog(&mut app, &transport)
+            .await
+            .expect("review");
+        assert_eq!(
+            app.auth_dialog.as_ref().expect("dialog").step,
+            AuthDialogStep::Review
+        );
+        advance_auth_dialog(&mut app, &transport)
+            .await
+            .expect("probe and save");
+        assert!(
+            app.auth_dialog.is_none(),
+            "configuration must pass its probe"
+        );
+        let settings = ProviderSettings::load(home.path().join("provider.json")).expect("settings");
+        let profile = settings.active_profile().expect("profile");
+        assert_eq!(profile.protocol, ProviderProtocol::OpenAiResponses);
+        let persisted = std::fs::read_to_string(home.path().join("provider.json")).expect("config");
+        assert!(!persisted.contains("test-responses-key"));
+        let runtime_env = golutra_agent_config::load_provider_runtime_env_from_paths(
+            &ProviderConfigPaths::global().expect("paths"),
+        )
+        .expect("runtime config");
+        let provider = ConfiguredProvider::resolve_from_reader_with_credential(
+            MockProvider::text_response("must not use mock"),
+            |key| runtime_env.get(key),
+            runtime_env.credential_provider(),
+        )
+        .expect("configured provider");
+        let response = provider
+            .complete(ProviderRequest {
+                request_id: ProviderRequestId::new(),
+                task_id: TaskId::new(),
+                turn_id: TurnId::new(),
+                session_id: None,
+                cache_scope: None,
+                provider_id: profile.name.clone(),
+                model_id: "gpt-golden".to_owned(),
+                messages: vec![ProviderMessage {
+                    role: ProviderRole::User,
+                    content: "Say hello.".to_owned(),
+                    tool_call_id: None,
+                    tool_name: None,
+                    tool_calls: Vec::new(),
+                    metadata: Default::default(),
+                }],
+                tools: Vec::new(),
+                cache_policy: Default::default(),
+                max_output_tokens: None,
+            })
+            .await
+            .expect("Responses generation");
+        assert_eq!(
+            response.message.expect("assistant message").content,
+            "golden answer"
+        );
+    })
+    .await;
+    match previous_home {
+        Some(value) => unsafe {
+            std::env::set_var("GOLUTRA_AGENT_HOME", value);
+        },
+        None => unsafe {
+            std::env::remove_var("GOLUTRA_AGENT_HOME");
+        },
+    }
+    if result.is_err() {
+        server.abort();
+    }
+    result.expect("bounded auth and generation");
+    server.await.expect("wire assertions");
 }
 
 #[tokio::test]
@@ -6637,6 +7213,244 @@ async fn developer_mode_observes_runtime_verification_and_evaluation_events() {
 }
 
 #[test]
+fn provider_refresh_updates_footer_without_overwriting_session_choices() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    )
+    .with_footer_context("/tmp", "mock-model")
+    .with_yolo(true);
+    app.apply_provider_ui_status(ProviderUiStatus {
+        message: "ready (custom)".to_owned(),
+        model: "gpt-test high".to_owned(),
+    });
+    assert_eq!(app.runtime_controls.effective_model(), "gpt-test");
+    assert!(footer_context_text(&app, 150).contains("gpt-test"));
+    assert!(!footer_context_text(&app, 150).contains("mock-model"));
+    app.runtime_controls
+        .set_custom_model("explicit-model")
+        .unwrap();
+    app.runtime_controls.cycle_effort(true);
+    let effort = app.runtime_controls.reasoning_effort;
+    app.apply_provider_ui_status(ProviderUiStatus {
+        message: "ready (custom)".to_owned(),
+        model: "gpt-new".to_owned(),
+    });
+    assert_eq!(app.runtime_controls.effective_model(), "explicit-model");
+    assert_eq!(app.runtime_controls.reasoning_effort, effort);
+    assert_eq!(
+        app.runtime_controls.permission_mode,
+        PermissionMode::Unrestricted
+    );
+    app.runtime_controls.select_profile(&ProviderChoice {
+        profile_name: "session-profile".to_owned(),
+        model_id: "session-model".to_owned(),
+        generation_config: None,
+    });
+    app.apply_provider_ui_status(ProviderUiStatus {
+        message: "ready (custom)".to_owned(),
+        model: "gpt-default".to_owned(),
+    });
+    assert_eq!(app.runtime_controls.effective_model(), "session-model");
+}
+
+#[test]
+fn provider_failure_is_shown_once_and_survives_history_replay() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (custom)".to_owned(),
+        None,
+    );
+    let task = TaskId::new();
+    let error = "provider is temporarily unavailable: 400错误，请稍后再试";
+    let summary = format!(
+        "runtime task execution failed: runtime task execution failed: provider call failed: {error}"
+    );
+    app.events = vec![
+        transcript_event(
+            1,
+            app.session_id,
+            task,
+            RuntimeEventType::ProviderStreamed,
+            json!({"provider_request_id":"fixture", "delta":{"kind":"text_delta","text":"Hi!"}}),
+        ),
+        transcript_event(
+            2,
+            app.session_id,
+            task,
+            RuntimeEventType::ProviderFailed,
+            json!({"error":error,"error_metadata":{"response_http_status":200,"http_status":400,"request_id":"req-fixture"}}),
+        ),
+        transcript_event(
+            3,
+            app.session_id,
+            task,
+            RuntimeEventType::LoopDecided,
+            json!({"summary":summary,"error":error}),
+        ),
+        transcript_event(
+            4,
+            app.session_id,
+            task,
+            RuntimeEventType::TaskCompleted,
+            json!({"summary":"runtime task finished with Failed","status":golutra_agent_core::TaskStatus::Failed}),
+        ),
+    ];
+    let turn = TurnId::new();
+    for event in &mut app.events {
+        event.turn_id = Some(turn);
+    }
+    app.projection = Some(UserProjection {
+        session_id: app.session_id,
+        task_id: Some(task),
+        status: golutra_agent_core::TaskStatus::Failed,
+        visible_steps: vec![VisibleStep {
+            label: "LoopDecided".to_owned(),
+            status: "Failed".to_owned(),
+            summary,
+        }],
+        pending_approval: None,
+        final_message: None,
+        residual_risks: vec![
+            "verification evidence is insufficient".to_owned(),
+            format!("runtime task execution failed: provider call failed: {error}"),
+            "uncommitted file changes need review".to_owned(),
+        ],
+    });
+    for fullscreen in [false, true] {
+        app.transcript.fullscreen = fullscreen;
+        let items = transcript_items(&app);
+        let text = items
+            .iter()
+            .flat_map(|item| &item.body)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(text.matches("400错误，请稍后再试").count(), 1, "{text}");
+        assert!(text.contains("Hi!"), "{text}");
+        assert!(text.contains("Request ID: req-fixture"));
+        assert!(text.contains("HTTP response: 200"));
+        assert!(text.contains("uncommitted file changes need review"));
+        assert!(!text.contains("verification evidence is insufficient"));
+        assert!(!items.iter().any(|item| item.title == "Task Completed"));
+    }
+    assert_eq!(app.events.len(), 4, "durable evidence is not removed");
+    let unrelated_failure = transcript_event(
+        5,
+        app.session_id,
+        TaskId::new(),
+        RuntimeEventType::TaskCompleted,
+        json!({"status":golutra_agent_core::TaskStatus::Failed, "summary":"unrelated failure"}),
+    );
+    app.events.push(unrelated_failure);
+    assert!(
+        transcript_items(&app)
+            .iter()
+            .any(|item| item.body.iter().any(|line| line == "unrelated failure"))
+    );
+    assert_eq!(
+        app.projection.as_ref().unwrap().status,
+        golutra_agent_core::TaskStatus::Failed
+    );
+    app.projection.as_mut().unwrap().visible_steps.clear();
+    assert!(
+        projection_overlay_items(app.projection.as_ref().unwrap())[0]
+            .body
+            .iter()
+            .any(|risk| risk == "verification evidence is insufficient"),
+        "unexplained risks remain visible"
+    );
+    app.events
+        .retain(|event| event.event_type != RuntimeEventType::LoopDecided);
+    assert!(
+        transcript_items(&app).iter().any(|item| item
+            .body
+            .iter()
+            .any(|line| line.contains("provider call failed:"))),
+        "paged-out failure must not hide risk evidence"
+    );
+}
+
+#[test]
+fn provider_failure_uses_full_error_instead_of_truncated_summary() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (custom)".to_owned(),
+        None,
+    );
+    let task = TaskId::new();
+    let cause = "Invalid prompt: your prompt was flagged as potentially violating our usage policy. Please try again with a different prompt. 完整错误末尾。";
+    let error = format!(
+        "provider failed: Failed to parse stream data for model 'fixture (adapter: OpenAIResp)'. Cause: {cause}"
+    );
+    let full_error = format!("runtime task execution failed: provider call failed: {error}");
+    app.events = vec![
+        transcript_event(
+            1,
+            app.session_id,
+            task,
+            RuntimeEventType::ProviderFailed,
+            json!({"error":error,"error_metadata":{"request_id":"req-long-error"}}),
+        ),
+        transcript_event(
+            2,
+            app.session_id,
+            task,
+            RuntimeEventType::LoopDecided,
+            json!({"summary":"runtime task execution failed: provider failed: Failed to parse stream data. Cause: Invalid", "error":full_error}),
+        ),
+        transcript_event(
+            3,
+            app.session_id,
+            task,
+            RuntimeEventType::TaskCompleted,
+            json!({"status":golutra_agent_core::TaskStatus::Failed,"summary":"runtime task finished with Failed"}),
+        ),
+    ];
+    let durable = app.events.clone();
+    for fullscreen in [false, true] {
+        app.transcript.fullscreen = fullscreen;
+        let items = transcript_items(&app);
+        let failure = items
+            .iter()
+            .find(|item| item.title == "Task failed")
+            .expect("failure");
+        assert_eq!(failure.body, vec![cause, "Request ID: req-long-error"]);
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| item.title == "Task failed")
+                .count(),
+            1
+        );
+        assert!(!items.iter().any(|item| item.title == "Task Completed"));
+    }
+    assert_eq!(
+        app.events, durable,
+        "display does not rewrite durable evidence"
+    );
+    // The full LoopDecided.error is sufficient even when ProviderFailed has
+    // fallen outside the loaded history page.
+    app.events.remove(0);
+    let items = transcript_items(&app);
+    let failure = items
+        .iter()
+        .find(|item| item.title == "Task failed")
+        .expect("failure");
+    assert_eq!(failure.body, vec![cause]);
+}
+
+#[test]
 fn failed_loop_decision_is_visible_in_transcript() {
     let mut app = TuiApp::new(
         ThreadId::new(),
@@ -6662,7 +7476,7 @@ fn failed_loop_decision_is_visible_in_transcript() {
 
     let items = transcript_items(&app);
 
-    assert_eq!(items[0].title, "Loop Decided");
+    assert_eq!(items[0].title, "Task failed");
     assert!(items[0].body[0].contains("model not found"));
 }
 
@@ -8011,11 +8825,8 @@ fn overlay_mouse_clicks_select_every_interactive_surface() {
         .into_iter()
         .find(|region| region.press == UiMousePress::Auth(2))
         .expect("custom provider region");
-    assert_eq!(
-        click_overlay(&mut app, custom.area.x, custom.area.y),
-        Some(UiMouseActivation::AuthContinue)
-    );
-    assert_eq!(app.auth_dialog.as_ref().expect("auth dialog").selected, 2);
+    assert_eq!(click_overlay(&mut app, custom.area.x, custom.area.y), None);
+    assert_eq!(app.auth_dialog.as_ref().expect("auth dialog").selected, 0);
     app.auth_dialog = None;
 
     app.resume_picker = Some(ResumePickerState::new(vec![
@@ -8102,8 +8913,15 @@ fn overlay_mouse_clicks_select_every_interactive_surface() {
         None
     );
     let settings = app.settings_dialog.as_ref().expect("settings dialog");
-    assert_eq!(settings.selected_row, SettingsRow::HighContrast);
-    assert!(settings.draft_preferences.high_contrast);
+    assert_eq!(settings.selected_row, SettingsRow::Profile);
+    assert_eq!(
+        settings.draft_preferences.high_contrast,
+        app.preferences.high_contrast
+    );
+    assert!(
+        overlay_uses_native_mouse(&app),
+        "settings leave text selection to the terminal"
+    );
 }
 
 #[test]
@@ -8204,10 +9022,7 @@ fn narrow_wrapped_overlays_keep_mouse_targets_aligned_with_visible_rows() {
         .into_iter()
         .find(|region| region.press == UiMousePress::Auth(AUTH_GROUP_ITEMS.len() - 1))
         .expect("visible wrapped auth option");
-    assert_eq!(
-        click_overlay(&mut app, quit.area.x, quit.area.y),
-        Some(UiMouseActivation::AuthContinue)
-    );
+    assert_eq!(click_overlay(&mut app, quit.area.x, quit.area.y), None);
 }
 
 #[tokio::test]

@@ -2794,6 +2794,7 @@ impl RuntimeHost {
                                     provider_id: contract.provider_id,
                                     model_id: contract.model_id,
                                     error: error.to_string(),
+                                    metadata: error.metadata().cloned(),
                                 },
                             )
                             .await?;
@@ -2806,6 +2807,7 @@ impl RuntimeHost {
                                     provider_id: contract.provider_id,
                                     model_id: contract.model_id,
                                     error: "compaction summary request timed out".to_owned(),
+                                    metadata: None,
                                 },
                             )
                             .await?;

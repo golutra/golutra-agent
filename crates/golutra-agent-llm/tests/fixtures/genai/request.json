@@ -33,7 +33,7 @@
         "type": "function",
         "function": {
           "name": "read_file",
-          "description": "Read workspace lines; use offset/limit and continuation.next_offset.",
+          "description": "Read workspace files instead of cat/sed; use offset/limit. Follow continuation.next_offset only when the task needs more content or the full file. Read relevant sections; do not drain unrelated files.",
           "parameters": {
             "type": "object",
             "properties": {"path": {"type": "string"}},

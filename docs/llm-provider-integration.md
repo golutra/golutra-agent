@@ -55,7 +55,7 @@ Golutra 不直接复制 qwen-code 的配置文件形状。Golutra 的核心仍�
 
 - `golutra-agent-llm` 已有 `MockProvider`、独立 OpenAI-compatible live adapter、基于固定 `rust-genai 0.7.0-beta.18` 的 `GenaiProviderAdapter`，以及显式使用其 `OpenAIResp` adapter 的 Responses 薄适配。
 - 默认 provider 是 mock。
-- CLI 已支持 `golutra-agent provider login`、`set-key`、`oauth-login`、`logout` 和 `use`；`provider login` 可填写 `--enable-thinking`、`--reasoning-effort low|medium|high|xhigh`、`--context-window-size <n>`、`--max-tokens <n>`。TUI 首次进入会检查 provider onboarding 状态。
+- CLI 已支持 `golutra-agent provider login`、`set-key`、`oauth-login`、`logout` 和 `use`；`provider login` 可填写 `--enable-thinking`、`--reasoning-effort low|medium|high|xhigh|max|ultra`、`--context-window-size <n>`、`--max-tokens <n>`。TUI 首次进入会检查 provider onboarding 状态。Responses / Chat Completions 按原值发送显式 effort，需上游模型支持；其他原生适配器暂不支持 `ultra`，不会静默降档。
 - 如果全局用户配置没有 active provider profile，TUI 会打开 provider setup；用户可以先选 Golutra API、Third-party Providers、Custom Provider 或 mock，再按 qwen-code 风格选择协议、base URL、凭据存储、推荐或自定义 model 和高级生成配置，最后在 review 页确认脱敏 install plan 后保存。交互输入的 API key 默认进入 `$GOLUTRA_AGENT_HOME/credentials.json`，也可只保存已有 envKey 引用。
 - Custom Provider 的 API key envKey 已按 qwen-code 规则由 `(protocol, baseUrl)` 派生：`GOLUTRA_AGENT_CUSTOM_PROVIDER_API_KEY_{PROTOCOL}_{NORMALIZED_BASE_URL}_{12_HEX_HASH}`。同一个 endpoint 的尾随 `/` 不会生成不同 key，不同协议或不同 endpoint 不会共享固定 `GOLUTRA_AGENT_PROVIDER_API_KEY`。
 - 真实联网调用必须显式选择协议并配置凭据。推荐设置：

@@ -1,6 +1,109 @@
 use super::*;
 
 #[tokio::test]
+async fn ordinary_output_budget_is_soft_and_completed_output_is_optional() {
+    let root = tempdir().unwrap();
+    // Comparable to the reported combined README/Cargo output, with multibyte text.
+    let content = "中文🙂 project information\n".repeat(750);
+    assert!(content.len() > 20_000 && content.len() < 24_000);
+    fs::write(root.path().join("output.txt"), &content).unwrap();
+    let executor = executor(root.path());
+    let session = SessionId::new();
+    for arguments in [
+        json!({}),
+        json!({"max_output_bytes":12000}),
+        json!({"max_output_bytes":20000}),
+    ] {
+        let result = start_terminal(&executor, session, "cat output.txt", arguments).await;
+        assert_eq!(result.envelope.status, ToolResultStatus::Ok);
+        assert_eq!(result.envelope.structured_facts["process_state"], "exited");
+        assert_eq!(result.envelope.structured_facts["terminal"], true);
+        assert_eq!(
+            result.envelope.structured_facts["next_action"]["action"],
+            "read"
+        );
+        assert_eq!(
+            result.envelope.structured_facts["next_action"]["optional"],
+            true
+        );
+        assert_eq!(artifact_text(&result), content);
+        let first = model_visible_tool_result_with_token_budget(&result.envelope, 4096);
+        let (header, first_text) = first.split_once(MODEL_OUTPUT_SEPARATOR).unwrap();
+        let facts: Value = serde_json::from_str(header).unwrap();
+        assert_eq!(
+            first_text,
+            result.envelope.model_visible_excerpt.as_deref().unwrap()
+        );
+        assert!(first_text.len() > 11_900 && first_text.len() <= 12_288);
+        let rest = read_terminal(
+            &executor,
+            session,
+            &result.envelope.structured_facts["process_id"],
+            json!({
+                "action":"read", "cursor":facts["structured_facts"]["output_cursor"]
+            }),
+        )
+        .await;
+        let second = model_visible_tool_result_with_token_budget(&rest.envelope, 4096);
+        let (_, second_text) = second.split_once(MODEL_OUTPUT_SEPARATOR).unwrap();
+        assert_eq!(format!("{first_text}{second_text}"), content);
+        assert_eq!(rest.envelope.structured_facts["output_has_more"], false);
+        assert_eq!(
+            rest.envelope.structured_facts["next_action"]["kind"],
+            "terminal"
+        );
+    }
+}
+
+#[tokio::test]
+async fn read_available_output_does_not_wait_for_running_process() {
+    let root = tempdir().unwrap();
+    let executor = executor(root.path());
+    let session = SessionId::new();
+    let start = start_terminal(&executor, session, "sleep 30", json!({"background":true})).await;
+    let process = &start.envelope.structured_facts["process_id"];
+    let read = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_terminal(
+            &executor,
+            session,
+            process,
+            json!({"action":"read", "wait_ms":10000, "wait_for_terminal":true}),
+        ),
+    )
+    .await
+    .expect("read must not wait for execution");
+    assert_eq!(read.envelope.structured_facts["process_state"], "running");
+    assert_eq!(
+        read.envelope.structured_facts["next_action"]["kind"],
+        "wait"
+    );
+    read_terminal(&executor, session, process, json!({"action":"terminate"})).await;
+}
+
+#[tokio::test]
+async fn failed_command_keeps_exit_status_when_output_remains() {
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("fail.sh"), "cat output.txt\nexit 7\n").unwrap();
+    fs::write(
+        root.path().join("output.txt"),
+        "failure detail\n".repeat(2000),
+    )
+    .unwrap();
+    let executor = executor(root.path());
+    let result = start_terminal(&executor, SessionId::new(), "sh fail.sh", json!({})).await;
+    assert_eq!(result.envelope.status, ToolResultStatus::Error);
+    let projected = model_visible_tool_result_with_token_budget(&result.envelope, 4096);
+    let facts: Value =
+        serde_json::from_str(projected.split(MODEL_OUTPUT_SEPARATOR).next().unwrap()).unwrap();
+    assert_eq!(facts["status"], "error");
+    assert_eq!(facts["structured_facts"]["exit_code"], 7);
+    assert_eq!(facts["structured_facts"]["process_state"], "failed");
+    assert_eq!(facts["structured_facts"]["output_has_more"], true);
+    assert_eq!(facts["structured_facts"]["next_action"]["action"], "read");
+}
+
+#[tokio::test]
 async fn pty_terminal_accepts_input_and_reports_exit() {
     let root = tempdir().unwrap();
     fs::write(root.path().join("interactive.sh"), "test -t 0 || exit 42\nprintf 'ready\\n'\nread -r value\nprintf 'received:%s\\n' \"$value\"\n").unwrap();
@@ -78,9 +181,40 @@ async fn small_model_budget_returns_an_explicit_replay_cursor() {
         replay
             .envelope
             .model_visible_excerpt
+            .as_deref()
             .unwrap()
             .starts_with("[earlier process output omitted]\ntext\n")
     );
+    // The provider receives the projected result, not the larger durable envelope.
+    // Check forward progress and complete recovery through that actual surface.
+    let mut page = replay;
+    let mut recovered = String::new();
+    for _ in 0..32 {
+        let projected = model_visible_tool_result_with_limit(&page.envelope, 1024);
+        assert!(projected.len() <= 1024);
+        let (header, text) = projected.split_once(MODEL_OUTPUT_SEPARATOR).unwrap();
+        let facts: Value = serde_json::from_str(header).unwrap();
+        let facts = &facts["structured_facts"];
+        let cursor = facts["output_cursor"].as_u64().unwrap();
+        assert!(
+            cursor > recovered.len() as u64,
+            "small preview must advance: {projected}"
+        );
+        recovered.push_str(text);
+        if facts["output_has_more"] == false {
+            break;
+        }
+        page = read_terminal(
+            &executor,
+            session,
+            &facts["process_id"],
+            json!({
+                "action":"read", "cursor":cursor, "max_output_bytes":256
+            }),
+        )
+        .await;
+    }
+    assert_eq!(recovered, artifact_text(&result));
 }
 
 #[tokio::test]
@@ -235,7 +369,9 @@ async fn output_pages_are_complete_repeatable_and_continue_after_exit() {
     );
     let listed = &listed.envelope.structured_facts["processes"][0];
     assert_eq!(listed["output_has_more"], true);
-    assert_eq!(listed["next_action"]["kind"], "wait");
+    assert_eq!(listed["next_action"]["kind"], "read");
+    assert_eq!(listed["next_action"]["optional"], true);
+    assert_eq!(listed["terminal"], true);
     assert_eq!(
         listed["next_action"]["cursor"],
         start.envelope.structured_facts["output_cursor"]

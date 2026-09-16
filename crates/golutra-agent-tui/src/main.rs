@@ -227,6 +227,8 @@ fn parse_runtime_reasoning_effort(
         "medium" => Some(golutra_agent_llm::ProviderReasoningEffort::Medium),
         "high" => Some(golutra_agent_llm::ProviderReasoningEffort::High),
         "xhigh" => Some(golutra_agent_llm::ProviderReasoningEffort::Xhigh),
+        "max" => Some(golutra_agent_llm::ProviderReasoningEffort::Max),
+        "ultra" => Some(golutra_agent_llm::ProviderReasoningEffort::Ultra),
         "default" => None,
         _ => None,
     }
@@ -388,6 +390,7 @@ struct TuiApp {
     provider_message: String,
     provider_model: String,
     runtime_controls: RuntimeControls,
+    runtime_settings_paths: Option<ProviderConfigPaths>,
     provider_choices: Vec<ProviderChoice>,
     preferences: TuiPreferences,
     preferences_path: Option<PathBuf>,
@@ -711,6 +714,7 @@ impl TuiApp {
             provider_message,
             provider_model,
             runtime_controls,
+            runtime_settings_paths: None,
             provider_choices,
             preferences: TuiPreferences::default(),
             preferences_path: None,
@@ -828,13 +832,40 @@ impl TuiApp {
         self
     }
 
-    fn with_loaded_runtime_settings(mut self) -> miette::Result<Self> {
+    fn with_loaded_runtime_settings(self) -> miette::Result<Self> {
         let paths = ProviderConfigPaths::global()
             .map_err(|error| miette::miette!("load runtime settings paths: {error}"))?;
+        self.with_loaded_runtime_settings_from_paths(paths)
+    }
+
+    fn with_loaded_runtime_settings_from_paths(
+        mut self,
+        paths: ProviderConfigPaths,
+    ) -> miette::Result<Self> {
         let settings = load_non_secret_runtime_settings(&paths, &self.workspace_path)
             .map_err(|error| miette::miette!("load runtime settings: {error}"))?;
+        // Respect an existing project settings layer; otherwise save globally.
+        // Loading does not require acquiring a write lock in a read-only project.
+        let project_paths =
+            ProviderConfigPaths::from_home(self.workspace_path.join(".golutra-agent"))
+                .map_err(|error| miette::miette!("load project settings paths: {error}"))?;
+        let project_selection = project_paths.home.join("runtime.json").exists();
+        self.runtime_settings_paths = Some(if project_selection {
+            project_paths
+        } else {
+            paths
+        });
         if let Some(profile) = settings.provider_profile {
-            self.runtime_controls.profile_name = Some(profile);
+            if let Some(choice) = self
+                .provider_choices
+                .iter()
+                .find(|choice| choice.profile_name == profile)
+            {
+                self.runtime_controls.select_profile(choice);
+            } else {
+                self.runtime_controls.profile_name = Some(profile);
+                self.runtime_controls.profile_overridden = true;
+            }
         }
         if let Some(model) = settings.model {
             self.runtime_controls.custom_model = Some(model);
@@ -910,9 +941,29 @@ impl TuiApp {
 
     fn refresh_provider_status(&mut self) {
         if let Ok(status) = current_provider_ui_status() {
-            self.provider_message = status.message;
-            self.provider_model = status.model;
+            self.apply_provider_ui_status(status);
+            let (mut controls, choices) =
+                RuntimeControls::discover(&self.provider_model, self.yolo);
+            // 配置刷新更新默认值，但不得覆盖用户本会话显式选择的模型、推理和权限。
+            controls.custom_model = self.runtime_controls.custom_model.clone();
+            controls.permission_mode = self.runtime_controls.permission_mode;
+            if self.runtime_controls.reasoning_overridden {
+                controls.reasoning_effort = self.runtime_controls.reasoning_effort;
+                controls.reasoning_overridden = true;
+            }
+            if !self.runtime_controls.profile_overridden {
+                self.runtime_controls = controls;
+            }
+            self.provider_choices = choices;
         }
+    }
+
+    fn apply_provider_ui_status(&mut self, status: ProviderUiStatus) {
+        if !self.runtime_controls.profile_overridden {
+            self.runtime_controls.model_id = clean_provider_model_label(&status.model);
+        }
+        self.provider_message = status.message;
+        self.provider_model = status.model;
     }
 
     async fn refresh_provider_status_from_runtime(&mut self, transport: &RuntimeTransport) {
@@ -922,8 +973,7 @@ impl TuiApp {
         )
         .await;
         if let Ok(Ok(status)) = result {
-            self.provider_message = status.message;
-            self.provider_model = status.model;
+            self.apply_provider_ui_status(status);
         }
     }
 
@@ -949,8 +999,7 @@ impl TuiApp {
         self.sync_approval_dialog_from_events();
         self.sync_question_dialog_from_events();
         if let Some(status) = snapshot.provider_status {
-            self.provider_message = status.message;
-            self.provider_model = status.model;
+            self.apply_provider_ui_status(status);
         }
         if self.projection.as_ref().is_some_and(|projection| {
             projection.status == golutra_agent_core::TaskStatus::WaitingAuthentication
@@ -1717,10 +1766,26 @@ impl TuiApp {
         };
     }
 
+    fn open_model_dialog(&mut self) {
+        self.open_settings_dialog();
+        if let Some(dialog) = &mut self.settings_dialog {
+            dialog.selected_row = SettingsRow::Model;
+            dialog.editing_model = !dialog.runtime_locked;
+        }
+    }
+
     fn apply_settings_dialog(&mut self) -> bool {
         let Some(dialog) = &mut self.settings_dialog else {
             return false;
         };
+        if dialog.editing_model
+            && let Err(error) = dialog.apply_model_input()
+        {
+            dialog.error = Some(error.clone());
+            self.status_message = error;
+            return false;
+        }
+        dialog.error = None;
         if !dialog.can_apply() {
             self.status_message =
                 "unrestricted mode disables workspace and approval guards; apply again to confirm"
@@ -1728,6 +1793,15 @@ impl TuiApp {
             return false;
         }
         let previous_keymap = self.preferences.keymap;
+        if let Some(paths) = &self.runtime_settings_paths
+            && let Err(error) =
+                settings::persist_model_selection(paths, &self.runtime_controls, &dialog.draft)
+        {
+            let error = format!("model settings were not saved: {error}");
+            dialog.error = Some(error.clone());
+            self.status_message = error;
+            return false;
+        }
         self.runtime_controls = dialog.draft.clone();
         self.preferences = dialog.draft_preferences.clone();
         self.yolo = self.runtime_controls.permission_mode == PermissionMode::Unrestricted;
@@ -1754,12 +1828,18 @@ impl TuiApp {
             self.status_message = "model is locked while a task is active".to_owned();
             return;
         }
-        match self.runtime_controls.set_custom_model(model) {
+        let mut controls = self.runtime_controls.clone();
+        match controls.set_custom_model(model).and_then(|()| {
+            self.runtime_settings_paths
+                .as_ref()
+                .map_or(Ok(()), |paths| {
+                    settings::persist_model_selection(paths, &self.runtime_controls, &controls)
+                })
+        }) {
             Ok(()) => {
-                self.status_message = format!(
-                    "session model set to {}",
-                    self.runtime_controls.effective_model()
-                );
+                self.runtime_controls = controls;
+                self.status_message =
+                    format!("model set to {}", self.runtime_controls.effective_model());
             }
             Err(error) => self.status_message = error,
         }
@@ -2740,7 +2820,7 @@ impl TuiApp {
             SlashCommand::Settings => self.open_settings_dialog(),
             SlashCommand::Model { model } => match model {
                 Some(model) => self.set_session_model(model),
-                None => self.open_settings_dialog(),
+                None => self.open_model_dialog(),
             },
             SlashCommand::Effort { effort } => match effort {
                 Some(effort) => self.set_session_effort(effort),
@@ -4288,6 +4368,7 @@ async fn run_app(
 
 struct OverlayScreenState {
     active: bool,
+    capture_mouse: bool,
     saved_inline: Option<Rect>,
     inline_screen_size: Option<ratatui::layout::Size>,
 }
@@ -4296,6 +4377,7 @@ impl OverlayScreenState {
     fn new() -> Self {
         Self {
             active: false,
+            capture_mouse: false,
             saved_inline: None,
             inline_screen_size: None,
         }
@@ -4340,7 +4422,8 @@ fn draw_interactive_frame_inner(
             .flush_interactive(terminal, app)
             .map_err(|error| miette::miette!("write terminal history: {error}"))?;
     }
-    sync_overlay_screen(terminal, overlay_screen, overlay_visible)?;
+    let capture_mouse = overlay_visible && !overlay_uses_native_mouse(app);
+    sync_overlay_screen(terminal, overlay_screen, overlay_visible, capture_mouse)?;
     if !overlay_screen.active {
         // 弹层内的尺寸变化留到主屏恢复后处理，不能用 alternate screen 的坐标更新历史锚点。
         prepare_inline_screen(terminal, overlay_screen, inline_history)
@@ -4389,17 +4472,35 @@ fn sync_overlay_screen(
     terminal: &mut InteractiveTerminal,
     overlay_screen: &mut OverlayScreenState,
     overlay_visible: bool,
+    capture_mouse: bool,
 ) -> miette::Result<()> {
-    if overlay_visible == overlay_screen.active {
-        return Ok(());
+    if overlay_visible != overlay_screen.active {
+        if overlay_visible {
+            enter_overlay_screen(terminal, overlay_screen)?;
+        } else {
+            leave_overlay_screen(terminal, overlay_screen)?;
+        }
+        overlay_screen.active = overlay_visible;
     }
-    if overlay_visible {
-        enter_overlay_screen(terminal, overlay_screen)?;
-    } else {
-        leave_overlay_screen(terminal, overlay_screen)?;
+    // 全屏与鼠标捕获是独立状态；认证页保留终端原生拖选，弹层之间切换也必须同步。
+    if capture_mouse != overlay_screen.capture_mouse {
+        if capture_mouse {
+            execute!(terminal.backend_mut(), event::EnableMouseCapture)
+        } else {
+            execute!(terminal.backend_mut(), event::DisableMouseCapture)
+        }
+        .map_err(|error| miette::miette!("update overlay mouse mode: {error}"))?;
+        overlay_screen.capture_mouse = capture_mouse;
+        set_mouse_capture_active(capture_mouse);
     }
-    overlay_screen.active = overlay_visible;
     Ok(())
+}
+
+fn overlay_uses_native_mouse(app: &TuiApp) -> bool {
+    matches!(
+        app.overlay_surface(),
+        Some(OverlaySurface::Auth | OverlaySurface::Settings)
+    ) || (app.auth_operation.is_some() && app.overlay_surface().is_none())
 }
 
 fn enter_overlay_screen(
@@ -4407,12 +4508,8 @@ fn enter_overlay_screen(
     overlay_screen: &mut OverlayScreenState,
 ) -> miette::Result<()> {
     overlay_screen.saved_inline = Some(terminal.current_buffer_mut().area);
-    execute!(
-        terminal.backend_mut(),
-        EnterAlternateScreen,
-        event::EnableMouseCapture
-    )
-    .map_err(|error| miette::miette!("enter overlay screen: {error}"))?;
+    execute!(terminal.backend_mut(), EnterAlternateScreen)
+        .map_err(|error| miette::miette!("enter overlay screen: {error}"))?;
     set_alternate_screen_active(true);
     // 使用同一终端对象切换矩形，原主屏锚点只由 saved_inline 保存。
     match terminal.set_viewport(Viewport::Fullscreen) {
@@ -5493,19 +5590,28 @@ fn handle_help_dialog_key(key: KeyEvent, app: &mut TuiApp) {
 }
 
 fn handle_settings_dialog_key(key: KeyEvent, app: &mut TuiApp) {
+    if (key.code == KeyCode::Enter
+        && app
+            .settings_dialog
+            .as_ref()
+            .is_some_and(|dialog| dialog.editing_model || dialog.unrestricted_confirmation))
+        || (key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL))
+    {
+        app.apply_settings_dialog();
+        return;
+    }
     let Some(dialog) = &mut app.settings_dialog else {
         return;
     };
+    dialog.error = None;
     if dialog.editing_model {
         match key.code {
-            KeyCode::Esc => {
-                dialog.editing_model = false;
-                dialog.model_input.set_text(dialog.draft.effective_model());
-                app.status_message = "model edit cancelled".to_owned();
-            }
-            KeyCode::Enter => match dialog.apply_model_input() {
-                Ok(()) => app.status_message = "model override staged".to_owned(),
-                Err(error) => app.status_message = error,
+            KeyCode::Esc => match dialog.apply_model_input() {
+                Ok(()) => app.status_message = "model edit kept; Esc saves settings".to_owned(),
+                Err(error) => {
+                    dialog.error = Some(error.clone());
+                    app.status_message = error;
+                }
             },
             KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 dialog.model_input.move_to_start();
@@ -5567,8 +5673,13 @@ fn handle_settings_dialog_key(key: KeyEvent, app: &mut TuiApp) {
 
     match key.code {
         KeyCode::Esc => {
-            app.settings_dialog = None;
-            app.status_message = "session settings discarded".to_owned();
+            if dialog.unrestricted_confirmation {
+                // Escape must not silently confirm a new permission escalation.
+                // Save the other edits while retaining the current permission.
+                dialog.draft.permission_mode = app.runtime_controls.permission_mode;
+                dialog.unrestricted_confirmation = false;
+            }
+            app.apply_settings_dialog();
         }
         KeyCode::Up | KeyCode::Char('k') => {
             dialog.selected_row = dialog.selected_row.move_by(false);
@@ -5589,14 +5700,6 @@ fn handle_settings_dialog_key(key: KeyEvent, app: &mut TuiApp) {
                 app.status_message =
                     "runtime controls are locked while the task is active".to_owned();
             }
-        }
-        KeyCode::Char('e')
-            if dialog.selected_row == SettingsRow::Model && !dialog.runtime_locked =>
-        {
-            dialog.editing_model = true;
-        }
-        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.apply_settings_dialog();
         }
         _ => {}
     }
@@ -5813,6 +5916,10 @@ fn handle_dashboard_key(key: KeyEvent, app: &mut TuiApp) {
 }
 
 fn handle_mouse(mouse: MouseEvent, app: &mut TuiApp) -> Option<UiMouseActivation> {
+    if overlay_uses_native_mouse(app) {
+        app.mouse_press = None;
+        return None;
+    }
     if app.tool_detail.is_some() && tool_detail::handle_tool_detail_navigation(mouse, app) {
         return None;
     }

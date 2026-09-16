@@ -1,9 +1,39 @@
-//! Session-local provider and execution controls.
+//! Provider and execution controls, with persisted local model selection.
 
-use golutra_agent_config::ProviderSettings;
+use golutra_agent_config::{
+    ProviderConfigPaths, ProviderSettings, patch_runtime_settings, read_runtime_settings,
+};
 use golutra_agent_llm::{ProviderGenerationConfig, ProviderReasoningEffort};
 
 use super::{ComposerInput, TuiPreferences};
+
+/// Patch only the user's model selection; retain unrelated settings written by
+/// desktop/CLI clients. The config layer locks, validates and atomically saves.
+pub(crate) fn persist_model_selection(
+    paths: &ProviderConfigPaths,
+    before: &RuntimeControls,
+    after: &RuntimeControls,
+) -> Result<(), String> {
+    let mut patch = serde_json::Map::new();
+    if before.custom_model != after.custom_model || before.profile_name != after.profile_name {
+        patch.insert(
+            "model".to_owned(),
+            serde_json::json!(after.effective_model()),
+        );
+    }
+    if before.profile_name != after.profile_name {
+        patch.insert(
+            "provider_profile".to_owned(),
+            serde_json::json!(after.profile_name),
+        );
+    }
+    if patch.is_empty() {
+        return Ok(());
+    }
+    let snapshot = read_runtime_settings(paths).map_err(|error| error.to_string())?;
+    patch_runtime_settings(paths, &snapshot.revision, patch).map_err(|error| error.to_string())?;
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum PermissionMode {
@@ -31,6 +61,7 @@ pub(crate) struct ProviderChoice {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RuntimeControls {
     pub(crate) profile_name: Option<String>,
+    pub(crate) profile_overridden: bool,
     pub(crate) model_id: String,
     pub(crate) custom_model: Option<String>,
     pub(crate) base_generation_config: Option<ProviderGenerationConfig>,
@@ -82,6 +113,7 @@ impl RuntimeControls {
         (
             Self {
                 profile_name: selected.map(|choice| choice.profile_name.clone()),
+                profile_overridden: false,
                 model_id,
                 custom_model: None,
                 base_generation_config,
@@ -117,6 +149,7 @@ impl RuntimeControls {
 
     pub(crate) fn select_profile(&mut self, choice: &ProviderChoice) {
         self.profile_name = Some(choice.profile_name.clone());
+        self.profile_overridden = true;
         self.model_id = choice.model_id.clone();
         self.custom_model = None;
         self.base_generation_config = choice.generation_config.clone();
@@ -138,12 +171,14 @@ impl RuntimeControls {
     }
 
     pub(crate) fn cycle_effort(&mut self, forward: bool) {
-        const EFFORTS: [Option<ProviderReasoningEffort>; 5] = [
+        const EFFORTS: [Option<ProviderReasoningEffort>; 7] = [
             None,
             Some(ProviderReasoningEffort::Low),
             Some(ProviderReasoningEffort::Medium),
             Some(ProviderReasoningEffort::High),
             Some(ProviderReasoningEffort::Xhigh),
+            Some(ProviderReasoningEffort::Max),
+            Some(ProviderReasoningEffort::Ultra),
         ];
         let current = EFFORTS
             .iter()
@@ -224,6 +259,8 @@ pub(crate) struct SettingsDialogState {
     pub(crate) editing_model: bool,
     pub(crate) unrestricted_confirmation: bool,
     pub(crate) runtime_locked: bool,
+    original_permission_mode: PermissionMode,
+    pub(crate) error: Option<String>,
 }
 
 impl SettingsDialogState {
@@ -244,6 +281,8 @@ impl SettingsDialogState {
             editing_model: false,
             unrestricted_confirmation: false,
             runtime_locked,
+            original_permission_mode: controls.permission_mode,
+            error: None,
         }
     }
 
@@ -321,6 +360,7 @@ impl SettingsDialogState {
 
     pub(crate) fn can_apply(&mut self) -> bool {
         if self.draft.permission_mode == PermissionMode::Unrestricted
+            && self.original_permission_mode != PermissionMode::Unrestricted
             && !self.unrestricted_confirmation
         {
             self.unrestricted_confirmation = true;
@@ -338,12 +378,22 @@ pub(crate) fn effort_label(value: Option<ProviderReasoningEffort>) -> &'static s
         Some(ProviderReasoningEffort::Medium) => "medium",
         Some(ProviderReasoningEffort::High) => "high",
         Some(ProviderReasoningEffort::Xhigh) => "xhigh",
+        Some(ProviderReasoningEffort::Max) => "max",
+        Some(ProviderReasoningEffort::Ultra) => "ultra",
     }
 }
 
-fn clean_provider_model_label(value: &str) -> String {
+pub(crate) fn clean_provider_model_label(value: &str) -> String {
     let value = value.trim();
-    for suffix in [" xhigh", " high", " medium", " low", " thinking"] {
+    for suffix in [
+        " ultra",
+        " max",
+        " xhigh",
+        " high",
+        " medium",
+        " low",
+        " thinking",
+    ] {
         if let Some(model) = value.strip_suffix(suffix) {
             return model.to_owned();
         }

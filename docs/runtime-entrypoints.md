@@ -63,7 +63,7 @@ explicit CLI flag such as `--execution-mode` or `--tool-profile` wins over the
 loaded files. Allowed fields are `provider_profile`, `model`,
 `execution_mode` (`open`/`strict`), `verify_on_change` (`auto`/`off`/`never`),
 `tool_profile` (`coding`/`full`) and `reasoning_effort`
-(`default`/`low`/`medium`/`high`/`xhigh`). Unknown fields, symlinks, malformed
+(`default`/`low`/`medium`/`high`/`xhigh`/`max`/`ultra`). Unknown fields, symlinks, malformed
 JSON, secret-shaped fields and files larger than 64 KiB are rejected; API keys
 and tokens remain in the credential store or environment references.
 

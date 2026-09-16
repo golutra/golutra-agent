@@ -322,8 +322,15 @@ impl OpenAiResponsesProvider {
         request: &ProviderRequest,
         account_id: Option<&str>,
     ) -> Result<ChatOptions, ProviderError> {
+        // rust-genai has no Ultra variant. Keep this gateway extension on the
+        // Responses wire rather than silently translating it to a lower effort.
+        let mut generation_config = self.config.generation_config.clone();
+        if generation_config.reasoning_effort == Some(super::ProviderReasoningEffort::Ultra) {
+            generation_config.reasoning_effort = None;
+            generation_config.enable_thinking = false;
+        }
         let mut options = genai_chat_options(
-            &self.config.generation_config,
+            &generation_config,
             request.max_output_tokens,
             true,
             self.cache_identity_for_request(request).as_ref(),
@@ -338,10 +345,17 @@ impl OpenAiResponsesProvider {
             options = options.with_verbosity(Verbosity::Low);
         }
         let mut reasoning = json!({"summary": "auto"});
-        if let Some(effort) = options
+        if let Some(effort) = self
+            .config
+            .generation_config
             .reasoning_effort
-            .as_ref()
-            .and_then(|effort| effort.as_keyword())
+            .map(super::ProviderReasoningEffort::as_wire_value)
+            .or_else(|| {
+                options
+                    .reasoning_effort
+                    .as_ref()
+                    .and_then(|effort| effort.as_keyword())
+            })
         {
             reasoning["effort"] = Value::String(effort.to_owned());
         }
@@ -793,14 +807,10 @@ fn map_responses_genai_error(error: genai::Error) -> ProviderError {
         }
         None => map_genai_error(error),
     };
-    if status.is_some_and(|status| status == 429 || (500..600).contains(&status)) {
-        mapped.with_metadata(ProviderErrorMetadata {
-            http_status: status.or(metadata.http_status),
-            ..metadata
-        })
-    } else {
-        mapped
-    }
+    mapped.with_metadata(ProviderErrorMetadata {
+        http_status: status.or(metadata.http_status),
+        ..metadata
+    })
 }
 
 fn chatgpt_account_id(access_token: &str) -> Option<String> {

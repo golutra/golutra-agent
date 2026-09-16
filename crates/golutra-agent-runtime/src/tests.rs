@@ -111,9 +111,13 @@ fn active_tool_result_budget_is_large_until_context_is_tight() {
         .expect("context plan");
     plan.budget_snapshot.budget_limit = 4_096;
 
-    assert_eq!(active_tool_result_token_budget(&plan, 0, 0), 2_048);
-    assert_eq!(active_tool_result_token_budget(&plan, 3_000, 0), 840);
-    assert_eq!(active_tool_result_token_budget(&plan, 4_096, 0), 256);
+    assert_eq!(active_tool_result_token_budget(&plan, 0, 0, 2_048), 2_048);
+    assert_eq!(active_tool_result_token_budget(&plan, 3_000, 0, 2_048), 840);
+    assert_eq!(active_tool_result_token_budget(&plan, 4_096, 0, 2_048), 256);
+    assert_eq!(
+        active_tool_result_token_budget_for_tool(&plan, 3_000, 0, "shell"),
+        840
+    );
 }
 
 #[test]
@@ -129,7 +133,7 @@ fn active_tool_result_budget_caps_repetitive_outputs_by_kind() {
     );
     assert_eq!(
         active_tool_result_token_budget_for_tool(&plan, 0, 0, "shell_session"),
-        1_536
+        4_096
     );
     assert_eq!(
         active_tool_result_token_budget_for_tool(&plan, 0, 0, "apply_patch"),
@@ -6278,6 +6282,22 @@ async fn terminal_batches_keep_same_process_interactions_and_foreground_writes_o
     .await;
     assert!(!extend_parallel_batch(&mut first.clone(), same));
     assert!(extend_parallel_batch(&mut first.clone(), other));
+    for (process_id, can_parallel) in [("one", false), ("two", true)] {
+        let read = provider_parallel_batch_kind(
+            &call(
+                "shell_session",
+                json!({"action":"read","process_id":process_id}),
+            ),
+            AgentToolProfile::Coding,
+            executor.registry(),
+            &executor,
+        )
+        .await;
+        assert_eq!(
+            extend_parallel_batch(&mut first.clone(), read),
+            can_parallel
+        );
+    }
     for action in ["write", "terminate"] {
         let kind = provider_parallel_batch_kind(
             &call("shell_session", json!({"action":action,"process_id":"one"})),

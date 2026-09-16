@@ -30,6 +30,7 @@ use unicode_width::UnicodeWidthStr;
 
 const MAX_OSC52_BYTES: usize = 100 * 1024;
 static ALTERNATE_SCREEN_ACTIVE: AtomicBool = AtomicBool::new(true);
+static MOUSE_CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Crossterm backend that keeps adjacent wide glyphs contiguous in the output stream.
 ///
@@ -326,6 +327,10 @@ pub(crate) fn alternate_screen_active() -> bool {
     ALTERNATE_SCREEN_ACTIVE.load(Ordering::Relaxed)
 }
 
+pub(crate) fn set_mouse_capture_active(active: bool) {
+    MOUSE_CAPTURE_ACTIVE.store(active, Ordering::Relaxed);
+}
+
 pub(crate) fn restored_inline_viewport(saved: Option<Rect>, size: Size) -> Rect {
     let saved = saved.unwrap_or(Rect::new(0, 0, size.width, size.height.max(1)));
     let width = saved.width.min(size.width).max(1);
@@ -436,7 +441,11 @@ fn suspend_terminal() -> io::Result<()> {
     disable_raw_mode()?;
     let alternate_screen = ALTERNATE_SCREEN_ACTIVE.load(Ordering::Relaxed);
     if let Err(error) = suspend_terminal_output(&mut io::stdout(), alternate_screen) {
-        let output_restore = resume_terminal_output(&mut io::stdout(), alternate_screen);
+        let output_restore = resume_terminal_output(
+            &mut io::stdout(),
+            alternate_screen,
+            MOUSE_CAPTURE_ACTIVE.load(Ordering::Relaxed),
+        );
         let raw_restore = enable_raw_mode();
         return Err(combine_terminal_errors(
             "suspend terminal output",
@@ -454,6 +463,7 @@ fn resume_terminal() -> io::Result<()> {
     let output = resume_terminal_output(
         &mut io::stdout(),
         ALTERNATE_SCREEN_ACTIVE.load(Ordering::Relaxed),
+        MOUSE_CAPTURE_ACTIVE.load(Ordering::Relaxed),
     );
     let raw_mode = enable_raw_mode();
     combine_terminal_results([
@@ -502,13 +512,16 @@ fn suspend_terminal_output(writer: &mut impl Write, alternate_screen: bool) -> i
     Ok(())
 }
 
-fn resume_terminal_output(writer: &mut impl Write, alternate_screen: bool) -> io::Result<()> {
+fn resume_terminal_output(
+    writer: &mut impl Write,
+    alternate_screen: bool,
+    capture_mouse: bool,
+) -> io::Result<()> {
     if alternate_screen {
-        execute!(
-            writer,
-            EnterAlternateScreen,
-            crossterm::event::EnableMouseCapture
-        )?;
+        execute!(writer, EnterAlternateScreen)?;
+    }
+    if capture_mouse {
+        execute!(writer, crossterm::event::EnableMouseCapture)?;
     }
     execute!(writer, EnableBracketedPaste)
 }
@@ -595,17 +608,21 @@ mod tests {
 
     #[test]
     fn suspended_terminal_preserves_inline_and_alternate_screen_modes() {
+        let mut auth_resume = Vec::new();
+        resume_terminal_output(&mut auth_resume, true, false).expect("auth resume");
+        assert!(contains_bytes(&auth_resume, b"\x1b[?1049h"));
+        assert!(!contains_bytes(&auth_resume, b"\x1b[?1000h"));
         let mut alternate_suspend = Vec::new();
         suspend_terminal_output(&mut alternate_suspend, true).expect("alternate suspend");
         let mut alternate_resume = Vec::new();
-        resume_terminal_output(&mut alternate_resume, true).expect("alternate resume");
+        resume_terminal_output(&mut alternate_resume, true, true).expect("alternate resume");
         assert!(contains_bytes(&alternate_suspend, b"\x1b[?1049l"));
         assert!(contains_bytes(&alternate_resume, b"\x1b[?1049h"));
 
         let mut inline_suspend = Vec::new();
         suspend_terminal_output(&mut inline_suspend, false).expect("inline suspend");
         let mut inline_resume = Vec::new();
-        resume_terminal_output(&mut inline_resume, false).expect("inline resume");
+        resume_terminal_output(&mut inline_resume, false, false).expect("inline resume");
         assert!(!contains_bytes(&inline_suspend, b"\x1b[?1049l"));
         assert!(!contains_bytes(&inline_resume, b"\x1b[?1049h"));
 

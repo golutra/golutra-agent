@@ -321,7 +321,7 @@ pub(super) fn contract(tool_name: &str, side_effect_type: SideEffectType) -> Too
                 },
                 "reasoning_effort": {
                     "type": "string",
-                    "enum": ["low", "medium", "high", "xhigh"],
+                    "enum": ["low", "medium", "high", "xhigh", "max", "ultra"],
                     "description": "Optional reasoning override; omit to inherit."
                 }
             },
@@ -371,7 +371,7 @@ pub(super) fn contract(tool_name: &str, side_effect_type: SideEffectType) -> Too
                     "maximum": max_poll_wait_ms(),
                     "description": "Initial wait before returning a running process ID; default 10000, or 0 with background=true. Does not set or extend process lifetime."
                 },
-                "max_output_bytes": {"type": "integer", "minimum": 256, "maximum": 4096, "description": "Output page size; default 1024. Read remaining pages with shell_session."}
+                "max_output_bytes": {"type": "integer", "minimum": 256, "description": "Optional preview budget in bytes (minimum 256); normally omit. Default 12288; larger requests are capped by runtime/context policy. Continue only if more output is needed."}
             },
             "required": []
         }),
@@ -425,13 +425,13 @@ fn shell_session_schema() -> Value {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "action": {"type": "string", "enum": ["wait", "write", "terminate", "list"], "description": "Wait/read, write stdin, terminate, or list this session's processes."},
+            "action": {"type": "string", "enum": ["wait", "read", "write", "terminate", "list"], "description": "Wait for execution, read available output without waiting, write stdin, terminate, or list processes. Unread output does not mean execution is still running."},
             "offset": {"type":"integer", "minimum":0, "description":"List offset; follow next_offset while has_more."},
             "limit": {"type":"integer", "minimum":1, "maximum":64, "description":"Processes per list page; default 4."},
             "process_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "ID returned by shell; required except for list."},
             "authoritative_pid": {"type": "integer", "minimum": 1, "maximum": u32::MAX, "description": "Optional extra OS PID check; must match start if supplied."},
             "cursor": {"type": "integer", "minimum": 0, "description": "Optional byte cursor for repeatable reads; omitted continues after the last delivered page."},
-            "max_output_bytes": {"type": "integer", "minimum": 256, "maximum": 4096, "description": "Output page size; default 1024. Continue reading while output_has_more is true."},
+            "max_output_bytes": {"type": "integer", "minimum": 256, "description": "Optional preview budget in bytes (minimum 256); normally omit. Default 12288; larger requests are capped by runtime/context policy. Continue only if more output is needed."},
             "input": {"type": "string", "maxLength": MAX_PROCESS_INPUT_CHARS, "description": "Stdin text for write."},
             "wait_ms": {"type": "integer", "minimum": 0, "maximum": max_poll_wait_ms(), "description": "Bounded event-driven wait in ms. Reaching this deadline does not stop the process."},
             "wait_for_terminal": {"type": "boolean", "description": "Wait for one terminal state or deadline."}

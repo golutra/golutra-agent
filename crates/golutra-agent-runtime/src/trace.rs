@@ -84,6 +84,7 @@ pub enum AgentLoopTraceEvent {
         provider_id: String,
         model_id: String,
         error: String,
+        metadata: Option<golutra_agent_llm::ProviderErrorMetadata>,
     },
     TokenUsageRecorded(golutra_agent_core::TokenUsageRecord),
     ToolStarted {

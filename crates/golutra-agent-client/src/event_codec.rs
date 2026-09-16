@@ -1018,6 +1018,7 @@ pub(crate) fn trace_event_payload(
             provider_id,
             model_id,
             error,
+            metadata,
         } => Some((
             RuntimeEventType::ProviderFailed,
             RuntimeEventSource::Provider,
@@ -1027,6 +1028,13 @@ pub(crate) fn trace_event_payload(
                 "provider_id": provider_id,
                 "model_id": model_id,
                 "error": error,
+                "error_metadata": metadata.map(|metadata| json!({
+                    "response_http_status": metadata.response_http_status,
+                    "http_status": metadata.http_status,
+                    "provider_code": metadata.provider_code,
+                    "request_id": metadata.request_id,
+                    "retry_after_ms": metadata.retry_after.map(|delay| delay.as_millis()),
+                })),
             }),
         )),
         AgentLoopTraceEvent::TokenUsageRecorded(record) => Some((
@@ -1425,6 +1433,29 @@ mod tests {
     use golutra_agent_core::WorkspaceChangeRequirement;
 
     use super::*;
+
+    #[test]
+    fn provider_failure_trace_persists_structured_diagnostics() {
+        let (_, _, payload) = trace_event_payload(AgentLoopTraceEvent::ProviderFailed {
+            request_id: golutra_agent_core::ProviderRequestId::new(),
+            provider_id: "custom".to_owned(),
+            model_id: "fixture".to_owned(),
+            error: "provider failed: invalid request".to_owned(),
+            metadata: Some(golutra_agent_llm::ProviderErrorMetadata {
+                response_http_status: Some(200),
+                http_status: Some(400),
+                provider_code: Some("invalid_request".to_owned()),
+                request_id: Some("fixture-400".to_owned()),
+                retry_after: None,
+            }),
+        })
+        .expect("provider failure payload");
+        assert_eq!(payload["error_metadata"]["response_http_status"], 200);
+        assert_eq!(payload["error_metadata"]["http_status"], 400);
+        assert_eq!(payload["error_metadata"]["request_id"], "fixture-400");
+        assert!(payload["error_metadata"]["retry_after_ms"].is_null());
+        assert_eq!(payload["error"], "provider failed: invalid request");
+    }
 
     #[test]
     fn legacy_pending_turn_recovery_rebuilds_its_task_contract() {

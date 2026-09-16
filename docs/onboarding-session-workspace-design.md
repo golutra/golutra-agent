@@ -302,7 +302,7 @@ TUI 输入框现在先经过 slash command parser：
 | `/auth status` | 展示 provider onboarding 状态 |
 | `/auth protocols` | 展示注册 provider protocols |
 | `/auth mock` | 将全局 provider 切换为 mock |
-| `/auth login [--protocol <protocol>] --base-url <url> --model <model> [--api-key <key>\|--api-key-env <env>] [--store disk\|environment] [--enable-thinking] [--reasoning-effort low\|medium\|high\|xhigh] [--context-window-size <n>] [--max-tokens <n>] [--scope user]` | secret/config/probe 事务成功后保存 provider v2；交互 key 默认进入 credentials file |
+| `/auth login [--protocol <protocol>] --base-url <url> --model <model> [--api-key <key>\|--api-key-env <env>] [--store disk\|environment] [--enable-thinking] [--reasoning-effort low\|medium\|high\|xhigh\|max\|ultra] [--context-window-size <n>] [--max-tokens <n>] [--scope user]` | secret/config/probe 事务成功后保存 provider v2；交互 key 默认进入 credentials file |
 | `/auth oauth-login --descriptor <json> --flow browser\|device --base-url <url> --model <model> [--profile <name>] [--protocol <protocol>]` | 在后台执行 PKCE/device OAuth、保存安全 token set并 probe 后激活 profile |
 | `/auth logout [profile]` | revoke（provider 支持时）并删除本地 credential，禁用 profile；省略 profile 时退出 active profile |
 | `/auth use <profile> [user]` | 激活已保存的全局 provider profile |

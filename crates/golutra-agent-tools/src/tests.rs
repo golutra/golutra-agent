@@ -363,8 +363,19 @@ async fn delegated_task_is_registered_only_with_a_backend_and_tracks_workspace_c
     assert_eq!(contract.side_effect_type, SideEffectType::Process);
     assert_eq!(
         contract.input_schema["properties"]["reasoning_effort"]["enum"],
-        json!(["low", "medium", "high", "xhigh"])
+        json!(["low", "medium", "high", "xhigh", "max", "ultra"])
     );
+    for effort in ["max", "ultra"] {
+        executor
+            .registry()
+            .validate_tool_arguments(
+                contract,
+                &json!({
+                    "task":"inspect fixture", "reasoning_effort":effort
+                }),
+            )
+            .expect("extended effort is accepted by the delegation schema");
+    }
     let policy = executor.evaluate(&request).expect("delegation policy");
     assert_eq!(policy.decision, PolicyDecision::Allow);
     assert!(!policy.resource.contains("inspect and update"));
@@ -5700,6 +5711,79 @@ fn validation_errors_mask_argument_values() {
 
     assert!(!error.contains("plain-secret-value"));
     assert!(error.contains("<redacted-value>"));
+}
+
+#[test]
+fn shell_page_size_errors_identify_the_control_without_exposing_text_values() {
+    let workspace = tempdir().expect("workspace");
+    let executor = executor(workspace.path());
+    for tool in ["shell", "shell_session"] {
+        for (value, expected) in [
+            (json!(255), "255 is less than the minimum of 256"),
+            (json!("plain-secret-value"), "<redacted-value>"),
+        ] {
+            let mut arguments = json!({"max_output_bytes":value});
+            if tool == "shell_session" {
+                arguments["action"] = json!("list");
+            }
+            let error = executor
+                .evaluate(&request(tool, arguments))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("max_output_bytes:"), "{error}");
+            assert!(error.contains(expected), "{error}");
+            assert!(!error.contains("plain-secret-value"), "{error}");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn rejected_shell_page_size_never_executes_and_explicit_correction_succeeds() {
+    // Repeat with fresh process state, including an observable side effect so
+    // silently clamping the rejected request would fail the test.
+    for _ in 0..3 {
+        let workspace = tempdir().expect("workspace");
+        let executor = executor(workspace.path()).with_sandbox(SystemSandbox::process_only());
+        let mut call = request(
+            "shell",
+            json!({
+                "argv":["/bin/sh", "-c", "printf x >> launches; printf done"],
+                "max_output_bytes":255
+            }),
+        );
+        let error = executor
+            .execute(call.clone(), CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(!workspace.path().join("launches").exists());
+        let report = executor.invalid_request_report(call.clone(), error.to_string());
+        assert_eq!(report.envelope.status, ToolResultStatus::Error);
+        assert_eq!(report.envelope.summary, "tool request is invalid");
+        assert!(
+            report
+                .envelope
+                .model_visible_excerpt
+                .as_deref()
+                .expect("diagnostic")
+                .contains("max_output_bytes: 255 is less than the minimum of 256")
+        );
+        call.arguments["max_output_bytes"] = json!(4096);
+        let report = execute_approved(&executor, call, CancellationToken::new()).await;
+        assert_eq!(report.envelope.status, ToolResultStatus::Ok);
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("launches")).unwrap(),
+            "x"
+        );
+        assert!(
+            report
+                .envelope
+                .model_visible_excerpt
+                .as_deref()
+                .expect("output")
+                .contains("done")
+        );
+    }
 }
 
 #[test]

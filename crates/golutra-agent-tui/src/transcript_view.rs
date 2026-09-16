@@ -440,8 +440,19 @@ fn transcript_operation_projections_after(
     items.extend(app.command_messages.iter().cloned().map(notice_projection));
     if let Some(projection) = &app.projection {
         if has_event_items {
+            // 分页历史不一定包含投影中的失败步骤；仅去重当前事件窗口实际展示的错误。
+            let failures = app
+                .events
+                .iter()
+                .filter(|event| {
+                    event.task_id == projection.task_id
+                        && event.event_type == RuntimeEventType::LoopDecided
+                        && status_event_transcript_item(event).is_some()
+                })
+                .filter_map(event_summary)
+                .collect::<Vec<_>>();
             items.extend(
-                projection_overlay_items(projection)
+                risk_overlay_items(projection, &failures)
                     .into_iter()
                     .map(notice_projection),
             );
@@ -748,6 +759,8 @@ fn event_operation_entries_with_boundary(
     let mut subagent_updates = HashMap::new();
     let mut turns_with_user_steps = HashSet::<TurnId>::new();
     let mut covered_user_step_tools = HashSet::<OperationId>::new();
+    let mut provider_failures = HashMap::new();
+    let mut reported_failures = HashSet::new();
     for event in typed_events {
         if event.event_type.is_task_terminal() {
             for record in &mut items {
@@ -761,6 +774,11 @@ fn event_operation_entries_with_boundary(
             }
         }
         match event.event_type {
+            RuntimeEventType::ProviderFailed => {
+                if let Some(task_id) = event.task_id {
+                    provider_failures.insert(task_id, event);
+                }
+            }
             RuntimeEventType::TaskCreated => {
                 let is_new_turn = event
                     .turn_id
@@ -1022,7 +1040,33 @@ fn event_operation_entries_with_boundary(
                 );
             }
             _ => {
-                if let Some(item) = status_event_transcript_item(event) {
+                // 同一任务的执行错误已展示后，终态仅确认状态，不再输出重复系统卡。
+                if event.event_type == RuntimeEventType::TaskCompleted
+                    && event_task_status(event) == Some(TaskStatus::Failed)
+                    && event
+                        .task_id
+                        .is_some_and(|id| reported_failures.contains(&id))
+                {
+                    continue;
+                }
+                if let Some(mut item) = status_event_transcript_item(event) {
+                    if event.event_type == RuntimeEventType::LoopDecided {
+                        item.title = "Task failed".to_owned();
+                        item.role = TranscriptRole::Error;
+                        if let Some(task_id) = event.task_id {
+                            reported_failures.insert(task_id);
+                            if let Some(failure) = provider_failures.get(&task_id)
+                                && let Some(error) =
+                                    failure.payload.get("error").and_then(Value::as_str)
+                                && failure.turn_id == event.turn_id
+                                && failure_event_error(event)
+                                    .is_some_and(|detail| detail.contains(error))
+                            {
+                                item.body = vec![visible_failure_detail(error).to_owned()];
+                                item.body.extend(provider_failure_details(failure));
+                            }
+                        }
+                    }
                     items.push(EventOperationEntry::new(
                         event,
                         notice_projection(item),
@@ -1324,11 +1368,19 @@ fn tool_started_projection(event: &RuntimeEvent) -> Option<OperationProjection> 
         id,
         item: TranscriptItem {
             role: TranscriptRole::Activity,
-            title: if invocation.is_empty()
+            title: if tool_name == "shell_session"
+                && arguments
+                    .and_then(|args| args.get("action"))
+                    .and_then(Value::as_str)
+                    == Some("read")
+            {
+                "Reading terminal output".to_owned()
+            } else if invocation.is_empty()
                 || matches!(
                     tool_name,
                     "shell" | "shell_session" | "subagent" | "delegate_task"
-                ) {
+                )
+            {
                 running_tool_title(tool_name)
             } else {
                 format!(
@@ -1423,9 +1475,17 @@ fn tool_operation_projection(event: &RuntimeEvent) -> Option<OperationProjection
     let process_state = facts
         .and_then(|facts| facts.get("process_state"))
         .and_then(Value::as_str);
-    let running_process =
-        matches!(tool_name, "shell" | "shell_session") && process_state == Some("running");
-    if running_process {
+    let reading_output = tool_name == "shell_session"
+        && facts
+            .and_then(|facts| facts.get("action"))
+            .and_then(Value::as_str)
+            == Some("read");
+    let running_process = !reading_output
+        && matches!(tool_name, "shell" | "shell_session")
+        && process_state == Some("running");
+    if reading_output && status == ToolResultStatus::Ok {
+        title = "Read terminal output".to_owned();
+    } else if running_process {
         title = if tool_name == "shell" {
             "Background terminal running"
         } else {
@@ -1496,7 +1556,12 @@ fn tool_operation_projection(event: &RuntimeEvent) -> Option<OperationProjection
         details.push("workspace changes unknown".to_owned());
     }
     if status != ToolResultStatus::Ok && !partial_child && !summary.trim().is_empty() {
-        body.push(summary.to_owned());
+        if let Some(diagnostic) = invalid_tool_request_diagnostic(event) {
+            title = format!("Failed · {tool_name}");
+            body.extend(bounded_output_lines(&diagnostic, 3));
+        } else {
+            body.push(summary.to_owned());
+        }
     }
     if delegated {
         if let Some(issues) = facts
@@ -1624,6 +1689,9 @@ fn project_process_update(
         && terminal
         && existing_notice.is_none()
         && items[target].projection.item(false).role == TranscriptRole::Activity;
+    // A late process event must not relabel a completed foreground command as
+    // a background job. Still refresh its process details below.
+    let completed_foreground = items[target].projection.item(false).title == "ran";
     let state = event
         .payload
         .get("process_state")
@@ -1637,6 +1705,7 @@ fn project_process_update(
     };
     let title = match state {
         "running" => "Background terminal running",
+        "exited" if completed_foreground => "ran",
         "exited" => "Background terminal completed",
         "cancelled" => "Background terminal cancelled",
         "terminated" => "Background terminal stopped",
@@ -2369,9 +2438,7 @@ pub(crate) fn status_event_transcript_item(event: &RuntimeEvent) -> Option<Trans
         return tool_event_transcript_item(event);
     }
     if event.event_type == RuntimeEventType::TaskCompleted
-        && event.payload.get("status").cloned().and_then(|status| {
-            serde_json::from_value::<golutra_agent_core::TaskStatus>(status).ok()
-        }) == Some(golutra_agent_core::TaskStatus::Completed)
+        && event_task_status(event) == Some(TaskStatus::Completed)
     {
         return None;
     }
@@ -2386,8 +2453,45 @@ pub(crate) fn status_event_transcript_item(event: &RuntimeEvent) -> Option<Trans
     Some(TranscriptItem {
         role: TranscriptRole::Status,
         title: title.to_owned(),
-        body: vec![summary],
+        body: vec![if event.event_type == RuntimeEventType::LoopDecided {
+            visible_failure_detail(failure_event_error(event).unwrap_or(&summary)).to_owned()
+        } else {
+            summary
+        }],
     })
+}
+
+fn event_task_status(event: &RuntimeEvent) -> Option<TaskStatus> {
+    serde_json::from_value(event.payload.get("status")?.clone()).ok()
+}
+
+// Keep argument rejection visible in collapsed and restored history, where
+// a generic summary alone gives neither the user nor the operator a cause.
+fn invalid_tool_request_diagnostic(event: &RuntimeEvent) -> Option<String> {
+    let envelope = event.payload.get("envelope")?;
+    if tool_result_status(event) != ToolResultStatus::Error
+        || envelope.get("summary").and_then(Value::as_str) != Some("tool request is invalid")
+    {
+        return None;
+    }
+    let tool_name = envelope
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .unwrap_or("tool");
+    let reason = envelope
+        .pointer("/structured_facts/error")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            envelope
+                .get("model_visible_excerpt")
+                .and_then(Value::as_str)
+        })?;
+    let reason = reason
+        .strip_prefix("tool arguments are invalid: ")
+        .unwrap_or(reason);
+    let prefix = format!("tool `{tool_name}` arguments do not match its contract: ");
+    Some(reason.strip_prefix(&prefix).unwrap_or(reason).to_owned())
 }
 
 fn tool_event_transcript_item(event: &RuntimeEvent) -> Option<TranscriptItem> {
@@ -2402,6 +2506,13 @@ fn tool_event_transcript_item(event: &RuntimeEvent) -> Option<TranscriptItem> {
     let tool_name = envelope
         .and_then(|value| value.get("tool_name"))
         .and_then(Value::as_str);
+    if let Some(diagnostic) = invalid_tool_request_diagnostic(event) {
+        return Some(TranscriptItem {
+            role: tool_status_role(status),
+            title: format!("Failed · {}", tool_name.unwrap_or("tool")),
+            body: bounded_output_lines(&diagnostic, 3),
+        });
+    }
     let facts = envelope.and_then(|value| value.get("structured_facts"));
     match tool_name {
         Some("shell") => {
@@ -2554,6 +2665,14 @@ pub(crate) fn projection_items(projection: &UserProjection) -> Vec<TranscriptIte
         .visible_steps
         .iter()
         .filter(|step| significant_step(step))
+        .filter(|step| {
+            !(step.label == "TaskCompleted"
+                && step.status == "Failed"
+                && projection
+                    .visible_steps
+                    .iter()
+                    .any(|other| other.label == "LoopDecided" && significant_step(other)))
+        })
         .map(step_item)
         .collect::<Vec<_>>();
     if let Some(pending_approval) = &projection.pending_approval {
@@ -2570,26 +2689,113 @@ pub(crate) fn projection_items(projection: &UserProjection) -> Vec<TranscriptIte
             body: vec![final_message.to_owned()],
         });
     }
-    if !projection.residual_risks.is_empty() {
+    items.extend(projection_overlay_items(projection));
+    items
+}
+
+pub(crate) fn projection_overlay_items(projection: &UserProjection) -> Vec<TranscriptItem> {
+    let failures = projection
+        .visible_steps
+        .iter()
+        .filter(|step| step.label == "LoopDecided" && significant_step(step))
+        .map(|step| step.summary.clone())
+        .collect::<Vec<_>>();
+    risk_overlay_items(projection, &failures)
+}
+
+fn risk_overlay_items(projection: &UserProjection, failures: &[String]) -> Vec<TranscriptItem> {
+    let mut items = Vec::new();
+    let risks = projection
+        .residual_risks
+        .iter()
+        .filter(|risk| {
+            let risk = execution_error_detail(risk);
+            let duplicate = failures
+                .iter()
+                .any(|failure| execution_error_detail(failure) == risk);
+            let derivative = risk == "verification evidence is insufficient"
+                && failures
+                    .iter()
+                    .any(|failure| failure.contains("provider call failed:"));
+            !duplicate && !derivative
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !risks.is_empty() {
         items.push(TranscriptItem {
             role: TranscriptRole::Status,
             title: "Residual risks".to_owned(),
-            body: projection.residual_risks.clone(),
+            body: risks,
         });
     }
     items
 }
 
-pub(crate) fn projection_overlay_items(projection: &UserProjection) -> Vec<TranscriptItem> {
-    let mut items = Vec::new();
-    if !projection.residual_risks.is_empty() {
-        items.push(TranscriptItem {
-            role: TranscriptRole::Status,
-            title: "Residual risks".to_owned(),
-            body: projection.residual_risks.clone(),
-        });
+fn execution_error_detail(mut text: &str) -> &str {
+    while let Some(detail) = text.strip_prefix("runtime task execution failed: ") {
+        text = detail;
     }
-    items
+    text
+}
+
+// Failure summaries are intentionally compact. The error field keeps the
+// complete, already sanitized diagnostic and must also win during replay.
+fn failure_event_error(event: &RuntimeEvent) -> Option<&str> {
+    ["error", "summary"].into_iter().find_map(|key| {
+        event
+            .payload
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+    })
+}
+
+fn visible_failure_detail(mut text: &str) -> &str {
+    // Strip only known error wrappers, never arbitrary provider message text.
+    loop {
+        let Some(detail) = [
+            "runtime task execution failed: ",
+            "provider call failed: ",
+            "provider failed: ",
+            "provider is temporarily unavailable: ",
+        ]
+        .into_iter()
+        .find_map(|prefix| text.strip_prefix(prefix)) else {
+            break;
+        };
+        text = detail;
+    }
+    // Genai also uses StreamParse for response.failed business errors. Present
+    // its actual cause without claiming every such error is a JSON parse error.
+    if text.starts_with("Failed to parse stream data for model '")
+        && let Some((_, cause)) = text.split_once("Cause: ")
+        && !cause.trim().is_empty()
+    {
+        return cause;
+    }
+    text
+}
+
+fn provider_failure_details(event: &RuntimeEvent) -> Vec<String> {
+    let Some(metadata) = event.payload.get("error_metadata") else {
+        return Vec::new();
+    };
+    [
+        ("response_http_status", "HTTP response"),
+        ("http_status", "Error status"),
+        ("provider_code", "Provider code"),
+        ("request_id", "Request ID"),
+    ]
+    .into_iter()
+    .filter_map(|(key, label)| {
+        let value = metadata.get(key).filter(|value| !value.is_null())?;
+        let text = value
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| value.to_string());
+        Some(format!("{label}: {text}"))
+    })
+    .collect()
 }
 
 pub(crate) fn significant_step(step: &VisibleStep) -> bool {
@@ -2600,6 +2806,13 @@ pub(crate) fn significant_step(step: &VisibleStep) -> bool {
 }
 
 pub(crate) fn step_item(step: &VisibleStep) -> TranscriptItem {
+    if step.label == "LoopDecided" && significant_step(step) {
+        return TranscriptItem {
+            role: TranscriptRole::Error,
+            title: "Task failed".to_owned(),
+            body: vec![visible_failure_detail(&step.summary).to_owned()],
+        };
+    }
     let role = if step.status.eq_ignore_ascii_case("failed")
         || step.summary.to_ascii_lowercase().contains("error")
     {
@@ -2838,6 +3051,61 @@ mod tests {
             entries[0].projection.item(false).title,
             "Subagents · 1 finished · 1 running"
         );
+    }
+
+    #[test]
+    fn completed_foreground_and_output_reads_have_distinct_titles() {
+        let call = ToolCallId::new();
+        let process = format!("proc-{call}");
+        let reading = tool_event(
+            0,
+            RuntimeEventType::ToolStarted,
+            json!({
+                "tool_call_id":ToolCallId::new(),"tool_name":"shell_session",
+                "arguments":{"action":"read","process_id":process}
+            }),
+        );
+        assert_eq!(
+            tool_started_projection(&reading).unwrap().item(false).title,
+            "Reading terminal output"
+        );
+        let completed = tool_event(
+            1,
+            RuntimeEventType::ToolCompleted,
+            json!({
+                "envelope":{"tool_call_id":call,"tool_name":"shell","status":"ok",
+                    "structured_facts":{"process_id":process,"command":"ls","process_state":"exited","terminal":true}}
+            }),
+        );
+        let updated = tool_event(
+            2,
+            RuntimeEventType::ProcessUpdated,
+            json!({
+                "process_id":process,"command":"ls","process_state":"exited","terminal":true,"exit_code":0
+            }),
+        );
+        let entries = event_operation_entries(&[completed, updated]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].projection.item(false).title, "ran");
+        for state in ["running", "exited"] {
+            let read = tool_event(
+                3,
+                RuntimeEventType::ToolCompleted,
+                json!({
+                    "envelope":{"tool_call_id":ToolCallId::new(),"tool_name":"shell_session","status":"ok",
+                        "structured_facts":{"process_id":process,"command":"ls","action":"read","process_state":state}}
+                }),
+            );
+            let entries = event_operation_entries(&[read]);
+            assert_eq!(
+                entries[0].projection.item(false).title,
+                "Read terminal output"
+            );
+            assert_eq!(
+                entries[0].projection.item(false).role,
+                TranscriptRole::Success
+            );
+        }
     }
 
     #[test]
@@ -3591,6 +3859,41 @@ mod tests {
 
         assert_eq!(item.role, TranscriptRole::Error);
         assert_eq!(item.title, "Failed");
+    }
+
+    #[test]
+    fn invalid_tool_arguments_show_the_cause_in_collapsed_and_restored_history() {
+        let cause = "max_output_bytes: 20000 is greater than the maximum of 4096";
+        let diagnostic = format!(
+            "tool arguments are invalid: tool `shell` arguments do not match its contract: {cause}"
+        );
+        for facts in [json!({"error":diagnostic}), json!({})] {
+            let event = tool_event(
+                1,
+                RuntimeEventType::ToolCompleted,
+                json!({
+                    "envelope": {
+                        "tool_call_id": ToolCallId::new(), "tool_name":"shell", "status":"error",
+                        "summary":"tool request is invalid", "structured_facts":facts,
+                        "model_visible_excerpt":diagnostic
+                    }
+                }),
+            );
+            let projection = event_operation_projections(std::slice::from_ref(&event)).remove(0);
+            for item in [
+                projection.item(false),
+                projection.item(true),
+                tool_event_transcript_item(&event).unwrap(),
+            ] {
+                assert_eq!(item.role, TranscriptRole::Error);
+                assert_eq!(item.title, "Failed · shell");
+                assert!(item.body.iter().any(|line| line == cause), "{item:?}");
+            }
+            let OperationProjection::ToolActivity { details, .. } = projection else {
+                panic!("tool activity")
+            };
+            assert!(details.contains(&diagnostic));
+        }
     }
 
     #[test]

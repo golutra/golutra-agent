@@ -143,12 +143,12 @@ impl NonSecretRuntimeSettings {
             ));
         }
         if let Some(effort) = &self.reasoning_effort
-            && !["default", "low", "medium", "high", "xhigh"]
+            && !["default", "low", "medium", "high", "xhigh", "max", "ultra"]
                 .iter()
                 .any(|allowed| effort.eq_ignore_ascii_case(allowed))
         {
             return Err(ConfigError::Validation(
-                "reasoning_effort must be `default`, `low`, `medium`, `high`, or `xhigh`"
+                "reasoning_effort must be `default`, `low`, `medium`, `high`, `xhigh`, `max`, or `ultra`"
                     .to_owned(),
             ));
         }

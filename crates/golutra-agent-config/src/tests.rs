@@ -1444,6 +1444,21 @@ fn non_secret_runtime_settings_reject_symlinked_layers() {
 }
 
 #[test]
+fn non_secret_runtime_settings_accept_max_and_ultra() {
+    for effort in ["max", "ultra"] {
+        let settings = NonSecretRuntimeSettings {
+            reasoning_effort: Some(effort.to_owned()),
+            ..Default::default()
+        };
+        settings.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(settings).unwrap()["reasoning_effort"],
+            effort
+        );
+    }
+}
+
+#[test]
 fn non_secret_runtime_settings_reject_invalid_reasoning_effort() {
     let error = NonSecretRuntimeSettings {
         reasoning_effort: Some("extreme".to_owned()),

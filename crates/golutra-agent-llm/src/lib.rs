@@ -417,8 +417,10 @@ fn canonical_provider_identity(provider_id: &str) -> String {
 }
 
 /// 脱敏后的 provider 诊断元数据，只用于重试决策和可行动的观测。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ProviderErrorMetadata {
+    /// 实际传输状态与 SSE 内错误状态分别保留，避免把响应正文中的 400 当作 HTTP 400。
+    pub response_http_status: Option<u16>,
     pub http_status: Option<u16>,
     pub provider_code: Option<String>,
     pub retry_after: Option<Duration>,
@@ -428,7 +430,8 @@ pub struct ProviderErrorMetadata {
 impl ProviderErrorMetadata {
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.http_status.is_none()
+        self.response_http_status.is_none()
+            && self.http_status.is_none()
             && self.provider_code.is_none()
             && self.retry_after.is_none()
             && self.request_id.is_none()
@@ -977,6 +980,8 @@ pub enum ProviderReasoningEffort {
     Medium,
     High,
     Xhigh,
+    Max,
+    Ultra,
 }
 
 impl ProviderReasoningEffort {
@@ -987,6 +992,8 @@ impl ProviderReasoningEffort {
             Self::Medium => "medium",
             Self::High => "high",
             Self::Xhigh => "xhigh",
+            Self::Max => "max",
+            Self::Ultra => "ultra",
         }
     }
 }
@@ -2438,7 +2445,9 @@ fn is_sensitive_header(name: &str) -> bool {
 
 pub fn provider_tool_description(tool_name: &str) -> &'static str {
     match tool_name {
-        "read_file" => "Read workspace lines; use offset/limit and continuation.next_offset.",
+        "read_file" => {
+            "Read workspace files instead of cat/sed; use offset/limit. Follow continuation.next_offset only when the task needs more content or the full file. Read relevant sections; do not drain unrelated files."
+        }
         "write_file" => {
             "Create a new UTF-8 file or completely rewrite one; returns status and digest."
         }
@@ -2449,7 +2458,7 @@ pub fn provider_tool_description(tool_name: &str) -> &'static str {
             "Atomically apply one unified or Begin/Update/Add/Delete patch; batch related multi-file changes; returns status, digest, preview."
         }
         "shell_session" => {
-            "Wait/read, write, terminate, or list by process_id; automatic cursor. Send waits for different processes in one response in parallel; sequence same-process calls. Follow next_action; read while output_has_more, even after exit. Never restart to read."
+            "Wait for running processes; read available output only as needed, or write/terminate/list by process_id; automatic cursor. Parallel waits for different processes; sequence same-process calls. output_has_more is not running. Never restart to read."
         }
         "subagent" => {
             "Spawn returns child_session_id; omit it on spawn. run_in_background runs concurrently; completion reported. Use returned handles for status/wait/send_input/resume/cancel; wait accepts child_session_ids. explore: read-only. Children cannot delegate."
@@ -3534,6 +3543,7 @@ fn provider_error_metadata(
     let payload_retry_after = value.and_then(provider_error_retry_after);
     let payload_request_id = value.and_then(request_id_from_value);
     ProviderErrorMetadata {
+        response_http_status: status,
         http_status: status.filter(|status| *status >= 400).or(payload_status),
         provider_code: value.and_then(provider_error_code),
         retry_after: payload_retry_after.or_else(|| retry_after_from_headers(headers)),
@@ -3611,14 +3621,11 @@ fn provider_error_from_value(
         .filter(|status| *status >= 400)
         .or_else(|| provider_error_status(value));
     let mapped = provider_error_kind(status, value);
-    if matches!(
-        &mapped,
-        ProviderError::Unavailable { .. } | ProviderError::RateLimited { .. }
-    ) {
-        mapped.with_metadata(provider_error_metadata(status, headers, Some(value)))
-    } else {
-        mapped
-    }
+    mapped.with_metadata(provider_error_metadata(
+        response_status,
+        headers,
+        Some(value),
+    ))
 }
 
 fn provider_credential_error(error: golutra_agent_auth::AuthError) -> ProviderError {

@@ -420,7 +420,7 @@ const SEARCHABLE_SLASH_HINTS: &[SlashCommandHint] = &[
     },
     SlashCommandHint {
         command: "/model",
-        description: "select or override the session model",
+        description: "select the model",
         selection: SlashCommandSelection::Execute,
     },
     SlashCommandHint {
@@ -761,7 +761,7 @@ fn parse_effort_command(tokens: &[String]) -> SlashInput {
     };
     if tokens.len() > 2 {
         return SlashInput::Error(
-            "/effort syntax: /effort [default|low|medium|high|xhigh]".to_owned(),
+            "/effort syntax: /effort [default|low|medium|high|xhigh|max|ultra]".to_owned(),
         );
     }
     SlashInput::Command(SlashCommand::Effort { effort })
@@ -1217,7 +1217,11 @@ fn parse_reasoning_effort(value: &str) -> Result<ProviderReasoningEffort, String
         "medium" => Ok(ProviderReasoningEffort::Medium),
         "high" => Ok(ProviderReasoningEffort::High),
         "xhigh" | "x_high" => Ok(ProviderReasoningEffort::Xhigh),
-        _ => Err("reasoning effort must be one of: low, medium, high, xhigh".to_owned()),
+        "max" => Ok(ProviderReasoningEffort::Max),
+        "ultra" => Ok(ProviderReasoningEffort::Ultra),
+        _ => {
+            Err("reasoning effort must be one of: low, medium, high, xhigh, max, ultra".to_owned())
+        }
     }
 }
 
@@ -1586,7 +1590,7 @@ mod tests {
             slash_command_suggestions("/"),
             vec![
                 "/help - open contextual keyboard reference".to_owned(),
-                "/model - select or override the session model".to_owned(),
+                "/model - select the model".to_owned(),
                 "/resume - open the full-screen session picker".to_owned(),
                 "/status - show runtime status".to_owned(),
                 "/new - start a new session".to_owned(),

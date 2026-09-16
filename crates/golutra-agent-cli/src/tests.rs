@@ -1,6 +1,18 @@
 use super::*;
 
 #[test]
+fn provider_reasoning_effort_accepts_lowercase_max_and_ultra() {
+    assert_eq!(
+        parse_reasoning_effort("max").unwrap(),
+        ProviderReasoningEffort::Max
+    );
+    assert_eq!(
+        parse_reasoning_effort("ultra").unwrap(),
+        ProviderReasoningEffort::Ultra
+    );
+}
+
+#[test]
 fn separate_cli_commands_use_the_same_controller_identity() {
     let session_id = SessionId::new();
     let takeover = command(

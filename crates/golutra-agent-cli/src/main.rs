@@ -2543,8 +2543,10 @@ fn parse_reasoning_effort(value: &str) -> miette::Result<ProviderReasoningEffort
         "medium" => Ok(ProviderReasoningEffort::Medium),
         "high" => Ok(ProviderReasoningEffort::High),
         "xhigh" | "x_high" => Ok(ProviderReasoningEffort::Xhigh),
+        "max" => Ok(ProviderReasoningEffort::Max),
+        "ultra" => Ok(ProviderReasoningEffort::Ultra),
         _ => Err(miette::miette!(
-            "reasoning effort must be one of: low, medium, high, xhigh"
+            "reasoning effort must be one of: low, medium, high, xhigh, max, ultra"
         )),
     }
 }

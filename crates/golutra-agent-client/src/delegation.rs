@@ -1386,8 +1386,10 @@ fn parse_reasoning_effort(value: &Value) -> Result<ProviderReasoningEffort, Clie
         "medium" => Ok(ProviderReasoningEffort::Medium),
         "high" => Ok(ProviderReasoningEffort::High),
         "xhigh" | "x_high" => Ok(ProviderReasoningEffort::Xhigh),
+        "max" => Ok(ProviderReasoningEffort::Max),
+        "ultra" => Ok(ProviderReasoningEffort::Ultra),
         _ => Err(ClientError::TaskExecution(
-            "reasoning_effort must be one of: low, medium, high, xhigh".to_owned(),
+            "reasoning_effort must be one of: low, medium, high, xhigh, max, ultra".to_owned(),
         )),
     }
 }
@@ -1817,6 +1819,16 @@ mod tests {
     use super::*;
     use crate::CommandClaim;
     use crate::event_codec::host_event;
+
+    #[test]
+    fn delegated_reasoning_effort_accepts_max_and_ultra() {
+        for (wire, effort) in [
+            ("max", ProviderReasoningEffort::Max),
+            ("ultra", ProviderReasoningEffort::Ultra),
+        ] {
+            assert_eq!(parse_reasoning_effort(&json!(wire)).unwrap(), effort);
+        }
+    }
 
     #[tokio::test]
     async fn runtime_close_cancels_and_reaps_a_delegation_operation() {

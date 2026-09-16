@@ -385,10 +385,10 @@ fn provider_surface_descriptions_are_bounded_without_dropping_capability_terms()
                 "cursor",
                 "output_has_more",
                 "different processes",
-                "one response",
-                "parallel",
+                "Parallel",
                 "sequence same-process calls",
-                "next_action",
+                "only as needed",
+                "not running",
             ][..],
         ),
         (
@@ -874,6 +874,25 @@ fn openai_config_prefers_configured_custom_api_key_env() {
 }
 
 #[test]
+fn extended_reasoning_efforts_round_trip_and_preserve_openai_wire_values() {
+    for (effort, wire) in [
+        (ProviderReasoningEffort::Max, "max"),
+        (ProviderReasoningEffort::Ultra, "ultra"),
+    ] {
+        let config: ProviderGenerationConfig =
+            serde_json::from_value(json!({"reasoning_effort":wire})).unwrap();
+        assert_eq!(config.reasoning_effort, Some(effort));
+        assert_eq!(
+            serde_json::to_value(&config).unwrap()["reasoning_effort"],
+            wire
+        );
+        let mut body = json!({"messages": []});
+        apply_generation_config_to_openai_body(&mut body, &config);
+        assert_eq!(body["reasoning_effort"], wire);
+    }
+}
+
+#[test]
 fn openai_config_reads_generation_config_and_applies_request_body() {
     let config = OpenAiCompatibleProvider::config_from_env_reader(|key| match key {
         GOLUTRA_AGENT_PROVIDER_API_KEY => Some("golutra-agent-key".to_owned()),
@@ -1067,8 +1086,70 @@ fn transient_error_type_is_classified_without_http_status() {
         &reqwest::header::HeaderMap::new(),
     );
 
-    assert!(matches!(error, ProviderError::Unavailable { .. }));
+    assert!(matches!(&error, ProviderError::WithMetadata { error, .. }
+        if matches!(**error, ProviderError::Unavailable { .. })));
     assert_eq!(error.http_status(), None);
+}
+
+#[tokio::test]
+async fn streamed_text_then_bad_request_preserves_failure_and_transport_evidence() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+    let address = listener.local_addr().expect("address");
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept");
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            request.push(socket.read_u8().await.expect("request header"));
+            assert!(request.len() <= 8192, "bounded fixture request");
+        }
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi!\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"error\":{\"status\":400,\"code\":\"invalid_request\",\"message\":\"400错误，请稍后再试\"}}\n\n"
+        );
+        socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nx-request-id: fixture-stream-400\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.expect("response");
+    });
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("client")
+        .get(format!("http://{address}"))
+        .send()
+        .await
+        .expect("headers");
+    let mut deltas = Vec::new();
+    let error = provider_response_from_openai_stream(response, &mut |event| deltas.push(event))
+        .await
+        .expect_err("visible text does not turn a failed stream into success");
+    server.await.expect("server");
+    assert!(matches!(&deltas[..], [ProviderStreamEvent::TextDelta { text }] if text == "Hi!"));
+    assert!(matches!(&error, ProviderError::WithMetadata { error, .. }
+        if matches!(**error, ProviderError::Failed { .. })));
+    let metadata = error.metadata().expect("diagnostics");
+    assert_eq!(metadata.response_http_status, Some(200));
+    assert_eq!(metadata.http_status, Some(400));
+    assert_eq!(metadata.provider_code.as_deref(), Some("invalid_request"));
+    assert_eq!(metadata.request_id.as_deref(), Some("fixture-stream-400"));
+}
+
+#[test]
+fn hard_provider_error_keeps_redacted_metadata_and_unknown_status() {
+    let error = provider_error_from_value(
+        &json!({"error": {
+            "code": "invalid_request", "request_id": "sk-test1234567890abcdef",
+            "message": "400错误，请稍后再试"
+        }}),
+        None,
+        &reqwest::header::HeaderMap::new(),
+    );
+    let metadata = error.metadata().expect("hard error diagnostics");
+    assert_eq!(metadata.response_http_status, None);
+    assert_eq!(
+        metadata.http_status, None,
+        "message text is not an HTTP status"
+    );
+    assert!(!metadata.request_id.as_deref().unwrap().contains("sk-test"));
+    assert!(matches!(error, ProviderError::WithMetadata { error, .. }
+        if matches!(*error, ProviderError::Failed { .. })));
 }
 
 #[test]
