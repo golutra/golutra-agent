@@ -1951,9 +1951,11 @@ async fn assert_delegation_input_and_cancel(
         .expect("wait cancellation");
     assert_eq!(
         stopped.status,
-        golutra_core::ToolResultStatus::Cancelled,
+        golutra_core::ToolResultStatus::Ok,
         "{stopped:?}"
     );
+    assert_eq!(stopped.structured_facts["child_cancel_requested"], true);
+    assert_eq!(stopped.structured_facts["child_status"], "cancelled");
     assert_ne!(stopped.structured_facts["completed"], true);
     let events = host
         .storage
@@ -10209,6 +10211,7 @@ async fn recovery_transfer_carries_cumulative_governor_and_delegation_state() {
             max_cost_microusd: Some(500),
             started_children: 2,
             spent_tokens: 7_000,
+            spent_output_tokens: None,
             spent_cost_microusd: 125,
         },
     };
@@ -10739,6 +10742,7 @@ fn recovery_transfer_does_not_get_overwritten_by_stale_restarted_turn_metadata()
                 max_cost_microusd: Some(500),
                 started_children: 3,
                 spent_tokens: 8_000,
+                spent_output_tokens: None,
                 spent_cost_microusd: 240,
             },
         }),
@@ -10814,6 +10818,7 @@ fn canonical_delegation_recovery_state(
             max_cost_microusd,
             started_children,
             spent_tokens,
+            spent_output_tokens: None,
             spent_cost_microusd: 0,
         },
     }

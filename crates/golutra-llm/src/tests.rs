@@ -337,6 +337,7 @@ fn provider_tool_descriptions_own_file_and_question_usage_details() {
     assert!(subagent.contains("run_in_background"));
     assert!(subagent.contains("Children cannot delegate"));
     assert!(subagent.contains("child_session_ids"));
+    assert!(subagent.contains("omit it on spawn"));
     assert!(provider_tool_description("shell_session").contains("process_id"));
     assert!(provider_tool_description("shell_session").contains("cursor"));
     assert_ne!(

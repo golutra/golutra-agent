@@ -37,6 +37,15 @@ The parent owns child creation, admission, cancellation and budget settlement. O
 
 Provider requests without matching usage records leave token/cost totals unknown, including a failed resumed request. An earlier turn's known usage cannot make that new request appear free. Admission settlement retains the conservative reservation fallback when usage is unavailable.
 
+Output admission and provider accounting use separate counters. `spent_tokens`
+retains observed total provider usage; `spent_output_tokens` settles the output
+reservation pool. Long cached or uncached input therefore does not consume an
+output allowance. Actual output exhaustion still blocks admission, and explicit
+cost limits remain effective. Missing output usage uses conservative accounting;
+legacy checkpoints without the output counter retain their previous conservative
+total-based charge. Unsettled crash-recovery reservations still exhaust the
+available admission cap until durable settlement replaces them.
+
 Implementation boundaries: `delegation` owns child startup/cleanup, `delegation_control` owns lifecycle requests and result projection, `delegation_policy` owns limits, `delegation_context` owns explicit context inheritance, `delegation_notifications` owns durable completion delivery, and `RuntimeVerificationService` owns contract-aware verification.
 
 ## Explicit parent context
@@ -69,6 +78,11 @@ Shared checkpoint objects are fully written and synced in temporary files before
 
 Batch results include `child_results` and `child_pending_ids`. Failed, interrupted and Partial children are terminal for waiting purposes; terminal does not mean successful. Each result keeps its own session/task identity, findings and verification facts. Results are repeatable and never consumed by a wait; request `status` for a child to page its complete output.
 
+Once a batch wait has observed an execution's terminal result, it retains that
+result instead of querying the session's latest execution again. A concurrent
+resume cannot replace the completed result with a newer running task. Pending
+items are refreshed so simultaneous completions remain visible.
+
 ## Completion delivery and cancellation
 
 Child completion is persisted as a `SubagentUpdated` event in the parent session. TUI cards update independently, and archived cards receive a single completion notice. The model receives a bounded runtime observation at a request boundary; results already returned by a completed tool call are not injected again. Notifications survive reconnect, and missing notices can be reconstructed from persisted launch/result records after orphan reconciliation. Completed or cancelled parent tasks are not automatically restarted; later input can consume the persisted history.
@@ -81,11 +95,36 @@ Child supervisors query durable state on their own control events, completion si
 
 Cancelling a wait cancels only that wait. Interrupting the current parent response stops foreground children but leaves explicitly background children running. `subagent` action `cancel` stops the named child. Protocol `Abort` with `cancel_children: true` also cancels children of an active parent. Host shutdown cancels and reaps all owned work. Deadlines continue to apply to background work.
 
+Observing a parent-requested cancellation is a successful control operation,
+with `child_cancel_requested: true`, while the child's `cancelled`/`interrupted`
+status, `completed: false`, findings and verification diagnostics remain intact.
+The acknowledgement must match that execution's task ID, including after
+reconnect. Unrequested interruption, an already cancelling operation, failure
+or timeout does not become successful through this rule. A new child execution
+explicitly identifies its latest assignment; earlier assignments remain history
+and are not instructions to restart cancelled side effects.
+
 ## Optional worktree isolation
 
 Use `isolation: "worktree"` on spawn for a separate Git checkout of the parent's committed `HEAD`. Uncommitted parent changes are excluded. Tools, project instructions, project verifier discovery and side-effect checkpoints use the child checkout. Runtime identity, storage and permissions still belong to the parent workspace; a worktree is not a security sandbox.
 
 Worktrees are retained under the runtime workspace state directory for review and same-child resume. Results expose `child_workspace_path` and `child_isolation`. No changes are automatically merged, discarded or committed. Resume keeps the original checkout; a missing or replaced checkout fails explicitly instead of silently switching back to the parent directory. Review and integrate changes explicitly, then remove the known checkout with Git when it is no longer needed.
+
+## Batch findings and comparison
+
+Batch waits preserve the terminal execution they actually observed, even if a
+concurrent caller resumes that child before the remaining children finish.
+Model-facing batch results retain child/session identity, terminal state, short
+findings, failure diagnostics and continuation cursors. Repeated governance and
+accounting metadata stays in durable envelopes rather than occupying each child's
+answer budget. Large findings still require explicit pagination; necessary status
+queries, reads and verification remain available.
+
+The [2026-09-16 comparison](benchmarks/subagents-20260916.md) records matched
+Golutra/Codex lifecycle, long-fork, cancellation, coding and ten-child tests,
+including failures and evaluator corrections. The reusable harness is
+`scripts/compare_subagents.py`; run performance samples sequentially, with a new
+private output directory, to avoid mixing resource contention into latency.
 
 ## Validation (2026-09-15)
 

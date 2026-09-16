@@ -1062,6 +1062,85 @@ fn model_visible_read_output_keeps_raw_newlines_and_beats_json_embedding() {
 }
 
 #[test]
+fn ten_short_child_findings_survive_budget_without_repeated_governance_metadata() {
+    let results: Vec<_> = (0..10)
+        .map(|index| {
+            json!({
+        "child_session_id":golutra_core::SessionId::new(), "summary":"subagent completed",
+        "content":format!("fact-{index}"), "facts":{
+            "child_task_id":golutra_core::TaskId::new(), "child_status":"completed",
+            "completed":true,"child_terminal":true,"child_findings_available":true,
+            "child_verification_status":"pass","child_result_has_more":false,
+            "child_task":"verbose original assignment".repeat(100),
+            "verification":{"credential":"must-not-leak","checks":"governance noise".repeat(500)},
+            "usage":{"total_tokens":10000},"delegation":{"depth":1}}})
+        })
+        .collect();
+    let envelope = projection_envelope(
+        "subagent",
+        ToolResultStatus::Ok,
+        "10 subagent results; 0 still running",
+        json!({"child_results":results,"child_pending_ids":[],"completed":true}),
+        None,
+    );
+    let visible = model_visible_tool_result_with_token_budget(&envelope, 2048);
+    let parsed: Value = serde_json::from_str(&visible).unwrap();
+    assert!(!visible.contains("must-not-leak"));
+    assert!(!visible.contains("governance noise"));
+    for (index, child) in parsed["structured_facts"]["child_results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(child["content"], format!("fact-{index}"));
+        assert_eq!(
+            child["facts"]["child_task_id"],
+            results[index]["facts"]["child_task_id"]
+        );
+        assert_eq!(child["facts"]["completed"], true);
+    }
+    assert_eq!(
+        parsed["structured_facts"]["child_results"]
+            .as_array()
+            .unwrap()
+            .len(),
+        10
+    );
+}
+
+#[test]
+fn batch_projection_preserves_child_failure_and_pagination_without_raw_metadata() {
+    let envelope = projection_envelope(
+        "subagent",
+        ToolResultStatus::Ok,
+        "2 child results",
+        json!({"completed":false,"child_results":[
+            {"child_session_id":"failed-child","content":"已完成部分检查","summary":"failed check",
+             "facts":{"child_status":"failed","child_terminal":true,"completed":false,
+                 "child_verification_status":"fail","child_diagnostic":["checksum mismatch"],
+                 "verification":{"secret":"must-not-leak"}}},
+            {"child_session_id":"paged-child","content":"分页结果","facts":{
+                "child_status":"completed","child_task_id":"current-execution",
+                "child_result_has_more":true,"child_result_next_offset":300,"completed":true}}
+        ]}),
+        None,
+    );
+    let visible = model_visible_tool_result_with_token_budget(&envelope, 2048);
+    let value: Value = serde_json::from_str(&visible).unwrap();
+    let children = &value["structured_facts"]["child_results"];
+    assert_eq!(children[0]["content"], "已完成部分检查");
+    assert_eq!(children[0]["facts"]["child_status"], "failed");
+    assert_eq!(
+        children[0]["facts"]["child_diagnostic"][0],
+        "checksum mismatch"
+    );
+    assert_eq!(children[1]["facts"]["child_result_next_offset"], 300);
+    assert_eq!(children[1]["facts"]["child_task_id"], "current-execution");
+    assert!(!visible.contains("must-not-leak"));
+}
+
+#[test]
 fn ten_child_wait_results_keep_handles_and_states_under_the_model_budget() {
     let ids: Vec<_> = (0..10)
         .map(|_| golutra_core::SessionId::new().to_string())

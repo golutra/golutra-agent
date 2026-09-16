@@ -5476,6 +5476,10 @@ fn project_subagent_model_facts(value: &Value) -> Value {
     };
     let mut projected = serde_json::Map::new();
     for (key, value) in source {
+        if key == "child_results" {
+            projected.insert(key.clone(), project_subagent_batch(value));
+            continue;
+        }
         if key.starts_with("child_")
             || matches!(
                 key.as_str(),
@@ -5508,6 +5512,51 @@ fn project_subagent_model_facts(value: &Value) -> Value {
         }
     }
     Value::Object(projected)
+}
+
+fn project_subagent_batch(value: &Value) -> Value {
+    let Some(results) = value.as_array() else {
+        return Value::Null;
+    };
+    // 批量结果先去掉每个子任务重复的治理元数据，再分配内容预算；
+    // 否则十个很短的答案也会因外壳过大被全部压成状态，迫使模型逐一重复查询。
+    let mut projected = results.iter().take(MAX_MODEL_TOOL_RESULT_ITEMS).map(|result| {
+        let source = &result["facts"];
+        let mut facts = serde_json::Map::new();
+        for key in ["child_task_id", "child_status", "child_terminal", "completed",
+            "child_cancel_requested", "child_verification_status", "child_verification_issues",
+            "child_diagnostic", "child_findings_available", "child_result_has_more",
+            "child_result_next_offset", "model_visible_truncated", "child_workspace_path",
+            "child_isolation", "error", "reason", "cancelled", "timed_out", "blocked"] {
+            if let Some(value) = source.get(key)
+                && !value.is_null() && !value.as_array().is_some_and(Vec::is_empty)
+            {
+                facts.insert(key.to_owned(), project_model_tool_value(value, 0));
+            }
+        }
+        let content = result.get("content").and_then(Value::as_str).unwrap_or_default();
+        if content.chars().take(MAX_MODEL_TOOL_RESULT_FACT_STRING_CHARS + 1).count()
+            > MAX_MODEL_TOOL_RESULT_FACT_STRING_CHARS {
+            facts.insert("model_visible_truncated".to_owned(), Value::Bool(true));
+        }
+        let mut item = json!({"child_session_id":result.get("child_session_id"),
+            "content":bounded_text(content, MAX_MODEL_TOOL_RESULT_FACT_STRING_CHARS), "facts":facts});
+        if let Some(error) = result.get("error") {
+            item["error"] = project_model_tool_value(error, 0);
+        }
+        if (content.is_empty() || source["completed"] != true)
+            && let Some(summary) = result.get("summary").and_then(Value::as_str) {
+            item["summary"] = Value::String(bounded_text(summary, MAX_MODEL_TOOL_RESULT_SUMMARY_CHARS));
+        }
+        item
+    }).collect::<Vec<_>>();
+    if results.len() > MAX_MODEL_TOOL_RESULT_ITEMS {
+        projected.push(
+            json!({"omitted_results":results.len()-MAX_MODEL_TOOL_RESULT_ITEMS,
+            "next_action":"read status for the remaining requested child handles"}),
+        );
+    }
+    Value::Array(projected)
 }
 
 fn serialize_model_tool_projection(
@@ -5634,6 +5683,7 @@ fn model_fact_priority(tool_name: &str) -> &'static [&'static str] {
             "child_pending_ids",
             "child_results",
             "child_terminal",
+            "child_cancel_requested",
             "child_task_id",
             "child_result_has_more",
             "child_result_next_offset",
@@ -5727,6 +5777,7 @@ fn model_fact_mandatory(tool_name: &str) -> &'static [&'static str] {
             "child_pending_ids",
             "child_results",
             "child_terminal",
+            "child_cancel_requested",
             "child_task_id",
             "child_result_has_more",
             "child_result_next_offset",

@@ -80,7 +80,7 @@ pub(super) fn validate_start(arguments: &Value) -> Result<(), ClientError> {
             .is_some_and(|value| !value.is_null())
     {
         return Err(ClientError::TaskExecution(
-            "use resume to continue an existing child".to_owned(),
+            "spawn assigns a new child_session_id; omit this field on spawn. Use resume with a returned handle to continue an existing child".to_owned(),
         ));
     }
     Ok(())
@@ -276,8 +276,12 @@ async fn bounded_wait(
     ms: u64,
     cancellation: CancellationToken,
 ) -> Result<TaskDelegationOutput, ClientError> {
-    if let Some(result) = operation.result.borrow().clone() {
-        return result.map_err(ClientError::TaskExecution);
+    // 发布路径先锁 lifecycle 再写 watch；必须先释放 watch 读锁再解释 lifecycle。
+    let cached_result = operation.result.borrow().clone();
+    if let Some(result) = cached_result {
+        return result
+            .map(|output| cancellation_observation(operation, output))
+            .map_err(ClientError::TaskExecution);
     }
     let child = operation_session(operation)
         .ok_or_else(|| ClientError::TaskExecution("child handle is unavailable".to_owned()))?;
@@ -290,9 +294,74 @@ async fn bounded_wait(
     )
     .await
     {
-        Ok(result) => result,
+        Ok(result) => result.map(|output| cancellation_observation(operation, output)),
         Err(_) => Ok(running_operation_output(operation, child, true)),
     }
+}
+
+fn cancellation_observation(
+    operation: &DelegationOperation,
+    mut output: TaskDelegationOutput,
+) -> TaskDelegationOutput {
+    let lifecycle = operation
+        .lifecycle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // 只有父代理明确取消的同一次 execution 可确认为控制成功；失败/超时不能借此放行。
+    if lifecycle.parent_cancel_requested
+        && output.status == ToolResultStatus::Cancelled
+        && matches!(
+            output.structured_facts["child_status"].as_str(),
+            Some("cancelled" | "interrupted")
+        )
+        && output.structured_facts["child_task_id"] == json!(lifecycle.child_task_id)
+        && lifecycle.child_task_id.is_some()
+    {
+        mark_cancellation_observed(&mut output);
+    }
+    output
+}
+
+fn mark_cancellation_observed(output: &mut TaskDelegationOutput) {
+    output.status = ToolResultStatus::Ok;
+    output.summary = "requested subagent cancellation observed".to_owned();
+    output.structured_facts["child_cancel_requested"] = json!(true);
+}
+
+async fn persisted_cancellation_observation(
+    host: &RuntimeHost,
+    request: &ToolRequest,
+    mut output: TaskDelegationOutput,
+) -> Result<TaskDelegationOutput, ClientError> {
+    if output.status != ToolResultStatus::Cancelled
+        || !matches!(
+            output.structured_facts["child_status"].as_str(),
+            Some("cancelled" | "interrupted")
+        )
+        || output.structured_facts["child_task_id"].is_null()
+    {
+        return Ok(output);
+    }
+    // 重连后只相信父会话实际记录的取消确认，且必须匹配同一 child/task，不能按会话泛化。
+    let events = host
+        .storage
+        .repositories
+        .events
+        .load(request.session_id, None, None)
+        .await?;
+    if events.iter().any(|event| {
+        let envelope = &event.payload["envelope"];
+        let facts = &envelope["structured_facts"];
+        event.event_type == RuntimeEventType::ToolCompleted
+            && envelope["tool_name"] == "subagent"
+            && envelope["status"] == "ok"
+            && facts["child_cancel_requested"] == true
+            && facts["child_session_id"] == output.structured_facts["child_session_id"]
+            && facts["child_task_id"] == output.structured_facts["child_task_id"]
+    }) {
+        mark_cancellation_observed(&mut output);
+    }
+    Ok(output)
 }
 
 pub(super) async fn dispatch(
@@ -354,10 +423,16 @@ async fn wait_many(
             .remove("child_session_ids");
         single.arguments["child_session_id"] = json!(child);
         let cancellation = cancellation.clone();
-        waits.push(async move { dispatch_single(host, &single, cancellation, "wait").await });
+        waits.push(async move {
+            (
+                *child,
+                dispatch_single(host, &single, cancellation, "wait").await,
+            )
+        });
     }
     let mut wait_expired = false;
-    while let Some(result) = waits.next().await {
+    let mut observed = std::collections::BTreeMap::new();
+    while let Some((child, result)) = waits.next().await {
         if cancellation.is_cancelled() {
             return Err(ClientError::TaskCancelled);
         }
@@ -368,6 +443,19 @@ async fn wait_many(
                 .and_then(Value::as_bool)
                 == Some(true)
         });
+        // 已返回的终态绑定这次 execution；重新查最新状态会被并发 resume 替换。
+        // 超时/运行中快照仍需刷新，避免 any 模式遗漏同时完成的其他子任务。
+        if result.is_err()
+            || result.as_ref().is_ok_and(|output| {
+                output
+                    .structured_facts
+                    .get("child_terminal")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+            })
+        {
+            observed.insert(child, result);
+        }
         if !wait_all {
             break;
         }
@@ -378,7 +466,11 @@ async fn wait_many(
     for child in targets {
         let mut single = request.clone();
         single.arguments["child_session_id"] = json!(child);
-        match dispatch_single(host, &single, cancellation.clone(), "status").await {
+        let result = match observed.remove(&child) {
+            Some(result) => result,
+            None => dispatch_single(host, &single, cancellation.clone(), "status").await,
+        };
+        match result {
             Ok(output) => {
                 let output = page_output(output, &request.arguments);
                 if output
@@ -438,7 +530,7 @@ async fn dispatch_single(
         }
         "cancel" => {
             if let Some(operation) = &operation {
-                operation.cancel();
+                operation.request_parent_cancellation();
             }
             cancel_child(host, child).await;
         }
@@ -459,13 +551,23 @@ async fn dispatch_single(
         _ => {}
     }
     if let Some(operation) = &operation {
-        if let Some(result) = operation.result.borrow().clone() {
-            return result.map_err(ClientError::TaskExecution);
+        let cached_result = operation.result.borrow().clone();
+        if let Some(result) = cached_result {
+            return result
+                .map(|output| cancellation_observation(operation, output))
+                .map_err(ClientError::TaskExecution);
         }
-        let mut output = running_output(child, false);
+        let mut output = running_operation_output(operation, child, false);
         if action == "cancel" {
             output.summary = "subagent cancellation requested".to_owned();
             output.structured_facts["child_status"] = json!("aborting");
+            output.structured_facts["child_cancel_requested"] = json!(
+                operation
+                    .lifecycle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .parent_cancel_requested
+            );
         } else if host
             .storage
             .repositories
@@ -493,7 +595,8 @@ async fn dispatch_single(
         .projections
         .state(child, None)
         .await?;
-    state_output(host, &state).await
+    let output = state_output(host, &state).await?;
+    persisted_cancellation_observation(host, request, output).await
 }
 
 async fn send_input_once(
@@ -708,6 +811,103 @@ fn findings(events: &[RuntimeEvent], task: Option<golutra_core::TaskId>) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spawn_rejects_a_caller_chosen_name_instead_of_inventing_a_handle() {
+        let error = validate_start(&json!({"action":"spawn","child_session_id":"c0"}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("omit this field on spawn"));
+        assert!(validate_start(&json!({"action":"spawn","task":"read a file"})).is_ok());
+    }
+
+    #[test]
+    fn requested_cancellation_is_an_observation_without_hiding_child_failure() {
+        let operation = DelegationOperation::new(SessionId::new(), CancellationToken::new());
+        let task = golutra_core::TaskId::new();
+        operation.lifecycle.lock().unwrap().child_task_id = Some(task);
+        let result = TaskDelegationOutput {
+            status: ToolResultStatus::Cancelled,
+            summary: "interrupted".to_owned(),
+            content: "partial findings".to_owned(),
+            structured_facts: json!({"child_task_id":task,"child_status":"cancelled","child_terminal":true,"completed":false}),
+        };
+        assert_eq!(
+            cancellation_observation(&operation, result.clone()).status,
+            ToolResultStatus::Cancelled
+        );
+        operation.request_parent_cancellation();
+        let observed = cancellation_observation(&operation, result.clone());
+        assert_eq!(observed.status, ToolResultStatus::Ok);
+        assert_eq!(observed.structured_facts["completed"], false);
+        assert_eq!(observed.content, "partial findings");
+        let mut different_execution = result.clone();
+        different_execution.structured_facts["child_task_id"] = json!(golutra_core::TaskId::new());
+        assert_eq!(
+            cancellation_observation(&operation, different_execution).status,
+            ToolResultStatus::Cancelled
+        );
+        let mut failed = result;
+        failed.status = ToolResultStatus::Error;
+        failed.structured_facts["child_status"] = json!("failed");
+        assert_eq!(
+            cancellation_observation(&operation, failed).status,
+            ToolResultStatus::Error
+        );
+        let timed_out = DelegationOperation::new(SessionId::new(), CancellationToken::new());
+        timed_out.cancel();
+        timed_out.request_parent_cancellation();
+        assert!(!timed_out.lifecycle.lock().unwrap().parent_cancel_requested);
+    }
+
+    #[tokio::test]
+    async fn cancellation_observation_survives_reconnect_only_for_matching_execution() {
+        let host = RuntimeHost::in_memory().await.unwrap();
+        let parent = host.default_session_id();
+        let child = SessionId::new();
+        let task = golutra_core::TaskId::new();
+        let request = ToolRequest {
+            tool_call_id: ToolCallId::new(),
+            provider_tool_call_id: None,
+            session_id: parent,
+            turn_id: None,
+            tool_name: "subagent".to_owned(),
+            arguments: json!({}),
+        };
+        host.record_event(super::super::super::host_event(
+            1,
+            parent,
+            None,
+            RuntimeEventType::ToolCompleted,
+            golutra_protocol::RuntimeEventSource::Runtime,
+            json!({"envelope":{"tool_name":"subagent","status":"ok","structured_facts":{
+                "child_session_id":child,"child_task_id":task,"child_cancel_requested":true}}}),
+        ))
+        .await
+        .unwrap();
+        let mut output = TaskDelegationOutput {
+            status: ToolResultStatus::Cancelled,
+            summary: "cancelled".to_owned(),
+            content: String::new(),
+            structured_facts: json!({"child_session_id":child,"child_task_id":task,"child_status":"cancelled","completed":false}),
+        };
+        assert_eq!(
+            persisted_cancellation_observation(&host, &request, output.clone())
+                .await
+                .unwrap()
+                .status,
+            ToolResultStatus::Ok
+        );
+        output.structured_facts["child_task_id"] = json!(golutra_core::TaskId::new());
+        assert_eq!(
+            persisted_cancellation_observation(&host, &request, output)
+                .await
+                .unwrap()
+                .status,
+            ToolResultStatus::Cancelled
+        );
+        host.close().await.unwrap();
+    }
 
     #[test]
     fn unicode_findings_pages_are_lossless_and_repeatable() {

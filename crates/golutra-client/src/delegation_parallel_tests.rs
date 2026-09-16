@@ -120,6 +120,50 @@ async fn multi_wait_returns_any_then_all_without_consuming_results() {
 }
 
 #[tokio::test]
+async fn multi_wait_keeps_observed_execution_when_another_turn_resumes_child() {
+    let host = RuntimeHost::in_memory().await.unwrap();
+    let parent = host.default_session_id();
+    let (first, first_op) = operation(&host, parent).await;
+    let (second, second_op) = operation(&host, parent).await;
+    let original = result(first, "completed");
+    let original_task = original.structured_facts["child_task_id"].clone();
+    first_op.complete(&Ok(original));
+    let call = request(
+        parent,
+        json!({"action":"wait","child_session_ids":[first,second],"wait_mode":"all","wait_ms":1000}),
+    );
+    let waiting = control::dispatch(&host, &call, CancellationToken::new(), "wait");
+    tokio::pin!(waiting);
+    // 先让 wait 观察第一项终态、停在第二项；模拟另一个父轮次此时续跑第一项。
+    assert!(
+        timeout(Duration::from_millis(10), &mut waiting)
+            .await
+            .is_err()
+    );
+    let resumed = Arc::new(DelegationOperation::new(parent, CancellationToken::new()));
+    resumed.lifecycle.lock().unwrap().child_session_id = Some(first);
+    host.execution
+        .delegation_operations
+        .lock()
+        .await
+        .insert("resumed-first".to_owned(), resumed.clone());
+    second_op.complete(&Ok(result(second, "completed")));
+    let output = waiting.await.unwrap();
+    let observed = output.structured_facts["child_results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|value| value["child_session_id"] == json!(first))
+        .unwrap();
+    assert_eq!(observed["facts"]["child_task_id"], original_task);
+    assert_eq!(output.structured_facts["completed"], true);
+    assert_eq!(output.structured_facts["child_pending_ids"], json!([]));
+    assert!(!resumed.cancellation().is_cancelled());
+    resumed.complete(&Ok(result(first, "completed")));
+    host.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn published_result_is_available_before_notification_cleanup_and_survives_shutdown() {
     let host = RuntimeHost::in_memory().await.unwrap();
     let parent = host.default_session_id();

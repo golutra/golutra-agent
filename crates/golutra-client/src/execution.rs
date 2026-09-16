@@ -1412,20 +1412,26 @@ impl RuntimeHost {
             provider_session_policy,
         } = provider_plan;
         let context_budget = context_builder.budget_limit();
+        // 子会话的新 execution 必须明确当前任务边界，尤其不能从取消前的快照重跑旧副作用。
+        let context_objective = if delegated_task {
+            delegation::context_fork::execution_objective(&objective)
+        } else {
+            objective.clone()
+        };
         // 回放和 contributor 发现都没有副作用。并发执行可让恢复的长任务在
         // 首次 provider 请求前少付出一次存储往返；结果仍在下方按原顺序检查。
         let (resume_context_result, contributors_result) = tokio::join!(
             self.resume_provider_context(
                 task.session_id,
                 task.task_id,
-                &objective,
+                &context_objective,
                 &provider,
                 &prompt_cache_scope,
             ),
             self.context_contributors_for_task_with_budget(
                 task.session_id,
                 task.task_id,
-                objective.clone(),
+                context_objective.clone(),
                 task.payload.get("output_schema"),
                 context_budget,
             ),
@@ -1450,7 +1456,7 @@ impl RuntimeHost {
                 &self,
                 task.session_id,
                 task.task_id,
-                &objective,
+                &context_objective,
                 &task.payload,
                 &provider,
             )

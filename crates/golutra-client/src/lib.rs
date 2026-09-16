@@ -883,6 +883,10 @@ fn delegation_recovery_from_metadata(
     let active_children = parse_budget("active_children")?;
     let max_tokens = parse_budget("max_tokens")?;
     let spent_tokens = parse_budget("spent_tokens")?;
+    let spent_output_tokens = match budget.get("spent_output_tokens") {
+        None => None,
+        Some(_) => Some(parse_budget("spent_output_tokens")?),
+    };
     let spent_cost_microusd = parse_budget("spent_cost_microusd")?;
     let has_unsettled_reservation =
         active_children > 0 || reserved_tokens > 0 || reserved_cost_microusd > 0;
@@ -941,6 +945,13 @@ fn delegation_recovery_from_metadata(
         } else {
             spent_tokens.saturating_add(reserved_tokens)
         },
+        spent_output_tokens: spent_output_tokens.map(|spent| {
+            if has_unsettled_reservation {
+                spent.max(max_tokens)
+            } else {
+                spent.saturating_add(reserved_tokens)
+            }
+        }),
         spent_cost_microusd: if has_unsettled_reservation {
             match budget.get("max_cost_microusd").and_then(Value::as_u64) {
                 Some(max_cost) => spent_cost_microusd.max(max_cost),

@@ -64,6 +64,7 @@ struct BudgetState {
     started_children: usize,
     reserved_tokens: u64,
     spent_tokens: u64,
+    spent_output_tokens: u64,
     reserved_cost_microusd: u64,
     spent_cost_microusd: u64,
 }
@@ -84,6 +85,9 @@ pub(crate) struct DelegationRecoveryState {
     pub(crate) max_cost_microusd: Option<u64>,
     pub(crate) started_children: usize,
     pub(crate) spent_tokens: u64,
+    // 旧 checkpoint 只有总用量，恢复时保守按总量扣额度，不能凭空释放预算。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) spent_output_tokens: Option<u64>,
     pub(crate) spent_cost_microusd: u64,
 }
 
@@ -121,8 +125,8 @@ impl TimedDelegationRecoveryState {
 ///
 /// `max_tokens` is derived from each child's requested provider output allowance and is used
 /// to reserve future children before they start. `spent_tokens` records observed provider usage
-/// (which can include input tokens and multiple turns), so it is accounting evidence rather than
-/// a strict total-token cancellation cap.
+/// (including input and repeated rounds). Output admission is settled separately;
+/// input-cache volume must not exhaust the child's output allowance.
 #[derive(Debug)]
 pub(crate) struct DelegationBudget {
     max_active_children: usize,
@@ -200,7 +204,7 @@ impl DelegationBudget {
             return Err(DelegationLimit::ActiveChildren);
         }
         if state
-            .spent_tokens
+            .spent_output_tokens
             .saturating_add(state.reserved_tokens)
             .saturating_add(requested_tokens)
             > self.max_tokens
@@ -246,7 +250,9 @@ impl DelegationBudget {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let committed_tokens = state.spent_tokens.saturating_add(state.reserved_tokens);
+        let committed_tokens = state
+            .spent_output_tokens
+            .saturating_add(state.reserved_tokens);
         let committed_cost_microusd = state
             .spent_cost_microusd
             .saturating_add(state.reserved_cost_microusd);
@@ -259,6 +265,7 @@ impl DelegationBudget {
             "max_tokens": self.max_tokens,
             "reserved_tokens": state.reserved_tokens,
             "spent_tokens": state.spent_tokens,
+            "spent_output_tokens": state.spent_output_tokens,
             // 准入余额必须和使用统计分开；provider usage 可能包含输入 token 和多轮请求。
             "token_admission_committed": committed_tokens,
             "token_admission_remaining": self.max_tokens.saturating_sub(committed_tokens),
@@ -284,16 +291,22 @@ pub(crate) struct DelegationLease {
 }
 
 impl DelegationLease {
-    pub(crate) fn finish(&self, actual_tokens: u64, actual_cost_microusd: Option<u64>) {
+    pub(crate) fn finish(
+        &self,
+        actual_tokens: u64,
+        actual_cost_microusd: Option<u64>,
+        actual_output_tokens: Option<u64>,
+    ) {
         // A hard cost budget cannot treat missing provider pricing as free. The admission
         // reservation is the conservative accounting fallback when the response has no cost.
         self.release(
             actual_tokens,
             actual_cost_microusd.unwrap_or(self.requested_cost_microusd),
+            actual_output_tokens.unwrap_or(actual_tokens),
         );
     }
 
-    fn release(&self, actual_tokens: u64, actual_cost_microusd: u64) {
+    fn release(&self, actual_tokens: u64, actual_cost_microusd: u64, actual_output_tokens: u64) {
         if self.released.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -308,6 +321,9 @@ impl DelegationLease {
             .reserved_cost_microusd
             .saturating_sub(self.requested_cost_microusd);
         state.spent_tokens = state.spent_tokens.saturating_add(actual_tokens);
+        state.spent_output_tokens = state
+            .spent_output_tokens
+            .saturating_add(actual_output_tokens);
         state.spent_cost_microusd = state
             .spent_cost_microusd
             .saturating_add(actual_cost_microusd);
@@ -319,7 +335,11 @@ impl Drop for DelegationLease {
         // An aborted child still consumed the admission reservation unless a completed usage
         // record proves otherwise. Settling with zero would make the budget under-report work
         // on every exceptional path and allow later descendants to exceed the cap.
-        self.release(self.requested_tokens, self.requested_cost_microusd);
+        self.release(
+            self.requested_tokens,
+            self.requested_cost_microusd,
+            self.requested_tokens,
+        );
     }
 }
 
@@ -419,6 +439,9 @@ impl DelegationContext {
                 started_children: recovered.started_children,
                 reserved_tokens: 0,
                 spent_tokens: recovered.spent_tokens,
+                spent_output_tokens: recovered
+                    .spent_output_tokens
+                    .unwrap_or(recovered.spent_tokens),
                 reserved_cost_microusd: 0,
                 spent_cost_microusd: recovered.spent_cost_microusd,
             }),
@@ -487,9 +510,14 @@ impl DelegationContext {
         self.budget.cancellation()
     }
 
-    pub(crate) fn finish(&self, actual_tokens: u64, actual_cost_microusd: Option<u64>) {
+    pub(crate) fn finish(
+        &self,
+        actual_tokens: u64,
+        actual_cost_microusd: Option<u64>,
+        actual_output_tokens: Option<u64>,
+    ) {
         if let Some(lease) = &self.lease {
-            lease.finish(actual_tokens, actual_cost_microusd);
+            lease.finish(actual_tokens, actual_cost_microusd, actual_output_tokens);
         }
     }
 
@@ -535,61 +563,76 @@ impl DelegationContext {
         captured_at: DateTime<Utc>,
         actual_tokens: u64,
         actual_cost_microusd: Option<u64>,
+        actual_output_tokens: Option<u64>,
     ) -> TimedDelegationRecoveryState {
         self.recovery_state_with_settlement(
             captured_at,
-            Some((actual_tokens, actual_cost_microusd)),
+            Some((actual_tokens, actual_cost_microusd, actual_output_tokens)),
         )
     }
 
     fn recovery_state_with_settlement(
         &self,
         captured_at: DateTime<Utc>,
-        settlement: Option<(u64, Option<u64>)>,
+        settlement: Option<(u64, Option<u64>, Option<u64>)>,
     ) -> TimedDelegationRecoveryState {
         let state = self
             .budget
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (mut spent_tokens, mut spent_cost_microusd, unsettled_children) =
-            match (&self.lease, settlement) {
-                (Some(lease), Some((actual_tokens, actual_cost_microusd)))
-                    if !lease.released.load(Ordering::Acquire) =>
-                {
-                    (
-                        state
-                            .spent_tokens
-                            .saturating_add(
-                                state.reserved_tokens.saturating_sub(lease.requested_tokens),
-                            )
-                            .saturating_add(actual_tokens),
-                        state
-                            .spent_cost_microusd
-                            .saturating_add(
-                                state
-                                    .reserved_cost_microusd
-                                    .saturating_sub(lease.requested_cost_microusd),
-                            )
-                            .saturating_add(
-                                actual_cost_microusd.unwrap_or(lease.requested_cost_microusd),
-                            ),
-                        state.active_children.saturating_sub(1),
-                    )
-                }
-                _ => (
-                    state.spent_tokens.saturating_add(state.reserved_tokens),
+        let (
+            mut spent_tokens,
+            mut spent_cost_microusd,
+            mut spent_output_tokens,
+            unsettled_children,
+        ) = match (&self.lease, settlement) {
+            (Some(lease), Some((actual_tokens, actual_cost_microusd, actual_output_tokens)))
+                if !lease.released.load(Ordering::Acquire) =>
+            {
+                (
+                    state
+                        .spent_tokens
+                        .saturating_add(
+                            state.reserved_tokens.saturating_sub(lease.requested_tokens),
+                        )
+                        .saturating_add(actual_tokens),
                     state
                         .spent_cost_microusd
-                        .saturating_add(state.reserved_cost_microusd),
-                    state.active_children,
-                ),
-            };
+                        .saturating_add(
+                            state
+                                .reserved_cost_microusd
+                                .saturating_sub(lease.requested_cost_microusd),
+                        )
+                        .saturating_add(
+                            actual_cost_microusd.unwrap_or(lease.requested_cost_microusd),
+                        ),
+                    state
+                        .spent_output_tokens
+                        .saturating_add(
+                            state.reserved_tokens.saturating_sub(lease.requested_tokens),
+                        )
+                        .saturating_add(actual_output_tokens.unwrap_or(actual_tokens)),
+                    state.active_children.saturating_sub(1),
+                )
+            }
+            _ => (
+                state.spent_tokens.saturating_add(state.reserved_tokens),
+                state
+                    .spent_cost_microusd
+                    .saturating_add(state.reserved_cost_microusd),
+                state
+                    .spent_output_tokens
+                    .saturating_add(state.reserved_tokens),
+                state.active_children,
+            ),
+        };
         if unsettled_children > 0 {
             // A child's aggregate multi-turn usage can exceed its requested
             // output reservation. Until an actual settlement is durable, the
             // only safe admission checkpoint is to consume the remaining cap.
             spent_tokens = spent_tokens.max(self.budget.max_tokens);
+            spent_output_tokens = spent_output_tokens.max(self.budget.max_tokens);
             if let Some(max_cost_microusd) = self.budget.max_cost_microusd {
                 spent_cost_microusd = spent_cost_microusd.max(max_cost_microusd);
             }
@@ -610,6 +653,7 @@ impl DelegationContext {
                 max_cost_microusd: self.budget.max_cost_microusd,
                 started_children: state.started_children,
                 spent_tokens,
+                spent_output_tokens: Some(spent_output_tokens),
                 spent_cost_microusd,
             },
         }
@@ -745,6 +789,7 @@ mod tests {
                     max_cost_microusd: None,
                     started_children: 0,
                     spent_tokens: 0,
+                    spent_output_tokens: None,
                     spent_cost_microusd: 0,
                 },
             },
@@ -784,6 +829,7 @@ mod tests {
                 max_cost_microusd: None,
                 started_children: 0,
                 spent_tokens: 0,
+                spent_output_tokens: None,
                 spent_cost_microusd: 0,
             },
         }
@@ -812,6 +858,7 @@ mod tests {
                     max_cost_microusd: None,
                     started_children: 0,
                     spent_tokens: 0,
+                    spent_output_tokens: None,
                     spent_cost_microusd: 0,
                 },
             },
@@ -915,7 +962,7 @@ mod tests {
                 &cancellation,
             )
             .expect("child");
-        child.finish(900, Some(3));
+        child.finish(900, Some(3), None);
         let snapshot = root.budget.snapshot();
         assert_eq!(snapshot["active_children"], 0);
         assert_eq!(snapshot["spent_tokens"], 900);
@@ -933,6 +980,80 @@ mod tests {
             ),
             Err(DelegationLimit::Cancelled)
         ));
+    }
+
+    #[test]
+    fn long_input_usage_does_not_exhaust_output_admission_and_recovery_preserves_both() {
+        let cancellation = CancellationToken::new();
+        let root = DelegationContext::root(
+            SessionId::new(),
+            Some(10_000),
+            Some(4_096),
+            None,
+            cancellation.clone(),
+        );
+        let launch = |context: &DelegationContext| {
+            context.child(
+                SessionId::new(),
+                TaskId::new(),
+                ThreadId::new(),
+                4_096,
+                None,
+                &cancellation,
+            )
+        };
+        let child = launch(&root).unwrap();
+        let now = Utc::now();
+        let checkpoint = child.settlement_recovery_state(now, 200_000, None, Some(600));
+        child.finish(200_000, None, Some(600));
+        assert_eq!(root.budget.snapshot()["spent_tokens"], 200_000);
+        assert_eq!(root.budget.snapshot()["spent_output_tokens"], 600);
+        assert_eq!(root.budget.snapshot()["token_admission_committed"], 600);
+        assert_eq!(checkpoint.state.spent_tokens, 200_000);
+        assert_eq!(checkpoint.state.spent_output_tokens, Some(600));
+        let recovered =
+            DelegationContext::recovered(checkpoint, now, cancellation.clone()).unwrap();
+        let resumed =
+            launch(&recovered).expect("long prompt must not block same-child continuation");
+        resumed.finish(1_000, None, Some(40));
+        assert_eq!(recovered.budget.snapshot()["spent_tokens"], 201_000);
+        assert_eq!(recovered.budget.snapshot()["spent_output_tokens"], 640);
+    }
+
+    #[test]
+    fn actual_output_exhaustion_and_missing_output_remain_conservative() {
+        for output in [Some(50_000), None] {
+            let cancellation = CancellationToken::new();
+            let root = DelegationContext::root(
+                SessionId::new(),
+                Some(10_000),
+                Some(4_096),
+                None,
+                cancellation.clone(),
+            );
+            let child = root
+                .child(
+                    SessionId::new(),
+                    TaskId::new(),
+                    ThreadId::new(),
+                    4_096,
+                    None,
+                    &cancellation,
+                )
+                .unwrap();
+            child.finish(100_000, None, output);
+            assert!(matches!(
+                root.child(
+                    SessionId::new(),
+                    TaskId::new(),
+                    ThreadId::new(),
+                    4_096,
+                    None,
+                    &cancellation
+                ),
+                Err(DelegationLimit::TokenBudget)
+            ));
+        }
     }
 
     #[test]
@@ -956,7 +1077,7 @@ mod tests {
                 &cancellation,
             )
             .expect("child");
-        child.finish(10_000, None);
+        child.finish(10_000, None, None);
 
         let snapshot = root.budget.snapshot();
         assert_eq!(
@@ -988,6 +1109,7 @@ mod tests {
                     max_cost_microusd: Some(10),
                     started_children: 1,
                     spent_tokens: MIN_DELEGATED_TOKEN_BUDGET + 500,
+                    spent_output_tokens: None,
                     spent_cost_microusd: 12,
                 },
             },
@@ -1032,6 +1154,7 @@ mod tests {
                     max_cost_microusd: Some(10),
                     started_children: 1,
                     spent_tokens: 0,
+                    spent_output_tokens: None,
                     spent_cost_microusd: 10,
                 },
             },
@@ -1110,7 +1233,7 @@ mod tests {
                 &cancellation,
             )
             .expect("child");
-        child.finish(1_024, None);
+        child.finish(1_024, None, None);
 
         let snapshot = root.budget.snapshot();
         assert_eq!(snapshot["reserved_cost_microusd"], 0);
@@ -1182,7 +1305,7 @@ mod tests {
                 &cancellation,
             )
             .expect("child admission");
-        child.finish(900, Some(4));
+        child.finish(900, Some(4), None);
 
         let recovered = DelegationContext::recovered(
             root.recovery_state(Utc::now()),
@@ -1245,12 +1368,12 @@ mod tests {
         assert_eq!(reservation.state.spent_tokens, reservation.state.max_tokens);
         assert_eq!(reservation.state.spent_cost_microusd, 10_000);
 
-        let settlement = child.settlement_recovery_state(Utc::now(), 5_000, Some(2_000));
+        let settlement = child.settlement_recovery_state(Utc::now(), 5_000, Some(2_000), None);
         assert_eq!(settlement.state.started_children, 1);
         assert_eq!(settlement.state.spent_tokens, 5_000);
         assert_eq!(settlement.state.spent_cost_microusd, 2_000);
 
-        child.finish(5_000, Some(2_000));
+        child.finish(5_000, Some(2_000), None);
         let after_finish = root.recovery_state(settlement.captured_at);
         assert_eq!(after_finish.state.spent_tokens, 5_000);
         assert_eq!(after_finish.state.spent_cost_microusd, 2_000);
@@ -1291,7 +1414,7 @@ mod tests {
             10
         );
         for child in results.into_iter().flatten() {
-            child.finish(0, Some(0));
+            child.finish(0, Some(0), None);
         }
         for _ in 0..60 {
             let child = root
@@ -1304,7 +1427,7 @@ mod tests {
                     &CancellationToken::new(),
                 )
                 .unwrap();
-            child.finish(0, Some(0));
+            child.finish(0, Some(0), None);
         }
         let state = root.recovery_state(Utc::now());
         assert_eq!(state.state.started_children, 70);

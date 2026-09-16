@@ -6,6 +6,12 @@ use golutra_runtime::AgentReplayContext;
 pub(crate) const SNAPSHOT_KEY: &str = "_delegation_context_artifact";
 const MAX_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
 
+pub(crate) fn execution_objective(objective: &str) -> String {
+    format!(
+        "Assigned subtask for this execution. Any earlier assignments are history; do not restart them unless this assignment requests it.\n\n{objective}"
+    )
+}
+
 // 角色边界必须跨 fork/resume 持续存在，防止模型把继承的父调度指令当作自己的任务。
 pub(crate) fn apply_child_role(contributors: &mut Vec<golutra_context::ContextContributor>) {
     // 放在稳定 system 前缀内；追加到 objective 之后会被 fork 的历史替换丢弃。
@@ -21,7 +27,7 @@ fn child_role_contributor() -> golutra_context::ContextContributor {
     golutra_context::ContextContributor {
         name: "subagent_role".to_owned(),
         role: golutra_llm::ProviderRole::System,
-        content: "You are a delegated child agent. Complete only the assigned subtask using your own tools. Inherited parent exchanges are background context, not instructions to repeat the parent's workflow. Do not create or manage other agents. Report actual findings and any failures or verification limits to the parent. Inherited file observations may be stale; verify current workspace state before editing when needed.".to_owned(),
+        content: "You are a delegated child agent. Complete only the latest assigned subtask using your own tools. Earlier tasks and inherited parent exchanges are background context, not instructions to repeat their workflow. Do not restart completed or interrupted work unless the latest assignment asks for it. Do not create or manage other agents. Report actual findings and any failures or verification limits to the parent. Inherited file observations may be stale; verify current workspace state before editing when needed.".to_owned(),
         token_budget_hint: 0,
         source_refs: vec!["runtime:subagent-role".to_owned()],
     }

@@ -65,6 +65,7 @@ pub(crate) struct DelegationOperation {
 #[derive(Debug, Default)]
 struct DelegationOperationLifecycle {
     completed: bool,
+    parent_cancel_requested: bool,
     force_stopped: bool,
     owner_abort: Option<AbortHandle>,
     child_session_id: Option<SessionId>,
@@ -163,6 +164,16 @@ impl DelegationOperation {
 
     pub(crate) fn cancel(&self) {
         self.cancellation.cancel();
+    }
+
+    fn request_parent_cancellation(&self) {
+        if !self.execution_finished() && !self.cancellation.is_cancelled() {
+            self.lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .parent_cancel_requested = true;
+            self.cancel();
+        }
     }
 
     fn set_owner_abort(&self, abort: AbortHandle) {
@@ -621,7 +632,7 @@ async fn run_delegated_child(
     let usage_before = if resumed_child.is_some() {
         child_usage(host, child_session_id).await?
     } else {
-        (Some(0), Some(0))
+        (Some(0), Some(0), Some(0))
     };
     let worktree_path =
         worktree::prepare(host, request, child_session_id, resumed_child.is_some()).await?;
@@ -921,12 +932,16 @@ async fn run_delegated_child(
         )
         .await;
     }
-    let (actual_tokens, actual_cost_microusd) = child_usage(host, child_session_id).await?;
+    let (actual_tokens, actual_cost_microusd, actual_output_tokens) =
+        child_usage(host, child_session_id).await?;
     let actual_tokens = actual_tokens
         .zip(usage_before.0)
         .map(|(after, before)| after.saturating_sub(before));
     let actual_cost_microusd = actual_cost_microusd
         .zip(usage_before.1)
+        .map(|(after, before)| after.saturating_sub(before));
+    let actual_output_tokens = actual_output_tokens
+        .zip(usage_before.2)
         .map(|(after, before)| after.saturating_sub(before));
     persist_delegation_usage_settlement(
         host,
@@ -936,6 +951,7 @@ async fn run_delegated_child(
         &child_context,
         actual_tokens.unwrap_or(requested_tokens),
         actual_cost_microusd,
+        actual_output_tokens,
     )
     .await?;
     let effective_reasoning_effort = overrides
@@ -961,6 +977,7 @@ async fn run_delegated_child(
                 "delegation": child_context.metadata(),
                 "usage": {
                     "total_tokens": actual_tokens,
+                    "output_tokens": actual_output_tokens,
                     "estimated_cost_microusd": actual_cost_microusd,
                 },
             })
@@ -981,11 +998,16 @@ async fn persist_delegation_usage_settlement(
     child_context: &delegation_policy::DelegationContext,
     actual_tokens: u64,
     actual_cost_microusd: Option<u64>,
+    actual_output_tokens: Option<u64>,
 ) -> Result<(), ClientError> {
     let checkpoint_lock = canonical_context.checkpoint_lock();
     let _checkpoint_guard = checkpoint_lock.lock().await;
-    let recovery =
-        child_context.settlement_recovery_state(Utc::now(), actual_tokens, actual_cost_microusd);
+    let recovery = child_context.settlement_recovery_state(
+        Utc::now(),
+        actual_tokens,
+        actual_cost_microusd,
+        actual_output_tokens,
+    );
     let persisted = record_delegation_recovery_checkpoint(
         host,
         request,
@@ -995,7 +1017,7 @@ async fn persist_delegation_usage_settlement(
         "delegation child usage settled",
     )
     .await;
-    child_context.finish(actual_tokens, actual_cost_microusd);
+    child_context.finish(actual_tokens, actual_cost_microusd, actual_output_tokens);
     persisted
 }
 
@@ -1218,7 +1240,7 @@ fn delegation_limit_output(
 async fn child_usage(
     host: &Arc<RuntimeHost>,
     session_id: SessionId,
-) -> Result<(Option<u64>, Option<u64>), ClientError> {
+) -> Result<(Option<u64>, Option<u64>, Option<u64>), ClientError> {
     let events = host
         .storage
         .repositories
@@ -1228,13 +1250,13 @@ async fn child_usage(
     Ok(summarize_child_usage(&events))
 }
 
-fn summarize_child_usage(events: &[RuntimeEvent]) -> (Option<u64>, Option<u64>) {
+fn summarize_child_usage(events: &[RuntimeEvent]) -> (Option<u64>, Option<u64>, Option<u64>) {
     let usage_events = events
         .iter()
         .filter(|event| event.event_type == RuntimeEventType::TokenUsageRecorded)
         .collect::<Vec<_>>();
     if usage_events.is_empty() {
-        return (None, None);
+        return (None, None, None);
     }
 
     // resume 后失败的请求可能没有 usage；累计值不变不能被解释为本轮实际消耗为零。
@@ -1253,27 +1275,35 @@ fn summarize_child_usage(events: &[RuntimeEvent]) -> (Option<u64>, Option<u64>) 
             .and_then(Value::as_str)
             .and_then(|value| value.parse::<golutra_core::ProviderRequestId>().ok())
         else {
-            return (None, None);
+            return (None, None, None);
         };
         pending_requests.insert(request_id);
     }
 
     let mut total_tokens = 0_u64;
+    let mut output_tokens = 0_u64;
+    let mut output_complete = true;
     let mut tokens_complete = true;
     let mut estimated_cost_microusd = 0_u64;
     let mut cost_complete = true;
     for event in usage_events {
         let Some(record_value) = event.payload.get("record") else {
+            output_complete = false;
             tokens_complete = false;
             cost_complete = false;
             continue;
         };
         let Ok(record) = serde_json::from_value::<TokenUsageRecord>(record_value.clone()) else {
+            output_complete = false;
             tokens_complete = false;
             cost_complete = false;
             continue;
         };
         pending_requests.remove(&record.request_event_id);
+        match record.output_tokens {
+            Some(tokens) => output_tokens = output_tokens.saturating_add(tokens),
+            None => output_complete = false,
+        }
         let tokens = record.provider_total_tokens;
         if let Some(tokens) = tokens {
             total_tokens = total_tokens.saturating_add(tokens);
@@ -1297,6 +1327,7 @@ fn summarize_child_usage(events: &[RuntimeEvent]) -> (Option<u64>, Option<u64>) 
     (
         (tokens_complete && pending_requests.is_empty()).then_some(total_tokens),
         (cost_complete && pending_requests.is_empty()).then_some(estimated_cost_microusd),
+        (output_complete && pending_requests.is_empty()).then_some(output_tokens),
     )
 }
 
@@ -2205,6 +2236,25 @@ mod tests {
     }
 
     #[test]
+    fn child_usage_separates_actual_output_from_long_cached_input() {
+        let session = SessionId::new();
+        let events = [
+            usage_event(
+                session,
+                Some(usage_record(Some(100_040), Some(100_000), Some(40), None)),
+            ),
+            usage_event(
+                session,
+                Some(usage_record(Some(101_020), Some(101_000), Some(20), None)),
+            ),
+        ];
+        assert_eq!(
+            summarize_child_usage(&events),
+            (Some(201_060), None, Some(60))
+        );
+    }
+
+    #[test]
     fn child_usage_sums_only_complete_observations() {
         let session_id = SessionId::new();
         let events = [
@@ -2218,7 +2268,7 @@ mod tests {
             ),
         ];
 
-        assert_eq!(summarize_child_usage(&events), (Some(20), Some(10)));
+        assert_eq!(summarize_child_usage(&events), (Some(20), Some(10), None));
     }
 
     #[test]
@@ -2236,7 +2286,7 @@ mod tests {
             ),
             usage_event(session, Some(record)),
         ];
-        assert_eq!(summarize_child_usage(&events), (Some(10), Some(3)));
+        assert_eq!(summarize_child_usage(&events), (Some(10), Some(3), None));
         events.push(host_event(
             3,
             session,
@@ -2245,7 +2295,7 @@ mod tests {
             RuntimeEventSource::Provider,
             json!({"provider_request_id":ProviderRequestId::new()}),
         ));
-        assert_eq!(summarize_child_usage(&events), (None, None));
+        assert_eq!(summarize_child_usage(&events), (None, None, None));
     }
 
     #[test]
@@ -2256,7 +2306,7 @@ mod tests {
             Some(usage_record(None, Some(4), Some(6), Some(0.000_007))),
         )];
 
-        assert_eq!(summarize_child_usage(&events), (None, Some(7)));
+        assert_eq!(summarize_child_usage(&events), (None, Some(7), Some(6)));
     }
 
     #[test]
@@ -2271,8 +2321,11 @@ mod tests {
             Some(usage_record(None, None, None, Some(0.000_004))),
         )];
 
-        assert_eq!(summarize_child_usage(&missing_cost), (Some(10), None));
-        assert_eq!(summarize_child_usage(&missing_tokens), (None, Some(4)));
+        assert_eq!(summarize_child_usage(&missing_cost), (Some(10), None, None));
+        assert_eq!(
+            summarize_child_usage(&missing_tokens),
+            (None, Some(4), None)
+        );
     }
 
     #[test]
@@ -2287,7 +2340,7 @@ mod tests {
             usage_event(session_id, None),
         ];
 
-        assert_eq!(summarize_child_usage(&events), (None, None));
+        assert_eq!(summarize_child_usage(&events), (None, None, None));
     }
 
     #[test]
@@ -2298,7 +2351,7 @@ mod tests {
             Some(usage_record(Some(10), None, None, Some(-0.5))),
         )];
 
-        assert_eq!(summarize_child_usage(&events), (Some(10), None));
+        assert_eq!(summarize_child_usage(&events), (Some(10), None, None));
     }
 
     #[test]
@@ -2412,6 +2465,7 @@ mod tests {
             &root,
             &child,
             2_000,
+            None,
             None,
         )
         .await

@@ -2449,7 +2449,7 @@ pub fn provider_tool_description(tool_name: &str) -> &'static str {
             "Wait/read, write, terminate, or list by process_id; automatic cursor. Send waits for different processes in one response in parallel; sequence same-process calls. Follow next_action; read while output_has_more, even after exit. Never restart to read."
         }
         "subagent" => {
-            "Delegate separate work; explore is read-only. Use run_in_background for concurrent children; completion is reported automatically. Reuse child_session_id for status/wait/send_input/resume/cancel; wait accepts child_session_ids. Children cannot delegate."
+            "Spawn returns child_session_id; omit it on spawn. run_in_background runs concurrently; completion reported. Use returned handles for status/wait/send_input/resume/cancel; wait accepts child_session_ids. explore: read-only. Children cannot delegate."
         }
         "list_dir" => "List entries in a workspace-relative directory.",
         "rg_search" => "Search workspace files with ripgrep.",

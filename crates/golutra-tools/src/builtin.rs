@@ -297,7 +297,7 @@ pub(super) fn contract(tool_name: &str, side_effect_type: SideEffectType) -> Too
             "additionalProperties": false,
             "properties": {
                 "action": {"type": "string", "enum": ["spawn", "status", "wait", "send_input", "resume", "cancel"], "description": "Default spawn requires task. Reuse child_session_id: status/wait reads progress or result; send_input adds task text to active work; resume starts a new turn with task text in the same child history; cancel requests termination. Never respawn to retry a wait."},
-                "child_session_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                "child_session_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "System-assigned handle returned by spawn, not a name. Omit on spawn; reuse the returned value for other actions."},
                 "child_session_ids": {"type": "array", "minItems": 1, "maxItems": 1024, "items": {"type":"string", "minLength":1, "maxLength":128}, "description": "For wait only, instead of child_session_id. Wait on multiple children concurrently; results remain readable."},
                 "wait_mode": {"type":"string", "enum":["any","all"], "description":"Multi-child wait defaults to any completed child; all waits for every target within the shared wait_ms deadline. Timeout never cancels children."},
                 "offset": {"type": "integer", "minimum": 0, "description": "0-based result character offset. When child_result_has_more, read action=status with child_result_next_offset."},
