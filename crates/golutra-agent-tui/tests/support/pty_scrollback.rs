@@ -1737,7 +1737,22 @@ fn logout_removes_active_config_reopens_setup_and_stays_logged_out_after_restart
     wait_for_visible(&mut pty, &mut parser, "Ask Golutra");
     submit(&mut pty, &mut parser, "hello");
     wait_for_visible(&mut pty, &mut parser, "LOGOUT_HISTORY_PRESERVED");
-    parser.process(&pty.collect_for(Duration::from_millis(300)));
+    // 最后一个文本 delta 不代表 TaskCompleted 已到达；/logout 正确拒绝活跃任务。
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        parser.process(&pty.collect_for(Duration::from_millis(50)));
+        let screen = parser.screen().contents();
+        if screen.contains("LOGOUT_HISTORY_PRESERVED")
+            && screen.contains("Ask Golutra")
+            && !screen.contains("esc to interrupt")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "task did not become idle:\n{screen}"
+        );
+    }
     submit(&mut pty, &mut parser, "/logout");
     wait_for_visible(&mut pty, &mut parser, "Connect a Provider");
     assert!(parser.screen().alternate_screen());
