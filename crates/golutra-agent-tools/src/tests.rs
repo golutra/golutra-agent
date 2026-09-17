@@ -627,6 +627,34 @@ async fn enclosing_deadline_bounds_external_tools_and_reports_timeout() {
 }
 
 #[tokio::test]
+async fn expired_deadline_never_polls_ready_preparation_or_execution() {
+    let polls = std::sync::atomic::AtomicUsize::new(0);
+    let cancellation = CancellationToken::new();
+    for _ in 0..128 {
+        let expired = tokio::time::Instant::now();
+        let preparation = async { polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) };
+        assert!(matches!(
+            await_preparation_operation(preparation, &cancellation, Some(expired)).await,
+            Err(ToolInvocationStop::TimedOut)
+        ));
+        let operation_cancellation = cancellation.child_token();
+        let execution = async { polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) };
+        assert!(matches!(
+            await_tool_operation(
+                execution,
+                &cancellation,
+                &operation_cancellation,
+                Some(expired)
+            )
+            .await,
+            ToolOperationOutcome::TimedOut(None)
+        ));
+        assert!(operation_cancellation.is_cancelled());
+    }
+    assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn expired_deadline_prevents_file_side_effects() {
     let workspace = tempdir().expect("workspace");
     let target = workspace.path().join("deadline.txt");
