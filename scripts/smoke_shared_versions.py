@@ -175,7 +175,8 @@ def main() -> None:
                                           "archive_sha256": digest(args.baseline_npm_archive)}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps(report, ensure_ascii=False, indent=2))
+    # Windows redirected stdout can use a legacy code page; keep console JSON portable.
+    print(json.dumps(report, ensure_ascii=True, indent=2))
 
 
 if __name__ == "__main__":

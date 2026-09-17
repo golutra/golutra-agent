@@ -1,5 +1,8 @@
 from pathlib import Path
+import io
+import json
 import sys
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -12,6 +15,22 @@ LEGACY_ERROR = "sqlite operation failed: unknown query parameter `\\C:\\fixture`
 
 
 class LegacyBaselineTest(unittest.TestCase):
+    def test_unicode_diagnostics_are_saved_as_utf8_and_print_on_windows_code_pages(self):
+        report = {"limited_acceptance": {"stderr": "│ 路径解析失败"}}
+        console_bytes = io.BytesIO()
+        console = io.TextIOWrapper(console_bytes, encoding="cp1252")
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "report.json"
+            arguments = ["smoke_shared_versions.py", "--baseline-cli", "legacy.exe",
+                         "--candidate-cli", "candidate.exe", "--output", str(output)]
+            with patch.object(sys, "argv", arguments), patch.object(sys, "stdout", console), \
+                    patch.object(smoke, "smoke", return_value=report):
+                smoke.main()
+            console.flush()
+            self.assertEqual(json.loads(console_bytes.getvalue().decode("cp1252")), report)
+            self.assertEqual(json.loads(output.read_text(encoding="utf-8")), report)
+        console.close()
+
     def exercise(self, *, corrupt=False, candidate_error="data_unsupported"):
         baseline, candidate = Path("legacy.exe"), Path("candidate.exe")
 
