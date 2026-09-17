@@ -105,9 +105,23 @@ jobs:
       - name: Cross-platform compile
         run: cargo check --workspace --all-targets --locked
       - name: Native database paths and shared home
+        shell: bash
         run: |
           cargo test --locked -p golutra-agent-store sqlite_path_urls
           cargo test --locked -p golutra-agent-store --test shared_data_process
           cargo test --locked -p golutra-agent-config --test shared_settings_process
           cargo test --locked -p golutra-agent-auth --test shared_credentials_process
           cargo test --locked -p golutra-agent-client shared_home_tests
+          cargo test --locked -p golutra-agent-memory file_backed_store_preserves_updates_from_independent_instances
+          cargo test --locked -p golutra-agent-eval evaluation_store_is_durable_and_requires_regression_before_apply
+          cargo test --locked -p golutra-agent-code-intelligence persists_owner_only_index_and_rejects_oversized_input
+          cargo test --locked -p golutra-agent-evolution --lib run_lifecycle_is_durable_and_skill_ids_cannot_escape_the_store
+          cargo test --locked -p golutra-agent-app-server --lib transport_token_persists_without_overwriting_an_existing_identity
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Native CLI login and desktop settings
+        shell: bash
+        run: |
+          cargo build --release --locked -p golutra-agent-cli -p golutra-agent-app-server --bins
+          python scripts/smoke_native_runtime.py --binary-dir target/release

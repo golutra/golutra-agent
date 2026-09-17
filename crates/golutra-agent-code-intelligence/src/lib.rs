@@ -207,9 +207,11 @@ impl CodeIndexStore {
             .map_err(|error| CodeIntelligenceError::Io(error.to_string()))?;
         replace_file(&temporary, &self.path)?;
         set_owner_only_file(&self.path)?;
+        #[cfg(unix)]
         File::open(parent)
             .and_then(|directory| directory.sync_all())
-            .map_err(|error| CodeIntelligenceError::Io(error.to_string()))
+            .map_err(|error| CodeIntelligenceError::Io(error.to_string()))?;
+        Ok(())
     }
 
     pub fn load(&self) -> Result<Option<CodeGraph>, CodeIntelligenceError> {

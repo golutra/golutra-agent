@@ -511,9 +511,11 @@ fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), EvolutionError>
     set_owner_only_file(&temporary)?;
     replace_file(&temporary, path)?;
     set_owner_only_file(path)?;
+    #[cfg(unix)]
     File::open(parent)
         .and_then(|directory| directory.sync_all())
-        .map_err(|error| EvolutionError::Io(error.to_string()))
+        .map_err(|error| EvolutionError::Io(error.to_string()))?;
+    Ok(())
 }
 
 fn reject_symlink(path: &Path) -> Result<(), EvolutionError> {

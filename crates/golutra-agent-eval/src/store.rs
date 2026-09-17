@@ -1418,8 +1418,7 @@ impl EvaluationStore {
         set_owner_only_evaluation_file(&temporary)?;
         fs::rename(&temporary, path).map_err(|error| EvaluationError::Io(error.to_string()))?;
         set_owner_only_evaluation_file(path)?;
-        File::open(path)
-            .and_then(|file| file.sync_all())
+        file.sync_all()
             .map_err(|error| EvaluationError::Io(error.to_string()))?;
         if let Some(parent) = path.parent() {
             sync_evaluation_directory(parent)?;

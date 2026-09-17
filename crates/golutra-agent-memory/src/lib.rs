@@ -768,8 +768,7 @@ impl MemoryStore {
         set_owner_only_memory_file(&temporary)?;
         fs::rename(&temporary, path).map_err(|error| MemoryError::Io(error.to_string()))?;
         set_owner_only_memory_file(path)?;
-        File::open(path)
-            .and_then(|file| file.sync_all())
+        file.sync_all()
             .map_err(|error| MemoryError::Io(error.to_string()))?;
         if let Some(parent) = path.parent() {
             sync_memory_directory(parent)?;

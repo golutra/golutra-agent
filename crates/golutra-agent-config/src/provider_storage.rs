@@ -532,12 +532,13 @@ pub(crate) fn write_owner_only(path: &Path, content: &[u8]) -> Result<(), Config
         .as_file()
         .sync_all()
         .map_err(|error| ConfigError::Io(error.to_string()))?;
-    temporary
+    let persisted = temporary
         .persist(path)
         .map_err(|error| ConfigError::Io(error.error.to_string()))?;
     set_owner_only_file(path)?;
-    File::open(path)
-        .and_then(|file| file.sync_all())
+    // Windows 的 FlushFileBuffers 要求可写句柄；保留原子替换返回的句柄。
+    persisted
+        .sync_all()
         .map_err(|error| ConfigError::Io(error.to_string()))?;
     sync_directory(parent)
 }

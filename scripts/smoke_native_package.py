@@ -201,7 +201,9 @@ def check_desktop_settings(server: Path, cli: Path, home: Path, workspace: Path,
         result = subprocess.run([str(server), "--stdio"], cwd=workspace, env=environment,
             input="".join(json.dumps({"jsonrpc": "2.0", "id": index, "method": method, "params": params}) + "\n"
                           for index, (method, params) in enumerate(requests)),
-            capture_output=True, text=True, encoding="utf-8", timeout=30, check=True)
+            capture_output=True, text=True, encoding="utf-8", timeout=30)
+        if result.returncode != 0:
+            raise PackageError(f"native stdio server returned {result.returncode}: {result.stderr}")
         return [json.loads(line) for line in result.stdout.splitlines()]
 
     first = rpc([("config/runtime/read", {})])[0]["result"]
@@ -221,9 +223,10 @@ def check_desktop_settings(server: Path, cli: Path, home: Path, workspace: Path,
         raise PackageError("rejected settings update changed the file")
     status = json.loads(run(cli, ["storage", "status"], workspace, environment))
     identity = status["identity"]
-    if (Path(identity["config_home"]) != home.resolve()
-            or Path(identity["runtime_home"]) != home.resolve()
-            or Path(identity["workspace"]) != workspace.resolve()
+    # Windows Rust canonicalize 使用扩展路径前缀；比较真实目录身份，不比较字符串形式。
+    if (not Path(identity["config_home"]).samefile(home)
+            or not Path(identity["runtime_home"]).samefile(home)
+            or not Path(identity["workspace"]).samefile(workspace)
             or status["compatibility"]["status"] != "supported"):
         raise PackageError("CLI storage identity/compatibility disagrees with desktop home")
     checks.append("stdio settings revision conflicts and field validation preserve data; CLI reports same home")

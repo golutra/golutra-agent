@@ -259,6 +259,7 @@ impl Drop for FixtureServer {
 
 #[test]
 fn fixture_empty_connection_does_not_consume_a_response() {
+    use std::io::BufRead;
     let server = FixtureServer::new(vec!["FIRST_RESPONSE".to_owned()]);
     let address = server
         .url
@@ -276,8 +277,22 @@ fn fixture_empty_connection_does_not_consume_a_response() {
             b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}",
         )
         .unwrap();
-    let mut response = String::new();
-    socket.read_to_string(&mut response).unwrap();
+    // 按 HTTP 长度读取正文；正文完整后关闭连接的 EOF/RST 差异不属于夹具语义。
+    let mut reader = std::io::BufReader::new(socket);
+    let mut length = None;
+    loop {
+        let mut line = String::new();
+        assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+        if line == "\r\n" {
+            break;
+        }
+        if let Some(value) = line.strip_prefix("Content-Length: ") {
+            length = Some(value.trim().parse::<usize>().unwrap());
+        }
+    }
+    let mut body = vec![0; length.expect("fixture response content length")];
+    reader.read_exact(&mut body).unwrap();
+    let response = String::from_utf8(body).unwrap();
     assert!(response.contains("FIRST_RESPONSE"), "{response}");
     assert_eq!(*server.requests.lock().unwrap(), vec![json!({})]);
 }
@@ -404,7 +419,12 @@ fn assert_once_in_order(text: &str, needles: &[String]) {
 
 fn assert_message_spacing(text: &str) {
     let rows = text.lines().collect::<Vec<_>>();
-    for (index, row) in rows.iter().enumerate().skip(2) {
+    // 输入尚未提交时 composer 也以 › 开头；只检查分隔线之前的消息历史。
+    let history_end = rows
+        .iter()
+        .rposition(|row| row.starts_with('─'))
+        .unwrap_or(rows.len());
+    for (index, row) in rows.iter().enumerate().take(history_end).skip(2) {
         if !(row.starts_with("› ") || row.starts_with("• "))
             || row.contains("Ask Golutra")
             || row.contains("tokens/s")
@@ -633,6 +653,25 @@ fn screen_row(parser: &ScreenModel, marker: &str) -> usize {
 
 fn wait_for_visible(pty: &mut PtyHarness, parser: &mut ScreenModel, marker: &str) {
     wait_for_visible_markers(pty, parser, &[marker]);
+}
+
+fn wait_for_idle_reply(pty: &mut PtyHarness, parser: &mut ScreenModel, marker: &str) {
+    // 最后一个文本 delta 不代表任务已完成；等待 composer 和运行状态一起恢复。
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        parser.process(&pty.collect_for(Duration::from_millis(50)));
+        let screen = parser.screen().contents();
+        if screen.contains(marker)
+            && screen.contains("Ask Golutra")
+            && !screen.contains("esc to interrupt")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "task did not become idle:\n{screen}"
+        );
+    }
 }
 
 fn wait_for_visible_markers(pty: &mut PtyHarness, parser: &mut ScreenModel, markers: &[&str]) {
@@ -1736,8 +1775,7 @@ fn logout_removes_active_config_reopens_setup_and_stays_logged_out_after_restart
     let mut parser = ScreenModel::new(32, 110);
     wait_for_visible(&mut pty, &mut parser, "Ask Golutra");
     submit(&mut pty, &mut parser, "hello");
-    wait_for_visible(&mut pty, &mut parser, "LOGOUT_HISTORY_PRESERVED");
-    parser.process(&pty.collect_for(Duration::from_millis(300)));
+    wait_for_idle_reply(&mut pty, &mut parser, "LOGOUT_HISTORY_PRESERVED");
     submit(&mut pty, &mut parser, "/logout");
     wait_for_visible(&mut pty, &mut parser, "Connect a Provider");
     assert!(parser.screen().alternate_screen());
@@ -1816,8 +1854,7 @@ fn command_cards_keep_native_mouse_with_keyboard_details_and_resume() {
     submit(&mut pty, &mut parser, "运行日志命令");
     wait_for_visible(&mut pty, &mut parser, "Approval required");
     pty.write(b"3");
-    wait_for_visible(&mut pty, &mut parser, "CARD_TEST_DONE");
-    parser.process(&pty.collect_for(Duration::from_millis(400)));
+    wait_for_idle_reply(&mut pty, &mut parser, "CARD_TEST_DONE");
     assert!(!all_terminal_rows(&mut parser).contains("日志239"));
     pty.write("\x1b[200~保留草稿\x1b[201~".as_bytes());
     parser.process(&pty.collect_for(Duration::from_millis(200)));
