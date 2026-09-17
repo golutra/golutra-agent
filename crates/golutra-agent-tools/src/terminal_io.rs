@@ -27,7 +27,8 @@ pub(crate) fn open(command: &mut tokio::process::Command) -> io::Result<Terminal
             &mut slave,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut size,
+            // libc 在 macOS 接收可变指针、Linux 接收只读指针；原始指针兼容两种声明。
+            &raw mut size,
         )
     };
     if result != 0 {
