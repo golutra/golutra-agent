@@ -115,3 +115,11 @@ jobs:
           cargo test --locked -p golutra-agent-memory file_backed_store_preserves_updates_from_independent_instances
           cargo test --locked -p golutra-agent-eval evaluation_store_is_durable_and_requires_regression_before_apply
           cargo test --locked -p golutra-agent-code-intelligence persists_owner_only_index_and_rejects_oversized_input
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Native CLI login and desktop settings
+        shell: bash
+        run: |
+          cargo build --locked -p golutra-agent-cli -p golutra-agent-app-server --bins
+          python scripts/smoke_native_runtime.py --binary-dir target/debug
