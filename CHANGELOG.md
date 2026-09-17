@@ -6,8 +6,16 @@ follow [Semantic Versioning](https://semver.org/) where applicable.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-17
+
 ### Added
 
+- `/login` as an alias for `/auth`, and `/logout` to remove the active provider
+  configuration and local credential, then reopen setup while retaining history.
+- Keyboard tool details through Ctrl+O, with searchable persisted terminal
+  output and file diffs available after resume.
+- Native desktop release inventories with fixed versions, SHA-256 checksums,
+  npm/native payload parity checks and offline launch acceptance.
 - Open-source project governance, contribution, security, and support entry
   points.
 - Apache-2.0 and NOTICE files in source and binary distributions.
@@ -15,6 +23,17 @@ follow [Semantic Versioning](https://semver.org/) where applicable.
 
 ### Changed
 
+- Background subagents use configurable concurrency (default 10), execution-bound
+  lifecycle operations, batched waits and explicit usage accounting.
+- Command cards show bounded output previews; file changes show aligned line
+  numbers, addition/deletion counts and red/green rows without duplicate headers.
+- Main chat and tool details retain native terminal selection; keyboard
+  navigation replaces mouse capture for tool cards.
+- Model settings persist across restarts; custom setup offers Responses
+  explicitly, with lowercase reasoning levels through `max` and `ultra`.
+- Breaking: existing database formats are not migrated. Use a fresh Agent home
+  for obsolete schemas; only matching current formats can share configuration
+  and history. Unsupported data is rejected without rewriting it.
 - Breaking: Agent commands, crates, environment variables and data directories
   use `golutra-agent`, `golutra-agent-*`, `GOLUTRA_AGENT_*` and `.golutra-agent`.
   No old-name aliases or automatic data migration are installed. Native desktop
@@ -81,6 +100,7 @@ This is the initial public development baseline. See the repository history
 and [architecture documentation](docs/ARCHITECTURE.md) for the implementation
 details and current compatibility boundaries.
 
-[unreleased]: https://github.com/golutra/golutra-agent/compare/v0.2.0...HEAD
+[unreleased]: https://github.com/golutra/golutra-agent/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/golutra/golutra-agent/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/golutra/golutra-agent/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/golutra/golutra-agent/releases/tag/v0.1.0

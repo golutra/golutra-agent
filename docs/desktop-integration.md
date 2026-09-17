@@ -27,7 +27,7 @@ golutra-agent-vV-TARGET.tar.gz.manifest.json
 golutra-agent-vV-TARGET.tar.gz.smoke.json
 ```
 
-固定地址为 `https://github.com/OWNER/REPO/releases/download/vV/文件名`。CI 从 `GITHUB_REPOSITORY` 获取实际发布仓库，本地必须显式传 `--repository OWNER/REPO`（当前 origin 是 `seekskyworld/golutra-agent`），不把 README 中的品牌仓库地址当作下载位置。清单提供版本、源码 commit、平台、CPU、URL、归档摘要、文件摘要、启动合同和实际验收系统。**只有对应 tag 的 release 成功发布后地址才可下载**；本次修改不会覆盖已经发布的 0.2.0，也不会自动发布新版本。
+固定地址为 `https://github.com/OWNER/REPO/releases/download/vV/文件名`。CI 从 `GITHUB_REPOSITORY` 获取实际发布仓库，本地必须显式传 `--repository OWNER/REPO`。0.3.0 正式发布仓库为 `golutra/golutra-agent`；开发远端 `seekskyworld/golutra-agent` 不是此次产物下载源。清单提供版本、源码 commit、平台、CPU、URL、归档摘要、文件摘要、启动合同和实际验收系统。**只有对应 tag 的 release 成功发布后地址才可下载**；新版本不会覆盖已发布的 0.2.0 产物。
 
 桌面项目把版本、target、URL 和归档 SHA-256 一起锁进源码；构建时下载并核验摘要，安全解压，再打进安装包。不要用 `latest`，不要在用户安装时下载。拒绝错误架构、checksum 不符、绝对路径、`..`、链接、Windows drive/ADS 等不安全条目。摘要应来自已审阅并锁定的清单；同一下载位置的 `.sha256` 不是独立真实性证明。
 
@@ -116,8 +116,8 @@ python3 scripts/package_release.py --target aarch64-apple-darwin --output-dir di
 python3 scripts/package_npm.py --package platform --target aarch64-apple-darwin \
   --binary-dir target/aarch64-apple-darwin/release --output-dir dist/desktop/npm
 python3 scripts/smoke_native_package.py \
-  --archive dist/desktop/golutra-agent-v0.2.0-aarch64-apple-darwin.tar.gz \
-  --npm-archive dist/desktop/npm/golutra-agent-npm-darwin-arm64-0.2.0.tgz --require-pty
+  --archive dist/desktop/golutra-agent-v0.3.0-aarch64-apple-darwin.tar.gz \
+  --npm-archive dist/desktop/npm/golutra-agent-npm-darwin-arm64-0.3.0.tgz --require-pty
 # 汇总六个平台的产物及 smoke 后，正式构建不传两个 allow 参数：
 python3 scripts/desktop_release.py --dist release-assets --repository seekskyworld/golutra-agent
 ```

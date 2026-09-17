@@ -252,5 +252,6 @@ jobs:
             --provenance --access public
       - uses: softprops/action-gh-release@v2
         with:
+          body_path: docs/releases/${{ github.ref_name }}.md
           files: release-assets/**
           fail_on_unmatched_files: true
