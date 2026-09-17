@@ -122,7 +122,7 @@ async fn lock_shared(file: &File) -> StoreResult<()> {
         match FileExt::try_lock_shared(file) {
             Ok(()) => return Ok(()),
             Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock
+                if error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
                     && attempt < USAGE_LOCK_RETRIES =>
             {
                 tokio::time::sleep(USAGE_LOCK_RETRY_DELAY).await
@@ -158,7 +158,7 @@ pub(crate) async fn prepare_shared_store(pool: &SqlitePool, file: File) -> Store
         match FileExt::try_lock_exclusive(&file) {
             Ok(()) => break,
             Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock
+                if error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
                     && attempt < USAGE_LOCK_RETRIES =>
             {
                 tokio::time::sleep(USAGE_LOCK_RETRY_DELAY).await
@@ -184,7 +184,7 @@ pub(crate) async fn prepare_shared_store(pool: &SqlitePool, file: File) -> Store
                 }
                 FileExt::unlock(&file).map_err(|error| StoreError::Migration(error.to_string()))?;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {}
             Err(error) => return Err(StoreError::Migration(error.to_string())),
         }
     }

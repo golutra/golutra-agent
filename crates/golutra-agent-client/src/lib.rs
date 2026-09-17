@@ -2856,7 +2856,7 @@ impl RuntimeHost {
         set_owner_only_file(&path)?;
         match file.try_lock_exclusive() {
             Ok(()) => Ok(SessionLeaseAttempt::Acquired(Some(Arc::new(file)))),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
                 Ok(SessionLeaseAttempt::Busy)
             }
             Err(error) => Err(ClientError::Io(format!("{}: {error}", path.display()))),

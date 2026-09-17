@@ -107,4 +107,7 @@ jobs:
       - name: Native database paths and shared home
         run: |
           cargo test --locked -p golutra-agent-store sqlite_path_urls
+          cargo test --locked -p golutra-agent-store --test shared_data_process
+          cargo test --locked -p golutra-agent-config --test shared_settings_process
+          cargo test --locked -p golutra-agent-auth --test shared_credentials_process
           cargo test --locked -p golutra-agent-client shared_home_tests
