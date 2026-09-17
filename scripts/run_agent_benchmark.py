@@ -24,7 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run Golutra exec and resume failed verification in the same thread."
     )
-    parser.add_argument("--golutra", default="golutra")
+    parser.add_argument("--golutra", default="golutra-agent")
     parser.add_argument("--workspace", type=Path, required=True)
     prompt = parser.add_mutually_exclusive_group(required=True)
     prompt.add_argument("--prompt")

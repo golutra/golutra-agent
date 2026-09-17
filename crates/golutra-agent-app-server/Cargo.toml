@@ -1,0 +1,42 @@
+[package]
+name = "golutra-agent-app-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description.workspace = true
+readme.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+async-stream.workspace = true
+axum.workspace = true
+base64.workspace = true
+chrono.workspace = true
+clap.workspace = true
+fs2.workspace = true
+futures-util.workspace = true
+golutra-agent-client = { path = "../golutra-agent-client", version = "0.3.0" }
+golutra-agent-core.workspace = true
+golutra-agent-config = { path = "../golutra-agent-config", version = "0.3.0" }
+golutra-agent-protocol.workspace = true
+golutra-agent-store = { path = "../golutra-agent-store", version = "0.3.0" }
+miette.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tokio-util.workspace = true
+tower.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+reqwest.workspace = true
+tokio-tungstenite.workspace = true

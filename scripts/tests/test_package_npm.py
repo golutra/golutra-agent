@@ -120,8 +120,8 @@ class NpmPackageTest(unittest.TestCase):
             self.assertEqual(package_json["os"], ["darwin"])
             self.assertEqual(package_json["cpu"], ["arm64"])
             self.assertEqual(manifest["target"], "aarch64-apple-darwin")
-            self.assertIn("package/vendor/bin/golutra", names)
-            self.assertIn("package/vendor/bin/golutra-tui", names)
+            self.assertIn("package/vendor/bin/golutra-agent", names)
+            self.assertIn("package/vendor/bin/golutra-agent-tui", names)
 
     def test_windows_platform_package_uses_executable_suffix_and_cpu_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -149,8 +149,8 @@ class NpmPackageTest(unittest.TestCase):
             self.assertEqual(package_json["name"], "@golutra/agent-win32-arm64")
             self.assertEqual(package_json["os"], ["win32"])
             self.assertEqual(package_json["cpu"], ["arm64"])
-            self.assertIn("package/vendor/bin/golutra.exe", names)
-            self.assertIn("package/vendor/bin/golutra-tui.exe", names)
+            self.assertIn("package/vendor/bin/golutra-agent.exe", names)
+            self.assertIn("package/vendor/bin/golutra-agent-tui.exe", names)
 
     def test_platform_package_rejects_missing_binary(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -172,7 +172,7 @@ class NpmPackageTest(unittest.TestCase):
                 directory.type = tarfile.DIRTYPE
                 directory.mode = 0o755
                 archive.addfile(directory)
-                binary = tarfile.TarInfo("package/bin/golutra")
+                binary = tarfile.TarInfo("package/bin/golutra-agent")
                 binary.mode = 0o755
                 binary.size = 7
                 archive.addfile(binary, io.BytesIO(b"fixture"))
@@ -180,7 +180,7 @@ class NpmPackageTest(unittest.TestCase):
             package_dir = smoke_npm_package.extract_package(
                 archive_path, Path(temp_dir) / "extracted"
             )
-            executable = package_dir / "bin" / "golutra"
+            executable = package_dir / "bin" / "golutra-agent"
             self.assertEqual(executable.read_bytes(), b"fixture")
             self.assertEqual(executable.stat().st_mode & 0o777, 0o755)
 

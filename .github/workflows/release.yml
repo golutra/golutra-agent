@@ -37,9 +37,11 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             npm_suffix: win32-x64
+            rustflags: "-C target-feature=+crt-static"
           - os: windows-11-arm
             target: aarch64-pc-windows-msvc
             npm_suffix: win32-arm64
+            rustflags: "-C target-feature=+crt-static"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -57,6 +59,8 @@ jobs:
         run: python scripts/check_open_source.py
       - name: Build and package release archive
         shell: bash
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
         run: python scripts/package_release.py --output-dir dist --target "${{ matrix.target }}"
       - name: Package native npm target
         shell: bash
@@ -85,6 +89,32 @@ jobs:
             --root-tarball "$root_archive" \
             --platform-tarball "$platform_archive" \
             "${smoke_args[@]}"
+      - name: Native desktop offline acceptance (no Node/npm on PATH)
+        shell: bash
+        run: |
+          native_archive="$(find dist -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print -quit)"
+          npm_archive="$(find dist/npm -maxdepth 1 -type f -name '*.tgz' -print -quit)"
+          smoke_args=()
+          if [[ "${{ runner.os }}" != "Windows" ]]; then
+            smoke_args+=(--require-pty)
+          fi
+          python scripts/smoke_native_package.py --archive "$native_archive" --npm-archive "$npm_archive" "${smoke_args[@]}"
+          cargo test --locked -p golutra-agent-auth --test shared_credentials_process
+          cargo test --locked -p golutra-agent-config --test shared_settings_process
+          cargo test --locked -p golutra-agent-store --test shared_data_process
+          cargo test --locked -p golutra-agent-client shared_home_tests
+      - name: Refuse obsolete npm data in both directions (no migration)
+        shell: bash
+        run: |
+          mkdir -p .compatibility-baseline
+          npm pack "@golutra/agent-${{ matrix.npm_suffix }}@0.2.0" --ignore-scripts --pack-destination .compatibility-baseline
+          baseline_archive="$(find .compatibility-baseline -maxdepth 1 -name '*.tgz' -print -quit)"
+          suffix=""
+          if [[ "${{ runner.os }}" == "Windows" ]]; then suffix=".exe"; fi
+          python scripts/smoke_shared_versions.py \
+            --baseline-npm-archive "$baseline_archive" --baseline-version 0.2.0 \
+            --candidate-cli "target/${{ matrix.target }}/release/golutra-agent$suffix" \
+            --output "dist/shared-versions-${{ matrix.target }}.json"
       - uses: actions/upload-artifact@v4
         with:
           name: golutra-agent-${{ matrix.target }}
@@ -163,6 +193,8 @@ jobs:
           root_manifest="release-assets/npm/golutra-agent-npm-$version.tgz.manifest.json"
           test -f "$root_manifest"
           jq . "$root_manifest"
+      - name: Verify desktop inventory and npm/native payload parity
+        run: python scripts/desktop_release.py --dist release-assets
       - name: Publish platform npm packages with OIDC provenance
         shell: bash
         env:
@@ -220,5 +252,6 @@ jobs:
             --provenance --access public
       - uses: softprops/action-gh-release@v2
         with:
+          body_path: docs/releases/${{ github.ref_name }}.md
           files: release-assets/**
           fail_on_unmatched_files: true

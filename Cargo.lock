@@ -112,6 +112,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "arrayvec"
+version = "0.7.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+
+[[package]]
 name = "async-compression"
 version = "0.4.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -184,7 +190,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
 dependencies = [
  "axum-core",
- "base64",
+ "base64 0.22.1",
  "bytes",
  "form_urlencoded",
  "futures-util",
@@ -261,6 +267,12 @@ name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "base64ct"
@@ -1121,11 +1133,11 @@ dependencies = [
 
 [[package]]
 name = "genai"
-version = "0.7.0-beta.12"
+version = "0.7.0-beta.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7e8c78e496da661991768aede08fd6962d942011a9aa152d8c72ca4ebb31cf6"
+checksum = "0cf26388d7beb4c57357f5fe78b45ec37ac8d171e33970246fc83fbd51a67ab5"
 dependencies = [
- "base64",
+ "base64 0.23.1",
  "bytes",
  "derive_more",
  "eventsource-stream",
@@ -1226,20 +1238,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-app-server"
-version = "0.1.0"
+name = "golutra-agent-app-server"
+version = "0.3.0"
 dependencies = [
  "async-stream",
  "axum",
- "base64",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "fs2",
  "futures-util",
- "golutra-client",
- "golutra-core",
- "golutra-protocol",
- "golutra-store",
+ "golutra-agent-client",
+ "golutra-agent-config",
+ "golutra-agent-core",
+ "golutra-agent-protocol",
+ "golutra-agent-store",
  "miette",
  "reqwest 0.12.28",
  "secrecy",
@@ -1256,11 +1269,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-auth"
-version = "0.1.0"
+name = "golutra-agent-auth"
+version = "0.3.0"
 dependencies = [
  "async-trait",
- "base64",
+ "base64 0.22.1",
  "chrono",
  "fs2",
  "futures-util",
@@ -1278,22 +1291,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-cli"
-version = "0.1.0"
+name = "golutra-agent-cli"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "clap",
- "golutra-app-server",
- "golutra-auth",
- "golutra-client",
- "golutra-code-intelligence",
- "golutra-config",
- "golutra-core",
- "golutra-eval",
- "golutra-llm",
- "golutra-plugin",
- "golutra-project-service",
- "golutra-protocol",
+ "golutra-agent-app-server",
+ "golutra-agent-auth",
+ "golutra-agent-client",
+ "golutra-agent-code-intelligence",
+ "golutra-agent-config",
+ "golutra-agent-core",
+ "golutra-agent-eval",
+ "golutra-agent-llm",
+ "golutra-agent-plugin",
+ "golutra-agent-project-service",
+ "golutra-agent-protocol",
  "miette",
  "rmcp",
  "schemars 1.2.1",
@@ -1306,29 +1319,29 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-client"
-version = "0.1.0"
+name = "golutra-agent-client"
+version = "0.3.0"
 dependencies = [
  "async-trait",
- "base64",
+ "base64 0.22.1",
  "chrono",
  "fs2",
  "futures-util",
- "golutra-auth",
- "golutra-config",
- "golutra-context",
- "golutra-core",
- "golutra-eval",
- "golutra-evolution",
- "golutra-llm",
- "golutra-mcp",
- "golutra-memory",
- "golutra-plugin",
- "golutra-policy",
- "golutra-protocol",
- "golutra-runtime",
- "golutra-store",
- "golutra-tools",
+ "golutra-agent-auth",
+ "golutra-agent-config",
+ "golutra-agent-context",
+ "golutra-agent-core",
+ "golutra-agent-eval",
+ "golutra-agent-evolution",
+ "golutra-agent-llm",
+ "golutra-agent-mcp",
+ "golutra-agent-memory",
+ "golutra-agent-plugin",
+ "golutra-agent-policy",
+ "golutra-agent-protocol",
+ "golutra-agent-runtime",
+ "golutra-agent-store",
+ "golutra-agent-tools",
  "jsonschema",
  "reqwest 0.12.28",
  "ring",
@@ -1341,13 +1354,14 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
+ "tracing",
  "uuid",
  "walkdir",
 ]
 
 [[package]]
-name = "golutra-code-intelligence"
-version = "0.1.0"
+name = "golutra-agent-code-intelligence"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "fs2",
@@ -1365,12 +1379,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-config"
-version = "0.1.0"
+name = "golutra-agent-config"
+version = "0.3.0"
 dependencies = [
  "fs2",
- "golutra-auth",
- "golutra-llm",
+ "golutra-agent-auth",
+ "golutra-agent-llm",
  "secrecy",
  "serde",
  "serde_json",
@@ -1381,12 +1395,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-context"
-version = "0.1.0"
+name = "golutra-agent-context"
+version = "0.3.0"
 dependencies = [
  "chrono",
- "golutra-core",
- "golutra-llm",
+ "golutra-agent-core",
+ "golutra-agent-llm",
  "serde",
  "serde_json",
  "sha2",
@@ -1394,8 +1408,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-core"
-version = "0.1.0"
+name = "golutra-agent-core"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "schemars 1.2.1",
@@ -1406,13 +1420,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-eval"
-version = "0.1.0"
+name = "golutra-agent-eval"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "fs2",
- "golutra-core",
- "golutra-eval-model",
+ "golutra-agent-core",
+ "golutra-agent-eval-model",
  "schemars 1.2.1",
  "serde",
  "serde_json",
@@ -1423,11 +1437,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-eval-model"
-version = "0.1.0"
+name = "golutra-agent-eval-model"
+version = "0.3.0"
 dependencies = [
  "chrono",
- "golutra-core",
+ "golutra-agent-core",
  "schemars 1.2.1",
  "serde",
  "serde_json",
@@ -1435,14 +1449,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-eval-worker"
-version = "0.1.0"
+name = "golutra-agent-eval-worker"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "clap",
- "golutra-client",
- "golutra-core",
- "golutra-protocol",
+ "golutra-agent-client",
+ "golutra-agent-core",
+ "golutra-agent-protocol",
  "serde_json",
  "tempfile",
  "tokio",
@@ -1450,20 +1464,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-event"
-version = "0.1.0"
+name = "golutra-agent-event"
+version = "0.3.0"
 dependencies = [
- "golutra-protocol",
+ "golutra-agent-protocol",
 ]
 
 [[package]]
-name = "golutra-evolution"
-version = "0.1.0"
+name = "golutra-agent-evolution"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "fs2",
- "golutra-core",
- "golutra-eval",
+ "golutra-agent-core",
+ "golutra-agent-eval",
  "schemars 1.2.1",
  "serde",
  "serde_json",
@@ -1474,11 +1488,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-file-search"
-version = "0.1.0"
+name = "golutra-agent-file-search"
+version = "0.3.0"
 dependencies = [
- "golutra-core",
- "golutra-policy",
+ "golutra-agent-core",
+ "golutra-agent-policy",
  "regex",
  "serde",
  "serde_json",
@@ -1489,25 +1503,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-governor"
-version = "0.1.0"
+name = "golutra-agent-governor"
+version = "0.3.0"
 dependencies = [
- "golutra-core",
+ "golutra-agent-core",
  "schemars 1.2.1",
  "serde",
 ]
 
 [[package]]
-name = "golutra-llm"
-version = "0.1.0"
+name = "golutra-agent-llm"
+version = "0.3.0"
 dependencies = [
  "async-trait",
- "base64",
+ "base64 0.22.1",
  "eventsource-stream",
  "futures-util",
  "genai",
- "golutra-auth",
- "golutra-core",
+ "golutra-agent-auth",
+ "golutra-agent-core",
  "reqwest 0.12.28",
  "reqwest 0.13.4",
  "rustls",
@@ -1520,15 +1534,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-mcp"
-version = "0.1.0"
+name = "golutra-agent-mcp"
+version = "0.3.0"
 dependencies = [
  "async-trait",
- "golutra-core",
- "golutra-plugin",
- "golutra-policy",
- "golutra-sandbox",
- "golutra-tools",
+ "golutra-agent-core",
+ "golutra-agent-plugin",
+ "golutra-agent-policy",
+ "golutra-agent-sandbox",
+ "golutra-agent-tools",
  "rmcp",
  "serde_json",
  "tempfile",
@@ -1538,12 +1552,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-memory"
-version = "0.1.0"
+name = "golutra-agent-memory"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "fs2",
- "golutra-core",
+ "golutra-agent-core",
  "regex",
  "schemars 1.2.1",
  "serde",
@@ -1553,12 +1567,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-plugin"
-version = "0.1.0"
+name = "golutra-agent-plugin"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "fs2",
- "golutra-core",
+ "golutra-agent-core",
  "jsonschema",
  "serde",
  "serde_json",
@@ -1570,10 +1584,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-policy"
-version = "0.1.0"
+name = "golutra-agent-policy"
+version = "0.3.0"
 dependencies = [
- "golutra-core",
+ "golutra-agent-core",
  "shlex 1.3.0",
  "tempfile",
  "thiserror 2.0.18",
@@ -1582,8 +1596,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-project-service"
-version = "0.1.0"
+name = "golutra-agent-project-service"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1600,12 +1614,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-protocol"
-version = "0.1.0"
+name = "golutra-agent-protocol"
+version = "0.3.0"
 dependencies = [
  "chrono",
- "golutra-core",
- "golutra-eval-model",
+ "golutra-agent-core",
+ "golutra-agent-eval-model",
  "schemars 1.2.1",
  "serde",
  "serde_json",
@@ -1613,28 +1627,28 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-protocol-fixtures"
-version = "0.1.0"
+name = "golutra-agent-protocol-fixtures"
+version = "0.3.0"
 dependencies = [
  "chrono",
- "golutra-core",
- "golutra-eval",
- "golutra-evolution",
- "golutra-governor",
- "golutra-memory",
- "golutra-protocol",
+ "golutra-agent-core",
+ "golutra-agent-eval",
+ "golutra-agent-evolution",
+ "golutra-agent-governor",
+ "golutra-agent-memory",
+ "golutra-agent-protocol",
  "schemars 1.2.1",
  "serde",
  "serde_json",
 ]
 
 [[package]]
-name = "golutra-release"
-version = "0.1.0"
+name = "golutra-agent-release"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "fs2",
- "golutra-sandbox",
+ "golutra-agent-sandbox",
  "nix 0.30.1",
  "schemars 1.2.1",
  "serde",
@@ -1648,21 +1662,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-runtime"
-version = "0.1.0"
+name = "golutra-agent-runtime"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "chrono",
  "futures-util",
- "golutra-context",
- "golutra-core",
- "golutra-governor",
- "golutra-llm",
- "golutra-policy",
- "golutra-protocol",
- "golutra-sandbox",
- "golutra-tools",
- "golutra-verify",
+ "golutra-agent-context",
+ "golutra-agent-core",
+ "golutra-agent-governor",
+ "golutra-agent-llm",
+ "golutra-agent-policy",
+ "golutra-agent-protocol",
+ "golutra-agent-sandbox",
+ "golutra-agent-tools",
+ "golutra-agent-verify",
  "ignore",
  "jsonschema",
  "regex",
@@ -1681,22 +1695,23 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-sandbox"
-version = "0.1.0"
+name = "golutra-agent-sandbox"
+version = "0.3.0"
 dependencies = [
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
 ]
 
 [[package]]
-name = "golutra-store"
-version = "0.1.0"
+name = "golutra-agent-store"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "fs2",
- "golutra-core",
- "golutra-protocol",
+ "golutra-agent-core",
+ "golutra-agent-protocol",
  "serde",
  "serde_json",
  "sha2",
@@ -1708,18 +1723,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-supervisor"
-version = "0.1.0"
+name = "golutra-agent-supervisor"
+version = "0.3.0"
 dependencies = [
  "async-trait",
- "base64",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "fs2",
- "golutra-core",
- "golutra-protocol",
- "golutra-release",
- "golutra-sandbox",
+ "golutra-agent-core",
+ "golutra-agent-protocol",
+ "golutra-agent-release",
+ "golutra-agent-sandbox",
  "miette",
  "nix 0.30.1",
  "schemars 1.2.1",
@@ -1734,13 +1749,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-test-client"
-version = "0.1.0"
+name = "golutra-agent-test-client"
+version = "0.3.0"
 dependencies = [
  "chrono",
- "golutra-client",
- "golutra-core",
- "golutra-protocol",
+ "golutra-agent-client",
+ "golutra-agent-core",
+ "golutra-agent-protocol",
  "miette",
  "serde_json",
  "tempfile",
@@ -1748,20 +1763,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-tools"
-version = "0.1.0"
+name = "golutra-agent-tools"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "chrono",
  "futures-util",
- "golutra-code-intelligence",
- "golutra-core",
- "golutra-policy",
- "golutra-sandbox",
+ "golutra-agent-code-intelligence",
+ "golutra-agent-core",
+ "golutra-agent-policy",
+ "golutra-agent-sandbox",
  "jsonschema",
  "nix 0.30.1",
  "regex",
- "reqwest 0.12.28",
  "serde_json",
  "sha2",
  "shlex 1.3.0",
@@ -1774,22 +1788,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "golutra-tui"
-version = "0.1.0"
+name = "golutra-agent-tui"
+version = "0.3.0"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "crossterm",
  "fs2",
  "futures-util",
- "golutra-app-server",
- "golutra-auth",
- "golutra-client",
- "golutra-config",
- "golutra-core",
- "golutra-llm",
- "golutra-protocol",
+ "golutra-agent-app-server",
+ "golutra-agent-auth",
+ "golutra-agent-client",
+ "golutra-agent-config",
+ "golutra-agent-core",
+ "golutra-agent-llm",
+ "golutra-agent-protocol",
  "ignore",
  "miette",
  "nix 0.30.1",
@@ -1807,26 +1821,27 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width 0.1.14",
  "uuid",
+ "vt100",
 ]
 
 [[package]]
-name = "golutra-verify"
-version = "0.1.0"
+name = "golutra-agent-verify"
+version = "0.3.0"
 dependencies = [
  "chrono",
- "golutra-core",
+ "golutra-agent-core",
 ]
 
 [[package]]
-name = "golutra-vis"
-version = "0.1.0"
+name = "golutra-agent-vis"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "clap",
- "golutra-client",
- "golutra-core",
- "golutra-protocol",
- "golutra-tools",
+ "golutra-agent-client",
+ "golutra-agent-core",
+ "golutra-agent-protocol",
+ "golutra-agent-tools",
  "miette",
  "schemars 1.2.1",
  "serde",
@@ -2020,7 +2035,7 @@ version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96547c2556ec9d12fb1578c4eaf448b04993e7fb79cbaad930a656880a6bdfa0"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-channel",
  "futures-util",
@@ -2732,7 +2747,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "chrono",
  "getrandom 0.2.17",
  "http",
@@ -3265,7 +3280,7 @@ version = "0.12.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-core",
  "futures-util",
@@ -3306,7 +3321,7 @@ version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "encoding_rs",
  "futures-core",
@@ -3731,7 +3746,7 @@ version = "3.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76a5c54c7310e7b8b9577c286d7e399ddd876c3e12b3ed917a8aabc4b96e9e8c"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bs58",
  "chrono",
  "hex",
@@ -3956,7 +3971,7 @@ version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6798b1838b6a0f69c007c133b8df5866302197e404e8b6ee8ed3e3a5e68dc6"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "crc",
@@ -4031,7 +4046,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aa003f0038df784eb8fecbbac13affe3da23b45194bd57dba231c8f48199c526"
 dependencies = [
  "atoi",
- "base64",
+ "base64 0.22.1",
  "bitflags 2.13.0",
  "byteorder",
  "bytes",
@@ -4075,7 +4090,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db58fcd5a53cf07c184b154801ff91347e4c30d17a3562a635ff028ad5deda46"
 dependencies = [
  "atoi",
- "base64",
+ "base64 0.22.1",
  "bitflags 2.13.0",
  "byteorder",
  "chrono",
@@ -4836,6 +4851,27 @@ name = "vsimd"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
+
+[[package]]
+name = "vt100"
+version = "0.16.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "054ff75fb8fa83e609e685106df4faeffdf3a735d3c74ebce97ec557d5d36fd9"
+dependencies = [
+ "itoa",
+ "unicode-width 0.2.2",
+ "vte",
+]
+
+[[package]]
+name = "vte"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5924018406ce0063cd67f8e008104968b74b563ee1b85dde3ed1f7cb87d3dbd"
+dependencies = [
+ "arrayvec",
+ "memchr",
+]
 
 [[package]]
 name = "walkdir"

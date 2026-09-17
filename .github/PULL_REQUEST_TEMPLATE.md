@@ -13,7 +13,7 @@
 - [ ] I added or updated deterministic tests where behavior changed.
 - [ ] I regenerated protocol outputs with `just schema` when the schema changed.
 - [ ] I ran the relevant checks and listed any skipped checks below.
-- [ ] I did not include credentials, `.golutra` state, build output, or private workspace data.
+- [ ] I did not include credentials, `.golutra-agent` state, build output, or private workspace data.
 
 Checks run:
 

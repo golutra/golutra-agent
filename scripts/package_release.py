@@ -24,26 +24,26 @@ from typing import Any
 SCHEMA_VERSION = 2
 PACKAGE_NAME = "golutra-agent"
 BINARY_SPECS = (
-    ("golutra-cli", "golutra"),
-    ("golutra-tui", "golutra-tui"),
-    ("golutra-app-server", "golutra-app-server"),
-    ("golutra-vis", "golutra-vis"),
-    ("golutra-supervisor", "golutra-supervisor"),
-    ("golutra-launcher", "golutra-launcher"),
-    ("golutra-eval-worker", "golutra-eval-worker"),
+    ("golutra-agent", "golutra-agent"),
+    ("golutra-agent-tui", "golutra-agent-tui"),
+    ("golutra-agent-app-server", "golutra-agent-app-server"),
+    ("golutra-agent-vis", "golutra-agent-vis"),
+    ("golutra-agent-supervisor", "golutra-agent-supervisor"),
+    ("golutra-agent-launcher", "golutra-agent-launcher"),
+    ("golutra-agent-eval-worker", "golutra-agent-eval-worker"),
 )
 LEGAL_FILE_SPECS = (
     ("LICENSE", "LICENSE"),
     ("NOTICE", "NOTICE"),
 )
 BUILD_PACKAGES = (
-    "golutra-cli",
-    "golutra-tui",
-    "golutra-app-server",
-    "golutra-vis",
-    "golutra-supervisor",
-    "golutra-release",
-    "golutra-eval-worker",
+    "golutra-agent-cli",
+    "golutra-agent-tui",
+    "golutra-agent-app-server",
+    "golutra-agent-vis",
+    "golutra-agent-supervisor",
+    "golutra-agent-release",
+    "golutra-agent-eval-worker",
 )
 
 
@@ -211,6 +211,17 @@ def package_release(
         "created_at": created_at,
         "package_root": package_root,
         "files": files,
+        "desktop_launch": {
+            "contract_version": 2,
+            "cli": f"bin/golutra-agent{executable_suffix}",
+            "tui": f"bin/golutra-agent-tui{executable_suffix}",
+            "version_args": ["--version"],
+            "exec_args": ["--cwd", "<absolute-workspace>", "exec", "--json", "<prompt>"],
+            "home_env": "GOLUTRA_AGENT_HOME",
+            "node_required": False,
+            "install_downloads": False,
+            "update_owner": "distributor",
+        },
     }
     manifest_bytes = (
         json.dumps(manifest_value, indent=2, sort_keys=True, ensure_ascii=True).encode("utf-8")
@@ -467,7 +478,8 @@ def _read_archive(archive: Path) -> tuple[dict[str, bytes], dict[str, int]]:
 
 def _safe_archive_path(path: str) -> str:
     value = PurePosixPath(path)
-    if value.is_absolute() or ".." in value.parts or not value.parts:
+    if (value.is_absolute() or ".." in value.parts or not value.parts
+            or "\\" in path or ":" in path or "\x00" in path):
         raise PackageError(f"archive path is unsafe: {path}")
     return value.as_posix()
 

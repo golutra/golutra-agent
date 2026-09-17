@@ -23,8 +23,8 @@ PACKAGE_NAME = "@golutra/agent"
 PACKAGE_ROOT = "npm/agent"
 SCHEMA_VERSION = 1
 NATIVE_BINARY_SPECS = (
-    ("golutra-cli", "golutra"),
-    ("golutra-tui", "golutra-tui"),
+    ("golutra-agent", "golutra-agent"),
+    ("golutra-agent-tui", "golutra-agent-tui"),
 )
 LEGAL_FILES = ("LICENSE", "NOTICE")
 VERSION_PATTERN = re.compile(
@@ -122,7 +122,7 @@ def build_root_package(
     npm_bin: str,
 ) -> PackageResult:
     platforms = package_targets(targets)
-    with tempfile.TemporaryDirectory(prefix="golutra-npm-root-") as temp_dir:
+    with tempfile.TemporaryDirectory(prefix="golutra-agent-npm-root-") as temp_dir:
         staging_dir = Path(temp_dir) / "package"
         _copy_root_template(root, staging_dir)
         package_json = _read_json(staging_dir / "package.json")
@@ -143,8 +143,8 @@ def build_root_package(
             expected_version=version,
             required_paths={
                 "package/package.json",
-                "package/bin/golutra.js",
-                "package/bin/golutra-tui.js",
+                "package/bin/golutra-agent.js",
+                "package/bin/golutra-agent-tui.js",
                 "package/bin/run.js",
                 "package/LICENSE",
                 "package/NOTICE",
@@ -179,7 +179,7 @@ def build_platform_package(
     binary_dir = binary_dir.resolve()
     executable_suffix = ".exe" if platform.os == "win32" else ""
 
-    with tempfile.TemporaryDirectory(prefix=f"golutra-npm-{platform.npm_suffix}-") as temp_dir:
+    with tempfile.TemporaryDirectory(prefix=f"golutra-agent-npm-{platform.npm_suffix}-") as temp_dir:
         staging_dir = Path(temp_dir) / "package"
         vendor_bin = staging_dir / "vendor" / "bin"
         vendor_bin.mkdir(parents=True)
@@ -294,7 +294,7 @@ def _copy_legal_files(root: Path, destination: Path) -> None:
 
 def _pack(staging_dir: Path, output_path: Path, npm_bin: str) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="golutra-npm-pack-") as temp_dir:
+    with tempfile.TemporaryDirectory(prefix="golutra-agent-npm-pack-") as temp_dir:
         npm_args = [
             npm_bin,
             "pack",

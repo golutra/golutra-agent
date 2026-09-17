@@ -1,0 +1,30 @@
+[package]
+name = "golutra-agent-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description.workspace = true
+readme.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+golutra-agent-core.workspace = true
+golutra-agent-plugin = { path = "../golutra-agent-plugin", version = "0.3.0" }
+golutra-agent-sandbox.workspace = true
+golutra-agent-tools = { path = "../golutra-agent-tools", version = "0.3.0" }
+rmcp.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+golutra-agent-policy = { path = "../golutra-agent-policy", version = "0.3.0" }
+tempfile.workspace = true

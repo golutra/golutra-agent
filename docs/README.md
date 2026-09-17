@@ -6,8 +6,8 @@
 
 ## 先从目标开始
 
-普通用户不需要先阅读整套架构文档：安装 npm 包后运行 `golutra`，直接用自然语言描述目标；
-脚本和 CI 使用 `golutra exec`。默认 TUI 只展示进度和结果，遇到问题时再按需打开 JSON、debug
+普通用户不需要先阅读整套架构文档：安装 npm 包后运行 `golutra-agent`，直接用自然语言描述目标；
+脚本和 CI 使用 `golutra-agent exec`。默认 TUI 只展示进度和结果，遇到问题时再按需打开 JSON、debug
 或 run-bundle 观测面。
 
 按需要选择入口：
@@ -19,6 +19,8 @@
 - 想排查任务、token、缓存或验证结果：看 [观测与评估](evaluation-observability.md)、
   [运行时契约](runtime-contracts.md) 和 [外部验证](external-verification.md)。
 - 想维护或贡献代码：从下面的架构、契约和实现文档开始，并运行仓库质量检查。
+- 想随桌面安装包离线交付 Agent：看 [桌面原生集成合同](desktop-integration.md) 和 [验收记录](desktop-acceptance.md)。
+- 想让桌面与 npm 共用配置、历史及兼容升级：看 [共享数据兼容合同](shared-data-compatibility.md)。
 
 ## 推荐阅读顺序
 
@@ -46,6 +48,7 @@
 22. `runtime-entrypoints.md`：exec、App Server、Python/TypeScript SDK、MCP 和 Remote TUI 的进程模型、协议边界和验收方式。
 23. `runtime-stability.md`：长任务执行、provider/process 监督、崩溃恢复、任务对账和 restart soak 验收。
 24. `external-verification.md`：调用方声明的客观验证器、证据链和自动修复驱动。
+25. [tui-rendering.md](tui-rendering.md)：终端历史、流式显示、输入区锚点、工具卡片与真实 PTY 验收。
 
 ## 文档分工
 

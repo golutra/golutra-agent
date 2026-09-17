@@ -4,7 +4,7 @@
 
 本文定义并记录 Golutra 的 P3 受治理执行面：利用任务执行和开发者观察链路生成针对 agent 自身的代码候选，在隔离环境完成评估、构建、发布、监控和回滚，再由新版本承接下一轮任务。具体命令和持久化边界见 `supervisor-operations.md`，外部研究证据见 `research-self-evolving-agent-systems.md`。
 
-截至 2026-07-17，P2.5 前置门禁和 P3 E0-E4 的本地控制面已经落地：`golutra-supervisor`、`golutra-release`、sealed `golutra-eval-worker`、internal/external command producer、完整 TaskTrace ingestion、候选冻结、stable/candidate 不同二进制的 paired execution、sealed/fresh disclosure gate、OS-enforced producer/TrustedBuilder、内容寻址 release、stable/preview/canary pointer、rollback 及 `golutra-launcher` 都有实现和回归测试。当前进程不会热替换自己；已有任务继续由旧版本完成，下一次 launcher 启动读取 stable pointer。复杂远端集群调度、签名/TUF 服务和 E5 meta-evolution 仍不是当前本地交付范围。
+截至 2026-07-17，P2.5 前置门禁和 P3 E0-E4 的本地控制面已经落地：`golutra-agent-supervisor`、`golutra-agent-release`、sealed `golutra-agent-eval-worker`、internal/external command producer、完整 TaskTrace ingestion、候选冻结、stable/candidate 不同二进制的 paired execution、sealed/fresh disclosure gate、OS-enforced producer/TrustedBuilder、内容寻址 release、stable/preview/canary pointer、rollback 及 `golutra-agent-launcher` 都有实现和回归测试。当前进程不会热替换自己；已有任务继续由旧版本完成，下一次 launcher 启动读取 stable pointer。复杂远端集群调度、签名/TUF 服务和 E5 meta-evolution 仍不是当前本地交付范围。
 
 目标闭环：
 
@@ -34,7 +34,7 @@ golutra trace --full
 -> TrustedBuilder（Seatbelt/bubblewrap，无网络）
 -> ReleaseStore::build_checked（source/binary checksum）
 -> preview -> canary -> promote / rollback
--> golutra-launcher 读取 stable pointer 并 exec 下一版本
+-> golutra-agent-launcher 读取 stable pointer 并 exec 下一版本
 ```
 
 普通 RuntimeHost 不持有 stable pointer 写权限。Supervisor 也不读取 provider credential；command producer 子进程必须位于 OS-enforced sandbox，只有 candidate worktree 和独立 scratch 的写权限，没有网络，并使用清空敏感值后的环境，只能提交候选提案。版本评测同样不读取真实 provider credential：stable/candidate worker 使用 deterministic mock、独立 home/workspace 和外层断网 sandbox。assertion、sealed 答案、Supervisor state 与 release pointer 不挂载给 worker。process-only backend、越界 worktree、timeout 和超量输出都会失败。
@@ -86,7 +86,7 @@ Runtime Vn
 ## 目标组件
 
 ```text
-golutra-supervisor                 不参与普通任务执行
+golutra-agent-supervisor                 不参与普通任务执行
   ObservationIngestor              读取脱敏 runtime facts
   OpportunityMiner                 聚类失败和能力边界
   CandidateBroker                  调度内部/外部 producer
@@ -97,7 +97,7 @@ golutra-supervisor                 不参与普通任务执行
   DeploymentController             preview/canary/promote/rollback
   EpochScheduler                   持久化有限循环
 
-golutra-runtime Vn                可演化对象
+golutra-agent-runtime Vn                可演化对象
   AgentLoop
   Context / Provider / Tools
   RuntimeEvent / Verification
@@ -247,8 +247,8 @@ sealed holdout 的精确分数不能进入 parent fitness，只能提供晋升 v
 候选必须从已签名 parent source digest 创建独立 worktree：
 
 ```text
-$GOLUTRA_HOME/evolution/supervisor/worktrees/<candidate_id>/
-$GOLUTRA_HOME/evolution/supervisor/artifacts/<candidate_id>/
+$GOLUTRA_AGENT_HOME/evolution/supervisor/worktrees/<candidate_id>/
+$GOLUTRA_AGENT_HOME/evolution/supervisor/artifacts/<candidate_id>/
 ```
 
 worktree 只能由 Supervisor 从 epoch 绑定的 immutable stable release source 创建。冻结时不能信任 producer 声明的 `target_paths`：控制面会比较 parent/candidate 的完整文件集合和内容摘要，得到 canonical changed paths，再逐项应用 allowlist/denylist，并要求声明覆盖每一个真实变化。暗改或删除 sealed 文件即使未声明也会失败。
@@ -400,13 +400,13 @@ static policy
 当前安装脚本直接复制 binary。自部署需要改为内容寻址目录和稳定 launcher：
 
 ```text
-$GOLUTRA_HOME/releases/<release_digest>/bin/
-$GOLUTRA_HOME/releases/<release_digest>/release.json
-$GOLUTRA_HOME/releases/stable
-$GOLUTRA_HOME/releases/preview
+$GOLUTRA_AGENT_HOME/releases/<release_digest>/bin/
+$GOLUTRA_AGENT_HOME/releases/<release_digest>/release.json
+$GOLUTRA_AGENT_HOME/releases/stable
+$GOLUTRA_AGENT_HOME/releases/preview
 ```
 
-稳定的 `golutra-launcher` 读取受 Supervisor 管理的 stable pointer。候选只写新 release 目录，不能覆盖 launcher 或当前 stable 目录。
+稳定的 `golutra-agent-launcher` 读取受 Supervisor 管理的 stable pointer。候选只写新 release 目录，不能覆盖 launcher 或当前 stable 目录。
 
 ### ReleaseManifest
 
@@ -558,22 +558,22 @@ ReleaseRolledBack
 EvolutionEpochCompleted
 ```
 
-Supervisor 保留独立 append-only control log，并把脱敏摘要镜像为 RuntimeEvent，供 `golutra-vis` 和 developer mode 展示。候选不能改写 control log。
+Supervisor 保留独立 append-only control log，并把脱敏摘要镜像为 RuntimeEvent，供 `golutra-agent-vis` 和 developer mode 展示。候选不能改写 control log。
 
 ## 与当前 crate 的映射
 
 | 当前模块 | P3 扩展 |
 | --- | --- |
-| `golutra-eval` | execution-backed regression 和 P2.5 promotion 输入 |
-| `golutra-evolution` | GeneratedTask、skill 和当前 Runtime 内受控探索 |
-| `golutra-client` | 完整 TaskTrace export 和实际 baseline/candidate RuntimeHost |
-| `golutra-store` | schema migration ledger、release/evolution refs；不保存 signer secret |
-| `golutra-sandbox` | candidate build/run profile 与 denylist |
-| `golutra-governor` | evolution budget、risk lane、kill switch |
-| `golutra-app-server` | 现有版本继续服务 active attachment；部署调用方负责 drain 后再切 pointer |
-| `golutra-vis` | lineage、campaign、deployment、rollback 投影 |
-| `golutra-supervisor` | opportunity、有限 epoch、internal/external producer、archive、sealed/fresh gate、CLI 和 append-only control log |
-| `golutra-release` | TrustedBuilder、manifest、不可变 source/bin、stable/preview/canary pointer、launcher 和 rollback |
+| `golutra-agent-eval` | execution-backed regression 和 P2.5 promotion 输入 |
+| `golutra-agent-evolution` | GeneratedTask、skill 和当前 Runtime 内受控探索 |
+| `golutra-agent-client` | 完整 TaskTrace export 和实际 baseline/candidate RuntimeHost |
+| `golutra-agent-store` | schema migration ledger、release/evolution refs；不保存 signer secret |
+| `golutra-agent-sandbox` | candidate build/run profile 与 denylist |
+| `golutra-agent-governor` | evolution budget、risk lane、kill switch |
+| `golutra-agent-app-server` | 现有版本继续服务 active attachment；部署调用方负责 drain 后再切 pointer |
+| `golutra-agent-vis` | lineage、campaign、deployment、rollback 投影 |
+| `golutra-agent-supervisor` | opportunity、有限 epoch、internal/external producer、archive、sealed/fresh gate、CLI 和 append-only control log |
+| `golutra-agent-release` | TrustedBuilder、manifest、不可变 source/bin、stable/preview/canary pointer、launcher 和 rollback |
 
 ## 分阶段实施
 

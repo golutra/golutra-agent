@@ -2,11 +2,11 @@
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
-output_dir="${GOLUTRA_TBENCH_BIN_DIR:-/tmp/golutra-terminal-bench/bin}"
-build_dir="${GOLUTRA_TBENCH_BUILD_DIR:-/tmp/golutra-terminal-bench/build}"
-rust_image="${GOLUTRA_TBENCH_RUST_IMAGE:-rust:1.93-bookworm}"
-verify_image="${GOLUTRA_TBENCH_VERIFY_IMAGE:-debian:bullseye-slim}"
-rustup_dist_server="${GOLUTRA_TBENCH_RUSTUP_DIST_SERVER:-${RUSTUP_DIST_SERVER:-https://static.rust-lang.org}}"
+output_dir="${GOLUTRA_AGENT_TBENCH_BIN_DIR:-/tmp/golutra-agent-terminal-bench/bin}"
+build_dir="${GOLUTRA_AGENT_TBENCH_BUILD_DIR:-/tmp/golutra-agent-terminal-bench/build}"
+rust_image="${GOLUTRA_AGENT_TBENCH_RUST_IMAGE:-rust:1.93-bookworm}"
+verify_image="${GOLUTRA_AGENT_TBENCH_VERIFY_IMAGE:-debian:bullseye-slim}"
+rustup_dist_server="${GOLUTRA_AGENT_TBENCH_RUSTUP_DIST_SERVER:-${RUSTUP_DIST_SERVER:-https://static.rust-lang.org}}"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -36,7 +36,7 @@ mkdir -p "$output_dir" "$build_dir"
 output_dir=$(CDPATH= cd -- "$output_dir" && pwd)
 build_dir=$(CDPATH= cd -- "$build_dir" && pwd)
 
-proxy="${GOLUTRA_TBENCH_DOCKER_PROXY:-${HTTPS_PROXY:-${HTTP_PROXY:-}}}"
+proxy="${GOLUTRA_AGENT_TBENCH_DOCKER_PROXY:-${HTTPS_PROXY:-${HTTP_PROXY:-}}}"
 case "$proxy" in
   *://127.0.0.1:*|*://localhost:*)
     proxy=$(printf '%s' "$proxy" | sed -E 's#://(127\.0\.0\.1|localhost):#://host.docker.internal:#')
@@ -61,7 +61,7 @@ build_binary() {
     -e RUSTUP_DIST_SERVER="$rustup_dist_server" \
     -e TARGET="$target" \
     -e TARGET_CC_ENV="$cc_environment" \
-    -e OUTPUT_NAME="golutra-cli-$architecture.candidate" \
+    -e OUTPUT_NAME="golutra-agent-$architecture.candidate" \
     -v "$root:/src:ro" \
     -v "$target_dir:/target" \
     -v "$output_dir:/out" \
@@ -80,19 +80,19 @@ build_binary() {
       done
       export "$TARGET_CC_ENV=musl-gcc"
       CARGO_TARGET_DIR=/target \
-        cargo build --locked --release --target "$TARGET" -p golutra-cli
-      install -m 0755 "/target/$TARGET/release/golutra-cli" "/out/$OUTPUT_NAME"
+        cargo build --locked --release --target "$TARGET" -p golutra-agent-cli
+      install -m 0755 "/target/$TARGET/release/golutra-agent" "/out/$OUTPUT_NAME"
     '
 }
 
 verify_binary() {
   architecture=$1
   platform=$2
-  binary="/opt/golutra/golutra-cli-$architecture.candidate"
+  binary="/opt/golutra-agent/golutra-agent-$architecture.candidate"
 
   printf 'Verifying %s in Debian bullseye\n' "$architecture"
   docker run --rm --platform "$platform" \
-    -v "$output_dir:/opt/golutra:ro" \
+    -v "$output_dir:/opt/golutra-agent:ro" \
     "$verify_image" \
     "$binary" --help >/dev/null
 }
@@ -111,7 +111,7 @@ build_binary \
 verify_binary arm64 linux/arm64
 verify_binary amd64 linux/amd64
 
-mv "$output_dir/golutra-cli-arm64.candidate" "$output_dir/golutra-cli-arm64"
-mv "$output_dir/golutra-cli-amd64.candidate" "$output_dir/golutra-cli-amd64"
+mv "$output_dir/golutra-agent-arm64.candidate" "$output_dir/golutra-agent-arm64"
+mv "$output_dir/golutra-agent-amd64.candidate" "$output_dir/golutra-agent-amd64"
 
 printf 'Terminal-Bench binaries written to %s\n' "$output_dir"

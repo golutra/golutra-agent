@@ -6,7 +6,7 @@ import { GolutraClient, Thread } from "../.test-dist/index.js";
 const threadReference = {
   thread_id: "thread-1",
   session_id: "session-1",
-  workspace_root: "/tmp/golutra-sdk-test",
+  workspace_root: "/tmp/golutra-agent-sdk-test",
 };
 
 test("Thread and TurnHandle preserve the shared agent lifecycle", async () => {
@@ -252,7 +252,7 @@ test("TurnHandle ends or fails when the backing subscription settles", async () 
 test("governance helpers use the shared query and command contracts", async () => {
   const client = new GolutraClient(
     "http://127.0.0.1:47831",
-    "/tmp/golutra-sdk-test",
+    "/tmp/golutra-agent-sdk-test",
     { transportToken: "t".repeat(32) },
   );
   const queries = [];
@@ -308,7 +308,7 @@ test("Agent SSE reconnect keeps the consumed cursor and reaches the terminal eve
           instance_id: "runtime-1",
           pid: 1,
           base_url: "http://127.0.0.1:47831",
-          cwd: "/tmp/golutra-sdk-test",
+          cwd: "/tmp/golutra-agent-sdk-test",
           workspace_id: "workspace-1",
           default_session_id: "session-1",
           default_thread_id: "thread-1",
@@ -341,7 +341,7 @@ test("Agent SSE reconnect keeps the consumed cursor and reaches the terminal eve
   try {
     const client = new GolutraClient(
       "http://127.0.0.1:47831",
-      "/tmp/golutra-sdk-test",
+      "/tmp/golutra-agent-sdk-test",
       { transportToken: "t".repeat(32) },
     );
     const events = [];

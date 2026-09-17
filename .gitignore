@@ -7,6 +7,8 @@ sdk/typescript/.test-dist/
 __pycache__/
 *.py[cod]
 .venv/
+.golutra-agent/
+# 外部桌面目录不是 Agent 数据，也不得意外进入提交。
 .golutra/
 .env
 .env.*

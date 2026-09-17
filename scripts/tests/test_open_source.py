@@ -16,6 +16,13 @@ SPEC.loader.exec_module(check_open_source)
 
 
 class OpenSourceMetadataTest(unittest.TestCase):
+    def test_binary_paths_are_not_unversioned_dependencies(self) -> None:
+        manifest = {"bin": [{"name": "golutra-agent", "path": "src/main.rs"}],
+                    "dependencies": {"missing": {"path": "../missing"},
+                                     "valid": {"path": "../valid", "version": "0.2.0"}}}
+        self.assertEqual(check_open_source._path_dependencies_without_versions(manifest),
+                         ["dependencies.missing"])
+
     def test_repository_has_required_public_metadata(self) -> None:
         root = Path(__file__).resolve().parents[2]
         self.assertEqual(check_open_source.check_repository(root), [])
@@ -30,7 +37,7 @@ class OpenSourceMetadataTest(unittest.TestCase):
         self.assertEqual(package["publishConfig"]["access"], "public")
         self.assertEqual(
             package["bin"],
-            {"golutra": "bin/golutra.js", "golutra-tui": "bin/golutra-tui.js"},
+            {"golutra-agent": "bin/golutra-agent.js", "golutra-agent-tui": "bin/golutra-agent-tui.js"},
         )
         self.assertNotIn("optionalDependencies", package)
         self.assertFalse(

@@ -1336,7 +1336,7 @@ export class GolutraClient {
   private async fetchWithAttachment(url: URL, init: RequestInit = {}): Promise<Response> {
     const send = (attachmentId: string) => {
       const headers = this.transportHeaders(init.headers);
-      headers.set("x-golutra-attachment", attachmentId);
+      headers.set("x-golutra-agent-attachment", attachmentId);
       return fetch(url, { ...init, headers });
     };
     const attachment = await this.runtimeAttachment();
@@ -1360,8 +1360,8 @@ export class GolutraClient {
   private transportHeaders(initial?: HeadersInit): Headers {
     const headers = new Headers(initial);
     headers.set("authorization", `Bearer ${this.transportToken}`);
-    headers.set("x-golutra-actor-id", this.actorId);
-    headers.set("x-golutra-protocol-version", String(RUNTIME_PROTOCOL_VERSION));
+    headers.set("x-golutra-agent-actor-id", this.actorId);
+    headers.set("x-golutra-agent-protocol-version", String(RUNTIME_PROTOCOL_VERSION));
     return headers;
   }
 }

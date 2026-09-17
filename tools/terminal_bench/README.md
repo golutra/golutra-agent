@@ -1,10 +1,10 @@
 # Terminal-Bench Adapter
 
-`golutra_tbench_adapter.py` runs each Terminal-Bench trial with:
+`golutra_agent_tbench_adapter.py` runs each Terminal-Bench trial with:
 
 ```bash
-golutra --cwd <container-workdir> exec \
-  --run-dir /logs/golutra-runtime \
+golutra-agent --cwd <container-workdir> exec \
+  --run-dir /logs/golutra-agent-runtime \
   [--allow-network when proxy_url is configured] \
   --yolo --approval-mode auto \
   --max-elapsed-ms <remaining-agent-budget> \
@@ -25,7 +25,7 @@ configured so proxy variables reach the child; the disposable trial container,
 not yolo mode, remains the outer network/security boundary.
 
 Terminal-Bench mounts each trial's host logging directory at `/logs`. After a
-trial exits, its `golutra-runtime/` directory contains isolated raw runtime
+trial exits, its `golutra-agent-runtime/` directory contains isolated raw runtime
 state (`state/runtime.sqlite`, artifacts, checkpoints, memory, evaluation and
 evolution records), `observations/` with full owner-only event/conversation/
 trace JSON, and `debug-export/`, the redacted portable analysis bundle.
@@ -65,21 +65,21 @@ glibc before a benchmark starts:
 
 ```bash
 tools/terminal_bench/build_linux_binaries.sh \
-  --output-dir /tmp/golutra-terminal-bench/bin
+  --output-dir /tmp/golutra-agent-terminal-bench/bin
 ```
 
 When a host proxy uses loopback, the script rewrites it to
-`host.docker.internal`. Set `GOLUTRA_TBENCH_DOCKER_PROXY` to override that
+`host.docker.internal`. Set `GOLUTRA_AGENT_TBENCH_DOCKER_PROXY` to override that
 value. Then run Terminal-Bench with the generated paths. Pin both the harness
 and its LiteLLM dependency so a transitive release cannot silently change the
 runner's Python/Rust toolchain requirements:
 
 ```bash
 uvx --from 'terminal-bench==0.2.18' --with 'litellm==1.93.0' tb run \
-  --agent-import-path tools.terminal_bench.golutra_tbench_adapter:GolutraAgent \
+  --agent-import-path tools.terminal_bench.golutra_agent_tbench_adapter:GolutraAgent \
   --dataset terminal-bench-core==0.1.1 \
-  --agent-kwarg arm64_binary=/tmp/golutra-terminal-bench/bin/golutra-cli-arm64 \
-  --agent-kwarg amd64_binary=/tmp/golutra-terminal-bench/bin/golutra-cli-amd64 \
+  --agent-kwarg arm64_binary=/tmp/golutra-agent-terminal-bench/bin/golutra-agent-arm64 \
+  --agent-kwarg amd64_binary=/tmp/golutra-agent-terminal-bench/bin/golutra-agent-amd64 \
   --agent-kwarg proxy_url=http://host.docker.internal:7897 \
   --output-path /tmp/terminal-bench/runs
 ```
@@ -88,7 +88,7 @@ The `arm64_binary` and `amd64_binary` arguments are copied into the Linux
 trial container and must be Linux ELF binaries for the matching architecture.
 `collector_binary` is different: it is executed by the host after the trial
 finishes, so it must be a host-native Golutra CLI (for example,
-`target/release/golutra-cli` on macOS), not one of the Linux container
+`target/release/golutra-agent` on macOS), not one of the Linux container
 binaries. If no usable host collector is available, the adapter keeps the
 evaluation in a pending file for later ingestion.
 
@@ -102,7 +102,7 @@ both `NO_PROXY` variants. This keeps task-local services on the Compose network
 instead of routing them through the host proxy. The merged value is
 deduplicated and bounded before injection. For a proxy listening on the host loopback interface, use
 `host.docker.internal` rather than `127.0.0.1`. The
-`GOLUTRA_TBENCH_PROXY` host environment variable provides the same setting.
+`GOLUTRA_AGENT_TBENCH_PROXY` host environment variable provides the same setting.
 
 After the agent command exits, the adapter reads the retained trace's
 `token_usage_recorded` events and returns the provider input/output totals to
@@ -128,14 +128,14 @@ The adapter never imports or changes the upstream Terminal-Bench source. It
 only adapts the trial lifecycle and consumes the retained Golutra bundle:
 
 ```text
-<trial>/golutra-runtime/manifest.json
-<trial>/golutra-runtime/observations/manifest.json
-<trial>/golutra-runtime/observations/sessions/.../tasks/.../trace.json
-<trial>/golutra-runtime/terminal-bench-evaluation.json
+<trial>/golutra-agent-runtime/manifest.json
+<trial>/golutra-agent-runtime/observations/manifest.json
+<trial>/golutra-agent-runtime/observations/sessions/.../tasks/.../trace.json
+<trial>/golutra-agent-runtime/terminal-bench-evaluation.json
 ```
 
-The preferred bundle directory is `<trial>/golutra-runtime`; older harness
-layouts under `<trial>/sessions/golutra-runtime` remain readable. The collector
+The preferred bundle directory is `<trial>/golutra-agent-runtime`; older harness
+layouts under `<trial>/sessions/golutra-agent-runtime` remain readable. The collector
 starts before the blocking agent command, then waits for both `results.json` and
 the runtime manifest, derives only evidence files that actually exist, and
 invokes `<collector> --run-bundle ... eval ingest`
@@ -145,13 +145,13 @@ portable and resolve against the harness-owned trial output. Each collector
 attempt receives the remaining overall result-collection deadline instead of a
 fixed per-process timeout; retries and retry delays consume that same budget.
 It resolves that host collector from the explicit `collector_binary` agent
-argument or `GOLUTRA_TBENCH_COLLECTOR` first. Those settings are authoritative.
+argument or `GOLUTRA_AGENT_TBENCH_COLLECTOR` first. Those settings are authoritative.
 Without either override it considers only this repository's release/debug
-`golutra-cli` binaries, selects the newest executable, and rejects candidates
-older than the current Rust sources. It does not select an unrelated `golutra`
+`golutra-agent` binaries, selects the newest executable, and rejects candidates
+older than the current Rust sources. It does not select an unrelated `golutra-agent`
 command from the host `PATH`.
 If the result file, runtime identity, trace, or collector is unavailable, it
-keeps a `golutra-evaluation.pending.json` file with the reason and the original
+keeps a `golutra-agent-evaluation.pending.json` file with the reason and the original
 record instead of dropping the structured observation. This makes a later
 offline ingestion possible without rerunning the trial. Collector timeouts also
 retain the record path, error type, attempted timeout, and subprocess detail.

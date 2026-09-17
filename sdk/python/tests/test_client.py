@@ -14,7 +14,7 @@ from unittest.mock import patch
 SDK_SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SDK_SRC))
 
-from golutra_sdk import GolutraClient, GolutraError, GolutraHttpError, Thread
+from golutra_agent_sdk import GolutraClient, GolutraError, GolutraHttpError, Thread
 
 
 TOKEN = "python-sdk-test-token-000000000000000000000000000000000000000000"
@@ -136,8 +136,8 @@ class RuntimeHandler(BaseHTTPRequestHandler):
         )
         valid = (
             self.headers.get("authorization") == f"Bearer {TOKEN}"
-            and self.headers.get("x-golutra-actor-id", "").startswith("python-sdk-")
-            and self.headers.get("x-golutra-protocol-version") == "7"
+            and self.headers.get("x-golutra-agent-actor-id", "").startswith("python-sdk-")
+            and self.headers.get("x-golutra-agent-protocol-version") == "7"
         )
         if not valid:
             self._json({"error": "unauthorized"}, 401)
@@ -310,14 +310,14 @@ class ClientTest(unittest.TestCase):
         subscription.close()
         self.assertTrue(
             any(
-                headers.get("x-golutra-attachment") == RuntimeHandler.attachment_id
+                headers.get("x-golutra-agent-attachment") == RuntimeHandler.attachment_id
                 for headers in RuntimeHandler.observed_headers
             )
         )
         self.assertEqual(
             len(
                 {
-                    headers.get("x-golutra-actor-id")
+                    headers.get("x-golutra-agent-actor-id")
                     for headers in RuntimeHandler.observed_headers
                 }
             ),

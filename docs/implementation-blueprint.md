@@ -79,11 +79,11 @@ P2 当前状态包含类型、持久状态和受控本地流程；P2.5 已在此
 
 当前五类入口已共享同一 `RuntimeHost`/`RuntimeApplication` 边界：
 
-- `golutra exec` 提供 stdin、JSONL、durable thread resume、output file 和 ephemeral 模式；
+- `golutra-agent exec` 提供 stdin、JSONL、durable thread resume、output file 和 ephemeral 模式；
 - App Server 提供 HTTP/SSE、Unix IPC、WebSocket 和 stdio JSON-RPC；
 - Python/TypeScript SDK 提供 thread/turn handle、流式事件、steer、interrupt 和 approval；
-- `golutra mcp-server` 默认连接用户级 daemon，并支持显式 remote/embedded；
-- `golutra-tui remote` 将终端渲染与远程 Runtime 分离。
+- `golutra-agent mcp-server` 默认连接用户级 daemon，并支持显式 remote/embedded；
+- `golutra-agent-tui remote` 将终端渲染与远程 Runtime 分离。
 
 这些入口只负责传输、参数和 projection，不复制 RuntimeLane、AgentLoop 或终态验证逻辑。跨进程验收命令和输出语义见 `runtime-entrypoints.md`。
 
@@ -716,7 +716,7 @@ PromotionDecision
 - `RuntimeHost` 是执行与状态所有权边界，负责接收 `SessionCommand`、驱动 `RuntimeLane / AgentLoop`、写入 event、更新 projection、广播 live event。
 - `RuntimeStore` 是 durable facts，不直接等于 runtime host；store 可以恢复状态，但不能替代任务调度、运行中取消、订阅和 provider/tool loop。
 - `EventBus` 负责把 durable event 与 live event 统一起来：先 append 到 store，再发布给订阅者；断线重连时按 cursor replay，再接 live stream。
-- `EmbeddedTransport` 是 CLI/TUI 默认入口，必须持有 `Arc<RuntimeHost>` 并连接 `$GOLUTRA_HOME/state/runtime.sqlite`，不能只包临时 `RuntimeStore`。
+- `EmbeddedTransport` 是 CLI/TUI 默认入口，必须持有 `Arc<RuntimeHost>` 并连接 `$GOLUTRA_AGENT_HOME/state/runtime.sqlite`，不能只包临时 `RuntimeStore`。
 - `UnixIpcTransport` 用于 Unix 本地 daemon，`HttpSseTransport` 用于 Windows/Web/SDK/显式 remote；两者必须先按 cwd attachment，并与 `EmbeddedTransport` 对拍一致。
 - `RuntimeClient::subscribe` 的目标语义是 event stream；如果短期保留 snapshot API，也必须新增 live watch 能力，不能让 TUI 长期轮询历史事件。
 - cwd thread resolver 从全局 thread index 选择当前 cwd 最近 session/thread；TUI 新建会话可以显式生成新 ID，但首个 prompt 前不持久化 placeholder。
@@ -890,21 +890,21 @@ Debug Projection 只在 debug/audit/replay 模式启用，并且只承担治理�
 
 ## 第一阶段落地顺序
 
-1. `golutra-core`：核心 schema。
-2. `golutra-store`：SQLite、event log、artifact store。
-3. `golutra-runtime`：RuntimeLane、turn loop、LoopGuard、LoopDecision、verification 调度。
-4. `golutra-context`：ContextBuilder、TokenBudgetTracker、WorkingSummary。
-5. `golutra-llm`：provider contract、capability matrix、routing、usage normalization。
-6. `golutra-tools`：tool schema、permission、ToolResultEnvelope。
-7. `golutra-store` checkpoint 子模块：workspace checkpoint。
-8. `golutra-verify`：任务类型基础验证策略。
-9. `golutra-client` host 子模块：`RuntimeHost`、cwd thread resolver、`EventBus`、全局 `RuntimePaths`。
-10. `golutra-client`：统一 `RuntimeClient`、`RuntimeQuery`、event replay 和 live subscription 接口。
-11. `golutra-cli` / `golutra-tui`：默认通过 `EmbeddedTransport`，可显式选择 daemon/remote，只消费 command/query/event。
-12. `golutra-app-server`：用户级单实例管理多 cwd attachment，暴露 Unix IPC 与 HTTP command/query/SSE stream。
-13. `golutra-vis`：DebugProjection、event replay、audit 和 OTel JSON。
-14. `golutra-eval` / `golutra-evolution`：ImprovementCandidate、RegressionResult、PromotionDecision、GeneratedTask 与 Skill 生命周期。
-15. `golutra-plugin` / `golutra-mcp`：reviewed package、OS sandbox、approval 和统一 ToolContract bridge。
+1. `golutra-agent-core`：核心 schema。
+2. `golutra-agent-store`：SQLite、event log、artifact store。
+3. `golutra-agent-runtime`：RuntimeLane、turn loop、LoopGuard、LoopDecision、verification 调度。
+4. `golutra-agent-context`：ContextBuilder、TokenBudgetTracker、WorkingSummary。
+5. `golutra-agent-llm`：provider contract、capability matrix、routing、usage normalization。
+6. `golutra-agent-tools`：tool schema、permission、ToolResultEnvelope。
+7. `golutra-agent-store` checkpoint 子模块：workspace checkpoint。
+8. `golutra-agent-verify`：任务类型基础验证策略。
+9. `golutra-agent-client` host 子模块：`RuntimeHost`、cwd thread resolver、`EventBus`、全局 `RuntimePaths`。
+10. `golutra-agent-client`：统一 `RuntimeClient`、`RuntimeQuery`、event replay 和 live subscription 接口。
+11. `golutra-agent-cli` / `golutra-agent-tui`：默认通过 `EmbeddedTransport`，可显式选择 daemon/remote，只消费 command/query/event。
+12. `golutra-agent-app-server`：用户级单实例管理多 cwd attachment，暴露 Unix IPC 与 HTTP command/query/SSE stream。
+13. `golutra-agent-vis`：DebugProjection、event replay、audit 和 OTel JSON。
+14. `golutra-agent-eval` / `golutra-agent-evolution`：ImprovementCandidate、RegressionResult、PromotionDecision、GeneratedTask 与 Skill 生命周期。
+15. `golutra-agent-plugin` / `golutra-agent-mcp`：reviewed package、OS sandbox、approval 和统一 ToolContract bridge。
 16. TypeScript/Python SDK 与安装/三平台 CI 交付。
 
 入口优先级默认值：

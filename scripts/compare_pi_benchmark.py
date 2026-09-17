@@ -118,7 +118,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workspace", type=Path, required=True, help="fixture workspace to copy for each task")
     parser.add_argument("--pi-root", type=Path, required=True, help="Pi checkout")
     parser.add_argument("--output", type=Path, required=True, help="JSON report destination")
-    parser.add_argument("--golutra", default="target/debug/golutra-cli")
+    parser.add_argument("--golutra", default="target/debug/golutra-agent")
     parser.add_argument("--pi-agent-dir", type=Path, default=Path.home() / ".pi" / "agent")
     parser.add_argument("--provider", default="my-api")
     parser.add_argument("--model", default="gpt-5.5")
@@ -893,6 +893,61 @@ def elapsed_between(end: float | None, start: float | None) -> float | None:
     return round(max(0.0, end - start), 1)
 
 
+TRANSPORT_DIAGNOSTIC_DURATION_FIELDS = (
+    "stream_handle_ready_ms",
+    "first_stream_event_ms",
+    "first_business_event_ms",
+    "terminal_event_ms",
+)
+
+
+def transport_diagnostics_from_observation(
+    observation: dict[str, Any],
+) -> dict[str, Any] | None:
+    """投影 provider 的有界传输诊断，不复制原始响应元数据。"""
+    raw = observation.get("transport_diagnostics")
+    if not isinstance(raw, dict):
+        return None
+    transport = raw.get("transport")
+    if (
+        not isinstance(transport, str)
+        or not transport
+        or len(transport) > 64
+        or not transport.isascii()
+        or not all(
+            character.isalnum() or character in "_-."
+            for character in transport
+        )
+    ):
+        return None
+    attempt_count = raw.get("attempt_count")
+    if (
+        not isinstance(attempt_count, int)
+        or isinstance(attempt_count, bool)
+        or attempt_count < 1
+        or attempt_count > 32
+    ):
+        return None
+    projected: dict[str, Any] = {
+        "transport": transport,
+        "attempt_count": attempt_count,
+        "credential_refresh_attempted": raw.get("credential_refresh_attempted") is True,
+    }
+    previous_duration: int | None = None
+    for field in TRANSPORT_DIAGNOSTIC_DURATION_FIELDS:
+        value = raw.get(field)
+        if (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and 0 <= value <= 86_400_000
+        ):
+            if previous_duration is not None and value < previous_duration:
+                return None
+            projected[field] = value
+            previous_duration = value
+    return projected
+
+
 def provider_request_metrics(
     request_id: str,
     request_index: int,
@@ -939,6 +994,19 @@ def provider_request_metrics(
         partial = metrics.get(f"{field}_partial")
         if partial is not None:
             projection[f"{field}_partial"] = partial
+    transport_diagnostics = transport_diagnostics_from_observation(observation)
+    if transport_diagnostics is not None:
+        projection["transport_diagnostics"] = transport_diagnostics
+        for key in (
+            "stream_handle_ready_ms",
+            "first_stream_event_ms",
+            "first_business_event_ms",
+            "terminal_event_ms",
+            "attempt_count",
+            "credential_refresh_attempted",
+        ):
+            if key in transport_diagnostics:
+                projection[key] = transport_diagnostics[key]
     projection.update(
         provider_cache_round_diagnostics(
             cache_context,
@@ -1222,6 +1290,11 @@ def parse_golutra(
                 request_order.append(request_id)
             observation = request_observations.setdefault(request_id, {})
             observation["completed_ms"] = event_time
+            transport_diagnostics = transport_diagnostics_from_observation(
+                {"transport_diagnostics": payload.get("transport_diagnostics")}
+            )
+            if transport_diagnostics is not None:
+                observation["transport_diagnostics"] = transport_diagnostics
             if request_id and isinstance(payload.get("usage"), dict):
                 fallback_record = normalize_golutra_usage(
                     usage_record_from_provider_completed(event, payload)
@@ -1742,7 +1815,7 @@ def prepare_workspace(source: Path, destination: Path, seeds: dict[str, str]) ->
         path.write_text(content, encoding="utf-8")
 
 
-def golutra_scenario_command(
+def golutra_agent_scenario_command(
     args: argparse.Namespace,
     workspace: Path,
     prompt: str,
@@ -1903,12 +1976,12 @@ def run_cache_scenario(
     root: Path,
 ) -> dict[str, Any]:
     scenario_root = root / f"cache-{scenario_id}"
-    golutra_workspace = scenario_root / "golutra-workspace"
+    golutra_agent_workspace = scenario_root / "golutra-agent-workspace"
     pi_workspace = scenario_root / "pi-workspace"
     task = cache_scenario_task(scenario_id)
-    prepare_workspace(args.workspace, golutra_workspace, task.seeds)
+    prepare_workspace(args.workspace, golutra_agent_workspace, task.seeds)
     prepare_workspace(args.workspace, pi_workspace, task.seeds)
-    golutra_run = scenario_root / "golutra-run"
+    golutra_agent_run = scenario_root / "golutra-agent-run"
     pi_session = scenario_root / "pi-session"
     pi_session.mkdir(parents=True)
     pi_env = os.environ.copy()
@@ -1917,39 +1990,39 @@ def run_cache_scenario(
 
     if scenario_id == "same_thread_next_turn":
         warmup_task = cache_warmup_task()
-        golutra_warm_capture = run_process(
-            golutra_scenario_command(
+        golutra_agent_warm_capture = run_process(
+            golutra_agent_scenario_command(
                 args,
-                golutra_workspace,
+                golutra_agent_workspace,
                 warmup_task.prompt,
-                golutra_run,
+                golutra_agent_run,
             ),
             args.workspace,
             os.environ.copy(),
             args.timeout,
-            scenario_root / "golutra-warmup.stdout.jsonl",
-            scenario_root / "golutra-warmup.stderr.log",
+            scenario_root / "golutra-agent-warmup.stdout.jsonl",
+            scenario_root / "golutra-agent-warmup.stderr.log",
         )
-        golutra_warm_metrics = parse_golutra(
-            golutra_warm_capture.stdout,
-            golutra_warm_capture.elapsed_ms,
-            golutra_warm_capture.return_code,
-            golutra_run,
-            golutra_warm_capture.stdout_line_times_ms,
+        golutra_agent_warm_metrics = parse_golutra(
+            golutra_agent_warm_capture.stdout,
+            golutra_agent_warm_capture.elapsed_ms,
+            golutra_agent_warm_capture.return_code,
+            golutra_agent_run,
+            golutra_agent_warm_capture.stdout_line_times_ms,
         )
-        thread_id = run_bundle_thread_id(golutra_run)
-        if thread_id is None or golutra_warm_capture.return_code != 0:
-            golutra_metrics = unavailable_metrics(
+        thread_id = run_bundle_thread_id(golutra_agent_run)
+        if thread_id is None or golutra_agent_warm_capture.return_code != 0:
+            golutra_agent_metrics = unavailable_metrics(
                 "Golutra warmup did not produce a resumable thread",
-                golutra_warm_capture.return_code,
+                golutra_agent_warm_capture.return_code,
             )
         else:
-            golutra_capture = run_process(
-                golutra_scenario_command(
+            golutra_agent_capture = run_process(
+                golutra_agent_scenario_command(
                     args,
-                    golutra_workspace,
+                    golutra_agent_workspace,
                     task.prompt,
-                    golutra_run,
+                    golutra_agent_run,
                     thread_id,
                 ),
                 args.workspace,
@@ -1958,12 +2031,12 @@ def run_cache_scenario(
                 scenario_root / "golutra.stdout.jsonl",
                 scenario_root / "golutra.stderr.log",
             )
-            golutra_metrics = parse_golutra(
-                golutra_capture.stdout,
-                golutra_capture.elapsed_ms,
-                golutra_capture.return_code,
-                golutra_run,
-                golutra_capture.stdout_line_times_ms,
+            golutra_agent_metrics = parse_golutra(
+                golutra_agent_capture.stdout,
+                golutra_agent_capture.elapsed_ms,
+                golutra_agent_capture.return_code,
+                golutra_agent_run,
+                golutra_agent_capture.stdout_line_times_ms,
             )
 
         pi_warm_capture = run_process(
@@ -2002,9 +2075,9 @@ def run_cache_scenario(
             )
         warmup = {
             "golutra": {
-                **golutra_warm_metrics,
+                **golutra_agent_warm_metrics,
                 "verification": task_verification(
-                    warmup_task, golutra_warm_metrics, golutra_workspace
+                    warmup_task, golutra_agent_warm_metrics, golutra_agent_workspace
                 ),
             },
             "pi": {
@@ -2015,20 +2088,20 @@ def run_cache_scenario(
             },
         }
     else:
-        golutra_capture = run_process(
-            golutra_scenario_command(args, golutra_workspace, task.prompt, golutra_run),
+        golutra_agent_capture = run_process(
+            golutra_agent_scenario_command(args, golutra_agent_workspace, task.prompt, golutra_agent_run),
             args.workspace,
             os.environ.copy(),
             args.timeout,
             scenario_root / "golutra.stdout.jsonl",
             scenario_root / "golutra.stderr.log",
         )
-        golutra_metrics = parse_golutra(
-            golutra_capture.stdout,
-            golutra_capture.elapsed_ms,
-            golutra_capture.return_code,
-            golutra_run,
-            golutra_capture.stdout_line_times_ms,
+        golutra_agent_metrics = parse_golutra(
+            golutra_agent_capture.stdout,
+            golutra_agent_capture.elapsed_ms,
+            golutra_agent_capture.return_code,
+            golutra_agent_run,
+            golutra_agent_capture.stdout_line_times_ms,
         )
         pi_capture = run_process(
             pi_scenario_command(args, task.prompt, pi_session),
@@ -2045,18 +2118,18 @@ def run_cache_scenario(
             pi_capture.stdout_line_times_ms,
         )
 
-    golutra_verification = task_verification(task, golutra_metrics, golutra_workspace)
+    golutra_agent_verification = task_verification(task, golutra_agent_metrics, golutra_agent_workspace)
     pi_verification = task_verification(task, pi_metrics, pi_workspace)
     result = {
         "scenario_id": scenario_id,
         "normal_cache_kpi": scenario_id != "first_turn_cold",
         "golutra": cache_scenario_projection(
-            scenario_id, golutra_metrics, golutra_verification
+            scenario_id, golutra_agent_metrics, golutra_agent_verification
         ),
         "pi": cache_scenario_projection(scenario_id, pi_metrics, pi_verification),
         "artifacts": {
             "root": str(scenario_root),
-            "golutra_run": str(golutra_run),
+            "golutra_agent_run": str(golutra_agent_run),
             "pi_session": str(pi_session),
         },
     }
@@ -2072,22 +2145,22 @@ def run_cache_scenario(
 
 def run_task(task: Task, args: argparse.Namespace, root: Path) -> dict[str, Any]:
     task_root = root / task.task_id
-    golutra_workspace = task_root / "golutra-workspace"
+    golutra_agent_workspace = task_root / "golutra-agent-workspace"
     pi_workspace = task_root / "pi-workspace"
-    prepare_workspace(args.workspace, golutra_workspace, task.seeds)
+    prepare_workspace(args.workspace, golutra_agent_workspace, task.seeds)
     prepare_workspace(args.workspace, pi_workspace, task.seeds)
-    golutra_run = task_root / "golutra-run"
+    golutra_agent_run = task_root / "golutra-agent-run"
     verifier = Path(__file__).with_name("verify_compare_task.py").resolve()
     expected_json = json.dumps(task.expected_files, ensure_ascii=True, separators=(",", ":"))
-    golutra_command = [
+    golutra_agent_command = [
         str(Path(args.golutra).resolve()),
         "--cwd",
-        str(golutra_workspace),
+        str(golutra_agent_workspace),
         "exec",
         "--json",
         "--ephemeral",
         "--run-dir",
-        str(golutra_run),
+        str(golutra_agent_run),
         "--approval-mode",
         "auto",
         # Pi 的基准进程不启用沙箱，因此统一执行边界，并由 harness 负责功能断言。
@@ -2100,7 +2173,7 @@ def run_task(task: Task, args: argparse.Namespace, root: Path) -> dict[str, Any]
         "--verify-arg",
         "--workspace",
         "--verify-arg",
-        str(golutra_workspace),
+        str(golutra_agent_workspace),
         "--verify-arg",
         "--expected-json",
         "--verify-arg",
@@ -2111,20 +2184,20 @@ def run_task(task: Task, args: argparse.Namespace, root: Path) -> dict[str, Any]
         str(args.max_elapsed_ms),
         task.prompt,
     ]
-    golutra_capture = run_process(
-        golutra_command,
+    golutra_agent_capture = run_process(
+        golutra_agent_command,
         args.workspace,
         os.environ.copy(),
         args.timeout,
         task_root / "golutra.stdout.jsonl",
         task_root / "golutra.stderr.log",
     )
-    golutra_metrics = parse_golutra(
-        golutra_capture.stdout,
-        golutra_capture.elapsed_ms,
-        golutra_capture.return_code,
-        golutra_run,
-        golutra_capture.stdout_line_times_ms,
+    golutra_agent_metrics = parse_golutra(
+        golutra_agent_capture.stdout,
+        golutra_agent_capture.elapsed_ms,
+        golutra_agent_capture.return_code,
+        golutra_agent_run,
+        golutra_agent_capture.stdout_line_times_ms,
     )
     pi_session = task_root / "pi-session"
     pi_session.mkdir(parents=True)
@@ -2169,9 +2242,9 @@ def run_task(task: Task, args: argparse.Namespace, root: Path) -> dict[str, Any]
     return {
         "task_id": task.task_id,
         "prompt": task.prompt,
-        "golutra": {**golutra_metrics, "verification": task_verification(task, golutra_metrics, golutra_workspace)},
+        "golutra": {**golutra_agent_metrics, "verification": task_verification(task, golutra_agent_metrics, golutra_agent_workspace)},
         "pi": {**pi_metrics, "verification": task_verification(task, pi_metrics, pi_workspace)},
-        "artifacts": {"root": str(task_root), "golutra_run": str(golutra_run), "pi_session": str(pi_session)},
+        "artifacts": {"root": str(task_root), "golutra_agent_run": str(golutra_agent_run), "pi_session": str(pi_session)},
     }
 
 
@@ -2403,7 +2476,7 @@ def main() -> int:
         work_root = args.work_root.resolve()
         work_root.mkdir(parents=True, exist_ok=True)
     else:
-        work_root = Path(tempfile.mkdtemp(prefix="golutra-pi-benchmark-"))
+        work_root = Path(tempfile.mkdtemp(prefix="golutra-agent-pi-benchmark-"))
     report = {
         "schema_version": 4,
         "generated_at": now_iso(),
@@ -2416,7 +2489,7 @@ def main() -> int:
             "cache_scenarios": selected_cache_scenarios,
             "cache_kpi_scope": "same_session_tool_round_and_same_thread_next_turn_only",
             "cost_source": "unknown",
-            "golutra_approval_mode": "yolo",
+            "golutra_agent_approval_mode": "yolo",
             "project_verifier_discovery": False,
             "functional_assertions": "harness_response_and_fixture_files",
             "external_verifier": str(Path(__file__).with_name("verify_compare_task.py").resolve()),

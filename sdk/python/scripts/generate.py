@@ -8,7 +8,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[3]
 SCHEMA_PATH = ROOT / "schemas" / "sdk-protocol.schema.json"
-OUTPUT_PATH = ROOT / "sdk" / "python" / "src" / "golutra_sdk" / "generated.py"
+OUTPUT_PATH = ROOT / "sdk" / "python" / "src" / "golutra_agent_sdk" / "generated.py"
 
 
 def schema_type(schema: dict[str, Any] | bool) -> str:

@@ -52,7 +52,7 @@ class EngineState:
     env: dict[str, str]
     thread_id: str | None = None
     codex_cumulative_usage: dict[str, int] | None = None
-    golutra_cache_context: dict[str, Any] | None = None
+    golutra_agent_cache_context: dict[str, Any] | None = None
     turns: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -64,7 +64,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="rebuild status fields from an existing report and retained stdout artifacts",
     )
-    parser.add_argument("--golutra", type=Path, default=Path("target/debug/golutra-cli"))
+    parser.add_argument("--golutra", type=Path, default=Path("target/debug/golutra-agent"))
     parser.add_argument(
         "--pi-root",
         type=Path,
@@ -84,7 +84,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--work-root", type=Path)
     parser.add_argument("--keep-work-root", action="store_true")
-    parser.add_argument("--golutra-home-source", type=Path, default=Path.home() / ".golutra")
+    parser.add_argument("--golutra-agent-home-source", type=Path, default=Path.home() / ".golutra-agent")
     parser.add_argument("--pi-agent-source", type=Path, default=Path.home() / ".pi" / "agent")
     parser.add_argument("--codex-home-source", type=Path, default=Path.home() / ".codex")
     return parser.parse_args()
@@ -136,7 +136,7 @@ def copy_private(source: Path, destination: Path) -> None:
 
 def prepare_golutra_home(args: argparse.Namespace, destination: Path) -> None:
     private_directory(destination)
-    source = args.golutra_home_source.resolve(strict=True)
+    source = args.golutra_agent_home_source.resolve(strict=True)
     payload = json.loads((source / "provider.json").read_text(encoding="utf-8"))
     active = payload.get("active_profile")
     found = False
@@ -287,7 +287,7 @@ def prompt_metadata(prompt: str) -> dict[str, Any]:
     }
 
 
-def golutra_command(
+def golutra_agent_command(
     args: argparse.Namespace,
     state: EngineState,
     prompt: str,
@@ -432,6 +432,7 @@ def parse_codex(
     events = list(json_lines_with_times(capture.stdout, capture.stdout_line_times_ms))
     thread_id = None
     completed = False
+    turn_started_ms = None
     terminal_ms = None
     first_observable_ms = None
     final_message = ""
@@ -439,6 +440,8 @@ def parse_codex(
     tools: dict[str, str] = {}
     for event, observed_ms in events:
         event_type = event.get("type")
+        if event_type == "turn.started" and turn_started_ms is None:
+            turn_started_ms = observed_ms
         if event_type == "thread.started":
             candidate = event.get("thread_id")
             thread_id = str(candidate) if candidate else thread_id
@@ -476,7 +479,11 @@ def parse_codex(
     metrics["first_token_ms"] = (
         round(first_observable_ms, 1) if first_observable_ms is not None else None
     )
-    metrics["turn_first_token_ms"] = metrics["first_token_ms"]
+    metrics["turn_first_token_ms"] = (
+        round(first_observable_ms - turn_started_ms, 1)
+        if first_observable_ms is not None and turn_started_ms is not None
+        and first_observable_ms >= turn_started_ms else None
+    )
     metrics["first_observable_source"] = "codex_first_non_todo_item"
     metrics["final_message"] = final_message
     metrics["tool_call_count"] = len(tools)
@@ -877,17 +884,84 @@ def aggregate_turns(turns: list[dict[str, Any]]) -> dict[str, Any]:
         for request in turn.get("metrics", {}).get("provider_requests", [])
         if isinstance(request, dict)
     ]
+    # 只比较实际暴露的长输入请求时序；缺少 request 数据的产品保持 unknown。
+    long_requests = [
+        request for request in provider_requests
+        if isinstance(request.get("prompt_tokens"), int)
+        and request["prompt_tokens"] >= 16_384
+    ]
+    summary["long_request_count"] = len(long_requests) if provider_requests else None
+    for source, target in (("ttft_ms", "ttft"), ("terminal_latency_ms", "terminal")):
+        timings = [
+            float(request[source]) for request in long_requests
+            if isinstance(request.get(source), (int, float))
+        ]
+        summary[f"long_request_{target}_samples"] = len(timings) if provider_requests else None
+        summary[f"long_request_{target}_p50_ms"] = quantile(timings, 0.5)
+        summary[f"long_request_{target}_p95_ms"] = quantile(timings, 0.95)
+
+    # Responses adapter 的分段时延来自 provider 完成事件中的安全诊断。
+    # 缺失诊断保持 unknown，不能用外层事件时间猜测 HTTP 首字节。
+    transport_fields = (
+        ("stream_handle_ready_ms", "stream_handle_ready"),
+        ("first_stream_event_ms", "first_stream"),
+        ("first_business_event_ms", "first_business"),
+        ("terminal_event_ms", "terminal_event"),
+    )
     diagnosed_requests = [
+        request
+        for request in provider_requests
+        if isinstance(request.get("transport_diagnostics"), dict)
+    ]
+    summary["transport_diagnostic_requests"] = (
+        len(diagnosed_requests) if provider_requests else None
+    )
+    attempt_values = [
+        request["attempt_count"]
+        for request in diagnosed_requests
+        if isinstance(request.get("attempt_count"), int)
+        and not isinstance(request.get("attempt_count"), bool)
+    ]
+    summary["transport_attempts_total"] = sum(attempt_values) if provider_requests else None
+    summary["transport_retry_requests"] = (
+        sum(value > 1 for value in attempt_values) if provider_requests else None
+    )
+    for field, target in transport_fields:
+        timings = [
+            float(request[field])
+            for request in diagnosed_requests
+            if isinstance(request.get(field), (int, float))
+            and not isinstance(request.get(field), bool)
+        ]
+        summary[f"transport_{target}_samples"] = (
+            len(timings) if provider_requests else None
+        )
+        summary[f"transport_{target}_p50_ms"] = quantile(timings, 0.5)
+        summary[f"transport_{target}_p95_ms"] = quantile(timings, 0.95)
+        summary[f"transport_{target}_max_ms"] = max(timings, default=None)
+        long_timings = [
+            float(request[field])
+            for request in long_requests
+            if isinstance(request.get("transport_diagnostics"), dict)
+            and isinstance(request.get(field), (int, float))
+            and not isinstance(request.get(field), bool)
+        ]
+        summary[f"long_request_{target}_samples"] = (
+            len(long_timings) if provider_requests else None
+        )
+        summary[f"long_request_{target}_p50_ms"] = quantile(long_timings, 0.5)
+        summary[f"long_request_{target}_p95_ms"] = quantile(long_timings, 0.95)
+    cache_diagnosed_requests = [
         request
         for request in provider_requests
         if isinstance(request.get("cache_diagnostics"), dict)
     ]
-    if diagnosed_requests:
+    if cache_diagnosed_requests:
         prefix_relations: dict[str, int] = {}
         outcome_reasons: dict[str, int] = {}
         stable_miss_uncached = 0
         stable_miss_uncached_complete = True
-        for request in diagnosed_requests:
+        for request in cache_diagnosed_requests:
             relation = str(request.get("cache_prefix_relation") or "unknown")
             outcome = str(request.get("cache_outcome_reason") or "unknown")
             prefix_relations[relation] = prefix_relations.get(relation, 0) + 1
@@ -899,7 +973,7 @@ def aggregate_turns(turns: list[dict[str, Any]]) -> dict[str, Any]:
                 else:
                     stable_miss_uncached_complete = False
         stable_misses = outcome_reasons.get("provider_miss_on_stable_prefix", 0)
-        summary["cache_diagnostic_requests"] = len(diagnosed_requests)
+        summary["cache_diagnostic_requests"] = len(cache_diagnosed_requests)
         summary["cache_prefix_relations"] = prefix_relations
         summary["cache_outcome_reasons"] = outcome_reasons
         summary["stable_prefix_miss_requests"] = stable_misses
@@ -927,7 +1001,7 @@ def command_for(
     resume: bool = False,
 ) -> list[str]:
     if state.name == "golutra":
-        return golutra_command(args, state, prompt, stage, resume=resume)
+        return golutra_agent_command(args, state, prompt, stage, resume=resume)
     if state.name == "pi":
         return pi_command(args, state, prompt, stage, resume=resume)
     return codex_command(args, state, prompt, stage, resume=resume)
@@ -1524,11 +1598,11 @@ def parse_metrics(
             capture.return_code,
             state.artifact_root / "run",
             capture.stdout_line_times_ms,
-            previous_cache_context=state.golutra_cache_context,
+            previous_cache_context=state.golutra_agent_cache_context,
             track_cache_context=True,
         )
-        state.golutra_cache_context = metrics.pop(
-            "_last_cache_context", state.golutra_cache_context
+        state.golutra_agent_cache_context = metrics.pop(
+            "_last_cache_context", state.golutra_agent_cache_context
         )
     elif state.name == "pi":
         metrics = paired.parse_pi(
@@ -1905,6 +1979,27 @@ def markdown_report(report: dict[str, Any]) -> str:
         ("End-to-end P50", "elapsed_p50_ms"),
         ("First observable P50", "first_observable_p50_ms"),
         ("Provider TTFT P50", "provider_ttft_p50_ms"),
+        ("Transport diagnostics", "transport_diagnostic_requests"),
+        ("Transport attempts", "transport_attempts_total"),
+        ("Transport retries", "transport_retry_requests"),
+        ("Stream handle ready P50", "transport_stream_handle_ready_p50_ms"),
+        ("First stream event P50", "transport_first_stream_p50_ms"),
+        ("First business event P50", "transport_first_business_p50_ms"),
+        ("Transport terminal event P50", "transport_terminal_event_p50_ms"),
+        ("Long-input requests (>=16K)", "long_request_count"),
+        ("Long-input TTFT samples", "long_request_ttft_samples"),
+        ("Long-input TTFT P50", "long_request_ttft_p50_ms"),
+        ("Long-input TTFT P95", "long_request_ttft_p95_ms"),
+        ("Long-input stream handle samples", "long_request_stream_handle_ready_samples"),
+        ("Long-input stream handle P95", "long_request_stream_handle_ready_p95_ms"),
+        ("Long-input first stream samples", "long_request_first_stream_samples"),
+        ("Long-input first stream P95", "long_request_first_stream_p95_ms"),
+        ("Long-input first business samples", "long_request_first_business_samples"),
+        ("Long-input first business P95", "long_request_first_business_p95_ms"),
+        ("Long-input terminal event samples", "long_request_terminal_event_samples"),
+        ("Long-input terminal event P95", "long_request_terminal_event_p95_ms"),
+        ("Long-input terminal samples", "long_request_terminal_samples"),
+        ("Long-input terminal P95", "long_request_terminal_p95_ms"),
     )
     for label, key in rows:
         values = []
@@ -1978,6 +2073,7 @@ def markdown_report(report: dict[str, Any]) -> str:
                     ttft=display(metric.get("provider_first_token_ms"), milliseconds=True),
                 )
             )
+    lines.extend(timing_breakdown(report))
     lines.extend(
         (
             "",
@@ -1993,11 +2089,35 @@ def markdown_report(report: dict[str, Any]) -> str:
             "- Call accounting stores only tool names and argument digests. `Necessary calls` is a conservative lower bound; an exact repeated name/digest is reported as observed repetition, not silently suppressed or declared invalid.",
             "- Background waits count only explicit `shell_session` wait or process poll/reconnect operations. Verifier checks and repair turns are reported separately from model tool calls.",
             "- This is one controlled sample per product, not a population-level latency claim. Network order rotates by stage to reduce, not eliminate, upstream timing bias.",
+            "- Long-input request percentiles use nearest-rank on observed requests with at least 16,384 prompt tokens; sample counts are reported and missing timings are not zero-filled. These are descriptive values, not statistically established production P95. First-observable and provider-TTFT percentiles also use nearest-rank; E2E P50 uses the arithmetic median.",
             "",
         )
     )
     lines.extend(comparison_findings(report))
     return "\n".join(lines)
+
+
+def timing_breakdown(report: dict[str, Any]) -> list[str]:
+    """复用原始单调时钟指标，区分进程准备与 provider 等待，不改变计时起点。"""
+    lines = [
+        "", "## First Output Breakdown", "",
+        "| Stage | Engine | Before turn | Context preparation | Provider to first delta | Turn to first observable | Process to first observable |",
+        "| ---: | --- | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for stage in report["stages"]:
+        for engine in ENGINE_NAMES:
+            metrics = stage.get(engine, {}).get("metrics", {})
+            first = metrics.get("first_token_ms")
+            turn_first = metrics.get("turn_first_token_ms")
+            before_turn = (
+                round(first - turn_first, 1)
+                if isinstance(first, (int, float)) and isinstance(turn_first, (int, float))
+                else None
+            )
+            values = [before_turn, metrics.get("model_prep_ms"), metrics.get("provider_first_token_ms"), turn_first, first]
+            rendered = " | ".join(display(value, milliseconds=True) for value in values)
+            lines.append(f"| {stage['stage']} | {engine} | {rendered} |")
+    return lines
 
 
 def percentage_delta(value: Any, baseline: Any) -> str:
@@ -2096,15 +2216,15 @@ def comparison_findings(report: dict[str, Any]) -> list[str]:
         "",
         "## Findings",
         "",
-        "### Advantages",
+        "### Measured tradeoffs",
         "",
         f"- Golutra first observable P50 is {display(golutra.get('first_observable_p50_ms'), milliseconds=True)}, versus Pi {display(pi.get('first_observable_p50_ms'), milliseconds=True)} and Codex {display(codex.get('first_observable_p50_ms'), milliseconds=True)}; the measured winner is {first_winner[1]} at {display(first_winner[0], milliseconds=True)}.",
         f"- Golutra cache hit ratio is {ratio_display(golutra.get('cache_hit_ratio'))}, versus Pi {ratio_display(pi.get('cache_hit_ratio'))} and Codex {ratio_display(codex.get('cache_hit_ratio'))}; the measured cache-ratio winner is {cache_winner[1]} at {ratio_display(cache_winner[0])}.",
         "- Golutra exposes provider-round timing, request counts, and detailed usage coverage that are unavailable from Codex's JSON output.",
         "",
-        "### Gaps",
+        "### Cost and completion",
         "",
-        f"- Golutra provider total is {display(golutra.get('provider_total_tokens'))} ({percentage_delta(golutra.get('provider_total_tokens'), pi.get('provider_total_tokens'))} vs Pi), with {display(golutra.get('output_tokens'))} output tokens; extra tool/reasoning turns drive the excess.",
+        f"- Golutra provider total is {display(golutra.get('provider_total_tokens'))} ({percentage_delta(golutra.get('provider_total_tokens'), pi.get('provider_total_tokens'))} vs Pi), with {display(golutra.get('output_tokens'))} output tokens. Aggregate counts alone do not explain model decisions or prove which calls were unnecessary.",
         f"- End-to-end total is {display(golutra.get('elapsed_total_ms'), milliseconds=True)} ({percentage_delta(golutra.get('elapsed_total_ms'), pi.get('elapsed_total_ms'))} vs Pi; {percentage_delta(golutra.get('elapsed_total_ms'), codex.get('elapsed_total_ms'))} vs Codex). Golutra makes {display(golutra.get('tool_call_count'))} tool calls versus Pi {display(pi.get('tool_call_count'))} and Codex {display(codex.get('tool_call_count'))}.",
     ]
     if failed_details:
@@ -2349,21 +2469,21 @@ def main() -> int:
     prompts = turn_prompts()
 
     external_work_root = args.work_root.resolve() if args.work_root else None
-    work_context = None if external_work_root else tempfile.TemporaryDirectory(prefix="golutra-long-threeway-")
+    work_context = None if external_work_root else tempfile.TemporaryDirectory(prefix="golutra-agent-long-threeway-")
     work_root = external_work_root or Path(work_context.name)
     private_directory(work_root)
-    sensitive_context = tempfile.TemporaryDirectory(prefix="golutra-long-credentials-")
+    sensitive_context = tempfile.TemporaryDirectory(prefix="golutra-agent-long-credentials-")
     sensitive_root = Path(sensitive_context.name)
     try:
-        golutra_home = sensitive_root / "golutra"
+        golutra_agent_home = sensitive_root / "golutra"
         pi_home = sensitive_root / "pi"
         codex_home = sensitive_root / "codex"
-        prepare_golutra_home(args, golutra_home)
+        prepare_golutra_home(args, golutra_agent_home)
         prepare_pi_home(args, pi_home)
         prepare_codex_home(args, codex_home)
 
         homes = {
-            "golutra": ("GOLUTRA_HOME", golutra_home),
+            "golutra": ("GOLUTRA_AGENT_HOME", golutra_agent_home),
             "pi": ("PI_CODING_AGENT_DIR", pi_home),
             "codex": ("CODEX_HOME", codex_home),
         }
@@ -2433,7 +2553,7 @@ def main() -> int:
                 "measurement_mode": "live_provider",
                 "status_note": "provider calls executed under isolated temporary homes",
                 "stop_on_strict_failure": args.stop_on_strict_failure,
-                "golutra_version": version([str(args.golutra), "--version"], repository_root),
+                "golutra_agent_version": version([str(args.golutra), "--version"], repository_root),
                 "pi_version": version(
                     ["node", "packages/coding-agent/dist/cli.js", "--version"],
                     args.pi_root,

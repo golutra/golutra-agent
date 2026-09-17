@@ -41,7 +41,7 @@ inherits a previous verifier.
 
 ## Entry Points
 
-- `golutra exec`: `--completion-criterion`, `--verify-program`, repeated
+- `golutra-agent exec`: `--completion-criterion`, `--verify-program`, repeated
   `--verify-arg`, `--verify-cwd`, timeout/exit/output controls. With no explicit
   verifier it uses project discovery; `--no-project-verifier-discovery` opts out.
 - App Server and Rust SDK: `AgentTurnOptions.external_verifiers`.

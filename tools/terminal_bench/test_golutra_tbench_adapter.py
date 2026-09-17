@@ -61,8 +61,8 @@ def _load_adapter():
     }.items():
         sys.modules.setdefault(name, module)
 
-    path = Path(__file__).with_name("golutra_tbench_adapter.py")
-    spec = importlib.util.spec_from_file_location("golutra_tbench_adapter_under_test", path)
+    path = Path(__file__).with_name("golutra_agent_tbench_adapter.py")
+    spec = importlib.util.spec_from_file_location("golutra_agent_tbench_adapter_under_test", path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -316,7 +316,7 @@ class AdapterHelpersTest(unittest.TestCase):
 
             def copy_to_container(self, *args, **kwargs):
                 self.copy_calls.append((args, kwargs))
-                if kwargs.get("container_dir") == "/root/.golutra":
+                if kwargs.get("container_dir") == "/root/.golutra-agent":
                     raise OSError("archive API cannot write to a tmpfs path")
 
             def send_command(self, command):
@@ -360,7 +360,7 @@ class AdapterHelpersTest(unittest.TestCase):
             )
             logging_dir.mkdir(parents=True)
             session = Session()
-            with patch.dict(ADAPTER.os.environ, {"GOLUTRA_TBENCH_PROXY": ""}):
+            with patch.dict(ADAPTER.os.environ, {"GOLUTRA_AGENT_TBENCH_PROXY": ""}):
                 agent = ADAPTER.GolutraAgent(
                     model_name="terminal-bench/model-specific-candidate",
                     arm64_binary=str(binary),
@@ -407,7 +407,7 @@ class AdapterHelpersTest(unittest.TestCase):
                 if command[:2] == ["sh", "-c"]
             )
             self.assertIn(
-                "cp /installed-agent/auth/provider.json /root/.golutra/provider.json",
+                "cp /installed-agent/auth/provider.json /root/.golutra-agent/provider.json",
                 setup_command,
             )
             self.assertIn(
@@ -415,7 +415,7 @@ class AdapterHelpersTest(unittest.TestCase):
                 setup_command,
             )
             observation = json.loads(
-                (logging_dir.parent / "golutra-adapter-observation.json").read_text()
+                (logging_dir.parent / "golutra-agent-adapter-observation.json").read_text()
             )
             self.assertEqual(observation["status"], "failed")
             self.assertEqual(observation["code"], "agent_timeout")
@@ -461,7 +461,7 @@ class AdapterHelpersTest(unittest.TestCase):
                 "successful agent execution must not expose hidden evaluator files",
             )
             completed_observation = json.loads(
-                (logging_dir.parent / "golutra-adapter-observation.json").read_text()
+                (logging_dir.parent / "golutra-agent-adapter-observation.json").read_text()
             )
             self.assertEqual(completed_observation["status"], "completed")
             self.assertEqual(
@@ -485,7 +485,7 @@ class AdapterHelpersTest(unittest.TestCase):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
             trial_root = root / "trial"
-            run_dir = trial_root / "golutra-runtime"
+            run_dir = trial_root / "golutra-agent-runtime"
             (run_dir / "state").mkdir(parents=True)
             (run_dir / "manifest.json").write_text(
                 json.dumps({"terminal_outcome": {"kind": "in_progress"}}),
@@ -552,7 +552,7 @@ class AdapterHelpersTest(unittest.TestCase):
 
             self.assertEqual(result.failure_mode, "agent_installation_failed")
             observation = json.loads(
-                (trial_root / "golutra-adapter-observation.json").read_text()
+                (trial_root / "golutra-agent-adapter-observation.json").read_text()
             )
             self.assertEqual(observation["schema_version"], 1)
             self.assertEqual(observation["phase"], "setup")
@@ -562,7 +562,7 @@ class AdapterHelpersTest(unittest.TestCase):
 
     def test_preflight_diagnostic_is_bounded_and_redacted(self):
         raw = (
-            b"/installed-agent/golutra: /lib/aarch64-linux-gnu/libc.so.6: "
+            b"/installed-agent/golutra-agent: /lib/aarch64-linux-gnu/libc.so.6: "
             b"version `GLIBC_2.34' not found\n"
             b"authorization=Bearer top-secret-value\n"
             + b"x" * 10_000
@@ -582,8 +582,8 @@ class AdapterHelpersTest(unittest.TestCase):
             root = Path(temporary)
             explicit = root / "explicit"
             environment = root / "environment"
-            release = root / "target/release/golutra-cli"
-            debug = root / "target/debug/golutra-cli"
+            release = root / "target/release/golutra-agent"
+            debug = root / "target/debug/golutra-agent"
             for candidate in (explicit, environment, release, debug):
                 candidate.parent.mkdir(parents=True, exist_ok=True)
                 candidate.write_text("#!/bin/sh\n", encoding="utf-8")
@@ -593,7 +593,7 @@ class AdapterHelpersTest(unittest.TestCase):
 
             with patch.dict(
                 ADAPTER.os.environ,
-                {"GOLUTRA_TBENCH_COLLECTOR": str(environment)},
+                {"GOLUTRA_AGENT_TBENCH_COLLECTOR": str(environment)},
             ):
                 self.assertEqual(
                     ADAPTER.GolutraAgent._resolve_collector_binary(
@@ -610,7 +610,7 @@ class AdapterHelpersTest(unittest.TestCase):
 
             with patch.dict(
                 ADAPTER.os.environ,
-                {"GOLUTRA_TBENCH_COLLECTOR": ""},
+                {"GOLUTRA_AGENT_TBENCH_COLLECTOR": ""},
             ):
                 self.assertEqual(
                     ADAPTER.GolutraAgent._resolve_collector_binary(
@@ -641,9 +641,9 @@ class AdapterHelpersTest(unittest.TestCase):
     def test_collector_prefers_freshest_binary_and_rejects_stale_builds(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
-            release = root / "target/release/golutra-cli"
-            debug = root / "target/debug/golutra-cli"
-            source = root / "crates/golutra-cli/src/main.rs"
+            release = root / "target/release/golutra-agent"
+            debug = root / "target/debug/golutra-agent"
+            source = root / "crates/golutra-agent-cli/src/main.rs"
             for candidate in (release, debug):
                 candidate.parent.mkdir(parents=True, exist_ok=True)
                 candidate.write_text("#!/bin/sh\n", encoding="utf-8")
@@ -656,7 +656,7 @@ class AdapterHelpersTest(unittest.TestCase):
 
             with patch.dict(
                 ADAPTER.os.environ,
-                {"GOLUTRA_TBENCH_COLLECTOR": ""},
+                {"GOLUTRA_AGENT_TBENCH_COLLECTOR": ""},
             ):
                 self.assertEqual(
                     ADAPTER.GolutraAgent._resolve_collector_binary(
@@ -721,7 +721,7 @@ class AdapterHelpersTest(unittest.TestCase):
     def test_collector_owns_digest_canonicalization_and_correction_uses_bound_record(self):
         with TemporaryDirectory() as temporary:
             trial_root = Path(temporary)
-            run_dir = trial_root / "sessions/golutra-runtime"
+            run_dir = trial_root / "sessions/golutra-agent-runtime"
             trace_path = run_dir / "observations/session/task/trace.json"
             trace_path.parent.mkdir(parents=True)
             trace_path.write_text(
@@ -784,7 +784,7 @@ class AdapterHelpersTest(unittest.TestCase):
             agent._dataset_id = "terminal-bench"
             agent._dataset_version = "local"
             agent._model_name = "test/model"
-            agent._collector_binary = Path("/bin/golutra")
+            agent._collector_binary = Path("/bin/golutra-agent")
             agent._graceful_drain_timeout_sec = 0.01
             agent._max_external_correction_rounds = 1
             collector_timeouts = []
@@ -866,9 +866,9 @@ class AdapterHelpersTest(unittest.TestCase):
 
     def test_external_failure_writes_an_isolated_unscored_continuation_plan(self):
         with TemporaryDirectory() as temporary:
-            run_dir = Path(temporary) / "golutra-runtime"
+            run_dir = Path(temporary) / "golutra-agent-runtime"
             run_dir.mkdir()
-            collector = Path(temporary) / "golutra-cli"
+            collector = Path(temporary) / "golutra-agent-cli"
             collector.write_text("#!/bin/sh\n", encoding="utf-8")
             collector.chmod(0o755)
             agent = ADAPTER.GolutraAgent(
@@ -1164,33 +1164,33 @@ class AdapterHelpersTest(unittest.TestCase):
 
     def test_collector_uses_trial_root_as_the_evidence_base(self):
         command = ADAPTER._collector_command(
-            Path("/bin/golutra"),
-            Path("/trial/sessions/golutra-runtime"),
+            Path("/bin/golutra-agent"),
+            Path("/trial/sessions/golutra-agent-runtime"),
             "session-id",
-            Path("/trial/sessions/golutra-runtime/evaluation.json"),
+            Path("/trial/sessions/golutra-agent-runtime/evaluation.json"),
             Path("/trial"),
         )
 
         self.assertEqual(
             command,
             [
-                "/bin/golutra",
+                "/bin/golutra-agent",
                 "--run-bundle",
-                "/trial/sessions/golutra-runtime",
+                "/trial/sessions/golutra-agent-runtime",
                 "--session-id",
                 "session-id",
                 "eval",
                 "ingest",
                 "--artifact-base",
                 "/trial",
-                "/trial/sessions/golutra-runtime/evaluation.json",
+                "/trial/sessions/golutra-agent-runtime/evaluation.json",
             ],
         )
 
     def test_trace_token_usage_reports_provider_totals(self):
         with TemporaryDirectory() as temporary:
             trial_root = Path(temporary)
-            run_dir = trial_root / "sessions/golutra-runtime"
+            run_dir = trial_root / "sessions/golutra-agent-runtime"
             trace_path = run_dir / "observations/session/task/trace.json"
             trace_path.parent.mkdir(parents=True)
             trace_path.write_text(
@@ -1239,7 +1239,7 @@ class AdapterHelpersTest(unittest.TestCase):
     def test_collector_retains_result_without_ingesting_an_in_progress_bundle(self):
         with TemporaryDirectory() as temporary:
             trial_root = Path(temporary)
-            run_dir = trial_root / "sessions/golutra-runtime"
+            run_dir = trial_root / "sessions/golutra-agent-runtime"
             trace_path = run_dir / "observations/session/task/trace.json"
             trace_path.parent.mkdir(parents=True)
             trace_path.write_text(
@@ -1288,7 +1288,7 @@ class AdapterHelpersTest(unittest.TestCase):
                 encoding="utf-8",
             )
             (trial_root / "commands.txt").write_text("command", encoding="utf-8")
-            stale_pending = trial_root / "golutra-evaluation.pending.json"
+            stale_pending = trial_root / "golutra-agent-evaluation.pending.json"
             stale_pending.write_text(
                 json.dumps({"status": "pending_inputs"}), encoding="utf-8"
             )
@@ -1297,7 +1297,7 @@ class AdapterHelpersTest(unittest.TestCase):
             agent._dataset_id = "terminal-bench"
             agent._dataset_version = "0.1.1"
             agent._model_name = "test/model"
-            agent._collector_binary = Path("/bin/golutra")
+            agent._collector_binary = Path("/bin/golutra-agent")
             agent._graceful_drain_timeout_sec = 0.01
 
             with patch.object(ADAPTER.subprocess, "run") as collector:
@@ -1375,7 +1375,7 @@ class AdapterHelpersTest(unittest.TestCase):
             )
             self.assertEqual(
                 captured["name"],
-                "golutra-evaluation-case-name.1-of-1.run",
+                "golutra-agent-evaluation-case-name.1-of-1.run",
             )
             self.assertFalse(captured["daemon"])
             self.assertTrue(captured["started"])
@@ -1390,7 +1390,7 @@ class AdapterHelpersTest(unittest.TestCase):
             trials = {}
             for case_id, (runtime_task_id, assertion_name) in cases.items():
                 trial_root = run_root / case_id / f"{case_id}.1-of-1.run"
-                run_dir = trial_root / "sessions" / "golutra-runtime"
+                run_dir = trial_root / "sessions" / "golutra-agent-runtime"
                 run_dir.mkdir(parents=True)
                 (run_dir / "manifest.json").write_text(
                     json.dumps(
@@ -1477,7 +1477,7 @@ class AdapterHelpersTest(unittest.TestCase):
     def test_collector_rejects_a_result_with_another_trial_identity(self):
         with TemporaryDirectory() as temporary:
             trial_root = Path(temporary) / "target" / "target.1-of-1.run"
-            run_dir = trial_root / "sessions" / "golutra-runtime"
+            run_dir = trial_root / "sessions" / "golutra-agent-runtime"
             run_dir.mkdir(parents=True)
             (run_dir / "manifest.json").write_text(
                 json.dumps(

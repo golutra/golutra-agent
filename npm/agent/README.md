@@ -1,7 +1,7 @@
 # @golutra/agent
 
-Golutra is a simple coding agent for turning a plain-language goal into
-working, verified code. Install it once, run `golutra`, and start talking to the
+Golutra Agent is a simple coding agent for turning a plain-language goal into
+working, verified code. Install it once, run `golutra-agent`, and start talking to the
 agent; a Rust toolchain is not required.
 
 > Describe the outcome. Golutra handles the work and shows the evidence.
@@ -10,16 +10,16 @@ agent; a Rust toolchain is not required.
 
 ```bash
 npm install -g @golutra/agent
-golutra
+golutra-agent
 ```
 
-With no arguments, `golutra` opens the interactive TUI. Describe the outcome
+With no arguments, `golutra-agent` opens the interactive TUI. Describe the outcome
 you want and let the agent inspect the workspace, edit files, run checks, and
 report the real result. For scripts and CI, use the headless entry point:
 
 ```bash
-golutra exec "inspect this workspace and run the checks"
-golutra exec --json "summarize the current changes"
+golutra-agent exec "inspect this workspace and run the checks"
+golutra-agent exec --json "summarize the current changes"
 ```
 
 ## Why it feels simple
@@ -48,17 +48,23 @@ The package contains a small JavaScript launcher and selects the matching
 platform package for the host OS and CPU. Native binaries are published as
 versioned npm packages; installation does not run a network download script.
 
-- `golutra`: interactive TUI with no arguments, or the scriptable CLI with a
+- `golutra-agent`: interactive TUI with no arguments, or the scriptable CLI with a
   subcommand;
-- `golutra-tui`: explicit TUI alias.
+- `golutra-agent-tui`: explicit TUI alias.
 
 App-server, observation, supervisor, and evaluation binaries are distributed in
 the platform release archive documented at
 <https://github.com/golutra/golutra-agent/releases>.
 
-Non-secret runtime defaults may be kept in `$GOLUTRA_HOME/runtime.json` or the
-workspace's `.golutra/runtime.json`. Credentials remain in the owner-only
+Non-secret runtime defaults may be kept in `$GOLUTRA_AGENT_HOME/runtime.json` or the
+workspace's `.golutra-agent/runtime.json`. Credentials remain in the owner-only
 credential store or environment references.
+
+The default home is `~/.golutra-agent` (`GOLUTRA_AGENT_HOME` overrides it).
+The desktop-bundled Agent and npm Agent share this home when configured alike;
+Golutra desktop's own `.golutra` directory and `golutra` command stay separate.
+Old `GOLUTRA_HOME` and old command names are not aliases. Uninstalling either
+Agent installation does not remove shared configuration or history.
 
 This package is distributed under the Apache License 2.0. See `LICENSE` and
 `NOTICE` in the installed package.

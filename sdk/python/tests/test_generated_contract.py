@@ -9,7 +9,7 @@ from typing import get_args
 SDK_SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SDK_SRC))
 
-from golutra_sdk.generated import (
+from golutra_agent_sdk.generated import (
     DriverEnvelope,
     DriverKey,
     DriverResponseEnvelope,

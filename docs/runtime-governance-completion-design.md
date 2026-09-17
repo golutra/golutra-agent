@@ -179,7 +179,7 @@ TaskTraceService
 - checksum、引用闭包和缺失原因校验。
 - summary/full/forensic 三种视图。
 
-禁止让 CLI、TUI、SDK 和 `golutra-vis` 各自实现同一套拼装逻辑。
+禁止让 CLI、TUI、SDK 和 `golutra-agent-vis` 各自实现同一套拼装逻辑。
 
 ### PostTaskCoordinator
 
@@ -193,7 +193,7 @@ PostTaskCoordinator
   recover(RecoveryPolicy) -> RecoverySummary
 ```
 
-实现可以位于 `golutra-client` 的独立模块，job repository 位于 `golutra-store`。P3 的 evaluation/build/deploy job 后续复用同一 lease 语义，但不能复用 Runtime task lane。
+实现可以位于 `golutra-agent-client` 的独立模块，job repository 位于 `golutra-agent-store`。P3 的 evaluation/build/deploy job 后续复用同一 lease 语义，但不能复用 Runtime task lane。
 
 ### VerificationService
 
@@ -559,7 +559,7 @@ RegressionExecution
 5. event-only replay、单次 LLM judge 和来源 case 通过都不能单独晋升。
 6. runtime code candidate 在 P3 前保持 human review，不自动 apply。
 
-当前 campaign 要求非空 `candidate_files`，按排序后的路径/内容计算 canonical SHA-256，并拒绝调用方声明 digest 不一致或应用后 workspace digest 未变化的 no-op。CLI 使用 `golutra eval regress <candidate-id> --candidate-files <JSON_FILE> [--candidate-digest sha256:...]` 提交路径到内容的 JSON map。每个 case 的 expected/observed verdict 来自 baseline/candidate `RegressionExecution.status`，case hard gate 同时验证不同的持久 trace ref 和 workspace delta；旧 durable evaluation result 只保留 fixture/security 辅助检查，不再充当 observed verdict。
+当前 campaign 要求非空 `candidate_files`，按排序后的路径/内容计算 canonical SHA-256，并拒绝调用方声明 digest 不一致或应用后 workspace digest 未变化的 no-op。CLI 使用 `golutra-agent eval regress <candidate-id> --candidate-files <JSON_FILE> [--candidate-digest sha256:...]` 提交路径到内容的 JSON map。每个 case 的 expected/observed verdict 来自 baseline/candidate `RegressionExecution.status`，case hard gate 同时验证不同的持久 trace ref 和 workspace delta；旧 durable evaluation result 只保留 fixture/security 辅助检查，不再充当 observed verdict。
 
 ## Memory Quarantine
 
@@ -634,8 +634,8 @@ golutra trace --task <id> --view summary
 golutra trace --task <id> --full --wait-evaluation
 golutra trace --task <id> --forensic --output <path>
 golutra artifact get <artifact-id> --offset <n> --length <n>
-golutra eval job <job-id>
-golutra eval run-regression <candidate-id>
+golutra-agent eval job <job-id>
+golutra-agent eval run-regression <candidate-id>
 golutra memory candidates
 golutra memory review <candidate-id>
 ```
@@ -694,21 +694,21 @@ MemoryInvalidated
 
 | Crate | P2.5 已实施内容 |
 | --- | --- |
-| `golutra-core` | VerificationPlan/Assertion、ContextSnapshot、PostTaskJob、MemoryClaim 基础类型 |
-| `golutra-protocol` | typed Context/Evaluation projection、TaskTrace、artifact chunk、job、regression、memory query/command/event schema（runtime protocol v8，兼容 v7） |
-| `golutra-store` | context snapshot、job lease、trace ref closure、artifact range read、migration；`RuntimeRepositories` 五类事实访问 seam |
-| `golutra-context` | canonical request snapshot、contributor manifest、tool output budget |
-| `golutra-runtime` | task 前 verification plan、criterion/assertion 终态判定；completion/context guard/retry/trace/verification 模块边界 |
-| `golutra-verify` | VerifierRegistry 和首批客观 verifier |
-| `golutra-client` | `RuntimeApplication/GovernedRuntime` facade；command/query/session/execution/trace/post-task/governance/regression 独立模块和服务；Embedded 主路径通过 facade |
-| `golutra-eval` | execution-backed campaign/result，projection replay 降级为调试输入 |
-| `golutra-memory` | quarantine、structured claim、expiry/invalidation、review lifecycle |
-| `golutra-tools` | structured facts 上限、artifact range read、claim-specific evidence |
-| `golutra-tui` | 普通模式不变；developer mode 增加 completeness/job 状态和详情分页入口 |
-| `golutra-vis` | TaskTraceBundle 到 audit/OTel/lineage 的纯投影 |
-| `golutra-app-server` | trace/artifact/job endpoint 与 owner/remote 权限限制 |
+| `golutra-agent-core` | VerificationPlan/Assertion、ContextSnapshot、PostTaskJob、MemoryClaim 基础类型 |
+| `golutra-agent-protocol` | typed Context/Evaluation projection、TaskTrace、artifact chunk、job、regression、memory query/command/event schema（runtime protocol v8，兼容 v7） |
+| `golutra-agent-store` | context snapshot、job lease、trace ref closure、artifact range read、migration；`RuntimeRepositories` 五类事实访问 seam |
+| `golutra-agent-context` | canonical request snapshot、contributor manifest、tool output budget |
+| `golutra-agent-runtime` | task 前 verification plan、criterion/assertion 终态判定；completion/context guard/retry/trace/verification 模块边界 |
+| `golutra-agent-verify` | VerifierRegistry 和首批客观 verifier |
+| `golutra-agent-client` | `RuntimeApplication/GovernedRuntime` facade；command/query/session/execution/trace/post-task/governance/regression 独立模块和服务；Embedded 主路径通过 facade |
+| `golutra-agent-eval` | execution-backed campaign/result，projection replay 降级为调试输入 |
+| `golutra-agent-memory` | quarantine、structured claim、expiry/invalidation、review lifecycle |
+| `golutra-agent-tools` | structured facts 上限、artifact range read、claim-specific evidence |
+| `golutra-agent-tui` | 普通模式不变；developer mode 增加 completeness/job 状态和详情分页入口 |
+| `golutra-agent-vis` | TaskTraceBundle 到 audit/OTel/lineage 的纯投影 |
+| `golutra-agent-app-server` | trace/artifact/job endpoint 与 owner/remote 权限限制 |
 
-本阶段没有新增 `golutra-jobs`：durable job 目前由 `golutra-store` 持久化、`golutra-client` worker 编排，已被 evaluation/evolution 主链复用。只有 release job 形成独立复用需求时才重新评估拆 crate。
+本阶段没有新增 `golutra-agent-jobs`：durable job 目前由 `golutra-agent-store` 持久化、`golutra-agent-client` worker 编排，已被 evaluation/evolution 主链复用。只有 release job 形成独立复用需求时才重新评估拆 crate。
 
 应用层重构已把 command/query/session/trace/governance 入口固定在 `RuntimeApplication`，post-task worker 固定在 `PostTaskCoordinator`；`RuntimeHost` 仍是 lane、事件事务锁和 task supervision 的唯一 owner。该边界避免为了缩短文件而引入第二套事实或执行状态。
 
@@ -771,7 +771,7 @@ P2.5 已迁移已有事实，并且不保留两套运行语义：
 - task-level candidate artifact/digest、逐 `case_ref` baseline/candidate 隔离执行、durable regression trace bundle、paired result、资源预算和 hard gate 已实现；任一 case 缺 pair 时持久化 NeedsHumanReview，而不是中断在无 PromotionDecision 状态。
 - candidate file set 首次执行时冻结为不可变 `candidate_patch_set` artifact，并通过独立 `CandidatePatchFrozen` 事件进入完整性对账；campaign 和每次 candidate execution 都读取同一 artifact bytes。
 - deep failure 的 runtime-change candidate 自动进入 regression/promotion dispatcher；缺冻结补丁或隔离执行失败时形成 blocked `RegressionResult(NeedsReview)` 与 `PromotionDecision(NeedsHumanReview)`，不自动 apply runtime code。
-- runtime 源码版本候选走独立 P3 路径：stable release 与 candidate evaluation build 中的 `golutra-eval-worker` 是两个实际不同的 binary；它们在独立 home/workspace 和外层断网 OS sandbox 中运行。Supervisor 不向 worker 发送 assertion、partition、真实 case id 或 holdout 答案，并在进程外验证 workspace outcome、完整 trace、VerificationRecord 和引用 artifact blob。
+- runtime 源码版本候选走独立 P3 路径：stable release 与 candidate evaluation build 中的 `golutra-agent-eval-worker` 是两个实际不同的 binary；它们在独立 home/workspace 和外层断网 OS sandbox 中运行。Supervisor 不向 worker 发送 assertion、partition、真实 case id 或 holdout 答案，并在进程外验证 workspace outcome、完整 trace、VerificationRecord 和引用 artifact blob。
 - candidate worktree 由 Supervisor 从 epoch 的 immutable parent release source 创建；冻结时按完整文件摘要集合计算 canonical changed paths。proposal 的 `target_paths` 只是待核对声明，不能掩盖 evaluator、sandbox、release、policy 或其他 sealed 路径的新增、修改和删除。
 - secondary evaluation/memory store 负责 durable lifecycle，但不能伪装成事件源；EvaluationProjection 必须把 review/result/candidate/regression/decision 与 source-task RuntimeEvent 对账。缺事件、未终态 job/evaluation 或 unresolved regression artifact 都让 TaskTrace integrity 失败。
 - regression Pass/Fail/NeedsReview 都必须生成显式 PromotionDecision；失败不能只修改 candidate status。

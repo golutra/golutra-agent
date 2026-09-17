@@ -16,34 +16,34 @@ check:
     cargo check --workspace --locked
 
 schema:
-    cargo run --locked -p golutra-protocol-fixtures --bin export_sdk_schema -- schemas/sdk-protocol.schema.json
+    cargo run --locked -p golutra-agent-protocol-fixtures --bin export_sdk_schema -- schemas/sdk-protocol.schema.json
     npm run --prefix sdk/typescript generate
     python3 sdk/python/scripts/generate.py
-    cargo test --locked -p golutra-protocol-fixtures schema_smoke -- --nocapture
+    cargo test --locked -p golutra-agent-protocol-fixtures schema_smoke -- --nocapture
 
 fixture:
-    cargo test --locked -p golutra-protocol-fixtures
+    cargo test --locked -p golutra-agent-protocol-fixtures
 
 smoke:
     cargo test --workspace --locked
 
 replay-smoke:
-    cargo test --locked -p golutra-protocol-fixtures
+    cargo test --locked -p golutra-agent-protocol-fixtures
 
 transport-smoke:
-    cargo test --locked -p golutra-client
+    cargo test --locked -p golutra-agent-client
 
 tui-driver-process-smoke:
-    cargo test --locked -p golutra-tui --test tui_driver_process -- --test-threads=1
+    cargo test --locked -p golutra-agent-tui --test tui_driver_process -- --test-threads=1
 
 tui-driver-live-smoke:
-    cargo test --locked -p golutra-tui --test tui_driver_process live_provider_driver_smoke_is_isolated_and_opt_in -- --ignored --nocapture --test-threads=1
+    cargo test --locked -p golutra-agent-tui --test tui_driver_process live_provider_driver_smoke_is_isolated_and_opt_in -- --ignored --nocapture --test-threads=1
 
 provider-golden:
-    cargo test --locked -p golutra-llm --test provider_golden -- --skip live_provider_smoke_is_opt_in_and_never_reads_normal_user_credentials
+    cargo test --locked -p golutra-agent-llm --test provider_golden -- --skip live_provider_smoke_is_opt_in_and_never_reads_normal_user_credentials
 
 provider-live-smoke:
-    cargo test --locked -p golutra-llm --test provider_golden live_provider_smoke_is_opt_in_and_never_reads_normal_user_credentials -- --nocapture
+    cargo test --locked -p golutra-agent-llm --test provider_golden live_provider_smoke_is_opt_in_and_never_reads_normal_user_credentials -- --nocapture
 
 ts-check:
     npm test --prefix sdk/typescript

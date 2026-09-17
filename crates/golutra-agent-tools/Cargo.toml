@@ -1,0 +1,38 @@
+[package]
+name = "golutra-agent-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description.workspace = true
+readme.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+futures-util.workspace = true
+chrono.workspace = true
+golutra-agent-core.workspace = true
+golutra-agent-code-intelligence = { path = "../golutra-agent-code-intelligence", version = "0.3.0" }
+golutra-agent-policy = { path = "../golutra-agent-policy", version = "0.3.0" }
+golutra-agent-sandbox.workspace = true
+jsonschema.workspace = true
+regex.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+shlex.workspace = true
+similar.workspace = true
+thiserror.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+walkdir.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
+[dev-dependencies]

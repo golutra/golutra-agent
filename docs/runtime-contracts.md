@@ -12,7 +12,7 @@
 截至 2026-07-24，第一阶段硬契约及扩展执行边界已进入可运行链路：
 
 - `ToolContract` 使用唯一的 JSON Schema 校验输入；必填 path/pattern 和 `edit_file.edits[].old_text` 拒绝空串，`read_file` 以有界的 1-based 行窗口和 `continuation.next_offset` 续读，并用 `truncated`/`eof` 明确窗口是否省略后续内容，校验错误隐藏实例值，summary、structured facts 和 raw output 在持久化前统一脱敏；policy、workspace guard、approval、execution、artifact/evidence 顺序固定。
-- shell 使用 `shlex` 解析结构化 argv，不经过 shell 解释器；policy 会阻断敏感路径、`find -exec/-delete`、`rg --pre` 等执行型参数，把 `sed -i`、`cargo run`、未知脚本等降为 Ask；执行器支持 timeout、`CancellationToken`、每管道 2 MiB 上限，并在 Unix 上终止整个进程组后排空管道。`golutra-sandbox` 在 macOS 使用 Seatbelt、Linux 检测 bubblewrap，外部 MCP 没有 OS-enforced sandbox 时拒绝执行。
+- shell 使用 `shlex` 解析结构化 argv，不经过 shell 解释器；policy 会阻断敏感路径、`find -exec/-delete`、`rg --pre` 等执行型参数，把 `sed -i`、`cargo run`、未知脚本等降为 Ask；执行器支持 timeout、`CancellationToken`、每管道 2 MiB 上限，并在 Unix 上终止整个进程组后排空管道。`golutra-agent-sandbox` 在 macOS 使用 Seatbelt、Linux 检测 bubblewrap，外部 MCP 没有 OS-enforced sandbox 时拒绝执行。
 - `PolicyEvaluation.block_disposition` 把当前调用阻断区分为 `recoverable` 和 `terminal`：参数/schema 错误、缺失路径和可纠正的 shell 语法只生成 durable blocked/error tool result，回送模型后受连续失败预算约束；敏感路径、workspace escape、破坏性命令及旧事件中未分类的 Block 仍立即终止任务。Runtime 不通过 reason 文本猜测处置级别。
 - `RuntimeHost` 保存 task handle、pending turn queue 和 durable command ack；pause/resume/abort 影响真实执行，不是 UI 标记。终态 lane 拒绝控制转换。owner 退出后，新 host 取得 session lease 才能通过 durable reducer 分析 provider/tool lifecycle：`ToolStarted` 固化的 `ToolRecoveryPolicy` 决定 replay-safe、reconcile-before-retry 或 replay-forbidden，未闭合 provider request 单独记录。只有未闭合只读操作/provider request 时写 `TaskInterrupted`，存在未闭合副作用工具或后台进程时写 `TaskUncertain`；两者都明确 `safe_to_replay=false`，已经 `TurnStarted` 的输入永不自动重放。`TaskUncertain` 会冻结新 prompt 和未开始的 pending turn，直到 `ReconcileTask` 写入结构化 `TaskReconciliationRecord`；对账不能把任务伪造成 `Completed`。
 - `AgentHarness` 是公开执行 seam，封装 crate-private `AgentLoop` 的多轮 assistant/tool message、LoopGuard、有限 retry/fallback 和 verification-backed terminal state。初始或工具消息累积导致的 context overflow 会产生 `LoopGuardTriggered` 和 Blocked/AskUser `LoopDecision`，不会降级成笼统执行错误。
@@ -134,7 +134,7 @@ ProviderContract
 - provider 原始字段要进入 debug / replay 上下文，而不是被静默吞掉。
 - fallback 只能由 loop 层触发，provider adapter 不允许私自切换任务语义。
 - OpenAI-compatible、OpenAI Responses 与 native provider wire 都必须经过 committed golden fixture；升级 HTTP client、SSE parser 或 rust-genai 时，wire diff 必须显式审查。
-- live smoke 只能读取专用测试 env，不能隐式读取 `$GOLUTRA_HOME/provider.json` 或正常用户凭据。
+- live smoke 只能读取专用测试 env，不能隐式读取 `$GOLUTRA_AGENT_HOME/provider.json` 或正常用户凭据。
 
 ## TerminalStateContract
 
@@ -287,7 +287,7 @@ WorkspaceCheckpointContract
 要求：
 
 - checkpoint 只能作为 Golutra 恢复网，不能修改用户自己的 `.git` 历史。
-- checkpoint 和工具 policy 必须排除 `.git`、`.golutra`、`.gitignore` 命中项及 secret path；新文件也要在创建前形成 `existed=false` 恢复记录。
+- checkpoint 和工具 policy 必须排除 `.git`、`.golutra-agent`、`.gitignore` 命中项及 secret path；新文件也要在创建前形成 `existed=false` 恢复记录。
 - 默认遵守 `.gitignore` 和 policy 排除规则，避免保存依赖目录、构建产物和敏感文件。
 - checkpoint 失败不能让任务成功假象化；必须写入 event，并在必要时降级为 residual risk。
 - 非文件副作用不能伪装成可回滚，必须单独记录补偿或不可回滚风险。

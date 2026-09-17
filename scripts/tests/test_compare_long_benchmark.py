@@ -55,13 +55,13 @@ class CompareLongBenchmarkTest(unittest.TestCase):
         self.assertFalse(classification["strict_passed"])
 
     def test_terminal_event_success_ignores_nonzero_wrapper_status(self) -> None:
-        golutra_stdout = "".join(
+        golutra_agent_stdout = "".join(
             json.dumps(value) + "\n"
             for value in (
                 {"type": "turn.completed", "status": "completed"},
             )
         )
-        self.assertTrue(benchmark.terminal_event_success("golutra", golutra_stdout))
+        self.assertTrue(benchmark.terminal_event_success("golutra", golutra_agent_stdout))
         self.assertTrue(
             benchmark.terminal_event_success(
                 "pi", json.dumps({"type": "agent_end"}) + "\n"
@@ -162,6 +162,98 @@ class CompareLongBenchmarkTest(unittest.TestCase):
         )
         self.assertEqual(summary["stable_prefix_miss_requests"], 1)
         self.assertEqual(summary["stable_prefix_miss_uncached_tokens"], 1_200)
+
+    def test_long_request_percentiles_exclude_short_and_unknown_timings(self) -> None:
+        requests = [
+            {"prompt_tokens": 16_384, "ttft_ms": index * 100, "terminal_latency_ms": index * 1_000}
+            for index in range(1, 21)
+        ]
+        requests.extend([
+            {"prompt_tokens": 16_383, "ttft_ms": 99_999},
+            {"prompt_tokens": 20_000, "ttft_ms": None},
+        ])
+        summary = benchmark.aggregate_turns([{"metrics": {"provider_requests": requests}}])
+        self.assertEqual(summary["long_request_count"], 21)
+        self.assertEqual(summary["long_request_ttft_samples"], 20)
+        self.assertEqual(summary["long_request_ttft_p50_ms"], 1_000)
+        self.assertEqual(summary["long_request_ttft_p95_ms"], 1_900)
+        self.assertEqual(summary["long_request_terminal_p95_ms"], 19_000)
+        unknown = benchmark.aggregate_turns([{"metrics": {}}])
+        self.assertIsNone(unknown["long_request_count"])
+        self.assertIsNone(unknown["long_request_ttft_p95_ms"])
+
+    def test_transport_diagnostics_report_samples_and_keep_unknowns(self) -> None:
+        requests = [
+            {
+                "prompt_tokens": 20_000,
+                "transport_diagnostics": {
+                    "transport": "responses_sse",
+                    "attempt_count": 1,
+                    "stream_handle_ready_ms": 60,
+                    "first_stream_event_ms": 100,
+                    "first_business_event_ms": 140,
+                    "terminal_event_ms": 500,
+                },
+                "attempt_count": 1,
+                "stream_handle_ready_ms": 60,
+                "first_stream_event_ms": 100,
+                "first_business_event_ms": 140,
+                "terminal_event_ms": 500,
+            },
+            {
+                "prompt_tokens": 22_000,
+                "transport_diagnostics": {
+                    "transport": "responses_sse",
+                    "attempt_count": 2,
+                    "stream_handle_ready_ms": 180,
+                    "first_stream_event_ms": 300,
+                    "first_business_event_ms": 350,
+                    "terminal_event_ms": 900,
+                },
+                "attempt_count": 2,
+                "stream_handle_ready_ms": 180,
+                "first_stream_event_ms": 300,
+                "first_business_event_ms": 350,
+                "terminal_event_ms": 900,
+            },
+            {"prompt_tokens": 18_000},
+        ]
+        summary = benchmark.aggregate_turns([{"metrics": {"provider_requests": requests}}])
+        self.assertEqual(summary["transport_diagnostic_requests"], 2)
+        self.assertEqual(summary["transport_attempts_total"], 3)
+        self.assertEqual(summary["transport_retry_requests"], 1)
+        self.assertEqual(summary["transport_stream_handle_ready_p95_ms"], 180)
+        self.assertEqual(summary["transport_first_stream_p95_ms"], 300)
+        self.assertEqual(summary["long_request_stream_handle_ready_samples"], 2)
+        self.assertEqual(summary["long_request_first_business_samples"], 2)
+        self.assertEqual(summary["long_request_first_business_p95_ms"], 350)
+        self.assertEqual(summary["long_request_terminal_event_p95_ms"], 900)
+
+    def test_timing_breakdown_separates_startup_and_preserves_unknown(self) -> None:
+        rows = benchmark.timing_breakdown({"stages": [{
+            "stage": 1,
+            "golutra": {"metrics": {"first_token_ms": 1_500, "turn_first_token_ms": 1_200,
+                                     "model_prep_ms": 200, "provider_first_token_ms": 1_000}},
+            "codex": {"metrics": {"first_token_ms": 800}},
+        }]})
+        self.assertIn("| 1 | golutra | 300 ms | 200 ms | 1,000 ms | 1,200 ms | 1,500 ms |", rows)
+        self.assertIn("| 1 | codex | unknown | unknown | unknown | unknown | 800 ms |", rows)
+
+    def test_codex_turn_timing_requires_an_observed_turn_start(self) -> None:
+        item = {"type": "item.started", "item": {"type": "command_execution", "id": "cmd"}}
+        for events, arrivals, expected in [
+            ([item], [800.0], None),
+            ([{"type": "turn.started"}, item], [300.0, 800.0], 500.0),
+        ]:
+            capture = benchmark.paired.ProcessCapture(
+                stdout="\n".join(json.dumps(event) for event in events),
+                stderr="", return_code=0, elapsed_ms=900.0,
+                stdout_line_times_ms=arrivals,
+            )
+            metrics, _, _ = benchmark.parse_codex(capture, None)
+            self.assertEqual(metrics["first_token_ms"], 800.0)
+            self.assertEqual(metrics["turn_first_token_ms"], expected)
+            self.assertIsNone(metrics["provider_first_token_ms"])
 
     def test_subtract_cumulative_usage(self) -> None:
         current = {
