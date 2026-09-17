@@ -140,6 +140,34 @@ class DesktopReleaseTest(unittest.TestCase):
             with self.assertRaisesRegex(package_release.PackageError, "stale cross-build"):
                 desktop_release.inventory(root / "dist", allow_partial=True)
 
+    def test_legacy_baseline_limitation_is_only_allowed_for_verified_windows_boundary(self):
+        for target in ("aarch64-pc-windows-msvc", "aarch64-apple-darwin"):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.make_platform(root, target)
+                path = root / "dist" / f"shared-versions-{target}.json"
+                report = json.loads(path.read_text())
+                report.update({"expected_compatibility": "legacy_startup_unavailable",
+                               "legacy_baseline_available": False,
+                               "limited_acceptance": {
+                                   "reason": "windows-sqlite-url",
+                                   "legacy_reader_blocked_without_data_changes": True,
+                                   "candidate_rejected_old_schema_without_data_changes": True,
+                                   "old_schema_fixture": {"version": 5, "synthetic": True}}})
+                report["binaries"][0]["version"] = "golutra 0.2.0"
+                path.write_text(json.dumps(report))
+                if "windows" not in target:
+                    with self.assertRaisesRegex(package_release.PackageError, "stale cross-build"):
+                        desktop_release.inventory(root / "dist", allow_partial=True)
+                    continue
+                result = desktop_release.inventory(root / "dist", allow_partial=True)
+                self.assertEqual(result["artifacts"][0]["shared_data_acceptance"]["expected_compatibility"],
+                                 "legacy_startup_unavailable")
+                report["limited_acceptance"]["candidate_rejected_old_schema_without_data_changes"] = False
+                path.write_text(json.dumps(report))
+                with self.assertRaisesRegex(package_release.PackageError, "stale cross-build"):
+                    desktop_release.inventory(root / "dist", allow_partial=True)
+
 
 if __name__ == "__main__":
     unittest.main()

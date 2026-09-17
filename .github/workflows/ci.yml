@@ -125,3 +125,17 @@ jobs:
         run: |
           cargo build --release --locked -p golutra-agent-cli -p golutra-agent-app-server --bins
           python scripts/smoke_native_runtime.py --binary-dir target/release
+      - uses: actions/setup-node@v4
+        if: runner.os == 'Windows'
+        with:
+          node-version: 22
+      - name: Windows legacy baseline limitation and data safety
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p .compatibility-baseline
+          npm pack '@golutra/agent-win32-x64@0.2.0' --ignore-scripts --pack-destination .compatibility-baseline
+          python scripts/smoke_shared_versions.py \
+            --baseline-npm-archive .compatibility-baseline/golutra-agent-win32-x64-0.2.0.tgz \
+            --baseline-version 0.2.0 --candidate-cli target/release/golutra-agent.exe \
+            --output target/shared-versions-windows-ci.json

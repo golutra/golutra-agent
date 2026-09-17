@@ -119,9 +119,11 @@ python3 scripts/smoke_native_package.py \
   --archive dist/desktop/golutra-agent-v0.3.0-aarch64-apple-darwin.tar.gz \
   --npm-archive dist/desktop/npm/golutra-agent-npm-darwin-arm64-0.3.0.tgz --require-pty
 # 汇总六个平台的产物及 smoke 后，正式构建不传两个 allow 参数：
-python3 scripts/desktop_release.py --dist release-assets --repository seekskyworld/golutra-agent
+python3 scripts/desktop_release.py --dist release-assets --repository golutra/golutra-agent
 ```
 
 版本号示例应替换为将要发布的唯一新版本。CI 会构建七个原生程序、npm 包，验证 npm 入口，再在无 Node/npm 的 PATH 中运行绝对路径 native、四进程离线任务、共享历史/配置、未来 DB/config 拒绝、真实 Unix PTY 和移除内置目录后的并存检查。另有 auth 独立进程并发写入及 future credential 格式回归。
+
+Windows 已发布的 0.2.0 存在 SQLite URL 解析缺陷，空目录也无法启动。该平台的旧版基线明确记录为 `legacy_startup_unavailable`，不能宣称新旧程序双向格式验收通过。当前程序仍须完成全部原生运行与共享数据验收，并验证合成 schema 5 账本被拒绝且数据不变；旧程序失败启动也不能改写新版数据。Unix 继续使用真实 0.2.0 二进制进行双向拒绝测试。
 
 本机执行结果、实际开发产物摘要及平台未验证项见 [桌面交付验收记录](desktop-acceptance.md)。开发构建和本地清单不应作为已发布正式版本交付用户。

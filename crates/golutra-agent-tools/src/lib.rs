@@ -4158,6 +4158,12 @@ async fn await_tool_operation<F>(
 where
     F: std::future::Future,
 {
+    // An already-expired deadline must not poll even a synchronously ready write.
+    // Timer readiness can lag behind Instant::now() by a timer-wheel tick.
+    if deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
+        operation_cancellation.cancel();
+        return ToolOperationOutcome::TimedOut(None);
+    }
     tokio::pin!(operation);
     match deadline {
         Some(deadline) => {
@@ -4217,6 +4223,12 @@ async fn await_preparation_operation<F>(
 where
     F: std::future::Future,
 {
+    if cancellation.is_cancelled() {
+        return Err(ToolInvocationStop::Cancelled);
+    }
+    if deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
+        return Err(ToolInvocationStop::TimedOut);
+    }
     tokio::pin!(operation);
     match deadline {
         Some(deadline) => {
