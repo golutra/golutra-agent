@@ -259,6 +259,7 @@ impl Drop for FixtureServer {
 
 #[test]
 fn fixture_empty_connection_does_not_consume_a_response() {
+    use std::io::BufRead;
     let server = FixtureServer::new(vec!["FIRST_RESPONSE".to_owned()]);
     let address = server
         .url
@@ -276,8 +277,22 @@ fn fixture_empty_connection_does_not_consume_a_response() {
             b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}",
         )
         .unwrap();
-    let mut response = String::new();
-    socket.read_to_string(&mut response).unwrap();
+    // 按 HTTP 长度读取正文；正文完整后关闭连接的 EOF/RST 差异不属于夹具语义。
+    let mut reader = std::io::BufReader::new(socket);
+    let mut length = None;
+    loop {
+        let mut line = String::new();
+        assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+        if line == "\r\n" {
+            break;
+        }
+        if let Some(value) = line.strip_prefix("Content-Length: ") {
+            length = Some(value.trim().parse::<usize>().unwrap());
+        }
+    }
+    let mut body = vec![0; length.expect("fixture response content length")];
+    reader.read_exact(&mut body).unwrap();
+    let response = String::from_utf8(body).unwrap();
     assert!(response.contains("FIRST_RESPONSE"), "{response}");
     assert_eq!(*server.requests.lock().unwrap(), vec![json!({})]);
 }
