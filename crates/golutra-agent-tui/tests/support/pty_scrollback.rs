@@ -632,15 +632,25 @@ fn screen_row(parser: &ScreenModel, marker: &str) -> usize {
 }
 
 fn wait_for_visible(pty: &mut PtyHarness, parser: &mut ScreenModel, marker: &str) {
+    wait_for_visible_markers(pty, parser, &[marker]);
+}
+
+fn wait_for_visible_markers(pty: &mut PtyHarness, parser: &mut ScreenModel, markers: &[&str]) {
     // 长流夹具逐帧 sleep；macOS 的定时器合并和 CI 调度会延长实际发送时间。
     // 等待可见状态而非假定发送速率，仍保留有界超时。
     let deadline = Instant::now() + Duration::from_secs(30);
-    while !parser.screen().contents().contains(marker) && Instant::now() < deadline {
+    while !markers
+        .iter()
+        .all(|marker| parser.screen().contents().contains(marker))
+        && Instant::now() < deadline
+    {
         parser.process(&pty.collect_for(Duration::from_millis(50)));
     }
     assert!(
-        parser.screen().contents().contains(marker),
-        "missing {marker}:\n{}",
+        markers
+            .iter()
+            .all(|marker| parser.screen().contents().contains(marker)),
+        "missing {markers:?}:\n{}",
         parser.screen().contents()
     );
 }
@@ -667,7 +677,8 @@ fn pending_inputs_move_from_preview_to_history_for_tab_and_enter() {
         pty.write(b"hi");
         parser.process(&pty.collect_for(Duration::from_millis(150)));
         pty.write(&[key]);
-        wait_for_visible(&mut pty, &mut parser, preview);
+        // 同一次重绘也可拆成多个 PTY read；标题出现不代表预览行和 composer 已收到。
+        wait_for_visible_markers(&mut pty, &mut parser, &[preview, "↳ hi", "› Ask Golutra"]);
         let screen = parser.screen().contents();
         assert!(screen.contains("↳ hi"), "{screen}");
         assert!(
