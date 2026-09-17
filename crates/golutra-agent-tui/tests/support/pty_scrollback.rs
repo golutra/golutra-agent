@@ -1669,7 +1669,8 @@ fn native_mouse_and_shell_prefix_survive_draft_growth_and_fullscreen_picker() {
     );
     assert_once_in_order(&all_terminal_rows(&mut parser), &[]);
     submit(&mut pty, &mut parser, "/terminal true");
-    parser.process(&pty.collect_for(Duration::from_millis(700)));
+    // 登录 shell 的初始化耗时取决于宿主环境；恢复 composer 后再检查归档，不能采样挂起帧。
+    wait_for_visible(&mut pty, &mut parser, "Ask Golutra");
     assert_eq!(
         parser.screen().mouse_protocol_mode(),
         vt100::MouseProtocolMode::None

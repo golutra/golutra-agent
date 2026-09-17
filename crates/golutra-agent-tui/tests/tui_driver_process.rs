@@ -2237,7 +2237,7 @@ fn spawn_socket_driver(
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .kill_on_drop(true);
     ChildGuard(command.spawn().expect("spawn socket driver"))
 }
@@ -2338,7 +2338,10 @@ async fn close_socket_driver(
         .await
         .expect("socket driver exit timeout")
         .expect("socket driver exit");
-    assert!(status.success(), "socket driver exited with {status}");
+    assert!(
+        status.success(),
+        "socket driver {request_id} exited with {status}"
+    );
 }
 
 async fn submit_prompt(driver: &mut StdioDriver, request_id: &str, text: &str) {
