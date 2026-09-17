@@ -95,7 +95,21 @@ async fn compatible_processes_share_until_last_clone_and_crash_releases_lock() {
         "clone must retain lease"
     );
     drop(clone);
-    FileExt::try_lock_exclusive(&contender).unwrap();
+    // 并行测试 fork/exec 时可短暂继承关闭前的描述符；允许系统完成释放，
+    // 但真正泄漏的共享锁仍须在有界期限内失败。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match FileExt::try_lock_exclusive(&contender) {
+            Ok(()) => break,
+            Err(error)
+                if error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+                    && std::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            Err(error) => panic!("usage lock was not released after the last clone: {error}"),
+        }
+    }
     FileExt::unlock(&contender).unwrap();
     RuntimeStore::connect(&url).await.unwrap();
 }

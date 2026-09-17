@@ -105,6 +105,7 @@ impl FixtureServer {
                     thread::sleep(Duration::from_millis(10));
                     continue;
                 };
+                socket.set_nodelay(true).unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(3)))
                     .unwrap();
@@ -198,13 +199,18 @@ impl FixtureServer {
                 let length: usize = frames.iter().map(String::len).sum();
                 if write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n").is_err() { continue; }
                 let mut sent_all = true;
-                for frame in frames {
+                let stream_started = Instant::now();
+                for (index, frame) in frames.into_iter().enumerate() {
                     if flag.load(Ordering::Relaxed) || socket.write_all(frame.as_bytes()).is_err() {
                         sent_all = false;
                         break;
                     }
                     let _ = socket.flush();
-                    thread::sleep(Duration::from_millis(8));
+                    // 以流起点计时，避免 macOS 每帧调度超时累计成几十秒的夹具延迟。
+                    let due = stream_started + Duration::from_millis(8 * (index as u64 + 1));
+                    if let Some(remaining) = due.checked_duration_since(Instant::now()) {
+                        thread::sleep(remaining);
+                    }
                 }
                 if sent_all {
                     completed.fetch_add(1, Ordering::Release);
@@ -626,15 +632,25 @@ fn screen_row(parser: &ScreenModel, marker: &str) -> usize {
 }
 
 fn wait_for_visible(pty: &mut PtyHarness, parser: &mut ScreenModel, marker: &str) {
+    wait_for_visible_markers(pty, parser, &[marker]);
+}
+
+fn wait_for_visible_markers(pty: &mut PtyHarness, parser: &mut ScreenModel, markers: &[&str]) {
     // 长流夹具逐帧 sleep；macOS 的定时器合并和 CI 调度会延长实际发送时间。
     // 等待可见状态而非假定发送速率，仍保留有界超时。
     let deadline = Instant::now() + Duration::from_secs(30);
-    while !parser.screen().contents().contains(marker) && Instant::now() < deadline {
+    while !markers
+        .iter()
+        .all(|marker| parser.screen().contents().contains(marker))
+        && Instant::now() < deadline
+    {
         parser.process(&pty.collect_for(Duration::from_millis(50)));
     }
     assert!(
-        parser.screen().contents().contains(marker),
-        "missing {marker}:\n{}",
+        markers
+            .iter()
+            .all(|marker| parser.screen().contents().contains(marker)),
+        "missing {markers:?}:\n{}",
         parser.screen().contents()
     );
 }
@@ -661,7 +677,8 @@ fn pending_inputs_move_from_preview_to_history_for_tab_and_enter() {
         pty.write(b"hi");
         parser.process(&pty.collect_for(Duration::from_millis(150)));
         pty.write(&[key]);
-        wait_for_visible(&mut pty, &mut parser, preview);
+        // 同一次重绘也可拆成多个 PTY read；标题出现不代表预览行和 composer 已收到。
+        wait_for_visible_markers(&mut pty, &mut parser, &[preview, "↳ hi", "› Ask Golutra"]);
         let screen = parser.screen().contents();
         assert!(screen.contains("↳ hi"), "{screen}");
         assert!(

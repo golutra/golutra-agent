@@ -67,6 +67,7 @@ jsonschema = { version = "0.47", default-features = false }
 miette = { version = "7.6", features = ["fancy"] }
 nix = { version = "0.30", default-features = false, features = ["process", "signal"] }
 oauth2 = { version = "5.0", default-features = false, features = ["reqwest", "rustls-tls"] }
+percent-encoding = "2.3"
 pulldown-cmark = "0.13"
 ratatui = "0.28"
 regex = "1.11"

@@ -17,6 +17,7 @@ chrono.workspace = true
 fs2.workspace = true
 golutra-agent-core.workspace = true
 golutra-agent-protocol.workspace = true
+percent-encoding.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true

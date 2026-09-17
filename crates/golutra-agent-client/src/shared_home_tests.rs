@@ -22,7 +22,7 @@ async fn storage_identity(transport: &EmbeddedTransport) -> Value {
 #[tokio::test]
 async fn shared_home_identity_uses_resolved_paths_without_sensitive_settings() {
     let root = tempfile::tempdir().unwrap();
-    let home = root.path().join("共享 home");
+    let home = root.path().join("共享 home %2F #");
     let cwd = root.path().join("项目 workspace");
     std::fs::create_dir_all(&cwd).unwrap();
     let transport = EmbeddedTransport::from_home_and_cwd(&home, &cwd)
