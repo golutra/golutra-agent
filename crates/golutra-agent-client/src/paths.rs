@@ -278,7 +278,7 @@ impl RuntimePaths {
 
     #[must_use]
     pub fn sqlite_url(&self) -> String {
-        format!("sqlite://{}", self.runtime_db.display())
+        golutra_agent_store::sqlite_url_for_path(&self.runtime_db)
     }
 
     #[must_use]

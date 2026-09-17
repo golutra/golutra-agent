@@ -12,6 +12,40 @@ use tempfile::tempdir;
 
 use super::*;
 
+#[test]
+fn sqlite_path_urls_preserve_windows_prefixes_and_literal_url_characters() {
+    for path in [
+        r"\\?\C:\Users\共享 home\100%2F#done\runtime.sqlite",
+        r"\\?\UNC\server\share\共享 home\runtime.sqlite",
+        "/tmp/共享 home/100%2F#done?literal/runtime.sqlite",
+    ] {
+        let path = Path::new(path);
+        let url = sqlite_url_for_path(path);
+        let options = SqliteConnectOptions::from_str(&url).unwrap();
+        assert_eq!(options.get_filename(), path);
+        assert_eq!(
+            artifact_root_for_database_url(&url).unwrap(),
+            path.parent().unwrap().join("artifacts")
+        );
+    }
+}
+
+#[tokio::test]
+async fn sqlite_path_urls_open_and_reopen_the_exact_file() {
+    let root = tempdir().unwrap();
+    let home = root.path().join("共享 home %2F #");
+    std::fs::create_dir(&home).unwrap();
+    let home = home.canonicalize().unwrap();
+    let database = home.join("runtime.sqlite");
+    let url = sqlite_url_for_path(&database);
+    let first = RuntimeStore::connect(&url).await.unwrap();
+    let second = RuntimeStore::connect(&url).await.unwrap();
+    assert!(database.is_file());
+    assert_eq!(first.database_identity, second.database_identity);
+    assert_eq!(first.artifact_root, home.join("artifacts"));
+    assert_eq!(first.artifact_root, second.artifact_root);
+}
+
 fn context_snapshot_fixture(
     session_id: SessionId,
     task_id: TaskId,

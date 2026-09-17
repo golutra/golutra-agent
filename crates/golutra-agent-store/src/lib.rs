@@ -157,7 +157,7 @@ impl RuntimeStore {
         if is_in_memory_database_url(database_url) {
             return Self::in_memory().await;
         }
-        let artifact_root = artifact_root_for_database_url(database_url);
+        let artifact_root = artifact_root_for_database_url(database_url)?;
         Self::connect_with_artifact_root(database_url, artifact_root).await
     }
 
@@ -3282,15 +3282,27 @@ async fn persist_runtime_indexes(
     Ok(())
 }
 
-fn artifact_root_for_database_url(database_url: &str) -> PathBuf {
-    database_url
-        .strip_prefix("sqlite://")
-        .or_else(|| database_url.strip_prefix("sqlite:"))
-        .filter(|path| !path.is_empty() && *path != ":memory:")
-        .map(PathBuf::from)
-        .and_then(|path| path.parent().map(Path::to_path_buf))
+/// Encode a filesystem path for SQLx without treating Windows verbatim prefixes
+/// or literal percent/query characters as SQLite connection options.
+#[must_use]
+pub fn sqlite_url_for_path(path: &Path) -> String {
+    format!(
+        "sqlite://{}",
+        percent_encoding::utf8_percent_encode(
+            &path.to_string_lossy(),
+            percent_encoding::NON_ALPHANUMERIC,
+        )
+    )
+}
+
+fn artifact_root_for_database_url(database_url: &str) -> StoreResult<PathBuf> {
+    let options = SqliteConnectOptions::from_str(database_url)?;
+    Ok(options
+        .get_filename()
+        .parent()
+        .map(Path::to_path_buf)
         .unwrap_or_else(std::env::temp_dir)
-        .join("artifacts")
+        .join("artifacts"))
 }
 
 fn is_in_memory_database_url(database_url: &str) -> bool {

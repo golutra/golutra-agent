@@ -104,3 +104,7 @@ jobs:
           toolchain: 1.93.0
       - name: Cross-platform compile
         run: cargo check --workspace --all-targets --locked
+      - name: Native database paths and shared home
+        run: |
+          cargo test --locked -p golutra-agent-store sqlite_path_urls
+          cargo test --locked -p golutra-agent-client shared_home_tests
