@@ -105,9 +105,13 @@ jobs:
       - name: Cross-platform compile
         run: cargo check --workspace --all-targets --locked
       - name: Native database paths and shared home
+        shell: bash
         run: |
           cargo test --locked -p golutra-agent-store sqlite_path_urls
           cargo test --locked -p golutra-agent-store --test shared_data_process
           cargo test --locked -p golutra-agent-config --test shared_settings_process
           cargo test --locked -p golutra-agent-auth --test shared_credentials_process
           cargo test --locked -p golutra-agent-client shared_home_tests
+          cargo test --locked -p golutra-agent-memory file_backed_store_preserves_updates_from_independent_instances
+          cargo test --locked -p golutra-agent-eval evaluation_store_is_durable_and_requires_regression_before_apply
+          cargo test --locked -p golutra-agent-code-intelligence persists_owner_only_index_and_rejects_oversized_input
