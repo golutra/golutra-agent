@@ -6788,7 +6788,10 @@ async fn post_task_worker_does_not_claim_or_rewrite_a_foreign_workspace_job() {
         .await
         .expect("new workspace host");
     let mut processed_local = None;
-    for _ in 0..40 {
+    // worker 的空闲轮询间隔就是 1 秒；不能让断言期限与首次轮询同时到期。
+    let deadline =
+        std::time::Instant::now() + Duration::from_millis(POST_TASK_JOB_IDLE_POLL_MILLIS * 5);
+    while std::time::Instant::now() < deadline {
         let job = store
             .post_task_job_by_id(local_job.job_id)
             .await
