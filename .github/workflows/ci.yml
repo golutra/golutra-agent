@@ -121,5 +121,5 @@ jobs:
       - name: Native CLI login and desktop settings
         shell: bash
         run: |
-          cargo build --locked -p golutra-agent-cli -p golutra-agent-app-server --bins
-          python scripts/smoke_native_runtime.py --binary-dir target/debug
+          cargo build --release --locked -p golutra-agent-cli -p golutra-agent-app-server --bins
+          python scripts/smoke_native_runtime.py --binary-dir target/release
