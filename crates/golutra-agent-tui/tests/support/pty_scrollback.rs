@@ -105,6 +105,7 @@ impl FixtureServer {
                     thread::sleep(Duration::from_millis(10));
                     continue;
                 };
+                socket.set_nodelay(true).unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(3)))
                     .unwrap();
@@ -198,13 +199,18 @@ impl FixtureServer {
                 let length: usize = frames.iter().map(String::len).sum();
                 if write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n").is_err() { continue; }
                 let mut sent_all = true;
-                for frame in frames {
+                let stream_started = Instant::now();
+                for (index, frame) in frames.into_iter().enumerate() {
                     if flag.load(Ordering::Relaxed) || socket.write_all(frame.as_bytes()).is_err() {
                         sent_all = false;
                         break;
                     }
                     let _ = socket.flush();
-                    thread::sleep(Duration::from_millis(8));
+                    // 以流起点计时，避免 macOS 每帧调度超时累计成几十秒的夹具延迟。
+                    let due = stream_started + Duration::from_millis(8 * (index as u64 + 1));
+                    if let Some(remaining) = due.checked_duration_since(Instant::now()) {
+                        thread::sleep(remaining);
+                    }
                 }
                 if sent_all {
                     completed.fetch_add(1, Ordering::Release);
