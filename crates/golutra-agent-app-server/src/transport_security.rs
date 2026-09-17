@@ -141,6 +141,7 @@ fn create_token_file(path: &Path, token: &str) -> std::io::Result<()> {
 
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
+    #[cfg(unix)]
     if let Some(parent) = path.parent() {
         File::open(parent)?.sync_all()?;
     }
@@ -159,6 +160,22 @@ fn constant_time_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_token_persists_without_overwriting_an_existing_identity() {
+        let directory = tempfile::tempdir().expect("token directory");
+        let path = directory.path().join("transport.token");
+        let token = generated_token();
+        create_token_file(&path, &token).expect("persist transport token");
+        assert_eq!(read_token(&path).expect("reopen token"), token);
+        assert_eq!(
+            create_token_file(&path, &generated_token())
+                .expect_err("existing identity must not be overwritten")
+                .kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(read_token(&path).expect("original token"), token);
+    }
 
     #[test]
     fn bearer_authentication_does_not_expose_or_accept_the_wrong_token() {
