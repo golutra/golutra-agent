@@ -221,9 +221,10 @@ def check_desktop_settings(server: Path, cli: Path, home: Path, workspace: Path,
         raise PackageError("rejected settings update changed the file")
     status = json.loads(run(cli, ["storage", "status"], workspace, environment))
     identity = status["identity"]
-    if (Path(identity["config_home"]) != home.resolve()
-            or Path(identity["runtime_home"]) != home.resolve()
-            or Path(identity["workspace"]) != workspace.resolve()
+    # Windows Rust canonicalize 使用扩展路径前缀；比较真实目录身份，不比较字符串形式。
+    if (not Path(identity["config_home"]).samefile(home)
+            or not Path(identity["runtime_home"]).samefile(home)
+            or not Path(identity["workspace"]).samefile(workspace)
             or status["compatibility"]["status"] != "supported"):
         raise PackageError("CLI storage identity/compatibility disagrees with desktop home")
     checks.append("stdio settings revision conflicts and field validation preserve data; CLI reports same home")
