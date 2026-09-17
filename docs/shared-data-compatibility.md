@@ -60,6 +60,8 @@ cargo test --locked -p golutra-agent-client shared_home_tests
 python3 scripts/smoke_shared_versions.py --baseline-cli /absolute/old/golutra-agent --candidate-cli /absolute/new/golutra-agent --output dist/shared-versions.json
 ```
 
-同次构建的桌面/npm 共享由 `smoke_native_package.py` 验证：四个并发任务、共同历史、并发配置/凭据更新、格式拒绝与无 Node 启动；它同时验证新默认 home 与旧目录分离。`smoke_shared_versions.py` 只测试新旧程序双向拒绝，在显式指定的同一隔离 home、空 PATH 和两种首开顺序下确认拒绝前后数据库逻辑不变、原创建者仍能读取。报告固定 `expected_compatibility:reject`、`shared_data_compatible:false`，不再提供升级或续跑旧历史的模式。
+同次构建的桌面/npm 共享由 `smoke_native_package.py` 验证：四个并发任务、共同历史、并发配置/凭据更新、格式拒绝与无 Node 启动；它同时验证新默认 home 与旧目录分离。`smoke_shared_versions.py` 在旧基线可运行时测试新旧程序双向拒绝，在显式指定的同一隔离 home、空 PATH 和两种首开顺序下确认拒绝前后数据库逻辑不变、原创建者仍能读取，报告 `expected_compatibility:reject`。
+
+Windows npm 0.2.0 在打开数据库前就因 SQLite URL 解析失败，无法作为可运行旧基线。只有这一固定版本和明确错误可以报告 `expected_compatibility:legacy_startup_unavailable`；报告保留真实 stderr，并单独验证失败的旧程序未改写当前数据、新版拒绝合成 schema 5 账本且无数据改写。此时没有验证旧程序成功创建的数据，也没有完成双向格式边界运行。两种报告均为 `shared_data_compatible:false`，不提供升级或续跑旧历史的模式，其他启动错误仍会阻止发布。
 
 六个平台 release runner 执行 native smoke、配置/凭据多进程测试、数据使用期锁和 session ownership 测试，并下载固定 `@golutra/agent-<platform>@0.2.0` 仅作拒绝用负向夹具（构建时下载、禁用安装脚本，不随产品交付）。`shared-versions-<target>.json` 记录包及二进制摘要，正式清单拒绝缺失、摘要不匹配或仍声明升级兼容的报告。桌面项目负责 installer、签名、ConPTY、更新和卸载验收。内置 Agent 随桌面升级；npm 自行管理；任一卸载不得删除共享 home。未运行平台必须标未验证。

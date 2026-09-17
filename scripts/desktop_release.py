@@ -80,10 +80,20 @@ def inventory(dist: Path, *, repository: str = "golutra/golutra-agent",
         if matrix is not None:
             binaries = matrix.get("binaries", [])
             outcome = matrix.get("expected_compatibility")
+            limited = matrix.get("limited_acceptance", {})
+            known_legacy_limitation = (
+                platform.os == "win32" and outcome == "legacy_startup_unavailable"
+                and matrix.get("legacy_baseline_available") is False
+                and len(binaries) == 2 and binaries[0].get("version", "").split()[-1:] == ["0.2.0"]
+                and limited.get("reason") == "windows-sqlite-url"
+                and limited.get("legacy_reader_blocked_without_data_changes") is True
+                and limited.get("candidate_rejected_old_schema_without_data_changes") is True
+                and limited.get("old_schema_fixture") == {"version": 5, "synthetic": True}
+                and bool(matrix.get("limitations")))
             if (matrix.get("passed") is not True or len(binaries) != 2
                     or binaries[1].get("sha256") != cli_hash
                     or binaries[0].get("sha256") == cli_hash
-                    or outcome != "reject"
+                    or (outcome != "reject" and not known_legacy_limitation)
                     or matrix.get("shared_data_compatible") is not False):
                 raise PackageError(f"stale cross-build shared data acceptance: {target}")
         artifacts.append({
