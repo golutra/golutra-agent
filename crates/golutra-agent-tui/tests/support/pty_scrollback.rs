@@ -8,7 +8,7 @@ use serde_json::json;
 use std::net::{TcpListener, TcpStream};
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 // vt100 解析屏幕、Unicode、滚动与 alt-screen；补齐其未实现的 xterm ED(3) 扩展。
@@ -60,6 +60,7 @@ struct FixtureServer {
     stopped: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
     requests: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    completed_streams: Arc<AtomicUsize>,
 }
 
 impl FixtureServer {
@@ -95,6 +96,8 @@ impl FixtureServer {
         let flag = stopped.clone();
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured = requests.clone();
+        let completed_streams = Arc::new(AtomicUsize::new(0));
+        let completed = completed_streams.clone();
         let worker = thread::spawn(move || {
             let mut responses = responses.into_iter();
             while !flag.load(Ordering::Relaxed) {
@@ -194,12 +197,17 @@ impl FixtureServer {
                 }
                 let length: usize = frames.iter().map(String::len).sum();
                 if write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n").is_err() { continue; }
+                let mut sent_all = true;
                 for frame in frames {
                     if flag.load(Ordering::Relaxed) || socket.write_all(frame.as_bytes()).is_err() {
+                        sent_all = false;
                         break;
                     }
                     let _ = socket.flush();
                     thread::sleep(Duration::from_millis(8));
+                }
+                if sent_all {
+                    completed.fetch_add(1, Ordering::Release);
                 }
             }
         });
@@ -209,6 +217,7 @@ impl FixtureServer {
             stopped,
             worker: Some(worker),
             requests,
+            completed_streams,
         }
     }
 
@@ -617,7 +626,9 @@ fn screen_row(parser: &ScreenModel, marker: &str) -> usize {
 }
 
 fn wait_for_visible(pty: &mut PtyHarness, parser: &mut ScreenModel, marker: &str) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // 长流夹具逐帧 sleep；macOS 的定时器合并和 CI 调度会延长实际发送时间。
+    // 等待可见状态而非假定发送速率，仍保留有界超时。
+    let deadline = Instant::now() + Duration::from_secs(30);
     while !parser.screen().contents().contains(marker) && Instant::now() < deadline {
         parser.process(&pty.collect_for(Duration::from_millis(50)));
     }
@@ -834,7 +845,7 @@ fn streaming_with_suggestions_and_status_preserves_every_message_once() {
     wait_for_visible(&mut pty, &mut parser, "› /status");
     assert!(!all_terminal_rows(&mut parser).contains("• Status"));
     pty.write(b"\r");
-    parser.process(&pty.collect_for(Duration::from_secs(7)));
+    wait_for_visible(&mut pty, &mut parser, "POPUP_STREAM_DONE");
     let text = all_terminal_rows(&mut parser);
     assert_once_in_order(&text, &markers);
     for marker in [
@@ -1100,7 +1111,7 @@ fn status_during_stream_stays_between_the_same_paragraphs_after_resize() {
         }
     }
     submit(&mut pty, &mut parser, "/status");
-    parser.process(&pty.collect_for(Duration::from_secs(3)));
+    wait_for_visible(&mut pty, &mut parser, "STREAM_DONE");
     let before = all_terminal_rows(&mut parser);
     assert_once_in_order(&before, &markers);
     assert!(
@@ -1472,14 +1483,19 @@ fn output_arriving_in_tool_details_is_archived_once_after_return() {
     parser.process(&pty.collect_for(Duration::from_millis(300)));
     assert!(parser.screen().alternate_screen());
     assert!(parser.screen().contents().contains("DETAIL_ONLY_MARKER"));
-    parser.process(&pty.collect_for(Duration::from_secs(5)));
+    // 回复在详情页不可见，先确认服务端已发送两轮完整流，再返回验证归档。
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while server.completed_streams.load(Ordering::Acquire) < 2 && Instant::now() < deadline {
+        parser.process(&pty.collect_for(Duration::from_millis(50)));
+    }
+    assert_eq!(server.completed_streams.load(Ordering::Acquire), 2);
     assert!(
         parser.screen().alternate_screen(),
         "runtime completion must not close details"
     );
     assert!(!parser.screen().contents().contains("WHILE_DETAILS_DONE"));
     pty.write(b"\x1b");
-    parser.process(&pty.collect_for(Duration::from_millis(700)));
+    wait_for_visible(&mut pty, &mut parser, "WHILE_DETAILS_DONE");
     assert!(!parser.screen().alternate_screen());
     let text = all_terminal_rows(&mut parser);
     assert_once_in_order(&text, &markers);
