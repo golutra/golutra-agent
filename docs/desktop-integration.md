@@ -2,20 +2,20 @@
 
 Agent 自有命令、环境变量和数据目录已独立改名，不提供旧名称回退；桌面 IPC 接口保留原名。见[命名空间与桌面改接清单](agent-namespace.md)。
 
-桌面安装包直接携带现有 **native release archive**。用户安装时无需 Node.js、npm、Rust、Python，也不需要下载 Agent。Python/npm/Cargo 只用于本仓库的构建和验收。调用真实云端模型仍需要用户配置 provider、凭据及网络；离线安装不等于离线推理。
+桌面安装包直接携带从 **native release archive** 或 **npm 平台包**提取的原生程序及配套文件。普通 CLI/TUI 集成可在桌面构建时下载 npm 平台包，按下文校验后内置；需要 app-server 等完整工具集时使用原生归档。用户安装时无需 Node.js、npm、Rust、Python，也不需要下载 Agent。Python/npm/Cargo 只用于构建和验收。调用真实云端模型仍需要用户配置 provider、凭据及网络；离线安装不等于离线推理。
 
 ## 产物与版本锁定
 
 原生归档与 npm 平台包使用同一次 Cargo 构建的二进制。`desktop_release.py` 再比较两种归档内 CLI/TUI、LICENSE、NOTICE 的实际 SHA-256，不同则阻止发布。
 
-| 系统 | CPU | Rust target | npm 平台包后缀 | 原生格式 |
+| 系统 | CPU | Rust target | npm 平台包名 | 原生格式 |
 | --- | --- | --- | --- | --- |
-| Windows | x64 | x86_64-pc-windows-msvc | win32-x64 | zip |
-| Windows | ARM64 | aarch64-pc-windows-msvc | win32-arm64 | zip |
-| macOS | x64 | x86_64-apple-darwin | darwin-x64 | tar.gz |
-| macOS | ARM64 | aarch64-apple-darwin | darwin-arm64 | tar.gz |
-| Linux GNU | x64 | x86_64-unknown-linux-gnu | linux-x64 | tar.gz |
-| Linux GNU | ARM64 | aarch64-unknown-linux-gnu | linux-arm64 | tar.gz |
+| Windows | x64 | x86_64-pc-windows-msvc | `@golutra/agent-win32-x64` | zip |
+| Windows | ARM64 | aarch64-pc-windows-msvc | `@golutra/agent-win32-arm64` | zip |
+| macOS | x64 | x86_64-apple-darwin | `@golutra/agent-darwin-x64` | tar.gz |
+| macOS | ARM64 | aarch64-apple-darwin | `@golutra/agent-darwin-arm64` | tar.gz |
+| Linux GNU | x64 | x86_64-unknown-linux-gnu | `@golutra/agent-linux-x64` | tar.gz |
+| Linux GNU | ARM64 | aarch64-unknown-linux-gnu | `@golutra/agent-linux-arm64` | tar.gz |
 
 版本 `V` 的发布文件：
 
@@ -32,6 +32,43 @@ golutra-agent-vV-TARGET.tar.gz.smoke.json
 桌面项目把版本、target、URL 和归档 SHA-256 一起锁进源码；构建时下载并核验摘要，安全解压，再打进安装包。不要用 `latest`，不要在用户安装时下载。拒绝错误架构、checksum 不符、绝对路径、`..`、链接、Windows drive/ADS 等不安全条目。摘要应来自已审阅并锁定的清单；同一下载位置的 `.sha256` 不是独立真实性证明。
 
 正式清单要求六个平台均有匹配归档摘要的**本机运行验收**。`--allow-partial --allow-development` 只用于本地开发，不允许进入桌面正式锁定清单。
+
+## 从 npm 平台包内置 CLI/TUI
+
+`@golutra/agent` 根包提供 JavaScript 启动器，并通过 `optionalDependencies` 选择平台包。桌面构建直接下载上表对应的**平台包**即可；不要只复制根包的 `bin/*.js` 或全局安装生成的命令 shim。平台包的 `vendor/bin/` 已含可独立运行的 CLI/TUI，不需要 Node.js。包元数据中的 `engines.node` 是 npm 工具链约束，不是这两个原生文件的运行依赖。
+
+以下为 macOS ARM64、固定版本 `0.3.0` 的构建机示例；在专用下载目录执行，其他目标替换包名。选择依据是**桌面安装包的目标平台/架构**，不是构建机自身的平台；不要让根包的自动依赖选择决定交叉打包产物。
+
+```sh
+npm view @golutra/agent-darwin-arm64@0.3.0 name version dist.tarball dist.integrity --json
+npm pack @golutra/agent-darwin-arm64@0.3.0 --ignore-scripts --json
+```
+
+示例中的 `npm view` 用于首次锁定或明确升级版本时获取元数据，常规构建不据此自动更新锁定值。带 `--ignore-scripts` 的 `npm pack` 下载包而不做全局安装、不执行包脚本；从 JSON 结果读取实际文件名，不假定它与 GitHub Release 里的 npm 归档命名相同。构建器也可直接下载已锁定的 `dist.tarball` URL，下载本身不依赖 npm 命令。
+
+桌面接入按以下顺序处理：
+
+1. **锁定来源。** 审阅版本 `V` 的 `desktop-release-vV.json`，选定与 target 对应的 `artifacts` 条目，将版本、源码 commit、target、`npm_package`、`npm_sha256`、逐文件 `files` 摘要及注册表的 tarball URL、`dist.integrity` 一起锁进桌面仓库。正常构建只消费锁定值，不临时查询 `latest` 或自动接受新摘要。正式发布继续要求 `complete:true`、`development_only:false`，npm 已上架不能替代桌面发布验收。
+2. **验证归档。** 下载原始 `.tgz`，校验锁定的 SRI `dist.integrity`（通常为 SHA-512）和发布清单的 `npm_sha256`（整个 npm 归档的 SHA-256）。这两种摘要不能直接互相比较，也不能拿原生归档的 `sha256` 当 npm 包摘要。摘要或发布清单缺失、不一致时停止正式打包，重新确认发布来源；不通过重打包或更新锁值绕过。
+3. **验证文件。** 按上一节的安全解压约束处理归档，核对 `package/package.json` 的 name/version/os/cpu，以及 `package/vendor/manifest.json` 的 package/version/target。对实际文件重新计算 SHA-256：npm 的 `package/vendor/bin/<程序>` 对应发布清单 `files` 中的 `bin/<程序>`，`package/LICENSE`、`package/NOTICE` 分别对应 `LICENSE`、`NOTICE`。同时核对 npm manifest 的二进制摘要；不能仅相信包内自带的 manifest。
+4. **加入安装资源。** 保留下面的文件与布局，去掉归档最外层 `package/` 后放入桌面自己的资源目录，例如 `<resources>/agent/`。Unix 保留可执行权限，Windows 保留 `.exe` 后缀。npm 的 `vendor/manifest.json` 与原生归档的根 manifest 格式不同，保留其路径和语义，不将两者视为可互换清单。
+5. **定位与启动。** 桌面解析出 `<resources>/agent/vendor/bin/golutra-agent[.exe]` 或 `golutra-agent-tui[.exe]` 的绝对路径，以参数数组启动。检测、版本查询和实际启动使用同一套路径选择；CLI 与 TUI 必须同目录。TUI 接入 PTY/ConPTY，cwd 指向用户项目，数据目录按下文 `GOLUTRA_AGENT_HOME` 合同处理。用户显式选择外部原生路径时，同一选择规则也用于检测。
+
+```text
+package/
+  package.json
+  LICENSE
+  NOTICE
+  vendor/
+    manifest.json
+    bin/
+      golutra-agent[.exe]
+      golutra-agent-tui[.exe]
+```
+
+`package.json` 保留来源与平台信息，不需要运行其中任何 npm 入口。当前平台包只有上述两个原生程序，不包含 app-server、vis、supervisor、launcher 或 eval-worker；需要这些独立入口时改用完整原生归档。
+
+校验通过后仍须纳入桌面自身的签名、安装、升级和卸载流程。macOS 重新签名会改变二进制摘要：上游摘要在签名前验证，签名后的安装资源由桌面自己的产物清单记录。最终验收从实际安装目录用绝对路径启动，在无 Node/npm 的环境检查版本及 TUI，并验证已有 npm 安装可继续使用。**构建时下载一次，用户安装、启动和升级内置 Agent 时均不执行 `npm install -g`**；Agent 随桌面安装包升级，不改用户全局 PATH 或 npm prefix。
 
 ## 目录与启动
 
