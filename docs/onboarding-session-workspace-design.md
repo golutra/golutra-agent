@@ -298,7 +298,8 @@ TUI 输入框现在先经过 slash command parser：
 | `/resume [thread-id]` | 无参数时打开当前 workspace session 列表；带 thread id 时恢复指定 thread 并切换当前 session |
 | `/threads [limit]` | 列出当前 workspace 最近 threads |
 | `/fork <thread-id> [--from-turn <turn-id>]` | fork 全部历史或截断到指定 turn，创建新 thread/session 并切换 |
-| `/auth`、`/auth setup` | 打开 provider setup |
+| `/auth`、`/login`、`/auth setup` | 打开同一 provider setup；输入 `/login` 的候选显示 `/auth (alias: login)` |
+| `/logout` | 删除当前 active profile 的配置及本地凭据，清除 active 选择并自动打开 setup；保留其他 profiles、界面设置和会话历史。环境变量只解除引用，不修改 shell；无 active profile 时直接进入 setup。运行中任务或认证操作须先结束，remote TUI 不执行本地清理 |
 | `/auth status` | 展示 provider onboarding 状态 |
 | `/auth protocols` | 展示注册 provider protocols |
 | `/auth mock` | 将全局 provider 切换为 mock |

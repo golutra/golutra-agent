@@ -702,6 +702,21 @@ impl ProcessSupervisor {
         self.inner.updates.subscribe()
     }
 
+    /// 仅导出已结束进程的保留输出供本地详情持久化；不推进模型读取游标，也不改变进程状态。
+    pub async fn retained_terminal_output(
+        &self,
+        session_id: SessionId,
+        process_id: &str,
+    ) -> Result<Option<(String, bool)>, ToolError> {
+        let entry = self.entry(session_id, process_id).await?;
+        if !entry.state.lock().await.state.is_terminal() {
+            return Ok(None);
+        }
+        let output = entry.output.lock().await;
+        let ((text, lost), _) = output.page(0, usize::MAX);
+        Ok(Some((text, lost || output.truncated)))
+    }
+
     pub async fn current_updates(&self) -> Vec<ProcessUpdate> {
         let entries = self
             .inner

@@ -412,17 +412,13 @@ fn diff_preview(sample: &ChangeSample) -> Option<FileDiffPreview> {
     let mut lines = Vec::new();
     let mut retained_bytes = 0_usize;
     let mut truncated = false;
-    for change in TextDiff::from_lines(before, after).iter_all_changes() {
-        if change.tag() == ChangeTag::Equal {
-            continue;
-        }
-        let prefix = match change.tag() {
-            ChangeTag::Insert => '+',
-            ChangeTag::Delete => '-',
-            ChangeTag::Equal => ' ',
-        };
-        let value = change.value().trim_end_matches(['\r', '\n']);
-        let (line, _) = redact_sensitive_text(&format!("{prefix}{value}"));
+    // 预览保留 hunk 起点与邻近上下文，前端才能使用真实行号而非从 1 猜测。
+    let patch = TextDiff::from_lines(before, after)
+        .unified_diff()
+        .context_radius(2)
+        .to_string();
+    for value in patch.lines() {
+        let (line, _) = redact_sensitive_text(value);
         let line_bytes = line.len().saturating_add(1);
         if lines.len() >= MAX_DIFF_PREVIEW_LINES
             || retained_bytes.saturating_add(line_bytes) > MAX_DIFF_PREVIEW_BYTES
@@ -766,7 +762,7 @@ mod tests {
         assert_eq!(facts.diff_previews[0].path, "src/lib.rs");
         assert_eq!(
             facts.diff_previews[0].lines,
-            vec!["-two", "+three", "+four"]
+            vec!["@@ -1,2 +1,3 @@", " one", "-two", "+three", "+four"]
         );
         assert!(!facts.diff_previews[0].truncated);
     }

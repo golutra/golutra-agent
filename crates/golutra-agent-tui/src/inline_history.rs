@@ -27,6 +27,11 @@ pub(crate) struct HistoryDisplayRow {
 }
 
 fn unpadded_history_line(mut spans: Vec<Span<'static>>) -> Line<'static> {
+    // 去掉物理补齐空格时保留整行底色，缩放重排后 diff 仍覆盖新行宽。
+    let background = spans
+        .last()
+        .and_then(|span| span.style.bg)
+        .filter(|color| *color != ratatui::style::Color::Reset);
     // 缓存的是实际文字而非 Buffer 的补齐空格；缩窄时补齐格不能再次折成空白行。
     while let Some(last) = spans.last_mut() {
         last.content = last.content.trim_end().to_owned().into();
@@ -35,7 +40,12 @@ fn unpadded_history_line(mut spans: Vec<Span<'static>>) -> Line<'static> {
         }
         spans.pop();
     }
-    Line::from(spans)
+    let line = Line::from(spans);
+    if let Some(color) = background {
+        line.style(Style::default().bg(color))
+    } else {
+        line
+    }
 }
 
 fn retain_screen_rows(rows: &mut Vec<HistoryDisplayRow>, screen_height: u16) {
@@ -192,23 +202,6 @@ impl InlineHistoryState {
         display.extend(rows);
         retain_screen_rows(display, size.height);
         Ok(())
-    }
-
-    pub(crate) fn visible_tool_hits(&self, viewport: Rect) -> Vec<(Rect, OperationId)> {
-        let count = self.display_rows.len().min(usize::from(viewport.y));
-        let first_y = viewport.y.saturating_sub(count as u16);
-        self.display_rows[self.display_rows.len() - count..]
-            .iter()
-            .enumerate()
-            .filter_map(|(index, row)| {
-                row.tool_id.as_ref().map(|id| {
-                    (
-                        Rect::new(0, first_y + index as u16, viewport.width, 1),
-                        id.clone(),
-                    )
-                })
-            })
-            .collect()
     }
 
     pub(crate) fn new(session_id: SessionId) -> Self {
@@ -1104,6 +1097,8 @@ pub(crate) fn wrapped_history_rows(
             let height = u16::try_from(chunk_rows).expect("debug history chunk is u16-bounded");
             let area = Rect::new(0, 0, width, height);
             let mut buffer = Buffer::empty(area);
+            // Paragraph 的行样式不填满尾部空格；归档/缩放时显式保留整行 diff 底色。
+            buffer.set_style(area, line.style);
             Paragraph::new(line.clone())
                 .wrap(Wrap { trim: false })
                 .scroll((ratatui_vertical_scroll(offset, height), 0))
@@ -1308,10 +1303,20 @@ fn insert_history_lines<B: Backend>(
     let mut batch = Vec::new();
     let mut batch_rows = 0_usize;
 
-    for line in lines
+    for mut line in lines
         .into_iter()
         .flat_map(|line| bounded_history_line_segments(line, width))
     {
+        if line
+            .style
+            .bg
+            .is_some_and(|color| color != ratatui::style::Color::Reset)
+        {
+            // 历史缓存只存文字；按当前物理宽度重新补色，不能复用旧窗口的填充量。
+            let padding = usize::from(width).saturating_sub(line.width());
+            line.spans
+                .push(Span::styled(" ".repeat(padding), line.style));
+        }
         let line_rows = history_line_height(&line, width);
         if line_rows > max_rows {
             insert_history_batch(terminal, std::mem::take(&mut batch), batch_rows)?;

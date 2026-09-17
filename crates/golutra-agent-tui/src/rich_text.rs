@@ -29,6 +29,13 @@ pub(crate) fn detail_line(value: &str) -> Line<'static> {
     code::detail_line(value)
 }
 
+pub(crate) fn wrap_detail_spans(
+    spans: &[ratatui::text::Span<'static>],
+    width: usize,
+) -> Vec<Line<'static>> {
+    wrap::hard_wrap_spans(spans, width.max(1))
+}
+
 #[cfg(test)]
 mod tests {
     use ratatui::{

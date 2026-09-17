@@ -114,7 +114,8 @@ mod settings;
 mod stream_commit;
 mod terminal_integration;
 mod tool_detail;
-mod transcript_interaction;
+mod tool_detail_data;
+mod tool_preview;
 mod transcript_spacing;
 mod transcript_view;
 mod transcript_widget;
@@ -357,11 +358,7 @@ struct TuiApp {
     debug_scroll: PaneScrollState,
     events: Vec<RuntimeEvent>,
     command_messages: Vec<TranscriptItem>,
-    transcript_screen: Option<ratatui::buffer::Buffer>,
-    transcript_pointer: Option<transcript_interaction::TranscriptPointer>,
     tool_detail: Option<tool_detail::ToolDetailState>,
-    history_tool_hits: Vec<(Rect, OperationId)>,
-    history_tool_press: Option<(u16, u16, OperationId)>,
     resume_picker: Option<ResumePickerState>,
     queue_picker: Option<QueuePickerState>,
     approval_dialog: Option<ApprovalDialogState>,
@@ -681,11 +678,7 @@ impl TuiApp {
             },
             events: Vec::new(),
             command_messages: Vec::new(),
-            transcript_screen: None,
-            transcript_pointer: None,
             tool_detail: None,
-            history_tool_hits: Vec::new(),
-            history_tool_press: None,
             resume_picker: None,
             queue_picker: None,
             approval_dialog: None,
@@ -1982,22 +1975,11 @@ impl TuiApp {
 
     fn reset_transcript_view(&mut self) {
         self.tool_detail = None;
-        self.history_tool_hits.clear();
-        self.history_tool_press = None;
-        self.transcript_pointer = None;
-        self.transcript_screen = None;
         self.debug_scroll.reset(0);
         self.transcript.reset_view();
         self.transcript
             .scroll
             .reset(self.current_transcript_row_count());
-    }
-
-    fn toggle_operation(&mut self, id: OperationId) {
-        let anchor = self.first_visible_transcript_anchor();
-        let previous_row_count = self.transcript.scroll.row_count;
-        self.transcript.toggle_operation(id);
-        self.reflow_transcript_with_anchor(anchor, previous_row_count);
     }
 
     fn toggle_transcript_details(&mut self) {
@@ -2435,18 +2417,12 @@ impl TuiApp {
         let layout = full_transcript_layout(self, area);
         let lines = layout.plain_lines();
         let text = self
-            .transcript_pointer
+            .transcript
+            .search
             .as_ref()
-            .filter(|pointer| pointer.is_selection())
-            .map(transcript_interaction::TranscriptPointer::text)
-            .unwrap_or_else(|| {
-                self.transcript
-                    .search
-                    .as_ref()
-                    .and_then(TranscriptSearchState::current_line)
-                    .and_then(|line| lines.get(line).cloned())
-                    .unwrap_or_else(|| layout.plain_text())
-            });
+            .and_then(TranscriptSearchState::current_line)
+            .and_then(|line| lines.get(line).cloned())
+            .unwrap_or_else(|| layout.plain_text());
         self.status_message = match copy_to_terminal_clipboard(&text) {
             Ok((bytes, true)) => format!("copied {bytes} bytes (clipboard limit reached)"),
             Ok((bytes, false)) => format!("copied {bytes} bytes"),
@@ -2465,7 +2441,7 @@ impl TuiApp {
             }
             return;
         }
-        if (self.debug_mode && !self.transcript.fullscreen) || self.transcript.history.enabled {
+        if !self.transcript.fullscreen && (self.debug_mode || self.transcript.history.enabled) {
             return;
         }
         let rows = self.layout.transcript.height.max(1) as usize;
@@ -3481,6 +3457,14 @@ impl TuiApp {
         self.status_message = "connect a provider".to_owned();
     }
 
+    fn reset_provider_controls_after_logout(&mut self) {
+        // 退出后旧会话的模型/profile 覆盖也失效，否则重新登录仍可能指向已删除条目。
+        let permission_mode = self.runtime_controls.permission_mode;
+        self.runtime_controls = RuntimeControls::from_settings(None, "unconfigured", self.yolo).0;
+        self.runtime_controls.permission_mode = permission_mode;
+        self.provider_choices.clear();
+    }
+
     async fn execute_auth_command(
         &mut self,
         transport: &RuntimeTransport,
@@ -3504,6 +3488,9 @@ impl TuiApp {
         match command {
             SlashAuthCommand::Setup => {
                 self.open_auth_dialog();
+            }
+            SlashAuthCommand::ForgetActive => {
+                self.start_provider_disconnect(transport)?;
             }
             SlashAuthCommand::Status => {
                 self.refresh_provider_status_from_runtime(transport).await;
@@ -3656,6 +3643,7 @@ impl TuiApp {
             .await
         });
         self.auth_operation = Some(PendingAuthOperation {
+            reopen_setup: false,
             cancellation,
             progress,
             task,
@@ -3699,6 +3687,45 @@ impl TuiApp {
             })
         });
         self.auth_operation = Some(PendingAuthOperation {
+            reopen_setup: false,
+            cancellation,
+            progress,
+            task,
+        });
+        self.status_message = "logging out provider".to_owned();
+        Ok(())
+    }
+
+    fn start_provider_disconnect(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
+        if self.auth_operation.is_some() || has_active_task(self) {
+            self.status_message =
+                "finish or interrupt the active task/auth operation before /logout".to_owned();
+            return Ok(());
+        }
+        let paths = provider_paths_for_tui()?;
+        let cwd = provider_cwd_for_tui(transport)?.to_path_buf();
+        let cancellation = CancellationToken::new();
+        let (_progress_tx, progress) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            let outcome = golutra_agent_config::forget_active_provider_verified(&paths, &cwd)
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut body = vec![match outcome.profile {
+                Some(profile) => format!("provider profile {profile} and local credential removed"),
+                None => "no active provider configuration".to_owned(),
+            }];
+            if let Some(warning) = outcome.revocation_warning {
+                body.push(format!(
+                    "Local logout completed; remote revocation failed: {warning}"
+                ));
+            }
+            Ok(AuthTaskOutcome {
+                title: "Logged out".to_owned(),
+                body,
+            })
+        });
+        self.auth_operation = Some(PendingAuthOperation {
+            reopen_setup: true,
             cancellation,
             progress,
             task,
@@ -3728,6 +3755,12 @@ impl TuiApp {
         };
         match operation.task.await {
             Ok(Ok(outcome)) => {
+                // 本地删除已经提交，即使运行时重载失败也必须回到配置页并保留错误。
+                if operation.reopen_setup {
+                    self.reset_provider_controls_after_logout();
+                    self.refresh_provider_status();
+                    self.open_auth_dialog();
+                }
                 if let Err(error) =
                     notify_runtime_provider_configured(transport, self.session_id).await
                 {
@@ -4411,7 +4444,8 @@ fn draw_interactive_frame_inner(
     app: &mut TuiApp,
     inline_history: &mut InlineHistoryState,
 ) -> miette::Result<()> {
-    let overlay_visible = app.overlay_surface().is_some() || app.tool_detail.is_some();
+    let overlay_visible =
+        app.overlay_surface().is_some() || app.tool_detail.is_some() || app.transcript.fullscreen;
     if !overlay_screen.active {
         prepare_inline_screen(terminal, overlay_screen, inline_history)
             .map_err(|error| miette::miette!("prepare inline screen: {error}"))?;
@@ -4422,7 +4456,8 @@ fn draw_interactive_frame_inner(
             .flush_interactive(terminal, app)
             .map_err(|error| miette::miette!("write terminal history: {error}"))?;
     }
-    let capture_mouse = overlay_visible && !overlay_uses_native_mouse(app);
+    // 主聊天和工具详情交还终端原生选字；只有明确的选择器接管鼠标。
+    let capture_mouse = app.overlay_surface().is_some() && !overlay_uses_native_mouse(app);
     sync_overlay_screen(terminal, overlay_screen, overlay_visible, capture_mouse)?;
     if !overlay_screen.active {
         // 弹层内的尺寸变化留到主屏恢复后处理，不能用 alternate screen 的坐标更新历史锚点。
@@ -4443,8 +4478,6 @@ fn draw_interactive_frame_inner(
             .get_or_insert(terminal.current_buffer_mut().area);
     } else {
         overlay_screen.saved_inline = Some(terminal.current_buffer_mut().area);
-        app.history_tool_hits =
-            inline_history.visible_tool_hits(terminal.current_buffer_mut().area);
         let visible_rows = app.layout.transcript.height.saturating_sub(1) as usize;
         app.request_older_history_if_needed(visible_rows);
     }
@@ -4540,6 +4573,8 @@ fn leave_overlay_screen(
         LeaveAlternateScreen
     )
     .map_err(|error| miette::miette!("leave overlay screen: {error}"))?;
+    overlay_screen.capture_mouse = false;
+    set_mouse_capture_active(false);
     set_alternate_screen_active(false);
     terminal
         .restore_inline(restored)
@@ -4636,16 +4671,13 @@ async fn handle_key(
         tool_detail::handle_tool_detail_key(key, app);
         return Ok(());
     }
+    if app.transcript.fullscreen && app.overlay_surface().is_none() && key.code == KeyCode::Esc {
+        app.transcript.fullscreen = false;
+        app.transcript.scroll.reset(0);
+        app.invalidate_transcript_layout();
+        return Ok(());
+    }
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        if app
-            .transcript_pointer
-            .as_ref()
-            .is_some_and(|pointer| pointer.is_selection())
-        {
-            app.copy_transcript();
-            app.transcript_pointer = None;
-            return Ok(());
-        }
         return app.interrupt_or_quit(transport).await;
     }
     if key.code == KeyCode::F(1)
@@ -5469,6 +5501,7 @@ async fn handle_export_key(
 
 fn handle_paste(pasted: &str, app: &mut TuiApp) {
     if app.tool_detail.is_some() {
+        tool_detail::paste_query(app, pasted);
         return;
     }
     let normalized = pasted.replace("\r\n", "\n").replace('\r', "\n");
@@ -5920,101 +5953,12 @@ fn handle_mouse(mouse: MouseEvent, app: &mut TuiApp) -> Option<UiMouseActivation
         app.mouse_press = None;
         return None;
     }
-    if app.tool_detail.is_some() && tool_detail::handle_tool_detail_navigation(mouse, app) {
+    // 不处理主聊天/详情的迟到鼠标事件，避免切屏后误触工具或滚动历史。
+    if app.overlay_surface().is_none() {
+        app.mouse_press = None;
         return None;
     }
-    if app.tool_detail.is_none()
-        && app.overlay_surface().is_none()
-        && app.transcript.history.enabled
-        && app.transcript.compact_tools
-    {
-        let hit = app
-            .history_tool_hits
-            .iter()
-            .find(|(rect, _)| {
-                mouse.column >= rect.x
-                    && mouse.column < rect.right()
-                    && mouse.row >= rect.y
-                    && mouse.row < rect.bottom()
-            })
-            .map(|(_, id)| id.clone())
-            .or_else(|| transcript_toggle_at(app, app.layout.transcript, mouse.column, mouse.row));
-        match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) if hit.is_some() => {
-                app.history_tool_press = hit.map(|id| (mouse.column, mouse.row, id));
-                return None;
-            }
-            MouseEventKind::Up(MouseButton::Left) => {
-                if let Some((x, y, id)) = app.history_tool_press.take() {
-                    if x == mouse.column && y == mouse.row && hit.as_ref() == Some(&id) {
-                        tool_detail::open_tool_detail(app, id);
-                    }
-                    return None;
-                }
-            }
-            MouseEventKind::Drag(_) => app.history_tool_press = None,
-            _ => {}
-        }
-    }
     let target = app.layout.hit_test(mouse.column, mouse.row, app);
-    if (app.transcript.fullscreen || app.tool_detail.is_some()) && app.overlay_surface().is_none() {
-        match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) if target == UiHitTarget::Transcript => {
-                app.transcript_pointer = app.transcript_screen.clone().map(|snapshot| {
-                    transcript_interaction::TranscriptPointer {
-                        start: (mouse.column, mouse.row),
-                        end: (mouse.column, mouse.row),
-                        operation: if app.tool_detail.is_some() {
-                            None
-                        } else {
-                            transcript_toggle_at(
-                                app,
-                                app.layout.transcript,
-                                mouse.column,
-                                mouse.row,
-                            )
-                        },
-                        snapshot,
-                        area: app.layout.transcript,
-                        released: false,
-                    }
-                });
-                return None;
-            }
-            MouseEventKind::Drag(MouseButton::Left) => {
-                if let Some(pointer) = &mut app.transcript_pointer
-                    && !pointer.released
-                {
-                    pointer.end = (
-                        mouse
-                            .column
-                            .clamp(pointer.area.x, pointer.area.right().saturating_sub(1)),
-                        mouse
-                            .row
-                            .clamp(pointer.area.y, pointer.area.bottom().saturating_sub(1)),
-                    );
-                }
-                return None;
-            }
-            MouseEventKind::Up(MouseButton::Left) => {
-                if let Some(mut pointer) = app.transcript_pointer.take() {
-                    pointer.released = true;
-                    if pointer.is_selection() {
-                        app.transcript_pointer = Some(pointer);
-                    } else if pointer.start == (mouse.column, mouse.row)
-                        && let Some(id) = pointer.operation
-                    {
-                        app.toggle_operation(id);
-                    }
-                    return None;
-                }
-            }
-            MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                app.transcript_pointer = None;
-            }
-            _ => {}
-        }
-    }
     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
         if let Some(press) = mouse_press_at(app, mouse.column, mouse.row) {
             apply_mouse_press(app, press);
@@ -6022,17 +5966,6 @@ fn handle_mouse(mouse: MouseEvent, app: &mut TuiApp) -> Option<UiMouseActivation
             return None;
         }
         app.mouse_press = None;
-        if target == UiHitTarget::Transcript
-            && let Some(operation_id) =
-                transcript_toggle_at(app, app.layout.transcript, mouse.column, mouse.row)
-        {
-            if app.transcript.compact_tools {
-                tool_detail::open_tool_detail(app, operation_id);
-            } else {
-                app.toggle_operation(operation_id);
-            }
-            return None;
-        }
     }
     match mouse.kind {
         MouseEventKind::Up(MouseButton::Left) => {

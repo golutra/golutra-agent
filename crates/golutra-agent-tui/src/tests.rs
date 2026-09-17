@@ -5710,6 +5710,31 @@ async fn auth_dialog_keeps_dialog_open_and_rolls_back_when_probe_fails() {
     assert!(settings.profiles.is_empty());
 }
 
+#[test]
+fn logout_clears_session_provider_overrides_without_changing_permissions() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        true,
+        "ready".to_owned(),
+        None,
+    );
+    app.runtime_controls.profile_name = Some("removed".to_owned());
+    app.runtime_controls.profile_overridden = true;
+    app.runtime_controls.custom_model = Some("previous-model".to_owned());
+    app.runtime_controls.reasoning_overridden = true;
+    app.runtime_controls.reasoning_effort = Some(ProviderReasoningEffort::High);
+    let permission_mode = app.runtime_controls.permission_mode;
+    app.reset_provider_controls_after_logout();
+    assert!(app.runtime_controls.profile_name.is_none());
+    assert!(!app.runtime_controls.profile_overridden);
+    assert!(app.runtime_controls.custom_model.is_none());
+    assert!(!app.runtime_controls.reasoning_overridden);
+    assert!(app.runtime_controls.reasoning_effort.is_none());
+    assert_eq!(app.runtime_controls.permission_mode, permission_mode);
+}
+
 #[tokio::test]
 async fn slash_auth_login_failure_reports_error_without_persisting_profile() {
     let dir = tempfile::tempdir().expect("dir");
@@ -7562,8 +7587,8 @@ fn file_changes_are_compact_in_normal_mode_and_detailed_in_developer_mode() {
         .iter()
         .map(|cell| cell.symbol())
         .collect::<String>();
-    assert!(normal_text.contains("Edited 1 file (+2 -1)"));
-    assert!(normal_text.contains("src/lib.rs  +2 -1"));
+    assert!(normal_text.contains("Edited src/lib.rs"));
+    assert!(normal_text.contains("└ (+2 -1)"));
     assert!(!normal_text.contains("changes files="));
 
     app.set_debug_mode(true);
@@ -7718,7 +7743,7 @@ fn draw_inline_test_frame(terminal: &mut Terminal<TestBackend>, app: &mut TuiApp
 }
 
 #[tokio::test]
-async fn transcript_operation_details_toggle_with_ctrl_o_and_mouse() {
+async fn transcript_operation_details_toggle_with_ctrl_o_and_ignore_mouse() {
     let transport = RuntimeTransport::in_memory().await.expect("transport");
     let session_id = SessionId::new();
     let task_id = TaskId::new();
@@ -7771,7 +7796,7 @@ async fn transcript_operation_details_toggle_with_ctrl_o_and_mouse() {
         transcript_items(&app)[0]
             .body
             .iter()
-            .all(|line| line != "-old value")
+            .any(|line| line == "-old value")
     );
     handle_key(
         KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
@@ -7795,11 +7820,12 @@ async fn transcript_operation_details_toggle_with_ctrl_o_and_mouse() {
     .expect("collapse all transcript operations");
 
     app.enable_inline_history();
+    app.transcript.compact_tools = true;
     let mut terminal = Terminal::new(TestBackend::new(100, 20)).expect("terminal");
     terminal
         .draw(|frame| draw_ui(frame, &mut app))
         .expect("draw collapsed operation");
-    let (_, toggle) = transcript_toggle_regions(&app, app.layout.transcript)
+    let (_, toggle) = transcript_operation_regions(&app, app.layout.transcript)
         .into_iter()
         .next()
         .expect("visible operation toggle");
@@ -7812,13 +7838,34 @@ async fn transcript_operation_details_toggle_with_ctrl_o_and_mouse() {
         },
         &mut app,
     );
-
-    assert!(
-        transcript_items(&app)[0]
-            .body
-            .iter()
-            .any(|line| line == "+new value")
+    assert!(app.tool_detail.is_none());
+    handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: toggle.x,
+            row: toggle.y,
+            modifiers: KeyModifiers::NONE,
+        },
+        &mut app,
     );
+    assert!(app.tool_detail.is_none(), "mouse cannot open tool details");
+    app.input.insert_str("保留草稿🙂");
+    let open_close = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+    handle_key(open_close, &mut app, &transport).await.unwrap();
+    assert!(app.tool_detail.is_some());
+    handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: toggle.x,
+            row: toggle.y,
+            modifiers: KeyModifiers::NONE,
+        },
+        &mut app,
+    );
+    assert!(app.tool_detail.is_some());
+    handle_key(open_close, &mut app, &transport).await.unwrap();
+    assert!(app.tool_detail.is_none());
+    assert_eq!(app.input.text(), "保留草稿🙂");
 }
 
 #[test]

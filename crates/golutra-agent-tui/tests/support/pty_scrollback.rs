@@ -5,7 +5,7 @@ use golutra_agent_auth::{CredentialRef, SecretKind};
 use golutra_agent_config::{ProviderConfigPaths, ProviderProfile, ProviderSettings};
 use golutra_agent_llm::ProviderProtocol;
 use serde_json::json;
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -134,11 +134,21 @@ impl FixtureServer {
                         }
                     }
                 }
-                if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
-                    && let Ok(body) = serde_json::from_slice(&request[end + 4..])
-                {
-                    captured.lock().unwrap().push(body);
+                // TCP 探测/放弃连接并非 HTTP 请求，不能消耗下一轮夹具响应。
+                if request.is_empty() {
+                    continue;
                 }
+                let end = request
+                    .windows(4)
+                    .position(|bytes| bytes == b"\r\n\r\n")
+                    .expect("fixture request must contain complete headers");
+                let body = serde_json::from_slice(&request[end + 4..]).unwrap_or_else(|error| {
+                    panic!(
+                        "fixture must capture a complete JSON request: {error}; body_bytes={}",
+                        request.len() - end - 4
+                    )
+                });
+                captured.lock().unwrap().push(body);
                 let (content, calls) = responses
                     .next()
                     .unwrap_or_else(|| ("FIXTURE_DONE".to_owned(), Vec::new()));
@@ -224,8 +234,37 @@ impl FixtureServer {
 impl Drop for FixtureServer {
     fn drop(&mut self) {
         self.stopped.store(true, Ordering::Relaxed);
-        self.worker.take().unwrap().join().unwrap();
+        let result = self.worker.take().unwrap().join();
+        // 测试已经失败时保留首个诊断，避免析构再次 panic 中止整个测试进程。
+        if !thread::panicking() {
+            result.unwrap();
+        }
     }
+}
+
+#[test]
+fn fixture_empty_connection_does_not_consume_a_response() {
+    let server = FixtureServer::new(vec!["FIRST_RESPONSE".to_owned()]);
+    let address = server
+        .url
+        .strip_prefix("http://")
+        .unwrap()
+        .strip_suffix("/v1")
+        .unwrap();
+    drop(TcpStream::connect(address).unwrap());
+    let mut socket = TcpStream::connect(address).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    socket
+        .write_all(
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}",
+        )
+        .unwrap();
+    let mut response = String::new();
+    socket.read_to_string(&mut response).unwrap();
+    assert!(response.contains("FIRST_RESPONSE"), "{response}");
+    assert_eq!(*server.requests.lock().unwrap(), vec![json!({})]);
 }
 
 fn all_terminal_rows(parser: &mut ScreenModel) -> String {
@@ -1301,7 +1340,7 @@ fn narration_and_real_tool_results_remain_in_order_without_raw_file_previews() {
     assert_eq!(
         parser.screen().mouse_protocol_mode(),
         vt100::MouseProtocolMode::None,
-        "inline must allow native scroll and selection"
+        "tool cards must preserve native terminal selection"
     );
     pty.write(b"\x0f");
     parser.process(&pty.collect_for(Duration::from_millis(500)));
@@ -1310,12 +1349,12 @@ fn narration_and_real_tool_results_remain_in_order_without_raw_file_previews() {
         "{}",
         parser.screen().contents()
     );
-    assert_ne!(
+    assert_eq!(
         parser.screen().mouse_protocol_mode(),
         vt100::MouseProtocolMode::None
     );
     let expanded = parser.screen().contents();
-    assert!(expanded.contains("Back"), "{expanded}");
+    assert!(expanded.contains("Ctrl+O / Esc back"), "{expanded}");
     assert!(
         expanded.contains("RAW_HTML_SHOULD_STAY_IN_DETAILS"),
         "{expanded}"
@@ -1353,7 +1392,7 @@ fn narration_and_real_tool_results_remain_in_order_without_raw_file_previews() {
             .unwrap()
             .contains("Tool details")
     );
-    pty.write(b"\x1b[<0;3;1M\x1b[<0;3;1m");
+    pty.write(b"\x0f");
     parser.process(&pty.collect_for(Duration::from_millis(600)));
     assert!(!parser.screen().alternate_screen());
     assert!(parser.screen().contents().contains("保留草稿"));
@@ -1536,7 +1575,7 @@ fn auth_keeps_fullscreen_keyboard_navigation_and_native_mouse_selection() {
     let mut pty = PtyHarness::spawn(home.path(), workspace.path(), 110, 32);
     let mut parser = ScreenModel::new(32, 110);
     wait_for_visible(&mut pty, &mut parser, "Ask Golutra");
-    submit(&mut pty, &mut parser, "/auth");
+    submit(&mut pty, &mut parser, "/login");
     wait_for_visible(&mut pty, &mut parser, "Connect a Provider");
     assert!(parser.screen().alternate_screen());
     assert_eq!(
@@ -1641,6 +1680,67 @@ fn native_mouse_and_shell_prefix_survive_draft_growth_and_fullscreen_picker() {
 }
 
 #[test]
+fn logout_removes_active_config_reopens_setup_and_stays_logged_out_after_restart() {
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let server = FixtureServer::new(vec!["LOGOUT_HISTORY_PRESERVED".to_owned()]);
+    server.install(home.path());
+    let paths = ProviderConfigPaths::from_home(home.path()).unwrap();
+    let mut settings = ProviderSettings::load(&paths.user_config).unwrap();
+    let mut spare = ProviderProfile::mock();
+    spare.name = "spare".to_owned();
+    settings.upsert_profile(spare, false);
+    settings.save(&paths.user_config).unwrap();
+    let mut pty = PtyHarness::spawn_with_resume(
+        home.path(),
+        workspace.path(),
+        110,
+        32,
+        true,
+        Some("logout-history"),
+    );
+    let mut parser = ScreenModel::new(32, 110);
+    wait_for_visible(&mut pty, &mut parser, "Ask Golutra");
+    submit(&mut pty, &mut parser, "hello");
+    wait_for_visible(&mut pty, &mut parser, "LOGOUT_HISTORY_PRESERVED");
+    parser.process(&pty.collect_for(Duration::from_millis(300)));
+    submit(&mut pty, &mut parser, "/logout");
+    wait_for_visible(&mut pty, &mut parser, "Connect a Provider");
+    assert!(parser.screen().alternate_screen());
+    assert_eq!(
+        parser.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None
+    );
+    let saved = ProviderSettings::load(&paths.user_config).unwrap();
+    assert!(saved.active_profile.is_none());
+    assert_eq!(saved.profiles.len(), 1);
+    assert_eq!(saved.profiles[0].name, "spare");
+    // 正常退出向导后重新启动，不允许回退到另一个 Provider 或恢复被删配置。
+    pty.write(b"\x03");
+    parser.process(&pty.collect_for(Duration::from_millis(150)));
+    pty.write(b"\x03");
+    assert!(pty.wait().1.success());
+    let mut resumed = PtyHarness::spawn_with_resume(
+        home.path(),
+        workspace.path(),
+        110,
+        32,
+        true,
+        Some("logout-history"),
+    );
+    let mut screen = ScreenModel::new(32, 110);
+    wait_for_visible(&mut resumed, &mut screen, "Connect a Provider");
+    assert!(screen.screen().alternate_screen());
+    // 再次配置可正常返回主屏；此前的历史仍在。
+    resumed.write(b"\x1b[B\x1b[B\x1b[B\r");
+    wait_for_visible(&mut resumed, &mut screen, "Ask Golutra");
+    assert!(all_terminal_rows(&mut screen).contains("LOGOUT_HISTORY_PRESERVED"));
+    assert_eq!(server.requests.lock().unwrap().len(), 1);
+    submit(&mut resumed, &mut screen, "/quit");
+    assert!(resumed.wait().1.success());
+}
+
+#[test]
 fn xterm_erase_saved_lines_preserves_the_visible_screen() {
     let mut parser = ScreenModel::new(3, 20);
     parser.process(b"old1\r\nold2\r\nold3\r\nvisible\r\ntail");
@@ -1649,4 +1749,279 @@ fn xterm_erase_saved_lines_preserves_the_visible_screen() {
     parser.process(b"\x1b[3J");
     assert_eq!(parser.screen().contents(), screen);
     assert!(!all_terminal_rows(&mut parser).contains("old1"));
+}
+
+#[test]
+fn command_cards_keep_native_mouse_with_keyboard_details_and_resume() {
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let output = (0..240)
+        .map(|n| format!("日志{n:03} 中文🙂\n\n"))
+        .collect::<String>();
+    std::fs::write(workspace.path().join("log.txt"), &output).unwrap();
+    let server = FixtureServer::with_rounds(vec![
+        (
+            "读取命令日志。".into(),
+            vec![
+                json!({"index":0,"id":"long-log","type":"function","function":{"name":"shell","arguments":json!({"command":"cat log.txt"}).to_string()}}),
+            ],
+        ),
+        ("CARD_TEST_DONE".into(), vec![]),
+    ]);
+    server.install(home.path());
+    let mut pty = PtyHarness::spawn_with_resume(
+        home.path(),
+        workspace.path(),
+        100,
+        32,
+        true,
+        Some("saved-card-test"),
+    );
+    let mut parser = ScreenModel::new(32, 100);
+    wait_for_visible(&mut pty, &mut parser, "Ask Golutra");
+    submit(&mut pty, &mut parser, "运行日志命令");
+    wait_for_visible(&mut pty, &mut parser, "Approval required");
+    pty.write(b"3");
+    wait_for_visible(&mut pty, &mut parser, "CARD_TEST_DONE");
+    parser.process(&pty.collect_for(Duration::from_millis(400)));
+    assert!(!all_terminal_rows(&mut parser).contains("日志239"));
+    pty.write("\x1b[200~保留草稿\x1b[201~".as_bytes());
+    parser.process(&pty.collect_for(Duration::from_millis(200)));
+    let original = visible_screen_rows(&parser);
+    assert_eq!(
+        parser.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None
+    );
+    // 迟到的鼠标事件不再打开卡片、接管滚轮或修改界面。
+    let row = screen_row(&parser, "cat log.txt") as u16 + 1;
+    pty.write(
+        format!("\x1b[<35;5;{row}M\x1b[<0;5;{row}M\x1b[<0;5;{row}m\x1b[<64;5;{row}M").as_bytes(),
+    );
+    parser.process(&pty.collect_for(Duration::from_millis(200)));
+    assert!(!parser.screen().alternate_screen());
+    assert_eq!(visible_screen_rows(&parser), original);
+    assert_eq!(
+        parser.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None
+    );
+    pty.write(b"\x0f");
+    wait_for_visible(&mut pty, &mut parser, "Tool details");
+    assert!(parser.screen().alternate_screen());
+    assert_eq!(
+        parser.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None
+    );
+    wait_for_visible(&mut pty, &mut parser, "日志000");
+    pty.write("/日志239\r".as_bytes());
+    wait_for_visible(&mut pty, &mut parser, "日志239");
+    assert!(parser.screen().contents().contains("中文🙂"));
+    assert!(!parser.screen().contents().contains("Content unavailable"));
+    // 详情标题和正文均可由终端选择，点击不再执行返回动作。
+    pty.write(b"\x1b[<0;5;1M\x1b[<0;5;1m");
+    parser.process(&pty.collect_for(Duration::from_millis(150)));
+    assert!(parser.screen().alternate_screen());
+    pty.resize(72, 24);
+    parser.screen_mut().set_size(24, 72);
+    parser.process(&pty.collect_for(Duration::from_millis(250)));
+    assert_eq!(
+        parser.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None
+    );
+    pty.write(b"\x0f");
+    parser.process(&pty.collect_for(Duration::from_millis(300)));
+    assert!(!parser.screen().alternate_screen());
+    assert!(parser.screen().contents().contains("保留草稿"));
+    assert_eq!(
+        parser.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None
+    );
+    pty.write(b"\x0f");
+    wait_for_visible(&mut pty, &mut parser, "Tool details");
+    pty.write(b"\x1b");
+    parser.process(&pty.collect_for(Duration::from_millis(250)));
+    assert!(!parser.screen().alternate_screen());
+    assert!(parser.screen().contents().contains("保留草稿"));
+    assert_eq!(
+        parser.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None
+    );
+    pty.write(b"\x15");
+    parser.process(&pty.collect_for(Duration::from_millis(100)));
+    assert_eq!(
+        server.requests.lock().unwrap().len(),
+        2,
+        "viewing output must not call the provider"
+    );
+    submit(&mut pty, &mut parser, "/quit");
+    assert!(pty.wait().1.success());
+
+    // 删除当前文件后依然查看历史 artifact，防止把新文件内容误作旧执行输出。
+    std::fs::remove_file(workspace.path().join("log.txt")).unwrap();
+    let mut resumed = PtyHarness::spawn_with_resume(
+        home.path(),
+        workspace.path(),
+        100,
+        24,
+        true,
+        Some("saved-card-test"),
+    );
+    let mut restored = ScreenModel::new(24, 100);
+    wait_for_visible(&mut resumed, &mut restored, "Ask Golutra");
+    assert_eq!(
+        restored.screen().mouse_protocol_mode(),
+        vt100::MouseProtocolMode::None
+    );
+    resumed.write(b"\x0f");
+    wait_for_visible(&mut resumed, &mut restored, "Tool details");
+    resumed.write("/日志239\r".as_bytes());
+    wait_for_visible(&mut resumed, &mut restored, "日志239");
+    assert_eq!(server.requests.lock().unwrap().len(), 2);
+    resumed.write(b"\x1b");
+    restored.process(&resumed.collect_for(Duration::from_millis(200)));
+    submit(&mut resumed, &mut restored, "/quit");
+    assert!(resumed.wait().1.success());
+}
+
+#[test]
+fn single_file_diff_has_tree_counts_backgrounds_and_no_metadata() {
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let before = "# Demo\n\nText\n\n```python\n# 中文注释\nprint(\"Hello, world!\")\n```\n";
+    std::fs::write(workspace.path().join("test.md"), before).unwrap();
+    let server = FixtureServer::with_rounds(vec![
+        (
+            "修改注释。".into(),
+            vec![
+                json!({"index":0,"id":"edit-comment","type":"function","function":{"name":"edit_file","arguments":json!({"path":"test.md","edits":[{"old_text":"# 中文注释","new_text":"# English comment"}]}).to_string()}}),
+            ],
+        ),
+        ("COMMENT_DONE".into(), vec![]),
+    ]);
+    server.install(home.path());
+    let mut pty = PtyHarness::spawn_configured(home.path(), workspace.path(), 100, 32, true);
+    let mut parser = ScreenModel::new(32, 100);
+    wait_for_visible(&mut pty, &mut parser, "Ask Golutra");
+    submit(&mut pty, &mut parser, "修改注释");
+    wait_for_visible(&mut pty, &mut parser, "COMMENT_DONE");
+    parser.process(&pty.collect_for(Duration::from_millis(250)));
+    for expanded in [false, true] {
+        if expanded {
+            pty.write(b"\x0f");
+            wait_for_visible(&mut pty, &mut parser, "Tool details");
+            wait_for_visible(&mut pty, &mut parser, "6 + # English comment");
+            parser.process(&pty.collect_for(Duration::from_millis(300)));
+        }
+        let text = parser.screen().contents();
+        assert_eq!(text.matches("test.md").count(), 1, "{text}");
+        assert!(text.contains("└ (+1 -1)"), "{text}");
+        assert!(text.contains("6 - # 中文注释"), "{text}");
+        assert!(text.contains("6 + # English comment"), "{text}");
+        for hidden in [
+            "@@",
+            "Arguments",
+            "old_text",
+            "new_text",
+            "more changes",
+            "--- a/",
+        ] {
+            assert!(!text.contains(hidden), "unexpected {hidden}: {text}");
+        }
+        let removed = screen_row(&parser, "6 - # 中文注释") as u16;
+        let added = screen_row(&parser, "6 + # English comment") as u16;
+        let context = screen_row(&parser, "7   print") as u16;
+        let red = parser.screen().cell(removed, 90).unwrap().bgcolor();
+        let green = parser.screen().cell(added, 90).unwrap().bgcolor();
+        assert_ne!(red, green);
+        assert_ne!(red, parser.screen().cell(context, 90).unwrap().bgcolor());
+        assert_ne!(green, parser.screen().cell(context, 90).unwrap().bgcolor());
+        assert_eq!(
+            parser.screen().mouse_protocol_mode(),
+            vt100::MouseProtocolMode::None
+        );
+    }
+    assert_eq!(server.requests.lock().unwrap().len(), 2);
+    pty.write(b"\x0f");
+    parser.process(&pty.collect_for(Duration::from_millis(200)));
+    pty.resize(80, 36);
+    parser.screen_mut().set_size(36, 80);
+    parser.process(&pty.collect_for(Duration::from_millis(300)));
+    let removed = screen_row(&parser, "6 - # 中文注释") as u16;
+    let added = screen_row(&parser, "6 + # English comment") as u16;
+    assert_ne!(
+        parser.screen().cell(removed, 70).unwrap().bgcolor(),
+        parser.screen().cell(added, 70).unwrap().bgcolor()
+    );
+    submit(&mut pty, &mut parser, "/quit");
+    assert!(pty.wait().1.success());
+}
+
+#[test]
+fn file_cards_show_numbered_diff_and_open_saved_multi_file_changes() {
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let old = (1..=100)
+        .map(|n| format!("old-{n:03}\n"))
+        .collect::<String>();
+    let new = (1..=100)
+        .map(|n| format!("新行-{n:03}\n"))
+        .collect::<String>();
+    std::fs::write(workspace.path().join("sample.txt"), &old).unwrap();
+    std::fs::write(workspace.path().join("gone.txt"), "remove me\n").unwrap();
+    let patch = format!(
+        "*** Begin Patch\n*** Update File: sample.txt\n@@\n{}{}*** Add File: added.txt\n+hello world\n*** Delete File: gone.txt\n*** End Patch\n",
+        old.lines()
+            .map(|line| format!("-{line}\n"))
+            .collect::<String>(),
+        new.lines()
+            .map(|line| format!("+{line}\n"))
+            .collect::<String>()
+    );
+    let server = FixtureServer::with_rounds(vec![
+        (
+            "修改三个文件。".into(),
+            vec![
+                json!({"index":0,"id":"file-diff","type":"function","function":{"name":"apply_patch","arguments":json!({"patch":patch}).to_string()}}),
+            ],
+        ),
+        ("DIFF_TEST_DONE".into(), vec![]),
+    ]);
+    server.install(home.path());
+    let mut pty = PtyHarness::spawn_configured(home.path(), workspace.path(), 100, 40, true);
+    let mut parser = ScreenModel::new(40, 100);
+    wait_for_visible(&mut pty, &mut parser, "Ask Golutra");
+    submit(&mut pty, &mut parser, "修改文件");
+    wait_for_visible(&mut pty, &mut parser, "DIFF_TEST_DONE");
+    parser.process(&pty.collect_for(Duration::from_millis(300)));
+    let text = all_terminal_rows(&mut parser);
+    assert!(text.contains("Edited 3 files"), "{text}");
+    assert!(text.contains("└ (+101 -101)"), "{text}");
+    assert!(!text.contains("@@"), "{text}");
+    assert!(!text.contains("Arguments"), "{text}");
+    assert!(text.contains("old-001"), "{text}");
+    assert!(!text.contains("新行-100"), "default diff is bounded");
+    let added_row = screen_row(&parser, "hello world") as u16;
+    let deleted_row = screen_row(&parser, "remove me") as u16;
+    assert_ne!(
+        parser.screen().cell(added_row, 90).unwrap().bgcolor(),
+        parser.screen().cell(deleted_row, 90).unwrap().bgcolor(),
+        "added and removed backgrounds extend past the code"
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("sample.txt")).unwrap(),
+        new
+    );
+    pty.write(b"\x0f");
+    wait_for_visible(&mut pty, &mut parser, "Tool details");
+    pty.write("/新行-100\r".as_bytes());
+    wait_for_visible(&mut pty, &mut parser, "100 + 新行-100");
+    assert!(
+        parser.screen().contents().contains("100 + 新行-100"),
+        "{}",
+        parser.screen().contents()
+    );
+    assert_eq!(server.requests.lock().unwrap().len(), 2);
+    pty.write(b"\x1b");
+    parser.process(&pty.collect_for(Duration::from_millis(200)));
+    submit(&mut pty, &mut parser, "/quit");
+    assert!(pty.wait().1.success());
 }

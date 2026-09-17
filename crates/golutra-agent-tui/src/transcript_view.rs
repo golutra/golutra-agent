@@ -225,6 +225,7 @@ impl TranscriptState {
         self.invalidate_layout();
     }
 
+    #[cfg(test)]
     pub(crate) fn toggle_operation(&mut self, id: OperationId) {
         let overrides = if self.details_expanded {
             &mut self.collapsed_operations
@@ -338,18 +339,49 @@ impl OperationProjection {
             }
         };
         let mut item = item.clone();
-        let mut preview = if expanded {
+        if matches!(self, Self::FileChange { .. }) && details.iter().any(|line| line == "Diff") {
+            // 多文件的路径已在各自 diff 段落标识，不再重复打印前置文件清单。
+            item.body.retain(|line| {
+                !details.iter().any(|detail| {
+                    ["added ", "modified ", "deleted "]
+                        .iter()
+                        .any(|prefix| detail.strip_prefix(prefix) == Some(line.as_str()))
+                })
+            });
+        }
+        let mut preview = if matches!(self, Self::FileChange { .. }) {
+            let mut preview = crate::tool_preview::file_preview(details, expanded);
+            if expanded && matches!(item.role, TranscriptRole::Error | TranscriptRole::Warning) {
+                // 修改文件的失败命令仍需展示真实诊断，不能因精简 diff 吞掉失败输出。
+                let end = details
+                    .iter()
+                    .position(|line| line == "Diff")
+                    .unwrap_or(details.len());
+                preview.splice(0..0, details[..end].iter().cloned());
+            }
+            preview
+        } else if expanded {
             details.clone()
         } else {
-            default_tool_preview(details)
+            default_tool_preview(
+                details,
+                item.title == "ran"
+                    || item.title.contains("shell")
+                    || item.title.starts_with("Background terminal"),
+                item.role == TranscriptRole::Activity,
+            )
         };
         if !expanded && item.role == TranscriptRole::Activity {
             // 进行中的进程保留有界尾部；文件正文和参数不进入默认卡片。
-            let mut tail = details
+            let output_start = details
+                .iter()
+                .position(|line| line == "Output")
+                .unwrap_or(details.len());
+            let mut tail = details[..output_start]
                 .iter()
                 .rev()
                 .filter(|line| line.starts_with("│ "))
-                .take(3)
+                .take(5)
                 .cloned()
                 .collect::<Vec<_>>();
             tail.reverse();
@@ -402,8 +434,10 @@ pub(crate) fn transcript_operation_projections(app: &TuiApp) -> Vec<OperationPro
 }
 
 pub(crate) fn rendered_transcript_operation_projections(app: &TuiApp) -> Vec<OperationProjection> {
-    let committed = (app.transcript.history.enabled && app.transcript.search.is_none())
-        .then_some(&app.transcript.history.committed_event_ids);
+    let committed = (app.transcript.history.enabled
+        && !app.transcript.fullscreen
+        && app.transcript.search.is_none())
+    .then_some(&app.transcript.history.committed_event_ids);
     transcript_operation_projections_after(app, committed, true)
 }
 
@@ -1614,7 +1648,15 @@ fn tool_operation_projection(event: &RuntimeEvent) -> Option<OperationProjection
         .get("model_visible_excerpt")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let output_lines = bounded_output_lines(excerpt, 40);
+    let output_lines = if matches!(tool_name, "shell" | "shell_session") {
+        excerpt
+            .lines()
+            .take(40)
+            .map(|line| bounded_text(line, 500))
+            .collect()
+    } else {
+        bounded_output_lines(excerpt, 40)
+    };
     let changes = operation_file_changes(event);
     if !changes.is_empty() {
         let mut item = file_change_item(
@@ -1870,10 +1912,10 @@ fn running_tool_title(tool_name: &str) -> String {
 
 const DEFAULT_TOOL_PREVIEW_LINES: usize = 5;
 
-fn default_tool_preview(details: &[String]) -> Vec<String> {
-    let preview = details
+fn default_tool_preview(details: &[String], show_output: bool, running: bool) -> Vec<String> {
+    let mut preview = details
         .iter()
-        // 默认工具卡只展示调用摘要；参数及原始输出由展开视图提供，不能靠 JSON 缩进猜测内容。
+        // 参数仍在详情中；默认保留命令与执行计数，并在下面附上少量实际输出。
         .take_while(|line| {
             !matches!(
                 line.as_str(),
@@ -1882,11 +1924,36 @@ fn default_tool_preview(details: &[String]) -> Vec<String> {
         })
         .filter(|line| {
             let line = line.as_str();
-            !line.starts_with("exit ") && !line.contains(" · ")
+            !line.is_empty() && !line.starts_with("│ ")
         })
         .take(DEFAULT_TOOL_PREVIEW_LINES)
         .cloned()
         .collect::<Vec<_>>();
+    if show_output && let Some(start) = details.iter().position(|line| line == "Output") {
+        let output = details[start + 1..]
+            .iter()
+            .take_while(|line| {
+                !line.starts_with("Process: ")
+                    && !line.starts_with("State: ")
+                    && line.as_str() != "Facts"
+            })
+            .collect::<Vec<_>>();
+        let skip = if running {
+            output.len().saturating_sub(5)
+        } else {
+            0
+        };
+        preview.extend(
+            output
+                .iter()
+                .skip(skip)
+                .take(5)
+                .map(|line| format!("│ {line}")),
+        );
+        if output.len() > 5 {
+            preview.push("… more output · Ctrl+O to view".to_owned());
+        }
+    }
     preview
         .into_iter()
         .enumerate()
@@ -2305,13 +2372,13 @@ fn file_change_details(event: &RuntimeEvent, changes: &[FileChangeSummary]) -> V
         .collect::<Vec<_>>();
     if let Some(hunks) = event.payload.get("diff_hunks").and_then(Value::as_array) {
         details.push("Diff".to_owned());
-        details.extend(
+        details.extend(crate::tool_preview::numbered_diff(
             hunks
                 .iter()
                 .filter_map(Value::as_str)
                 .take(80)
                 .map(ToOwned::to_owned),
-        );
+        ));
     }
     if let Some(previews) = event.payload.get("diff_previews").and_then(Value::as_array) {
         details.push("Diff".to_owned());
@@ -2320,8 +2387,10 @@ fn file_change_details(event: &RuntimeEvent, changes: &[FileChangeSummary]) -> V
                 .get("path")
                 .and_then(Value::as_str)
                 .unwrap_or("file");
-            details.push(format!("@@ {path}"));
-            details.extend(
+            if changes.len() > 1 {
+                details.push(path.to_owned());
+            }
+            details.extend(crate::tool_preview::numbered_diff(
                 preview
                     .get("lines")
                     .and_then(Value::as_array)
@@ -2330,7 +2399,7 @@ fn file_change_details(event: &RuntimeEvent, changes: &[FileChangeSummary]) -> V
                     .filter_map(Value::as_str)
                     .take(80)
                     .map(ToOwned::to_owned),
-            );
+            ));
             if preview
                 .get("truncated")
                 .and_then(Value::as_bool)
@@ -2580,8 +2649,13 @@ fn file_change_item(changes: &[FileChangeSummary], status: ToolResultStatus) -> 
         .filter_map(|change| change.removed_lines)
         .fold(0_u64, u64::saturating_add);
     let noun = if changes.len() == 1 { "file" } else { "files" };
-    let edit_summary = if stats_complete {
-        format!("Edited {} {noun} (+{added} -{removed})", changes.len())
+    let edit_summary = if let [change] = changes {
+        let verb = match change.kind {
+            FileChangeKind::Added => "Created",
+            FileChangeKind::Modified => "Edited",
+            FileChangeKind::Deleted => "Deleted",
+        };
+        format!("{verb} {}", change.path)
     } else {
         format!("Edited {} {noun}", changes.len())
     };
@@ -2590,7 +2664,7 @@ fn file_change_item(changes: &[FileChangeSummary], status: ToolResultStatus) -> 
     } else {
         format!("{} · {edit_summary}", completed_tool_title("tool", status))
     };
-    let visible = changes.iter().take(5);
+    let visible = changes.iter().take(if changes.len() == 1 { 0 } else { 5 });
     let mut body: Vec<String> = visible
         .map(|change| match (change.added_lines, change.removed_lines) {
             (Some(added), Some(removed)) => {
@@ -2599,6 +2673,9 @@ fn file_change_item(changes: &[FileChangeSummary], status: ToolResultStatus) -> 
             _ => change.path.clone(),
         })
         .collect();
+    if stats_complete {
+        body.insert(0, format!("└ (+{added} -{removed})"));
+    }
     if changes.len() > 5 {
         body.push(format!("… {} more files", changes.len() - 5));
     }
@@ -3551,8 +3628,8 @@ mod tests {
 
         let item = status_event_transcript_item(&event).expect("change item");
 
-        assert_eq!(item.title, "Edited 1 file (+3 -1)");
-        assert_eq!(item.body, vec!["src/lib.rs  +3 -1"]);
+        assert_eq!(item.title, "Edited src/lib.rs");
+        assert_eq!(item.body, ["└ (+3 -1)"]);
     }
 
     #[test]
@@ -3580,8 +3657,8 @@ mod tests {
 
         let item = status_event_transcript_item(&event).expect("legacy change item");
 
-        assert_eq!(item.title, "Edited 1 file");
-        assert_eq!(item.body, vec!["src/legacy.rs"]);
+        assert_eq!(item.title, "Edited src/legacy.rs");
+        assert!(item.body.is_empty());
     }
 
     #[test]
@@ -3664,7 +3741,7 @@ mod tests {
         assert_eq!(item.role, TranscriptRole::Success);
         let collapsed = projections[0].item(false);
         assert!(collapsed.body.iter().any(|line| line == "  └ cargo test"));
-        assert!(!collapsed.body.iter().any(|line| line.contains("one")));
+        assert!(collapsed.body.iter().any(|line| line == "│ one"));
         assert!(
             projections[0]
                 .item(true)
@@ -3677,6 +3754,15 @@ mod tests {
         assert!(details.iter().all(|line| line != "Facts"));
         assert!(details.iter().any(|line| line == "four"));
         assert_eq!(running[0].item(false).title, "Running");
+        assert_eq!(
+            running[0]
+                .item(false)
+                .body
+                .iter()
+                .filter(|line| line.contains("running test two"))
+                .count(),
+            1
+        );
         assert!(
             running[0]
                 .item(false)
@@ -3719,7 +3805,7 @@ mod tests {
     }
 
     #[test]
-    fn file_diff_preview_is_hidden_until_operation_is_expanded() {
+    fn file_diff_preview_is_visible_in_both_card_and_details() {
         let event = tool_event(
             1,
             RuntimeEventType::ToolCompleted,
@@ -3749,13 +3835,30 @@ mod tests {
         let expanded = projection.item(true);
 
         assert!(
-            collapsed
+            !collapsed
                 .body
                 .iter()
                 .any(|line| line.contains("src/lib.rs"))
         );
         assert!(expanded.body.iter().any(|line| line == "-old"));
         assert!(expanded.body.iter().any(|line| line == "+new"));
+        assert!(collapsed.body.iter().any(|line| line == "-old"));
+        assert!(collapsed.body.iter().any(|line| line == "+new"));
+    }
+
+    #[test]
+    fn created_and_deleted_cards_use_actual_line_counts() {
+        for (kind, added, removed, title) in [
+            ("added", 1, 0, "Created test.py"),
+            ("deleted", 0, 2, "Deleted test.py"),
+        ] {
+            let event = tool_event(
+                1,
+                RuntimeEventType::ToolCompleted,
+                json!({"file_changes":[{"path":"test.py","kind":kind,"added_lines":added,"removed_lines":removed}]}),
+            );
+            assert_eq!(status_event_transcript_item(&event).unwrap().title, title);
+        }
     }
 
     #[test]
@@ -3803,9 +3906,9 @@ mod tests {
         };
 
         assert_eq!(item.role, TranscriptRole::Error);
-        assert_eq!(item.title, "Failed · Edited 1 file (+1 -0)");
+        assert_eq!(item.title, "Failed · Edited src/lib.rs");
         assert!(item.body.iter().any(|line| line == "shell command failed"));
-        assert!(item.body.iter().any(|line| line == "src/lib.rs  +1 -0"));
+        assert!(item.title.contains("src/lib.rs"));
         assert!(
             details
                 .iter()
@@ -3836,7 +3939,7 @@ mod tests {
         let item = status_event_transcript_item(&event).expect("legacy change item");
 
         assert_eq!(item.role, TranscriptRole::Warning);
-        assert_eq!(item.title, "Timed out · Edited 1 file");
+        assert_eq!(item.title, "Timed out · Created partial.txt");
     }
 
     #[test]

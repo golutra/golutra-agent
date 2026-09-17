@@ -152,9 +152,6 @@ pub(crate) fn draw_ui(frame: &mut Frame<'_>, app: &mut TuiApp) {
     }
     draw_bottom_pane(frame, layout.bottom, app);
     apply_palette_to_buffer(frame.buffer_mut(), app.palette());
-    if app.transcript.fullscreen {
-        super::transcript_interaction::update_transcript_screen(app, frame.buffer_mut());
-    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]

@@ -147,7 +147,18 @@ pub(crate) fn expanded_tool_layout(
     area: Rect,
 ) -> TranscriptLayout {
     transcript_layout_from_rows(
-        render_item_rows(app, projection.item(true), None, false, 0, area.width, 0),
+        render_item_rows(
+            app,
+            projection.item(true),
+            None,
+            (
+                false,
+                matches!(projection, super::OperationProjection::FileChange { .. }),
+            ),
+            0,
+            area.width,
+            0,
+        ),
         area,
     )
 }
@@ -284,6 +295,7 @@ fn render_operation_projections(
         let operation_id = projection.id().cloned();
         let toggle = projection.is_expandable();
         let mut item = projection.item(expanded);
+        let file_change = matches!(projection, super::OperationProjection::FileChange { .. });
         if (app.transcript.compact_tools || app.transcript.fullscreen) && toggle {
             if !expanded
                 && item.role == TranscriptRole::Success
@@ -295,14 +307,24 @@ fn render_operation_projections(
                 // 单文件标题已经带文件名，不再把同一路径重复展示一遍。
                 item.body.clear();
             }
-            item.title = format!("{} {}", if expanded { "▾" } else { "▸" }, item.title);
+            if !file_change {
+                item.title = format!("{} {}", if expanded { "▾" } else { "▸" }, item.title);
+            }
             if !expanded {
                 item.title = super::truncate_end_to_width(
                     &item.title,
                     usize::from(width.saturating_sub(2).max(1)),
                 );
                 // 折叠预算按显示宽度限制，长命令和宽字符不能把摘要撑成半屏。
-                item.body.truncate(3);
+                let limit = if matches!(projection, super::OperationProjection::FileChange { .. }) {
+                    15
+                } else {
+                    8
+                };
+                if item.body.len() > limit {
+                    item.body.truncate(limit - 1);
+                    item.body.push("… more · Ctrl+O to view".to_owned());
+                }
                 for line in &mut item.body {
                     *line = super::truncate_end_to_width(
                         line,
@@ -315,7 +337,7 @@ fn render_operation_projections(
             app,
             item,
             operation_id,
-            toggle,
+            (toggle, file_change),
             projection_index,
             width,
             skips.get(projection_index).copied().unwrap_or(0),
@@ -337,7 +359,10 @@ fn render_operation_projections(
 }
 
 fn live_stream_line_skips(app: &TuiApp, projection_count: usize) -> (Vec<usize>, bool) {
-    if !app.transcript.history.enabled || app.transcript.search.is_some() {
+    if !app.transcript.history.enabled
+        || app.transcript.fullscreen
+        || app.transcript.search.is_some()
+    {
         return (vec![0; projection_count], false);
     }
     let committed = (app.transcript.history.enabled && app.transcript.search.is_none())
@@ -380,39 +405,7 @@ fn live_stream_line_skips(app: &TuiApp, projection_count: usize) -> (Vec<usize>,
     (skips, continues_history)
 }
 
-pub(crate) fn transcript_toggle_at(
-    app: &TuiApp,
-    area: Rect,
-    column: u16,
-    row: u16,
-) -> Option<OperationId> {
-    if column < area.x || column >= area.right() || row < area.y || row >= area.bottom() {
-        return None;
-    }
-    let layout = transcript_layout(app, area);
-    let top_padding = transcript_top_padding(app, &layout, area);
-    let content_top = area.y.saturating_add(top_padding);
-    if row < content_top {
-        return None;
-    }
-    let visible_rows = area.height as usize;
-    let window = layout.visible_window(
-        visible_rows,
-        app.transcript.scroll.offset_from_bottom,
-        app.transcript.top_row_override,
-    );
-    let offset = usize::from(row.saturating_sub(content_top));
-    let visual_row = window.start.saturating_add(offset);
-    layout
-        .rows
-        .iter()
-        .find(|rendered| {
-            rendered.toggle && visual_row >= rendered.start && visual_row < rendered.end
-        })
-        .and_then(|rendered| rendered.operation_id.clone())
-}
-
-pub(crate) fn transcript_toggle_regions(app: &TuiApp, area: Rect) -> Vec<(String, Rect)> {
+pub(crate) fn transcript_operation_regions(app: &TuiApp, area: Rect) -> Vec<(String, Rect)> {
     if area.width == 0 || area.height == 0 {
         return Vec::new();
     }
@@ -440,7 +433,7 @@ pub(crate) fn transcript_toggle_regions(app: &TuiApp, area: Rect) -> Vec<(String
                 .saturating_add(top_padding)
                 .saturating_add(u16::try_from(row_offset).unwrap_or(u16::MAX));
             Some((
-                format!("transcript_operation_toggle:{}", operation_id.as_str()),
+                format!("transcript_operation:{}", operation_id.as_str()),
                 Rect::new(
                     area.x,
                     y,
@@ -454,15 +447,31 @@ pub(crate) fn transcript_toggle_regions(app: &TuiApp, area: Rect) -> Vec<(String
 
 fn render_item_rows(
     app: &TuiApp,
-    item: TranscriptItem,
+    mut item: TranscriptItem,
     operation_id: Option<OperationId>,
-    toggle: bool,
+    operation_style: (bool, bool),
     projection_index: usize,
     width: u16,
     skip_lines: usize,
 ) -> Vec<TranscriptRenderRow> {
+    let (toggle, file_change) = operation_style;
+    // 工具日志和文件内容不可信；默认预览与详情同样禁止把 ANSI/OSC 作为终端指令输出。
+    item.title = super::tool_detail_data::terminal_text(&item.title);
+    item.body = item
+        .body
+        .into_iter()
+        .map(|line| super::tool_detail_data::terminal_text(&line))
+        .collect();
     let palette = app.palette();
-    let color = role_color(app, &item.role);
+    let color = if operation_id.is_some()
+        && matches!(
+            item.role,
+            TranscriptRole::Success | TranscriptRole::Activity
+        ) {
+        palette.muted
+    } else {
+        role_color(app, &item.role)
+    };
     let marker = if item.title.starts_with("Interacted with") {
         if app.preferences.screen_reader {
             "> "
@@ -482,6 +491,7 @@ fn render_item_rows(
         item.role,
         TranscriptRole::User | TranscriptRole::Assistant | TranscriptRole::CommandResult
     );
+    let diff_number_width = super::tool_preview::number_width(&item.body);
     let mut body_lines = match item.role {
         TranscriptRole::Assistant => markdown_lines(
             &item.body.join("\n"),
@@ -514,6 +524,25 @@ fn render_item_rows(
                 .map(|line| Line::from(Span::styled(line.to_owned(), Style::default().fg(color))))
                 .collect()
         }
+        _ if file_change => item
+            .body
+            .into_iter()
+            .flat_map(|value| {
+                super::tool_preview::render_diff_line(
+                    &value,
+                    width.saturating_sub(2),
+                    diff_number_width,
+                    palette,
+                )
+                .unwrap_or_else(|| {
+                    vec![if value.starts_with("└ ") || value == "…" {
+                        Line::from(Span::styled(value, Style::default().fg(palette.muted)))
+                    } else {
+                        detail_line(&value)
+                    }]
+                })
+            })
+            .collect(),
         _ => item
             .body
             .into_iter()

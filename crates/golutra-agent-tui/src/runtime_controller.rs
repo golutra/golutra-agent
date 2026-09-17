@@ -157,10 +157,15 @@ impl TuiRuntimeController {
             .await?;
         let auth_operation_pending = app.auth_operation.is_some();
         let export_operation_pending = app.export_operation.is_some();
+        let details_changed = super::tool_detail::poll_data(app, &self.transport).await;
         app.poll_auth_operation(&self.transport).await;
         app.poll_export_operation().await;
         let recovered = app.poll_pending_recovery(&self.transport).await?;
-        Ok(changed || auth_operation_pending || export_operation_pending || recovered)
+        Ok(changed
+            || details_changed
+            || auth_operation_pending
+            || export_operation_pending
+            || recovered)
     }
 
     /// Synchronize the real terminal UI without awaiting projection/provider/debug I/O.
@@ -212,10 +217,15 @@ impl TuiRuntimeController {
 
         let auth_operation_pending = app.auth_operation.is_some();
         let export_operation_pending = app.export_operation.is_some();
+        let details_changed = super::tool_detail::poll_data(app, &self.transport).await;
         app.poll_auth_operation(&self.transport).await;
         app.poll_export_operation().await;
         let recovered = app.poll_pending_recovery(&self.transport).await?;
-        Ok(changed || auth_operation_pending || export_operation_pending || recovered)
+        Ok(changed
+            || details_changed
+            || auth_operation_pending
+            || export_operation_pending
+            || recovered)
     }
 
     fn start_interactive_refresh(&mut self, app: &TuiApp) {

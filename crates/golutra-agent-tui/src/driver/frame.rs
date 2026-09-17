@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 
 use super::super::{
     TuiApp, UiLayoutSnapshot, UiMousePress, display_width, overlay_mouse_regions,
-    transcript_toggle_regions,
+    transcript_operation_regions,
 };
 
 pub(super) fn scoped_runtime_events(
@@ -259,7 +259,7 @@ pub(super) fn frame_hit_regions(
         area,
     );
     let transcript_area = layout.transcript.intersection(area);
-    for (id, region) in transcript_toggle_regions(app, transcript_area) {
+    for (id, region) in transcript_operation_regions(app, transcript_area) {
         push_hit_region(&mut regions, &id, TuiHitPane::Transcript, region, area);
     }
     push_hit_region(

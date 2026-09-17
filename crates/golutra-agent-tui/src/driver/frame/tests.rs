@@ -200,7 +200,7 @@ fn cjk_lines_and_cells_skip_continuation_columns() {
 }
 
 #[test]
-fn hit_regions_expose_visible_transcript_operation_toggles() {
+fn hit_regions_identify_visible_transcript_operations_without_click_actions() {
     let session_id = SessionId::new();
     let task_id = TaskId::new();
     let turn_id = TurnId::new();
@@ -241,8 +241,8 @@ fn hit_regions_expose_visible_transcript_operation_toggles() {
     let regions = frame_hit_regions(layout, layout.transcript, &app);
     let toggle = regions
         .iter()
-        .find(|region| region.id == format!("transcript_operation_toggle:{tool_call_id}"))
-        .expect("operation toggle hit region");
+        .find(|region| region.id == format!("transcript_operation:{tool_call_id}"))
+        .expect("operation location");
 
     assert_eq!(toggle.pane, TuiHitPane::Transcript);
     assert_eq!(

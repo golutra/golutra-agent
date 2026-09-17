@@ -23,7 +23,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 mod provider_auth;
+mod provider_logout;
 mod provider_storage;
+pub use provider_logout::{ProviderLogoutOutcome, forget_active_provider_verified};
 mod revision;
 pub use revision::{RuntimeSettingsSnapshot, patch_runtime_settings, read_runtime_settings};
 

@@ -243,6 +243,7 @@ pub enum ReasoningEffortSelection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashAuthCommand {
     Setup,
+    ForgetActive,
     Status,
     Protocols,
     Mock,
@@ -385,7 +386,12 @@ const SEARCHABLE_SLASH_HINTS: &[SlashCommandHint] = &[
     },
     SlashCommandHint {
         command: "/auth",
-        description: "provider setup",
+        description: "(alias: login) Connect an LLM provider",
+        selection: SlashCommandSelection::Execute,
+    },
+    SlashCommandHint {
+        command: "/logout",
+        description: "clear current provider config and reconnect",
         selection: SlashCommandSelection::Execute,
     },
     SlashCommandHint {
@@ -576,7 +582,7 @@ pub fn slash_command_candidates(input: &str) -> Vec<SlashCommandCandidate> {
     if tokens.len() > 2 || (tokens.len() > 1 && input.ends_with(char::is_whitespace)) {
         return Vec::new();
     }
-    let mut suggestions = if first_token == "/auth"
+    let mut suggestions = if matches!(first_token, "/auth" | "/login")
         && (input.ends_with(char::is_whitespace) || tokens.len() > 1)
     {
         let action_prefix = if input.ends_with(char::is_whitespace) && tokens.len() == 1 {
@@ -624,7 +630,7 @@ fn matching_hints(
                 .command
                 .strip_prefix(auth_prefix_to_strip)
                 .unwrap_or(hint.command);
-            command.starts_with(prefix)
+            command.starts_with(prefix) || (hint.command == "/auth" && "/login".starts_with(prefix))
         })
         .map(|hint| SlashCommandCandidate {
             command: hint.command.to_owned(),
@@ -666,7 +672,11 @@ pub fn parse_slash_input(input: &str) -> SlashInput {
         "/doctor" => parse_doctor_command(&tokens),
         "/purge" => parse_purge_command(&tokens),
         "/fork" => parse_fork_command(&tokens),
-        "/auth" => parse_auth_command(&tokens),
+        "/auth" | "/login" => parse_auth_command(&tokens),
+        "/logout" if tokens.len() == 1 => {
+            SlashInput::Command(SlashCommand::Auth(SlashAuthCommand::ForgetActive))
+        }
+        "/logout" => SlashInput::Error("/logout does not take arguments".to_owned()),
         "/status" => SlashInput::Command(SlashCommand::Status),
         "/plan" => SlashInput::Command(SlashCommand::Plan),
         "/tasks" => SlashInput::Command(SlashCommand::Tasks),
@@ -1636,6 +1646,39 @@ mod tests {
             slash_command_suggestions("/auth o"),
             vec!["/auth oauth-login - authorize with OAuth descriptor".to_owned()]
         );
+    }
+
+    #[test]
+    fn login_alias_and_logout_are_executable_candidates() {
+        assert_eq!(parse_slash_input("/login"), parse_slash_input("/auth"));
+        assert_eq!(
+            parse_slash_input("/login status"),
+            parse_slash_input("/auth status")
+        );
+        assert_eq!(
+            slash_command_candidates("/login "),
+            slash_command_candidates("/auth ")
+        );
+        for input in ["/l", "/lo", "/login"] {
+            let candidates = slash_command_candidates(input);
+            let auth = candidates
+                .iter()
+                .find(|candidate| candidate.command == "/auth")
+                .unwrap();
+            assert!(auth.execute_on_select);
+            assert!(auth.description.contains("alias: login"));
+        }
+        let logout = slash_command_candidates("/logout");
+        assert_eq!(logout.len(), 1);
+        assert!(logout[0].execute_on_select);
+        assert_eq!(
+            parse_slash_input("/logout"),
+            SlashInput::Command(SlashCommand::Auth(SlashAuthCommand::ForgetActive))
+        );
+        assert!(matches!(
+            parse_slash_input("/logout all"),
+            SlashInput::Error(_)
+        ));
     }
 
     #[test]
