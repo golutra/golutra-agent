@@ -707,7 +707,7 @@ async fn auth_dialog_openai_flow_persists_user_key() {
 }
 
 #[tokio::test]
-async fn auth_dialog_base_url_requires_http_scheme() {
+async fn auth_dialog_base_url_completes_bare_hosts_and_rejects_other_schemes() {
     let transport = RuntimeTransport::in_memory().await.expect("transport");
     let mut app = TuiApp::new(
         ThreadId::new(),
@@ -722,6 +722,7 @@ async fn auth_dialog_base_url_requires_http_scheme() {
         dialog.provider = Some(OFFICIAL_PROVIDER_PRESET);
         dialog.step = AuthDialogStep::BaseUrl;
         dialog.base_url = "api.golutra.cn".to_owned();
+        dialog.protocol = ProviderProtocol::Anthropic;
     }
 
     advance_auth_dialog(&mut app, &transport)
@@ -729,11 +730,19 @@ async fn auth_dialog_base_url_requires_http_scheme() {
         .expect("advance");
 
     let dialog = app.auth_dialog.as_ref().expect("dialog");
+    assert_ne!(dialog.step, AuthDialogStep::BaseUrl);
+    assert_eq!(dialog.base_url, "https://api.golutra.cn/v1");
+    assert!(dialog.error.is_none());
+
+    let dialog = app.auth_dialog.as_mut().expect("dialog");
+    dialog.step = AuthDialogStep::BaseUrl;
+    dialog.base_url = "ftp://api.golutra.cn".to_owned();
+    advance_auth_dialog(&mut app, &transport)
+        .await
+        .expect("invalid scheme");
+    let dialog = app.auth_dialog.as_ref().expect("dialog");
     assert_eq!(dialog.step, AuthDialogStep::BaseUrl);
-    assert_eq!(
-        dialog.error.as_deref(),
-        Some("Base URL must start with http:// or https://")
-    );
+    assert!(dialog.error.as_deref().unwrap().contains("http or https"));
 }
 
 #[tokio::test]
@@ -5482,6 +5491,26 @@ async fn auth_review_can_replace_an_unreadable_provider_config() {
 
     let review = build_auth_review(&dialog).expect("review");
     dialog.review = Some(review.clone());
+    dialog.step = AuthDialogStep::Review;
+    dialog.error = Some("permission denied while saving provider.json".to_owned());
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "provider setup failed".to_owned(),
+        Some(dialog.clone()),
+    );
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("review frame");
+    let visible = terminal_buffer_text(&terminal);
+    assert!(
+        visible.contains("Save failed: permission denied"),
+        "{visible}"
+    );
+    assert!(visible.contains("Enter save"), "{visible}");
     let lines = auth_review_lines(&dialog)
         .into_iter()
         .map(|line| line.to_string())
@@ -5583,7 +5612,7 @@ async fn auth_review_includes_generation_config() {
 }
 
 #[tokio::test]
-async fn slash_auth_login_persists_native_anthropic_protocol_after_probe() {
+async fn slash_auth_login_persists_native_anthropic_protocol_without_probe() {
     let dir = tempfile::tempdir().expect("dir");
     let home = tempfile::tempdir().expect("home");
     let _guard = env_lock_guard().await;
@@ -5594,10 +5623,7 @@ async fn slash_auth_login_persists_native_anthropic_protocol_after_probe() {
     let transport = RuntimeTransport::for_cwd(dir.path())
         .await
         .expect("transport");
-    let base_url = spawn_probe_server(
-            r#"{"id":"msg-probe","type":"message","role":"assistant","model":"claude-test","content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#,
-        )
-        .await;
+    let base_url = "http://127.0.0.1:9".to_owned();
     let login = OpenAiCompatibleLogin {
         profile: "anthropic".to_owned(),
         protocol: ProviderProtocol::Anthropic,
@@ -5649,7 +5675,7 @@ async fn slash_auth_login_persists_native_anthropic_protocol_after_probe() {
 }
 
 #[tokio::test]
-async fn auth_dialog_keeps_dialog_open_and_rolls_back_when_probe_fails() {
+async fn auth_dialog_saves_offline_and_returns_to_input_without_probe() {
     let dir = tempfile::tempdir().expect("dir");
     let home = tempfile::tempdir().expect("home");
     let _guard = env_lock_guard().await;
@@ -5668,22 +5694,33 @@ async fn auth_dialog_keeps_dialog_open_and_rolls_back_when_probe_fails() {
         provider_status_message(),
         Some(AuthDialogState::new()),
     );
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
     {
         let dialog = app.auth_dialog.as_mut().expect("dialog");
         dialog.provider = Some(CUSTOM_PROVIDER_PRESET);
-        dialog.protocol = ProviderProtocol::OpenAiCompatible;
+        dialog.protocol = ProviderProtocol::Anthropic;
         dialog.step = AuthDialogStep::Review;
-        dialog.base_url = "http://127.0.0.1:9/v1".to_owned();
-        dialog.model = "gpt-5.5".to_owned();
+        dialog.base_url = format!("http://{}", listener.local_addr().expect("address"));
+        dialog.model = "cd-opus-5".to_owned();
         dialog.api_key = "test-key".to_owned();
+        dialog.credential_store = AuthCredentialStore::Disk;
+        dialog.review = Some(build_auth_review(dialog).expect("review"));
+        assert_eq!(
+            dialog.review.as_ref().unwrap().base_url,
+            format!("{}/v1", dialog.base_url)
+        );
     }
 
-    handle_auth_dialog_key(
-        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-        &mut app,
-        &transport,
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        handle_auth_dialog_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut app,
+            &transport,
+        ),
     )
     .await
+    .expect("save must not wait for the unresponsive endpoint")
     .expect("enter review");
 
     let paths = provider_paths_for_tui().expect("paths");
@@ -5698,16 +5735,52 @@ async fn auth_dialog_keeps_dialog_open_and_rolls_back_when_probe_fails() {
         },
     }
 
-    let dialog = app.auth_dialog.as_ref().expect("dialog still open");
-    assert_eq!(dialog.step, AuthDialogStep::Review);
-    assert!(
-        dialog
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("provider probe failed"))
+    assert!(app.auth_dialog.is_none());
+    assert!(app.overlay_surface().is_none());
+    assert_eq!(app.status_message, "provider saved");
+    let profile = settings.active_profile().expect("saved profile");
+    assert_eq!(profile.protocol, ProviderProtocol::Anthropic);
+    assert_eq!(profile.model_id.as_deref(), Some("cd-opus-5"));
+    assert_eq!(
+        profile.base_url.as_deref(),
+        Some(format!("http://{}/v1", listener.local_addr().unwrap()).as_str())
     );
-    assert_eq!(app.status_message, "provider setup failed");
-    assert!(settings.profiles.is_empty());
+    assert!(home.path().join("credentials.json").exists());
+    assert!(
+        !std::fs::read_to_string(&paths.user_config)
+            .expect("config")
+            .contains("test-key")
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err(),
+        "saving and reloading must not contact the provider"
+    );
+    let events = transport
+        .replay_events(golutra_agent_protocol::EventFilter {
+            session_id: app.session_id,
+            task_id: None,
+            after_sequence_no: None,
+        })
+        .await
+        .expect("events");
+    let events: Vec<RuntimeEvent> = events
+        .into_iter()
+        .map(|value| serde_json::from_value(value).expect("event"))
+        .collect();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_type == RuntimeEventType::ProviderConfigured)
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event.event_type,
+            RuntimeEventType::ProviderProbeStarted | RuntimeEventType::ProviderProbeCompleted
+        )),
+        "local save must not claim a successful connection probe"
+    );
 }
 
 #[test]
@@ -5733,6 +5806,105 @@ fn logout_clears_session_provider_overrides_without_changing_permissions() {
     assert!(!app.runtime_controls.reasoning_overridden);
     assert!(app.runtime_controls.reasoning_effort.is_none());
     assert_eq!(app.runtime_controls.permission_mode, permission_mode);
+}
+
+#[tokio::test]
+async fn auth_save_replaces_stale_model_overrides_for_next_turn_and_restart() {
+    let _guard = env_lock_guard().await;
+    let previous_home = std::env::var_os("GOLUTRA_AGENT_HOME");
+    for project_override in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("GOLUTRA_AGENT_HOME", home.path());
+        }
+        let paths = ProviderConfigPaths::global().unwrap();
+        let project_paths =
+            ProviderConfigPaths::from_home(workspace.path().join(".golutra-agent")).unwrap();
+        let target = if project_override {
+            &project_paths
+        } else {
+            &paths
+        };
+        for layer in if project_override {
+            vec![&paths, target]
+        } else {
+            vec![&paths]
+        } {
+            let snapshot = golutra_agent_config::read_runtime_settings(layer).unwrap();
+            golutra_agent_config::patch_runtime_settings(layer, &snapshot.revision,
+                json!({"model":"gpt-5.6-sol", "provider_profile": if project_override { "previous" } else { "custom" },
+                    "reasoning_effort":"xhigh", "subagent_max_concurrent":7, "tool_profile":"coding"})
+                    .as_object().unwrap().clone()).unwrap();
+        }
+        let new_app = || {
+            TuiApp::new(
+                ThreadId::new(),
+                SessionId::new(),
+                None,
+                true,
+                "ready".into(),
+                None,
+            )
+            .with_footer_context(workspace.path(), "gpt-5.6-sol")
+            .with_yolo(true)
+            .with_discovered_runtime_controls()
+            .with_loaded_runtime_settings_from_paths(paths.clone())
+            .unwrap()
+        };
+        let mut app = new_app();
+        assert_eq!(app.runtime_controls.effective_model(), "gpt-5.6-sol");
+        assert!(app.runtime_controls.profile_overridden);
+        app.open_auth_dialog();
+        let dialog = app.auth_dialog.as_mut().unwrap();
+        dialog.provider = Some(CUSTOM_PROVIDER_PRESET);
+        dialog.protocol = ProviderProtocol::Anthropic;
+        dialog.step = AuthDialogStep::Review;
+        dialog.base_url = "http://127.0.0.1:9".into();
+        dialog.model = "cd-opus-5".into();
+        dialog.api_key = "offline-test-key".into();
+        dialog.credential_store = AuthCredentialStore::Disk;
+        dialog.review = Some(build_auth_review(dialog).unwrap());
+        let transport = RuntimeTransport::for_cwd(workspace.path()).await.unwrap();
+        handle_auth_dialog_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut app,
+            &transport,
+        )
+        .await
+        .unwrap();
+        assert!(app.auth_dialog.is_none(), "{:?}", app.auth_dialog);
+        for current in [&app, &new_app()] {
+            assert_eq!(current.runtime_controls.effective_model(), "cd-opus-5");
+            assert_eq!(
+                current.runtime_controls.permission_mode,
+                PermissionMode::Unrestricted
+            );
+            assert_eq!(current.runtime_controls.reasoning_effort, None);
+            assert!(footer_context_text(current, 120).contains("cd-opus-5"));
+            let payload = current.runtime_prompt_payload("hi".into());
+            assert_eq!(payload["provider_profile"], "custom");
+            assert_eq!(payload["provider_model"], "cd-opus-5");
+        }
+        for layer in [&paths, target] {
+            let saved = golutra_agent_config::read_runtime_settings(layer)
+                .unwrap()
+                .settings;
+            assert_eq!(saved.model.as_deref(), Some("cd-opus-5"));
+            assert_eq!(saved.provider_profile.as_deref(), Some("custom"));
+            assert_eq!(saved.reasoning_effort.as_deref(), Some("default"));
+            assert_eq!(saved.subagent_max_concurrent, Some(7));
+            assert_eq!(saved.tool_profile.as_deref(), Some("coding"));
+        }
+    }
+    match previous_home {
+        Some(value) => unsafe {
+            std::env::set_var("GOLUTRA_AGENT_HOME", value);
+        },
+        None => unsafe {
+            std::env::remove_var("GOLUTRA_AGENT_HOME");
+        },
+    }
 }
 
 #[tokio::test]
@@ -5762,7 +5934,7 @@ async fn slash_auth_login_failure_reports_error_without_persisting_profile() {
             profile: "custom".to_owned(),
             protocol: ProviderProtocol::OpenAiCompatible,
             base_url: "http://127.0.0.1:9/v1".to_owned(),
-            model: "gpt-5.5".to_owned(),
+            model: String::new(),
             api_key_env: "GOLUTRA_AGENT_CUSTOM_PROVIDER_API_KEY_TEST".to_owned(),
             api_key: Some("test-key".to_owned()),
             credential_store: AuthCredentialStore::Ephemeral,
@@ -5790,11 +5962,7 @@ async fn slash_auth_login_failure_reports_error_without_persisting_profile() {
     assert_eq!(app.status_message, "provider setup failed");
     assert!(settings.profiles.is_empty());
     assert!(app.command_messages.iter().any(|item| {
-        item.title == "Auth failed"
-            && item
-                .body
-                .iter()
-                .any(|line| line.contains("provider probe failed"))
+        item.title == "Auth failed" && item.body.iter().any(|line| line.contains("model"))
     }));
 }
 
@@ -5910,9 +6078,9 @@ async fn auth_custom_responses_selection_persists_and_uses_responses_wire() {
     };
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
-    let base_url = format!("http://{}/v1", listener.local_addr().expect("address"));
+    let base_url = format!("http://{}", listener.local_addr().expect("address"));
     let server = tokio::spawn(async move {
-        for is_generation in [false, true] {
+        {
             let (mut socket, _) = listener.accept().await.expect("accept");
             let mut request = Vec::new();
             let (header_end, content_length) = loop {
@@ -5940,7 +6108,7 @@ async fn auth_custom_responses_selection_persists_and_uses_responses_wire() {
                 request.extend_from_slice(&chunk[..count]);
             }
             let headers = String::from_utf8_lossy(&request[..header_end]);
-            let (content_type, body) = if is_generation {
+            let (content_type, body) = {
                 assert!(headers.starts_with("POST /v1/responses HTTP/1.1\r\n"));
                 let body: serde_json::Value =
                     serde_json::from_slice(&request[header_end..header_end + content_length])
@@ -5954,9 +6122,6 @@ async fn auth_custom_responses_selection_persists_and_uses_responses_wire() {
                         "../../golutra-agent-llm/tests/fixtures/openai-responses/text-response.sse"
                     ),
                 )
-            } else {
-                assert!(headers.starts_with("GET /v1/models?client_version="));
-                ("application/json", r#"{"data":[{"id":"gpt-golden"}]}"#)
             };
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -6026,10 +6191,10 @@ async fn auth_custom_responses_selection_persists_and_uses_responses_wire() {
         );
         advance_auth_dialog(&mut app, &transport)
             .await
-            .expect("probe and save");
+            .expect("save locally");
         assert!(
             app.auth_dialog.is_none(),
-            "configuration must pass its probe"
+            "saved configuration must close setup"
         );
         let settings = ProviderSettings::load(home.path().join("provider.json")).expect("settings");
         let profile = settings.active_profile().expect("profile");

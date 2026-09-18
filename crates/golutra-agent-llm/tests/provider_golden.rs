@@ -151,6 +151,81 @@ async fn native_provider_request_and_text_response_match_goldens() {
 }
 
 #[tokio::test]
+async fn copied_operation_urls_preserve_proxy_prefix_on_the_wire() {
+    for (protocol, model, operation, fixture) in [
+        (
+            ProviderProtocol::OpenAiCompatible,
+            "gpt-golden",
+            "chat/completions",
+            include_str!("fixtures/openai-compatible/text_response.json"),
+        ),
+        (
+            ProviderProtocol::OpenAiResponses,
+            "gpt-golden",
+            "responses",
+            include_str!("fixtures/openai-responses/text-response.sse"),
+        ),
+        (
+            ProviderProtocol::Anthropic,
+            "claude-test",
+            "messages",
+            include_str!("fixtures/anthropic/text_response.json"),
+        ),
+        (
+            ProviderProtocol::Gemini,
+            "gemini-test",
+            "models/gemini-test:generateContent",
+            include_str!("fixtures/gemini/text_response.json"),
+        ),
+    ] {
+        let reply = if protocol == ProviderProtocol::OpenAiResponses {
+            TestProviderResponse::sse(200, fixture)
+        } else {
+            TestProviderResponse::json(200, fixture)
+        };
+        let (origin, captured) = spawn_provider_sequence(vec![reply]).await;
+        let base_url = format!("{origin}/proxy/Custom/v2/{operation}/");
+        let request = simple_request(model);
+        let response = match protocol {
+            ProviderProtocol::OpenAiCompatible => {
+                OpenAiCompatibleProvider::new(TEST_API_KEY, base_url, model)
+                    .complete(request)
+                    .await
+            }
+            ProviderProtocol::OpenAiResponses => {
+                openai_responses_generic_provider(base_url)
+                    .complete(request)
+                    .await
+            }
+            _ => {
+                GenaiProviderAdapter::from_config(GenaiProviderConfig {
+                    api_key: TEST_API_KEY.to_owned(),
+                    api_key_env: "GOLDEN_TEST_API_KEY".to_owned(),
+                    provider_id: protocol.id().to_owned(),
+                    base_url,
+                    model_id: model.to_owned(),
+                    protocol,
+                    generation_config: ProviderGenerationConfig::default(),
+                    custom_headers: Default::default(),
+                    cache_capabilities: None,
+                })
+                .complete(request)
+                .await
+            }
+        }
+        .unwrap_or_else(|error| panic!("{protocol:?}: {error}"));
+        assert!(response.message.is_some());
+        let requests = captured.await.expect("captured request");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].path,
+            format!("/proxy/Custom/v2/{operation}"),
+            "{protocol:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn native_provider_tool_calls_match_goldens() {
     for case in cases() {
         let (base_url, _captured) = spawn_provider(200, case.tool_response_fixture).await;
@@ -632,7 +707,7 @@ async fn openai_responses_provider_matches_sse_goldens_and_auth_headers() {
         serde_json::from_str(include_str!("fixtures/openai-responses/request.json"))
             .expect("Responses request fixture");
 
-    assert_eq!(captured.path, "/responses");
+    assert_eq!(captured.path, "/v1/responses");
     assert_eq!(captured.body, expected);
     assert_eq!(
         captured.headers.get("authorization").map(String::as_str),
@@ -867,7 +942,7 @@ async fn openai_responses_completion_and_probe_refresh_once_after_401() {
     assert!(
         captured
             .iter()
-            .all(|request| request.path.starts_with("/models?"))
+            .all(|request| request.path.starts_with("/v1/models?"))
     );
     assert_eq!(probe.model_available, Some(true));
     assert_eq!(
@@ -890,7 +965,7 @@ async fn openai_responses_forces_rust_genai_responses_routing_for_grok_model() {
         .expect("grok Responses request");
     let captured = captured.await.expect("grok Responses capture");
 
-    assert_eq!(captured[0].path, "/responses");
+    assert_eq!(captured[0].path, "/v1/responses");
     assert_eq!(captured[0].body["model"], "grok-4.5");
     assert_eq!(captured[0].body["stream"], true);
 }
@@ -950,7 +1025,7 @@ async fn openai_responses_projects_stable_cache_identity_and_retention() {
     assert_ne!(first_key, other_key);
     let session_header = session_id.to_string();
     for request in &requests[..3] {
-        assert_eq!(request.path, "/responses");
+        assert_eq!(request.path, "/v1/responses");
         assert_eq!(request.body["prompt_cache_retention"], "24h");
     }
     assert_eq!(
@@ -1329,8 +1404,7 @@ fn cases() -> [ProtocolCase; 4] {
 
 fn provider(case: ProtocolCase, base_url: String) -> GenaiProviderAdapter {
     let base_url = match case.protocol {
-        ProviderProtocol::Anthropic => format!("{base_url}/v1"),
-        ProviderProtocol::Gemini => format!("{base_url}/v1beta"),
+        ProviderProtocol::Anthropic | ProviderProtocol::Gemini => base_url,
         ProviderProtocol::VertexAi => {
             format!("{base_url}/v1/projects/golden-project/locations/us-central1")
         }

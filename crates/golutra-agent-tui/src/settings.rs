@@ -35,6 +35,27 @@ pub(crate) fn persist_model_selection(
     Ok(())
 }
 
+/// An explicit /auth activation replaces stale /model and profile overrides,
+/// including when the provider keeps the same profile name.
+pub(crate) fn persist_auth_selection(
+    paths: &ProviderConfigPaths,
+    controls: &RuntimeControls,
+) -> Result<(), String> {
+    let snapshot = read_runtime_settings(paths).map_err(|error| error.to_string())?;
+    let patch = serde_json::json!({
+        "provider_profile": controls.profile_name,
+        "model": controls.effective_model(),
+        "reasoning_effort": effort_label(controls.reasoning_effort),
+    });
+    patch_runtime_settings(
+        paths,
+        &snapshot.revision,
+        patch.as_object().unwrap().clone(),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum PermissionMode {
     #[default]

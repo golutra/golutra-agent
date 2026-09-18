@@ -1,5 +1,5 @@
 {
-  "path": "/chat/completions",
+  "path": "/v1/chat/completions",
   "body": {
     "max_tokens": 128,
     "messages": [

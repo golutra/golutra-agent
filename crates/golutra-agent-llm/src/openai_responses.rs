@@ -32,7 +32,7 @@ use super::{
     env_mapping, first_env, generation_config_from_reader, missing_env_error,
     protocol_capabilities, provider_credential_error, provider_http_client,
     provider_http_error_with_headers, provider_transport_error, response_json_or_error,
-    sanitize_provider_error, validate_native_base_url,
+    sanitize_provider_error, validate_provider_base_url,
 };
 
 const CHATGPT_ACCOUNT_ID_HEADER: &str = "ChatGPT-Account-Id";
@@ -162,7 +162,7 @@ impl OpenAiResponsesProvider {
             .map(|(_, value)| value)
             .or_else(|| mapping.default_base_url.map(ToOwned::to_owned))
             .ok_or_else(|| missing_env_error(mapping.base_url))?;
-        let base_url = validate_native_base_url(&base_url)
+        let base_url = validate_provider_base_url(ProviderProtocol::OpenAiResponses, &base_url)
             .map_err(|message| ProviderError::NotConfigured { message })?;
         let generation_config = generation_config_from_reader(&reader)?;
         if generation_config
@@ -242,11 +242,14 @@ impl OpenAiResponsesProvider {
     }
 
     async fn send_probe(&self, force_refresh: bool) -> Result<reqwest::Response, ProviderError> {
+        let base_url =
+            validate_provider_base_url(ProviderProtocol::OpenAiResponses, &self.config.base_url)
+                .map_err(|message| ProviderError::NotConfigured { message })?;
         let (token, account_id) = self.resolve_credential(force_refresh).await?;
         self.authenticated_probe_request(
             self.probe_client.get(format!(
                 "{}/models?client_version={}",
-                self.config.base_url.trim_end_matches('/'),
+                base_url,
                 env!("CARGO_PKG_VERSION")
             )),
             token.expose_secret(),
@@ -306,15 +309,15 @@ impl OpenAiResponsesProvider {
         Ok((token, account_id))
     }
 
-    fn service_target(&self, api_key: &str) -> ServiceTarget {
-        ServiceTarget {
-            endpoint: Endpoint::from_owned(format!(
-                "{}/",
-                self.config.base_url.trim_end_matches('/')
-            )),
+    fn service_target(&self, api_key: &str) -> Result<ServiceTarget, ProviderError> {
+        let base_url =
+            validate_provider_base_url(ProviderProtocol::OpenAiResponses, &self.config.base_url)
+                .map_err(|message| ProviderError::NotConfigured { message })?;
+        Ok(ServiceTarget {
+            endpoint: Endpoint::from_owned(format!("{base_url}/")),
             auth: AuthData::from_single(api_key.to_owned()),
             model: ModelIden::new(AdapterKind::OpenAIResp, self.config.model_id.clone()),
-        }
+        })
     }
 
     fn chat_options(
@@ -433,7 +436,7 @@ impl OpenAiResponsesProvider {
             let response = match self
                 .client
                 .exec_chat_stream(
-                    self.service_target(token.expose_secret()),
+                    self.service_target(token.expose_secret())?,
                     chat_request.clone(),
                     Some(&options),
                 )

@@ -1736,6 +1736,8 @@ impl RuntimeHost {
                 .get("probe")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+        let verified_install =
+            command.payload.get("verified").and_then(Value::as_bool) == Some(true);
         if should_probe {
             self.record_event(host_event(
                 self.next_sequence_no(),
@@ -1795,7 +1797,7 @@ impl RuntimeHost {
                 }),
             ))
             .await?;
-        } else {
+        } else if verified_install {
             self.record_event(host_event(
                 self.next_sequence_no(),
                 session_id,
@@ -1814,7 +1816,7 @@ impl RuntimeHost {
 
         // Provider auth/configuration may have changed without changing the
         // task payload. Drop the route snapshot so the next turn observes the
-        // newly verified credential and endpoint immediately.
+        // newly saved credential and endpoint immediately.
         self.execution
             .provider_route_cache
             .lock()
@@ -1844,8 +1846,11 @@ impl RuntimeHost {
                 .lock()
                 .await
                 .authentication_resolved(session_id, self.next_sequence_no())?;
-            transition.event.payload["summary"] =
-                json!("provider authentication submitted and verified");
+            transition.event.payload["summary"] = if should_probe || verified_install {
+                json!("provider authentication submitted and verified")
+            } else {
+                json!("provider configuration saved; connectivity not checked")
+            };
             transition.event.payload["request_id"] = json!(pending.request_id);
             transition.event.payload["command_id"] = json!(command.command_id);
             transition.event.payload["runtime_lane"] = json!(transition.lane);
@@ -1855,7 +1860,14 @@ impl RuntimeHost {
         Ok(CommandAck {
             command_id: command.command_id,
             accepted: true,
-            reason: Some("provider configuration loaded and verified".to_owned()),
+            reason: Some(
+                if should_probe || verified_install {
+                    "provider configuration loaded and verified"
+                } else {
+                    "provider configuration loaded; connectivity not checked"
+                }
+                .to_owned(),
+            ),
         })
     }
 

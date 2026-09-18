@@ -409,25 +409,87 @@ pub(crate) fn apply_generation_config_to_openai_body(
 
 #[must_use]
 pub fn normalize_openai_base_url(value: &str) -> String {
-    let trimmed = value.trim().trim_end_matches('/');
-    let with_scheme = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        trimmed.to_owned()
-    } else {
-        format!("https://{trimmed}")
-    };
-    let without_slash = with_scheme.trim_end_matches('/').to_owned();
-    let after_scheme = without_slash
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(without_slash.as_str());
-    if after_scheme.contains('/') {
-        without_slash
-    } else {
-        format!("{without_slash}/v1")
-    }
+    validate_provider_base_url(ProviderProtocol::OpenAiCompatible, value)
+        .unwrap_or_else(|_| value.trim().trim_end_matches('/').to_owned())
 }
 
 pub fn validate_openai_base_url(value: &str) -> Result<String, String> {
+    validate_provider_base_url(ProviderProtocol::OpenAiCompatible, value)
+}
+
+/// rust-genai routes by model name. Use that same routing decision for URL
+/// defaults, without guessing a protocol from the hostname.
+pub fn validate_provider_base_url_for_model(
+    protocol: ProviderProtocol,
+    value: &str,
+    model: &str,
+) -> Result<String, String> {
+    let protocol = if protocol == ProviderProtocol::Genai {
+        use genai::adapter::AdapterKind;
+        match AdapterKind::from_model(model).map_err(|error| error.to_string())? {
+            AdapterKind::OpenAI | AdapterKind::DeepSeek => ProviderProtocol::OpenAiCompatible,
+            AdapterKind::OpenAIResp => ProviderProtocol::OpenAiResponses,
+            AdapterKind::Anthropic => ProviderProtocol::Anthropic,
+            AdapterKind::Gemini => ProviderProtocol::Gemini,
+            AdapterKind::Vertex => ProviderProtocol::VertexAi,
+            _ => protocol,
+        }
+    } else {
+        protocol
+    };
+    validate_provider_base_url(protocol, value)
+}
+
+/// Normalize only unambiguous protocol defaults and operation suffixes. Explicit
+/// proxy prefixes and API versions remain authoritative; this never probes a server.
+pub fn validate_provider_base_url(
+    protocol: ProviderProtocol,
+    value: &str,
+) -> Result<String, String> {
+    let normalized = validate_native_base_url(value)?;
+    let parsed = reqwest::Url::parse(&normalized).map_err(|error| error.to_string())?;
+    let path = parsed.path().trim_end_matches('/');
+    let (default_path, suffix) = match protocol {
+        ProviderProtocol::OpenAiCompatible => ("/v1", "/chat/completions"),
+        ProviderProtocol::OpenAiResponses => ("/v1", "/responses"),
+        ProviderProtocol::Anthropic => ("/v1", "/messages"),
+        ProviderProtocol::Gemini => ("/v1beta", "/models"),
+        ProviderProtocol::VertexAi | ProviderProtocol::Genai if path.is_empty() => {
+            return Err(match protocol {
+                ProviderProtocol::VertexAi => "Vertex AI Base URL requires an API path, typically /v1/projects/PROJECT/locations/LOCATION".to_owned(),
+                _ => "For a bare host, select an explicit protocol (OpenAI, Responses, Anthropic or Gemini); rust-genai requires the provider's API base path".to_owned(),
+            });
+        }
+        _ => return Ok(normalized),
+    };
+    let base_path = if protocol == ProviderProtocol::Gemini {
+        // Accept copied generate/stream URLs while leaving the configured model
+        // authoritative. Query strings (including API keys) are rejected above.
+        path.rsplit_once("/models/")
+            .filter(|(_, operation)| {
+                !operation.contains('/')
+                    && (operation.ends_with(":generateContent")
+                        || operation.ends_with(":streamGenerateContent"))
+            })
+            .map(|(prefix, _)| prefix)
+            .unwrap_or_else(|| path.strip_suffix(suffix).unwrap_or(path))
+    } else {
+        path.strip_suffix(suffix).unwrap_or(path)
+    };
+    let base_path = if base_path.is_empty() {
+        default_path
+    } else {
+        base_path
+    };
+    // Preserve the host spelling, port and encoded path of validated input.
+    let origin_end = normalized.find("://").expect("validated scheme") + 3;
+    let path_start = normalized[origin_end..]
+        .find('/')
+        .map_or(normalized.len(), |offset| origin_end + offset);
+    Ok(format!("{}{base_path}", &normalized[..path_start]))
+}
+
+pub fn validate_native_base_url(value: &str) -> Result<String, String> {
     let value = value.trim();
     if value.is_empty() {
         return Err("provider base URL cannot be empty".to_owned());
@@ -443,34 +505,21 @@ pub fn validate_openai_base_url(value: &str) -> Result<String, String> {
     {
         return Err("provider base URL has an invalid HTTP scheme".to_owned());
     }
-    let normalized = normalize_openai_base_url(value);
-    let parsed = reqwest::Url::parse(&normalized)
-        .map_err(|error| format!("provider base URL is invalid: {error}"))?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err("provider base URL must use http or https".to_owned());
-    }
-    if parsed.host_str().is_none() {
-        return Err("provider base URL must include a host".to_owned());
-    }
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err("provider base URL must not include user credentials".to_owned());
-    }
-    if parsed.query().is_some() || parsed.fragment().is_some() {
-        return Err("provider base URL must not include a query or fragment".to_owned());
-    }
-    Ok(normalized)
-}
-
-pub fn validate_native_base_url(value: &str) -> Result<String, String> {
-    let value = value.trim().trim_end_matches('/');
-    if value.is_empty() {
-        return Err("provider base URL cannot be empty".to_owned());
-    }
-    let normalized = if value.starts_with("http://") || value.starts_with("https://") {
-        value.to_owned()
+    let normalized = if lower.starts_with("http://") || lower.starts_with("https://") {
+        // Canonicalize only the scheme, not case-sensitive proxy paths.
+        let (scheme, rest) = value.split_once("://").expect("HTTP scheme");
+        format!(
+            "{}://{}",
+            scheme.to_ascii_lowercase(),
+            rest.trim_end_matches('/')
+        )
     } else {
-        format!("https://{value}")
+        format!("https://{}", value.trim_end_matches('/'))
     };
+    let authority = normalized.split_once("://").expect("HTTP scheme").1;
+    if authority.is_empty() || authority.starts_with(['/', '?', '#']) || authority.contains('\\') {
+        return Err("provider base URL must include a valid host and path".to_owned());
+    }
     let parsed = reqwest::Url::parse(&normalized)
         .map_err(|error| format!("provider base URL is invalid: {error}"))?;
     if !matches!(parsed.scheme(), "http" | "https") {

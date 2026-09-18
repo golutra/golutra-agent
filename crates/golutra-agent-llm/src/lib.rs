@@ -39,6 +39,7 @@ pub(crate) use provider_config::{
 };
 pub use provider_config::{
     normalize_openai_base_url, validate_native_base_url, validate_openai_base_url,
+    validate_provider_base_url, validate_provider_base_url_for_model,
 };
 
 const GOLUTRA_AGENT_PROVIDER_MODE: &str = "GOLUTRA_AGENT_PROVIDER_MODE";

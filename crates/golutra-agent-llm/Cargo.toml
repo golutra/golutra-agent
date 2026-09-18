@@ -18,7 +18,7 @@ base64.workspace = true
 eventsource-stream.workspace = true
 futures-util.workspace = true
 genai.workspace = true
-golutra-agent-auth = { path = "../golutra-agent-auth", version = "0.3.0" }
+golutra-agent-auth = { path = "../golutra-agent-auth", version = "0.3.1" }
 golutra-agent-core.workspace = true
 reqwest.workspace = true
 reqwest13.workspace = true
