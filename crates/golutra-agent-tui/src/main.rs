@@ -30,11 +30,10 @@ use golutra_agent_client::{
 };
 use golutra_agent_config::{
     BuiltinOAuthMethod, ProviderConfigPaths, ProviderConfigScope, ProviderInstallPlan,
-    ProviderProfile, apply_oauth_provider_install_plan_verified,
-    apply_provider_install_plan_verified, generate_custom_provider_api_key_env,
-    load_non_secret_runtime_settings, load_provider_settings, logout_provider_profile_verified,
-    provider_auth_service, provider_onboarding_state, provider_protocol_has_runtime_adapter,
-    update_provider_settings_verified,
+    ProviderProfile, apply_oauth_provider_install_plan_verified, apply_provider_install_plan,
+    generate_custom_provider_api_key_env, load_non_secret_runtime_settings, load_provider_settings,
+    logout_provider_profile_verified, provider_auth_service, provider_onboarding_state,
+    provider_protocol_has_runtime_adapter, update_provider_settings_verified,
 };
 use golutra_agent_core::{
     ActorKind, ApprovalRequest, ApprovalScope, EventId, QueryId, SessionId, TaskId, ThreadId,
@@ -930,6 +929,36 @@ impl TuiApp {
             self.persist_preferences();
         }
         self.status_message = "keyboard reference".to_owned();
+    }
+
+    fn activate_saved_provider(&mut self) -> miette::Result<()> {
+        let paths = provider_paths_for_tui()?;
+        let settings = load_provider_settings(&paths)
+            .map_err(|error| miette::miette!("load saved provider: {error}"))?;
+        if settings.active_profile().is_none() {
+            return Err(miette::miette!("no active provider to select"));
+        }
+        let (mut controls, choices) =
+            RuntimeControls::from_settings(Some(&settings), &self.provider_model, self.yolo);
+        controls.permission_mode = self.runtime_controls.permission_mode;
+        // Send the newly selected model explicitly on the very next turn.
+        controls.custom_model = Some(controls.model_id.clone());
+        settings::persist_auth_selection(&paths, &controls).map_err(|error| {
+            miette::miette!(
+                "provider saved, but global model selection could not be saved: {error}"
+            )
+        })?;
+        if let Some(target) = &self.runtime_settings_paths
+            && target.home != paths.home
+        {
+            settings::persist_auth_selection(target, &controls).map_err(|error| {
+                miette::miette!("provider saved, but model selection could not be saved: {error}")
+            })?;
+        }
+        self.runtime_controls = controls;
+        self.provider_choices = choices;
+        self.refresh_provider_status();
+        Ok(())
     }
 
     fn refresh_provider_status(&mut self) {
@@ -3513,7 +3542,7 @@ impl TuiApp {
             SlashAuthCommand::Mock => {
                 apply_auth_mock()?;
                 notify_runtime_provider_configured(transport, self.session_id).await?;
-                self.refresh_provider_status();
+                self.activate_saved_provider()?;
                 self.auth_dialog = None;
                 self.push_system_message(
                     "Auth updated",
@@ -3542,7 +3571,7 @@ impl TuiApp {
                 {
                     Ok(()) => {
                         notify_runtime_provider_configured(transport, self.session_id).await?;
-                        self.refresh_provider_status();
+                        self.activate_saved_provider()?;
                         self.push_system_message(
                             "Auth updated",
                             vec![format!("active provider profile set to {profile}")],
@@ -3556,8 +3585,8 @@ impl TuiApp {
             }
             SlashAuthCommand::Login(login) => match apply_auth_login(transport, *login).await {
                 Ok(()) => {
-                    notify_runtime_provider_configured(transport, self.session_id).await?;
-                    self.refresh_provider_status();
+                    notify_runtime_provider_saved(transport, self.session_id).await?;
+                    self.activate_saved_provider()?;
                     self.auth_dialog = None;
                     self.push_system_message(
                         "Auth updated",
@@ -3644,6 +3673,7 @@ impl TuiApp {
         });
         self.auth_operation = Some(PendingAuthOperation {
             reopen_setup: false,
+            activate_profile: true,
             cancellation,
             progress,
             task,
@@ -3688,6 +3718,7 @@ impl TuiApp {
         });
         self.auth_operation = Some(PendingAuthOperation {
             reopen_setup: false,
+            activate_profile: false,
             cancellation,
             progress,
             task,
@@ -3726,6 +3757,7 @@ impl TuiApp {
         });
         self.auth_operation = Some(PendingAuthOperation {
             reopen_setup: true,
+            activate_profile: false,
             cancellation,
             progress,
             task,
@@ -3768,7 +3800,15 @@ impl TuiApp {
                     self.status_message = "provider runtime reload failed".to_owned();
                     return;
                 }
-                self.refresh_provider_status();
+                if operation.activate_profile {
+                    if let Err(error) = self.activate_saved_provider() {
+                        self.push_system_message("Auth failed", vec![error.to_string()]);
+                        self.status_message = "provider model selection failed".to_owned();
+                        return;
+                    }
+                } else {
+                    self.refresh_provider_status();
+                }
                 self.push_system_message(outcome.title, outcome.body);
             }
             Ok(Err(error)) => {

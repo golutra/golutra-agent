@@ -29,7 +29,7 @@ use super::{
     custom_headers_from_reader, env_mapping, first_env, generation_config_from_reader,
     missing_env_error, protocol_capabilities, provider_tool_schema_for_contract,
     request_id_from_headers, retry_after_from_headers, sanitize_provider_error,
-    selected_protocol_from_reader, validate_native_base_url,
+    selected_protocol_from_reader, validate_provider_base_url_for_model,
 };
 
 #[derive(Clone, PartialEq, Eq)]
@@ -159,7 +159,7 @@ impl GenaiProviderAdapter {
             .map(|(_, value)| value)
             .or_else(|| mapping.default_base_url.map(ToOwned::to_owned))
             .ok_or_else(|| missing_env_error(mapping.base_url))?;
-        let base_url = validate_native_base_url(&base_url)
+        let base_url = validate_provider_base_url_for_model(protocol, &base_url, &model_id)
             .map_err(|message| ProviderError::NotConfigured { message })?;
         let generation_config = generation_config_from_reader(&reader)?;
         if generation_config
@@ -249,11 +249,14 @@ impl GenaiProviderAdapter {
                 });
             }
         };
+        let base_url = validate_provider_base_url_for_model(
+            self.config.protocol,
+            &self.config.base_url,
+            &self.config.model_id,
+        )
+        .map_err(|message| ProviderError::NotConfigured { message })?;
         Ok(ServiceTarget {
-            endpoint: Endpoint::from_owned(format!(
-                "{}/",
-                self.config.base_url.trim_end_matches('/')
-            )),
+            endpoint: Endpoint::from_owned(format!("{}/", base_url)),
             auth: AuthData::from_single(api_key.to_owned()),
             model: ModelIden::new(adapter_kind, self.config.model_id.clone()),
         })

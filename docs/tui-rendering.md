@@ -12,7 +12,11 @@
 
 本地运行时，模型选择立即用于当前会话，并保存到 `$GOLUTRA_AGENT_HOME/runtime.json`，重启后继续使用；若项目已存在 `.golutra-agent/runtime.json`，则更新该项目层，避免旧的项目覆盖使模型还原。显式切换 profile 时同时保存对应选择。保存复用锁、revision 校验和原子文件替换，只修改模型相关字段，不改写凭据、provider 定义或权限；失败时保留编辑框及草稿，不假报成功。`/model <model-id>` 使用同一机制。远程 TUI 保持会话覆盖，不写本地配置冒充修改远程主机。
 
-选择 `3 Custom Provider` 后，协议列表分别提供 `1 OpenAI Chat Completions`（`/chat/completions`）和 `2 OpenAI Responses`（`/responses`）。两者是独立协议，不自动互换；根据服务商支持的接口选择。Base URL 填 API 基础地址（例如 `https://api.openai.com/v1`），不附加 `/responses` 或 `/chat/completions`。保存前探测凭据和模型列表，保存的协议决定后续生成请求使用的接口。
+选择 `3 Custom Provider` 后，协议列表分别提供 `1 OpenAI Chat Completions`（`/chat/completions`）和 `2 OpenAI Responses`（`/responses`）。两者是独立协议，不自动互换；根据服务商支持的接口选择。确认页 Enter 只在本地校验并保存配置和凭据，不探测模型、不发送联网验证请求；保存成功后返回聊天输入，实际连通性由后续模型请求验证。`/auth login` 使用相同保存路径；本地保存失败则保留向导并在确认页顶部显示错误。保存的协议决定后续生成请求使用的接口。
+
+Base URL 可填裸域名（默认 HTTPS）或完整基础地址。OpenAI Chat Completions、Responses、Anthropic 在没有路径时补 `/v1`，Gemini 补 `/v1beta`；已有版本号、自定义代理路径和 ChatGPT 的 `/backend-api/codex` 保持原样。按所选协议识别完整的 `/chat/completions`、`/responses`、`/messages` 或 Gemini `/models/<model>:generateContent` / `:streamGenerateContent` 地址，去掉操作后缀以避免重复拼接；实际模型仍以 Model 字段为准。带凭据、查询参数或 fragment 的地址拒绝保存。Vertex AI 需要明确的项目/区域基础路径，不能从裸域名猜测；rust-genai 按其已有模型路由为 OpenAI、Anthropic、Gemini、DeepSeek 补默认路径，其他路由要求明确 API 基础路径。确认页和保存内容显示规范化地址，运行时对已有配置及环境变量使用同一规则，不联网尝试多个端点。
+
+`/auth` 明确保存或切换 provider 后，当前会话采用新 profile 的模型与推理设置，同时更新全局及当前已存在的项目 runtime 设置层中的对应选择。即使复用 `custom` 等同名 profile，也不会保留旧 `/model` 覆盖导致新协议搭配旧模型；下一次请求和重启后都使用新选择。权限、工具设置及子代理并发配置保持原值。普通状态刷新继续保留用户当前 `/model` 选择。
 
 Reasoning effort 在设置页和认证高级配置中的顺序统一为 `default → low → medium → high → xhigh → max → ultra`，界面、配置和请求值均使用小写；`/effort max`、`/effort ultra` 同样可用。Responses 和 Chat Completions 按显式选择发送原值，具体模型是否接受由上游决定。`ultra` 是网关扩展，当前 Genai 原生适配器不支持时明确报错，不自动降档；`max` 在其他原生协议中沿用依赖库的协议映射。
 

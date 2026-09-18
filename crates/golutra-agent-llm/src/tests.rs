@@ -799,6 +799,127 @@ fn openai_base_url_accepts_bare_host() {
 }
 
 #[test]
+fn provider_base_url_defaults_and_full_endpoints_are_idempotent() {
+    for (protocol, version, operation) in [
+        (ProviderProtocol::OpenAiCompatible, "v1", "chat/completions"),
+        (ProviderProtocol::OpenAiResponses, "v1", "responses"),
+        (ProviderProtocol::Anthropic, "v1", "messages"),
+        (
+            ProviderProtocol::Gemini,
+            "v1beta",
+            "models/gemini-test:generateContent",
+        ),
+    ] {
+        for (input, expected) in [
+            (
+                "api.example.com".to_owned(),
+                format!("https://api.example.com/{version}"),
+            ),
+            (
+                " https://api.example.com/ ".to_owned(),
+                format!("https://api.example.com/{version}"),
+            ),
+            (
+                "HTTP://localhost:8080/".to_owned(),
+                format!("http://localhost:8080/{version}"),
+            ),
+            (
+                "http://[::1]:8080".to_owned(),
+                format!("http://[::1]:8080/{version}"),
+            ),
+            (
+                format!("https://api.example.com/{version}/{operation}/"),
+                format!("https://api.example.com/{version}"),
+            ),
+            (
+                "https://api.example.com/proxy/Custom/v2/".to_owned(),
+                "https://api.example.com/proxy/Custom/v2".to_owned(),
+            ),
+            (
+                format!("https://api.example.com/proxy/v2/{operation}"),
+                "https://api.example.com/proxy/v2".to_owned(),
+            ),
+        ] {
+            let normalized = validate_provider_base_url(protocol, &input).expect("valid URL");
+            assert_eq!(normalized, expected, "{protocol:?}: {input}");
+            assert_eq!(
+                validate_provider_base_url(protocol, &normalized).unwrap(),
+                normalized
+            );
+        }
+    }
+    assert_eq!(
+        validate_provider_base_url(
+            ProviderProtocol::OpenAiResponses,
+            "https://chatgpt.com/backend-api/codex/responses"
+        )
+        .unwrap(),
+        "https://chatgpt.com/backend-api/codex"
+    );
+    assert_eq!(
+        validate_provider_base_url(
+            ProviderProtocol::Gemini,
+            "https://api.example.com/v1/models/gemini-test:streamGenerateContent"
+        )
+        .unwrap(),
+        "https://api.example.com/v1"
+    );
+    assert_eq!(
+        validate_provider_base_url(
+            ProviderProtocol::VertexAi,
+            "https://region-aiplatform.googleapis.com/v1/projects/test/locations/global/"
+        )
+        .unwrap(),
+        "https://region-aiplatform.googleapis.com/v1/projects/test/locations/global"
+    );
+    assert!(validate_provider_base_url(ProviderProtocol::VertexAi, "https://example.com").is_err());
+    for (model, version) in [
+        ("claude-test", "v1"),
+        ("gpt-test", "v1"),
+        ("gemini-test", "v1beta"),
+        ("deepseek-chat", "v1"),
+    ] {
+        assert_eq!(
+            validate_provider_base_url_for_model(
+                ProviderProtocol::Genai,
+                "https://api.example.com",
+                model
+            )
+            .unwrap(),
+            format!("https://api.example.com/{version}")
+        );
+    }
+}
+
+#[test]
+fn provider_base_url_rejects_unsafe_components_for_every_protocol() {
+    for protocol in [
+        ProviderProtocol::OpenAiCompatible,
+        ProviderProtocol::OpenAiResponses,
+        ProviderProtocol::Anthropic,
+        ProviderProtocol::Gemini,
+        ProviderProtocol::VertexAi,
+        ProviderProtocol::Genai,
+    ] {
+        for invalid in [
+            "",
+            "file:///tmp/provider",
+            "https:///v1",
+            "https:",
+            "http:/example.com",
+            "https://user:secret@example.com/v1",
+            "https://example.com/v1?key=secret",
+            "https://example.com/v1#fragment",
+        ] {
+            assert!(
+                validate_provider_base_url(protocol, invalid).is_err(),
+                "{protocol:?}: {invalid}"
+            );
+        }
+    }
+}
+
+#[test]
 fn openai_base_url_validation_rejects_missing_hosts_and_unsafe_components() {
     for invalid in [
         "",

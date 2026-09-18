@@ -15,7 +15,7 @@ use golutra_agent_llm::{
     ConfiguredProvider, GOLUTRA_AGENT_PROVIDER_CACHE_CAPABILITIES,
     GOLUTRA_AGENT_PROVIDER_CUSTOM_HEADERS, GOLUTRA_AGENT_PROVIDER_ROUTE_ID, ModelCatalog,
     ProviderCacheCapabilities, ProviderGenerationConfig, ProviderHeaderConfig, ProviderHeaderValue,
-    ProviderProtocol, validate_native_base_url, validate_openai_base_url,
+    ProviderProtocol, validate_provider_base_url_for_model,
 };
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
@@ -34,10 +34,11 @@ pub use provider_auth::{
     builtin_oauth_methods_for_provider,
 };
 pub(crate) use provider_storage::{
-    SecretMutation, SecretMutationAction, acquire_provider_settings_lock, default_secret_store,
-    load_provider_settings_for_install_unlocked, load_provider_settings_unlocked,
-    persist_profile_in_settings, provider_install_error, replaced_credential,
-    run_provider_install_transaction, run_provider_settings_transaction, write_json_owner_only,
+    ProviderInstallProbe, SecretMutation, SecretMutationAction, acquire_provider_settings_lock,
+    default_secret_store, load_provider_settings_for_install_unlocked,
+    load_provider_settings_unlocked, persist_profile_in_settings, provider_install_error,
+    replaced_credential, run_provider_install_transaction, run_provider_settings_transaction,
+    write_json_owner_only,
 };
 pub use provider_storage::{
     generate_custom_provider_api_key_env, golutra_agent_home, provider_auth_service,
@@ -484,13 +485,15 @@ impl ProviderProfile {
         model_id: impl Into<String>,
         credential_ref: CredentialRef,
     ) -> Result<Self, ConfigError> {
-        let base_url = normalize_provider_base_url(protocol, &base_url.into())?;
+        let model_id = model_id.into();
+        let base_url = validate_provider_base_url_for_model(protocol, &base_url.into(), &model_id)
+            .map_err(ConfigError::Validation)?;
         let name = name.into();
         let profile = Self {
             cache_capabilities: Some(ProviderCacheCapabilities::for_provider(protocol, &name)),
             name,
             protocol,
-            model_id: Some(model_id.into()),
+            model_id: Some(model_id),
             base_url: Some(base_url),
             credential_ref: Some(credential_ref),
             oauth: None,
@@ -538,10 +541,12 @@ impl ProviderProfile {
                     "provider profile requires credential_ref".to_owned(),
                 ));
             }
-            if self.protocol == ProviderProtocol::OpenAiCompatible {
-                validate_openai_base_url(self.base_url.as_deref().unwrap_or_default())
-                    .map_err(ConfigError::Validation)?;
-            }
+            validate_provider_base_url_for_model(
+                self.protocol,
+                self.base_url.as_deref().unwrap_or_default(),
+                self.model_id.as_deref().unwrap_or_default(),
+            )
+            .map_err(ConfigError::Validation)?;
         }
         if let Some(generation_config) = &self.generation_config {
             generation_config
@@ -596,7 +601,8 @@ impl ProviderInstallPlan {
         }
         if self.pending_secret.is_some() {
             return Err(ConfigError::Validation(
-                "provider plans containing a secret require verified async installation".to_owned(),
+                "provider plans containing a secret require transactional async installation"
+                    .to_owned(),
             ));
         }
         let path = &paths.user_config;
@@ -991,6 +997,25 @@ pub fn validate_provider_protocol_runtime_supported(
     }
 }
 
+/// Save a provider and its credential atomically without contacting the provider.
+/// Local validation and rollback on persistence failures still apply.
+pub async fn apply_provider_install_plan(
+    paths: &ProviderConfigPaths,
+    workspace_root: impl AsRef<Path>,
+    plan: &ProviderInstallPlan,
+) -> Result<(), ProviderInstallError> {
+    let store = default_secret_store(paths)
+        .map_err(|error| provider_install_error("secret-store", error.to_string()))?;
+    apply_provider_install_plan_with_probe(
+        paths,
+        workspace_root,
+        plan,
+        store,
+        ProviderInstallProbe::Skip,
+    )
+    .await
+}
+
 pub async fn apply_provider_install_plan_verified(
     paths: &ProviderConfigPaths,
     workspace_root: impl AsRef<Path>,
@@ -1072,13 +1097,30 @@ pub async fn apply_provider_install_plan_verified_with_store(
     plan: &ProviderInstallPlan,
     store: Arc<dyn SecretStore>,
 ) -> Result<(), ProviderInstallError> {
+    apply_provider_install_plan_with_probe(
+        paths,
+        workspace_root,
+        plan,
+        store,
+        ProviderInstallProbe::Required,
+    )
+    .await
+}
+
+async fn apply_provider_install_plan_with_probe(
+    paths: &ProviderConfigPaths,
+    workspace_root: impl AsRef<Path>,
+    plan: &ProviderInstallPlan,
+    store: Arc<dyn SecretStore>,
+    probe: ProviderInstallProbe,
+) -> Result<(), ProviderInstallError> {
     if plan.scope == ProviderConfigScope::Workspace {
         return Err(provider_install_error(
             "mutate",
             "workspace provider config is no longer supported; use global user provider config",
         ));
     }
-    run_provider_install_transaction(paths, workspace_root, store, |user| {
+    run_provider_install_transaction(paths, workspace_root, store, probe, |user| {
         let previous_reference = user
             .profiles
             .iter()
@@ -1397,17 +1439,6 @@ fn require_non_empty(value: Option<&str>, field: &str) -> Result<(), ConfigError
 
 fn live_profile_requires_connection_fields(protocol: ProviderProtocol) -> bool {
     protocol != ProviderProtocol::Mock
-}
-
-fn normalize_provider_base_url(
-    protocol: ProviderProtocol,
-    value: &str,
-) -> Result<String, ConfigError> {
-    if protocol == ProviderProtocol::OpenAiCompatible {
-        validate_openai_base_url(value).map_err(ConfigError::Validation)
-    } else {
-        validate_native_base_url(value).map_err(ConfigError::Validation)
-    }
 }
 
 fn missing_fields(

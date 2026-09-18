@@ -248,7 +248,7 @@ pub(crate) async fn advance_auth_dialog(
                 AuthAdvanceAction::None
             }
             AuthDialogStep::BaseUrl => {
-                match validate_auth_base_url(&dialog.base_url) {
+                match validate_auth_base_url(dialog.protocol, &dialog.base_url) {
                     Ok(base_url) => {
                         dialog.base_url = base_url;
                         dialog.api_key_env = suggested_api_key_env(dialog);
@@ -359,16 +359,16 @@ pub(crate) async fn advance_auth_dialog(
         AuthAdvanceAction::SaveMock => {
             apply_auth_mock()?;
             notify_runtime_provider_configured(transport, app.session_id).await?;
-            app.refresh_provider_status();
+            app.activate_saved_provider()?;
             app.auth_dialog = None;
             app.status_message = "using mock provider".to_owned();
         }
         AuthAdvanceAction::SaveOpenAiCompatible(login) => {
             apply_auth_login(transport, *login).await?;
-            notify_runtime_provider_configured(transport, app.session_id).await?;
-            app.refresh_provider_status();
+            notify_runtime_provider_saved(transport, app.session_id).await?;
+            app.activate_saved_provider()?;
             app.auth_dialog = None;
-            app.status_message = "provider connected".to_owned();
+            app.status_message = "provider saved".to_owned();
         }
         AuthAdvanceAction::StartBuiltinOAuth(method) => {
             app.auth_dialog = None;
@@ -383,6 +383,8 @@ pub(crate) fn report_auth_dialog_error(app: &mut TuiApp, error: miette::Report) 
     let message = error.to_string();
     if let Some(dialog) = &mut app.auth_dialog {
         dialog.error = Some(message);
+        dialog.scroll = 0;
+        dialog.manual_scroll = false;
     }
     app.status_message = "provider setup failed".to_owned();
 }
@@ -671,7 +673,11 @@ pub(crate) fn build_auth_review(dialog: &AuthDialogState) -> Result<AuthReview, 
         provider_title: provider.title,
         profile: login.profile,
         protocol: login.protocol.id().to_owned(),
-        base_url: login.base_url,
+        base_url: preview_plan
+            .profile
+            .base_url
+            .clone()
+            .unwrap_or(login.base_url),
         model: login.model,
         credential: match login.credential_store {
             AuthCredentialStore::Environment => format!("env:{}", login.api_key_env),
@@ -691,21 +697,15 @@ pub(crate) fn build_auth_review(dialog: &AuthDialogState) -> Result<AuthReview, 
     })
 }
 
-pub(crate) fn validate_auth_base_url(value: &str) -> Result<String, String> {
-    let trimmed = value.trim().trim_end_matches('/').to_owned();
-    if trimmed.is_empty() {
-        return Err("Base URL cannot be empty".to_owned());
+pub(crate) fn validate_auth_base_url(
+    protocol: ProviderProtocol,
+    value: &str,
+) -> Result<String, String> {
+    // The model is entered later; model-routed defaults are resolved in review.
+    if protocol == ProviderProtocol::Genai {
+        return golutra_agent_llm::validate_native_base_url(value);
     }
-    if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
-        return Err("Base URL must start with http:// or https://".to_owned());
-    }
-    let Some((_, rest)) = trimmed.split_once("://") else {
-        return Err("Base URL must start with http:// or https://".to_owned());
-    };
-    if rest.split('/').next().unwrap_or_default().trim().is_empty() {
-        return Err("Base URL host cannot be empty".to_owned());
-    }
-    Ok(trimmed)
+    golutra_agent_llm::validate_provider_base_url(protocol, value)
 }
 
 pub(crate) fn normalize_model_id(value: &str) -> String {
@@ -753,7 +753,7 @@ pub(crate) async fn apply_auth_login(
     .map_err(|error| miette::miette!("{error}"))?;
     profile.generation_config = login.generation_config;
     profile.custom_headers = login.custom_headers;
-    apply_provider_install_plan_verified(
+    apply_provider_install_plan(
         &paths,
         cwd,
         &ProviderInstallPlan {
@@ -773,11 +773,26 @@ pub(crate) async fn notify_runtime_provider_configured(
     transport: &RuntimeTransport,
     session_id: SessionId,
 ) -> miette::Result<()> {
+    reload_runtime_provider(transport, session_id, true).await
+}
+
+pub(crate) async fn notify_runtime_provider_saved(
+    transport: &RuntimeTransport,
+    session_id: SessionId,
+) -> miette::Result<()> {
+    reload_runtime_provider(transport, session_id, false).await
+}
+
+async fn reload_runtime_provider(
+    transport: &RuntimeTransport,
+    session_id: SessionId,
+    verified: bool,
+) -> miette::Result<()> {
     let ack = transport
         .send_command(session_command(
             session_id,
             SessionCommandKind::ProviderConfigured,
-            json!({"verified": true}),
+            json!({"probe": false, "verified": verified}),
         ))
         .await
         .map_err(|error| miette::miette!("{error}"))?;

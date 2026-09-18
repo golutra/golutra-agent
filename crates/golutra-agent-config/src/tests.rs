@@ -555,6 +555,34 @@ fn provider_profile_rejects_an_invalid_or_credentialed_base_url() {
 }
 
 #[test]
+fn provider_profile_normalizes_urls_before_persistence() {
+    for (protocol, model, path) in [
+        (ProviderProtocol::OpenAiCompatible, "gpt-test", "v1"),
+        (ProviderProtocol::OpenAiResponses, "gpt-test", "v1"),
+        (ProviderProtocol::Anthropic, "cd-opus-5", "v1"),
+        (ProviderProtocol::Gemini, "gemini-test", "v1beta"),
+        (ProviderProtocol::Genai, "claude-test", "v1"),
+    ] {
+        let profile = ProviderProfile::live_profile(
+            "custom",
+            protocol,
+            "https://api.example.com",
+            model,
+            env_credential("GOLUTRA_AGENT_PROVIDER_API_KEY"),
+        )
+        .expect("profile");
+        assert_eq!(
+            profile.base_url.as_deref(),
+            Some(format!("https://api.example.com/{path}").as_str())
+        );
+        let stored: ProviderProfile =
+            serde_json::from_str(&serde_json::to_string(&profile).unwrap()).unwrap();
+        stored.validate().expect("round trip");
+        assert_eq!(stored.base_url, profile.base_url);
+    }
+}
+
+#[test]
 fn onboarding_requires_explicit_provider_profile() {
     let _home = IsolatedGolutraHome::new();
     let state = provider_onboarding_state().expect("onboarding");
@@ -931,6 +959,51 @@ fn redacted_runtime_env_hides_hashed_custom_provider_keys() {
             .get("GOLUTRA_AGENT_PROVIDER_MODEL")
             .map(String::as_str),
         Some("model")
+    );
+}
+
+#[tokio::test]
+async fn local_provider_install_persists_offline_and_rejects_invalid_updates() {
+    let home = tempdir().expect("home");
+    let workspace = tempdir().expect("workspace");
+    let paths = ProviderConfigPaths::from_home(home.path()).expect("paths");
+    let mut plan = ProviderInstallPlan {
+        scope: ProviderConfigScope::User,
+        profile: ProviderProfile::openai_compatible(
+            "custom",
+            "http://127.0.0.1:9/v1",
+            "offline-model",
+            disk_credential(),
+        )
+        .expect("profile"),
+        activate: true,
+        pending_secret: Some(SecretString::from("offline-key".to_owned())),
+    };
+    apply_provider_install_plan(&paths, workspace.path(), &plan)
+        .await
+        .expect("offline save");
+    let config = fs::read(&paths.user_config).expect("saved config");
+    let credentials = fs::read(home.path().join("credentials.json")).expect("saved credentials");
+    assert_eq!(
+        ProviderSettings::load(&paths.user_config)
+            .expect("settings")
+            .active_profile
+            .as_deref(),
+        Some("custom")
+    );
+    plan.profile.model_id = Some(String::new());
+    plan.pending_secret = Some(SecretString::from("replacement-key".to_owned()));
+    let error = apply_provider_install_plan(&paths, workspace.path(), &plan)
+        .await
+        .expect_err("invalid model");
+    assert_eq!(error.step, "mutate");
+    assert_eq!(
+        fs::read(&paths.user_config).expect("config unchanged"),
+        config
+    );
+    assert_eq!(
+        fs::read(home.path().join("credentials.json")).expect("credentials unchanged"),
+        credentials
     );
 }
 
