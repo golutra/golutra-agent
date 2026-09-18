@@ -16,6 +16,7 @@ use super::ResumeSelectionDirection;
 #[derive(Debug)]
 pub(crate) struct PendingAuthOperation {
     pub(crate) reopen_setup: bool,
+    pub(crate) activate_profile: bool,
     pub(crate) cancellation: CancellationToken,
     pub(crate) progress: mpsc::UnboundedReceiver<AuthTaskProgress>,
     pub(crate) task: JoinHandle<Result<AuthTaskOutcome, String>>,

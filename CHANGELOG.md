@@ -6,6 +6,23 @@ follow [Semantic Versioning](https://semver.org/) where applicable.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-19
+
+### Fixed
+
+- Provider setup saves configuration and credentials locally without waiting for
+  a network probe. The review page shows save failures and the Enter action clearly.
+- Explicit provider activation replaces stale model and reasoning overrides in
+  the current session and persisted runtime settings, including same-name profiles.
+- Bare provider hosts receive protocol-specific API paths: `/v1` for OpenAI Chat
+  Completions, Responses and Anthropic; `/v1beta` for Gemini. Recognized operation
+  URLs are converted to base URLs without duplicating the operation suffix.
+- Existing API versions, proxy prefixes and ChatGPT backend paths are retained.
+  Configuration, setup preview and runtime requests use the same URL rules;
+  ambiguous native-provider paths produce actionable configuration errors.
+- Locally saved provider settings no longer emit a successful connectivity-check
+  event when no connectivity check was performed.
+
 ## [0.3.0] - 2026-09-17
 
 ### Added
@@ -100,7 +117,8 @@ This is the initial public development baseline. See the repository history
 and [architecture documentation](docs/ARCHITECTURE.md) for the implementation
 details and current compatibility boundaries.
 
-[unreleased]: https://github.com/golutra/golutra-agent/compare/v0.3.0...HEAD
+[unreleased]: https://github.com/golutra/golutra-agent/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/golutra/golutra-agent/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/golutra/golutra-agent/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/golutra/golutra-agent/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/golutra/golutra-agent/releases/tag/v0.1.0

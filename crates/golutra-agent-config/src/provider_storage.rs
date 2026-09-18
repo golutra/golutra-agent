@@ -2,6 +2,12 @@
 
 use super::*;
 
+#[derive(Clone, Copy)]
+pub(crate) enum ProviderInstallProbe {
+    Required,
+    Skip,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InvalidProviderSettingsPolicy {
     Reject,
@@ -260,6 +266,7 @@ where
         workspace_root,
         store,
         InvalidProviderSettingsPolicy::Reject,
+        ProviderInstallProbe::Required,
         mutate,
     )
     .await
@@ -269,6 +276,7 @@ pub(crate) async fn run_provider_install_transaction<F>(
     paths: &ProviderConfigPaths,
     workspace_root: impl AsRef<Path>,
     store: Arc<dyn SecretStore>,
+    probe: ProviderInstallProbe,
     mutate: F,
 ) -> Result<(), ProviderInstallError>
 where
@@ -279,6 +287,7 @@ where
         workspace_root,
         store,
         InvalidProviderSettingsPolicy::ReplaceJson,
+        probe,
         mutate,
     )
     .await
@@ -289,6 +298,7 @@ pub(crate) async fn run_provider_settings_transaction_with_policy<F>(
     workspace_root: impl AsRef<Path>,
     store: Arc<dyn SecretStore>,
     invalid_settings_policy: InvalidProviderSettingsPolicy,
+    probe: ProviderInstallProbe,
     mutate: F,
 ) -> Result<(), ProviderInstallError>
 where
@@ -318,18 +328,21 @@ where
         .map_err(|error| provider_install_error("mutate", error.to_string()))?;
     let secret_snapshots = snapshot_secrets(Arc::clone(&store), &secret_mutations).await?;
 
-    let transaction_result = async {
+    let transaction_result: Result<(), ProviderInstallError> = async {
         apply_secret_mutations(Arc::clone(&store), &secret_mutations).await?;
         persist_provider_settings_file(&paths.user_config, &user_snapshot, &user_settings)
             .map_err(|error| provider_install_error("persist", error.to_string()))?;
 
-        probe_provider_after_settings_update(
-            &workspace_root,
-            &paths.home,
-            &user_settings,
-            Arc::clone(&store),
-        )
-        .await
+        if matches!(probe, ProviderInstallProbe::Required) {
+            probe_provider_after_settings_update(
+                &workspace_root,
+                &paths.home,
+                &user_settings,
+                Arc::clone(&store),
+            )
+            .await?;
+        }
+        Ok(())
     }
     .await;
 

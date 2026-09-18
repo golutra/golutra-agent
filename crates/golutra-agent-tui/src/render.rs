@@ -365,7 +365,20 @@ fn auth_dialog_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
         AuthDialogStep::BaseUrl => auth_input_lines(
             &auth_step_title(dialog),
             "Base URL",
-            "endpoint URL for the selected protocol",
+            match dialog.protocol {
+                ProviderProtocol::Gemini => {
+                    "host or API base URL; bare hosts get /v1beta automatically"
+                }
+                ProviderProtocol::VertexAi => {
+                    "API base URL including /v1/projects/PROJECT/locations/LOCATION"
+                }
+                ProviderProtocol::Genai => {
+                    "API base URL; known model protocols get defaults in review; other providers need an explicit path"
+                }
+                _ => {
+                    "host or API base URL; bare hosts get /v1 automatically; custom paths are preserved"
+                }
+            },
             &dialog.base_url,
             dialog.error.as_deref(),
             false,
@@ -865,7 +878,15 @@ pub(crate) fn auth_review_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> 
         "Enter save   Esc back   Ctrl+C twice quit",
         Style::default().fg(Color::DarkGray),
     )));
-    push_auth_error(&mut lines, dialog.error.as_deref());
+    if let Some(error) = &dialog.error {
+        lines.insert(
+            2,
+            Line::from(Span::styled(
+                format!("Save failed: {error}"),
+                Style::default().fg(Color::Red),
+            )),
+        );
+    }
     lines
 }
 
@@ -2683,6 +2704,14 @@ pub(crate) fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
     let overlay_help = match surface {
         Some(OverlaySurface::Help) => {
             Some("1-5 topic   Tab switch   Up/Down scroll   F1 or Esc close")
+        }
+        Some(OverlaySurface::Auth)
+            if app
+                .auth_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.step == AuthDialogStep::Review) =>
+        {
+            Some("Provider setup   Enter save   Esc back   Ctrl+C twice quit")
         }
         Some(OverlaySurface::Auth) => {
             Some("Provider setup   Enter continue   Esc back   Ctrl+C twice quit")
