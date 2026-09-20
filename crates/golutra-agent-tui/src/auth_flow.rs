@@ -13,6 +13,11 @@ pub(crate) async fn handle_auth_dialog_key(
         .as_ref()
         .map_or(0, |dialog| auth_scroll_max(dialog, app.layout.transcript));
     match key.code {
+        KeyCode::Char('e' | 'E') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(dialog) = &mut app.auth_dialog {
+                dialog.toggle_credential_input();
+            }
+        }
         KeyCode::Esc => {
             if let Some(dialog) = &mut app.auth_dialog {
                 dialog.go_back();
@@ -78,7 +83,6 @@ pub(crate) async fn handle_auth_dialog_key(
                         | AuthDialogStep::ThirdPartyChoice
                         | AuthDialogStep::AuthMethod
                         | AuthDialogStep::Protocol
-                        | AuthDialogStep::CredentialStore
                 )
                 && let Some(index) = character
                     .to_digit(10)
@@ -91,7 +95,6 @@ pub(crate) async fn handle_auth_dialog_key(
                     }
                     AuthDialogStep::AuthMethod => dialog.auth_method_count().saturating_sub(1),
                     AuthDialogStep::Protocol => dialog.protocol_options().len().saturating_sub(1),
-                    AuthDialogStep::CredentialStore => 1,
                     AuthDialogStep::BaseUrl
                     | AuthDialogStep::ApiKey
                     | AuthDialogStep::EnvKey
@@ -134,7 +137,6 @@ pub(crate) fn auth_step_accepts_vim_selection_keys(dialog: &AuthDialogState) -> 
             | AuthDialogStep::ThirdPartyChoice
             | AuthDialogStep::AuthMethod
             | AuthDialogStep::Protocol
-            | AuthDialogStep::CredentialStore
             | AuthDialogStep::AdvancedConfig
     )
 }
@@ -251,11 +253,11 @@ pub(crate) async fn advance_auth_dialog(
                 match validate_auth_base_url(dialog.protocol, &dialog.base_url) {
                     Ok(base_url) => {
                         dialog.base_url = base_url;
-                        dialog.api_key_env = suggested_api_key_env(dialog);
-                        dialog.step = if dialog.credential_store == AuthCredentialStore::Ephemeral {
-                            AuthDialogStep::ApiKey
+                        dialog.step = if dialog.credential_store == AuthCredentialStore::Environment
+                        {
+                            AuthDialogStep::EnvKey
                         } else {
-                            AuthDialogStep::CredentialStore
+                            AuthDialogStep::ApiKey
                         };
                         dialog.error = None;
                     }
@@ -263,24 +265,6 @@ pub(crate) async fn advance_auth_dialog(
                         dialog.error = Some(error);
                     }
                 }
-                AuthAdvanceAction::None
-            }
-            AuthDialogStep::CredentialStore => {
-                dialog.credential_store = if dialog.selected == 1 {
-                    AuthCredentialStore::Environment
-                } else {
-                    AuthCredentialStore::Disk
-                };
-                if dialog.credential_store == AuthCredentialStore::Environment {
-                    dialog.api_key.clear();
-                }
-                dialog.step = if dialog.credential_store == AuthCredentialStore::Environment {
-                    AuthDialogStep::EnvKey
-                } else {
-                    AuthDialogStep::ApiKey
-                };
-                dialog.selected = 0;
-                dialog.error = None;
                 AuthAdvanceAction::None
             }
             AuthDialogStep::ApiKey => {
@@ -295,6 +279,10 @@ pub(crate) async fn advance_auth_dialog(
                 AuthAdvanceAction::None
             }
             AuthDialogStep::EnvKey => {
+                if dialog.api_key_env.trim().is_empty() {
+                    dialog.error = Some("Environment variable name cannot be empty".to_owned());
+                    return Ok(());
+                }
                 match CredentialRef::environment(dialog.api_key_env.trim(), SecretKind::ApiKey) {
                     Ok(_) => {
                         dialog.api_key_env = dialog.api_key_env.trim().to_owned();
@@ -595,11 +583,7 @@ pub(crate) fn provider_scope(scope: AuthConfigScope) -> ProviderConfigScope {
 
 pub(crate) fn auth_login(dialog: &AuthDialogState) -> Result<OpenAiCompatibleLogin, String> {
     let provider = dialog.provider.unwrap_or(CUSTOM_PROVIDER_PRESET);
-    let api_key_env = if dialog.api_key_env.trim().is_empty() {
-        suggested_api_key_env(dialog)
-    } else {
-        dialog.api_key_env.trim().to_owned()
-    };
+    let api_key_env = dialog.api_key_env.trim().to_owned();
     Ok(OpenAiCompatibleLogin {
         profile: provider.profile.to_owned(),
         protocol: dialog.protocol,
@@ -617,17 +601,6 @@ pub(crate) fn auth_login(dialog: &AuthDialogState) -> Result<OpenAiCompatibleLog
         custom_headers: parse_dialog_custom_headers(&dialog.custom_headers)?,
         scope: AuthConfigScope::User,
     })
-}
-
-pub(crate) fn suggested_api_key_env(dialog: &AuthDialogState) -> String {
-    match dialog.provider.unwrap_or(CUSTOM_PROVIDER_PRESET).source {
-        AuthProviderSource::Custom => {
-            generate_custom_provider_api_key_env(dialog.protocol, dialog.base_url.trim())
-        }
-        AuthProviderSource::Official | AuthProviderSource::ThirdParty => {
-            "GOLUTRA_AGENT_PROVIDER_API_KEY".to_owned()
-        }
-    }
 }
 
 pub(crate) fn build_auth_review(dialog: &AuthDialogState) -> Result<AuthReview, String> {

@@ -1676,6 +1676,98 @@ fn model_editor_uses_native_mouse_and_enter_applies_to_next_provider_request() {
 }
 
 #[test]
+fn auth_credential_shortcut_saves_disk_or_env_without_storage_page() {
+    use golutra_agent_auth::CredentialSource;
+
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    install_mock_provider(home.path());
+    let mut pty = PtyHarness::spawn(home.path(), workspace.path(), 110, 32);
+    let mut parser = ScreenModel::new(32, 110);
+    let paths = ProviderConfigPaths::from_home(home.path()).unwrap();
+    let secret = "isolated-auth-shortcut-secret";
+
+    for environment in [false, true] {
+        wait_for_visible(&mut pty, &mut parser, "Ask Golutra");
+        submit(&mut pty, &mut parser, "/auth");
+        wait_for_visible(&mut pty, &mut parser, "Connect a Provider");
+        pty.write(b"3");
+        wait_for_visible(&mut pty, &mut parser, "Step 1/6");
+        pty.write(b"1");
+        wait_for_visible(&mut pty, &mut parser, "Step 2/6");
+        submit(&mut pty, &mut parser, "http://127.0.0.1:9");
+        wait_for_visible_markers(&mut pty, &mut parser, &["Step 3/6", "API Key", "Ctrl+E"]);
+        assert!(!parser.screen().contents().contains("Credential storage"));
+        pty.write(secret.as_bytes());
+        parser.process(&pty.collect_for(Duration::from_millis(150)));
+        assert!(!parser.screen().contents().contains(secret));
+        // 验证真实 Ctrl+E 字节经过主输入分发后到达认证页，而不是插入字符 e。
+        pty.write(b"\x05");
+        wait_for_visible(&mut pty, &mut parser, "Environment variable name");
+        assert!(!parser.screen().contents().contains(secret));
+        assert!(
+            !parser
+                .screen()
+                .contents()
+                .contains("GOLUTRA_AGENT_CUSTOM_PROVIDER_API_KEY")
+        );
+        if environment {
+            submit(&mut pty, &mut parser, "GOLUTRA_AGENT_PTY_TEST_KEY");
+        } else {
+            pty.write(b"\x05");
+            wait_for_visible(&mut pty, &mut parser, "API Key");
+            assert!(!parser.screen().contents().contains("*****"));
+            submit(&mut pty, &mut parser, secret);
+        }
+        wait_for_visible(&mut pty, &mut parser, "Step 4/6");
+        submit(&mut pty, &mut parser, "gpt-golden");
+        wait_for_visible(&mut pty, &mut parser, "Step 5/6");
+        pty.write(b"\r");
+        wait_for_visible(&mut pty, &mut parser, "Review provider setup");
+        assert!(!parser.screen().contents().contains(secret));
+        pty.write(b"\r");
+        wait_for_visible(&mut pty, &mut parser, "Ask Golutra");
+        assert!(!parser.screen().alternate_screen());
+        assert_eq!(
+            parser.screen().mouse_protocol_mode(),
+            vt100::MouseProtocolMode::None
+        );
+        let settings = ProviderSettings::load(&paths.user_config).unwrap();
+        let profile = settings
+            .profiles
+            .iter()
+            .find(|profile| profile.name == "custom")
+            .unwrap();
+        let source = &profile.credential_ref.as_ref().unwrap().source;
+        if environment {
+            assert!(
+                matches!(source, CredentialSource::Environment { key } if key == "GOLUTRA_AGENT_PTY_TEST_KEY")
+            );
+        } else {
+            assert!(matches!(source, CredentialSource::Disk));
+        }
+        assert!(
+            !std::fs::read_to_string(&paths.user_config)
+                .unwrap()
+                .contains(secret)
+        );
+        let credentials_path = home.path().join("credentials.json");
+        if environment {
+            // 最后一个本地凭据被替换后，存储层会移除空文件。
+            assert!(!credentials_path.exists());
+        } else {
+            assert!(
+                std::fs::read_to_string(credentials_path)
+                    .unwrap()
+                    .contains(secret)
+            );
+        }
+    }
+    submit(&mut pty, &mut parser, "/quit");
+    assert!(pty.wait().1.success());
+}
+
+#[test]
 fn auth_keeps_fullscreen_keyboard_navigation_and_native_mouse_selection() {
     let home = tempdir().unwrap();
     let workspace = tempdir().unwrap();
