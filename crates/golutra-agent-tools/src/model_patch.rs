@@ -26,6 +26,10 @@ pub(crate) enum ModelPatchFileKind {
         lines: Vec<String>,
         no_newline: bool,
     },
+    Replace {
+        lines: Vec<String>,
+        no_newline: bool,
+    },
     Delete,
 }
 
@@ -67,7 +71,7 @@ pub(crate) fn parse(input: &str) -> Result<ModelPatch, String> {
         return Err("patch must start with *** Begin Patch".to_owned());
     }
 
-    let mut files = Vec::new();
+    let mut files: Vec<ModelPatchFile> = Vec::new();
     let mut seen_path_identities = BTreeSet::new();
     let mut index = 1_usize;
     let mut ended = false;
@@ -96,7 +100,17 @@ pub(crate) fn parse(input: &str) -> Result<ModelPatch, String> {
         } else {
             return Err(format!("unsupported patch control line: {line}"));
         };
-        if !seen_path_identities.insert(lexical_path_identity(&path)) {
+        // 删除后在同一原始路径新增表示完整替换；合并后仍走整批 git apply 校验，
+        // 不真的先删除文件。词法别名不能据此绕过已有路径冲突检查。
+        let replacement = (kind == "add")
+            .then(|| {
+                files.iter().position(|file| {
+                    file.path.as_os_str() == path.as_os_str()
+                        && matches!(file.kind, ModelPatchFileKind::Delete)
+                })
+            })
+            .flatten();
+        if !seen_path_identities.insert(lexical_path_identity(&path)) && replacement.is_none() {
             return Err(format!(
                 "patch names the file more than once: {}",
                 path.display()
@@ -146,11 +160,18 @@ pub(crate) fn parse(input: &str) -> Result<ModelPatch, String> {
             }
             _ => unreachable!("patch kind is selected above"),
         };
-        files.push(ModelPatchFile {
-            path,
-            move_path,
-            kind: file_kind,
-        });
+        if let Some(previous) = replacement {
+            let ModelPatchFileKind::Add { lines, no_newline } = file_kind else {
+                unreachable!("only Add File can complete a replacement")
+            };
+            files[previous].kind = ModelPatchFileKind::Replace { lines, no_newline };
+        } else {
+            files.push(ModelPatchFile {
+                path,
+                move_path,
+                kind: file_kind,
+            });
+        }
     }
 
     if !ended {
@@ -400,6 +421,19 @@ pub(crate) fn render(
                 }
                 let edited = join_lines(lines, !no_newline);
                 append_diff(&mut output, &file.path, "", &edited, false, true)?;
+            }
+            ModelPatchFileKind::Replace { lines, no_newline } => {
+                let original = originals.get(&file.path).ok_or_else(|| {
+                    format!("replacement target does not exist: {}", file.path.display())
+                })?;
+                let original = std::str::from_utf8(original).map_err(|_| {
+                    format!(
+                        "replacement target is not valid UTF-8: {}",
+                        file.path.display()
+                    )
+                })?;
+                let edited = join_lines(lines, !no_newline);
+                append_diff(&mut output, &file.path, original, &edited, true, true)?;
             }
             ModelPatchFileKind::Delete => {
                 let original = originals.get(&file.path).ok_or_else(|| {

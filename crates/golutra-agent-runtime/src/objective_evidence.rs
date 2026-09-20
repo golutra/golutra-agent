@@ -75,7 +75,8 @@ pub(super) fn objective_validation_report(
             .get("command")
             .and_then(serde_json::Value::as_str)?;
         let kind = objective_validation_command_kind(command)?;
-        let identity = objective_validation_command_identity(command)?;
+        let identity =
+            validation_identity_in_workdir(objective_validation_command_identity(command)?, report);
         let exited_cleanly = shell_report_exited_cleanly(report);
         let passed = exited_cleanly
             && (kind != ObjectiveValidationKind::Test || test_report_executed_tests(report));
@@ -136,7 +137,8 @@ fn prepared_objective_validation_report(
         .structured_facts
         .get(PREPARED_OBJECTIVE_VALIDATION_FACT)?;
     let kind = ObjectiveValidationKind::from_label(metadata.get("kind")?.as_str()?)?;
-    let identity = metadata.get("identity")?.as_str()?.to_owned();
+    let identity =
+        validation_identity_in_workdir(metadata.get("identity")?.as_str()?.to_owned(), report);
     let exited_cleanly = shell_report_exited_cleanly(report);
     let executed_tests =
         kind != ObjectiveValidationKind::Test || test_report_executed_tests(report);
@@ -158,6 +160,23 @@ fn prepared_objective_validation_report(
         passed,
         message,
     })
+}
+
+/// 使用执行器已经解析的实际目录，避免相同命令在不同子项目之间错误互相复验。
+fn validation_identity_in_workdir(identity: String, report: &ToolExecutionReport) -> String {
+    let Some(workdir) = report
+        .envelope
+        .structured_facts
+        .get("workdir")
+        .and_then(Value::as_str)
+    else {
+        return identity;
+    };
+    let mut digest = Sha256::new();
+    digest.update((identity.len() as u64).to_le_bytes());
+    digest.update(identity.as_bytes());
+    digest.update(workdir.as_bytes());
+    format!("{:x}", digest.finalize())
 }
 
 fn shell_report_exited_cleanly(report: &ToolExecutionReport) -> bool {
@@ -418,6 +437,9 @@ fn objective_validation_command_atoms_with_depth(
             serde_json::to_string(&(program, "stdin", stdin)).ok()?,
         ]);
     }
+    if requires_shell_script_analysis(command)? {
+        return objective_validation_shell_script_atoms(command, wrapper_depth);
+    }
     objective_validation_command_kind_with_depth(command, wrapper_depth)?;
     parts[0] = program;
     Some(vec![serde_json::to_string(&parts).ok()?])
@@ -432,11 +454,20 @@ fn objective_validation_shell_script_atoms(script: &str, wrapper_depth: u8) -> O
     let tree = parser.parse(script, None)?;
     let root = tree.root_node();
     let mut atoms = Vec::new();
-    if !collect_objective_validation_atoms(root, script.as_bytes(), wrapper_depth, &mut atoms)
-        || atoms.is_empty()
+    let mut validation_end = 0;
+    if !collect_objective_validation_atoms(
+        root,
+        script.as_bytes(),
+        wrapper_depth,
+        &mut atoms,
+        &mut validation_end,
+    ) || validation_end == 0
     {
         return None;
     }
+    // 前置/中间步骤造成的目录和环境变化必须参与身份；最后一次验证之后的
+    // 非验证步骤不改变已经执行过的测试，避免附加编译检查造成不必要的复验。
+    atoms.truncate(validation_end);
     Some(atoms)
 }
 
@@ -445,12 +476,19 @@ fn collect_objective_validation_atoms(
     source: &[u8],
     wrapper_depth: u8,
     atoms: &mut Vec<String>,
+    validation_end: &mut usize,
 ) -> bool {
     match node.kind() {
         "program" | "list" => {
             let mut cursor = node.walk();
             for child in node.named_children(&mut cursor) {
-                if !collect_objective_validation_atoms(child, source, wrapper_depth, atoms) {
+                if !collect_objective_validation_atoms(
+                    child,
+                    source,
+                    wrapper_depth,
+                    atoms,
+                    validation_end,
+                ) {
                     return false;
                 }
             }
@@ -464,32 +502,95 @@ fn collect_objective_validation_atoms(
                 objective_validation_command_atoms_with_depth(command.trim(), wrapper_depth)
             {
                 atoms.append(&mut command_atoms);
+                *validation_end = atoms.len();
+                true
+            } else {
+                append_shell_setup_atom(node, source, atoms)
             }
-            true
         }
         "redirected_statement" => {
             if let Some((_, atom)) =
                 objective_validation_python_heredoc(node, source, wrapper_depth)
             {
                 atoms.push(atom);
+                *validation_end = atoms.len();
+                true
+            } else {
+                append_shell_setup_atom(node, source, atoms)
             }
-            true
         }
         "pipeline" | "test_command" => {
             if objective_validation_statement_kind(node, source, wrapper_depth).is_some() {
-                let Ok(statement) = node.utf8_text(source) else {
+                if !append_shell_validation_atom(node, source, atoms) {
                     return false;
-                };
-                let Ok(atom) = serde_json::to_string(&(node.kind(), statement.trim())) else {
-                    return false;
-                };
-                atoms.push(atom);
+                }
+                *validation_end = atoms.len();
+                true
+            } else {
+                append_shell_setup_atom(node, source, atoms)
             }
-            true
         }
-        "comment" | "variable_assignment" => true,
+        "comment" => true,
+        "variable_assignment" => append_shell_validation_atom(node, source, atoms),
         _ => false,
     }
+}
+
+/// 外部进程不能改变父 Shell 的环境；工程文件变化另由新鲜度检查处理。
+/// 这里保留有上下文副作用的 Shell 内建命令与赋值，不把所有修复命令都变成新验证。
+fn shell_setup_changes_context(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    if node.kind() == "variable_assignment" {
+        return true;
+    }
+    if node.kind() == "command" {
+        let Some(parts) = node.utf8_text(source).ok().and_then(shlex::split) else {
+            return true;
+        };
+        return matches!(
+            parts.first().map(String::as_str),
+            Some(
+                "cd" | "pushd"
+                    | "popd"
+                    | "read"
+                    | "readarray"
+                    | "mapfile"
+                    | "getopts"
+                    | "let"
+                    | "shift"
+                    | "set"
+                    | "shopt"
+                    | "umask"
+                    | "ulimit"
+            )
+        ) || (parts.first().is_some_and(|part| part == "printf")
+            && parts.iter().any(|part| part == "-v"));
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| shell_setup_changes_context(child, source))
+}
+
+fn append_shell_setup_atom(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    atoms: &mut Vec<String>,
+) -> bool {
+    !shell_setup_changes_context(node, source) || append_shell_validation_atom(node, source, atoms)
+}
+
+fn append_shell_validation_atom(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    atoms: &mut Vec<String>,
+) -> bool {
+    let Ok(statement) = node.utf8_text(source) else {
+        return false;
+    };
+    let Ok(atom) = serde_json::to_string(&(node.kind(), statement.trim())) else {
+        return false;
+    };
+    atoms.push(atom);
+    true
 }
 
 fn objective_validation_command_kind_with_depth(
@@ -519,6 +620,9 @@ fn objective_validation_command_kind_with_depth(
             && parts.len() == 2
             && python_source_asserts_runtime_state(&stdin))
         .then_some(ObjectiveValidationKind::Diagnostic);
+    }
+    if requires_shell_script_analysis(command)? {
+        return objective_validation_shell_script_kind(command, wrapper_depth);
     }
     match program {
         "cargo" => cargo_validation_kind(&parts),
@@ -553,6 +657,20 @@ fn objective_validation_command_kind_with_depth(
         "swift" => swift_validation_kind(&parts),
         _ => None,
     }
+}
+
+/// shlex 只解码 argv，不能判断连接符、管道或后台执行；直接脚本与显式 Shell 包装复用同一语义。
+fn requires_shell_script_analysis(command: &str) -> Option<bool> {
+    let mut parser = tree_sitter::Parser::new();
+    parser
+        .set_language(&tree_sitter_bash::LANGUAGE.into())
+        .ok()?;
+    let tree = parser.parse(command, None)?;
+    let root = tree.root_node();
+    if root.has_error() {
+        return None;
+    }
+    Some(root.child_count() != 1 || root.child(0)?.kind() != "command")
 }
 
 const CARGO_OPTIONS_WITH_VALUES: &[&str] = &[
@@ -797,6 +915,14 @@ fn objective_validation_shell_script_kind(
     }
 
     let source = script.as_bytes();
+    // 后台启动只证明 Shell 接受了任务，不能将启动成功当作测试终态。
+    if (0..root.child_count()).any(|index| {
+        root.child(index).is_some_and(|child| {
+            !child.is_named() && child.utf8_text(source).is_ok_and(|text| text == "&")
+        })
+    }) {
+        return None;
+    }
     if root.named_child_count() == 1 {
         let statement = root.named_child(0)?;
         if let Some((kind, _)) =

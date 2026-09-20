@@ -29,6 +29,8 @@ mod long_task_compaction_tests;
 mod long_task_correction_tests;
 #[path = "unlimited_task_tests.rs"]
 mod unlimited_task_tests;
+#[path = "validation_shell_tests.rs"]
+mod validation_shell_tests;
 
 use golutra_agent_context::{
     ContextBudgetPolicy, ContextBuilder, ContextContributor, ContextMessageSource,

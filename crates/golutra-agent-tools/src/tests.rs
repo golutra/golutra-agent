@@ -17,6 +17,9 @@ use super::*;
 mod terminal_tests;
 use crate::builtin::contract;
 
+#[path = "replacement_patch_tests.rs"]
+mod replacement_patch_tests;
+
 #[test]
 fn only_typed_preflight_argument_errors_receive_the_admission_recovery_marker() {
     let workspace = tempdir().unwrap();

@@ -2649,6 +2649,7 @@ impl ToolRuntime {
                 file.kind,
                 model_patch::ModelPatchFileKind::Update(_)
                     | model_patch::ModelPatchFileKind::Delete
+                    | model_patch::ModelPatchFileKind::Replace { .. }
             );
             let source_path =
                 self.resolve_tool_path("apply_patch", &file.path, source_requires_existing)?;
