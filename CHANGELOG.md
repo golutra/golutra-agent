@@ -6,6 +6,44 @@ follow [Semantic Versioning](https://semver.org/) where applicable.
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-09-20
+
+### Changed
+
+- Long-running tasks no longer have implicit elapsed-time, tool-call, cost,
+  correction-round or no-progress cutoffs. Explicit budgets, cancellation,
+  permissions and protocol errors remain authoritative.
+- Recoverable connection outages wait and resume the same logical request;
+  background work can continue during recovery. HTTP, authentication and
+  configuration failures retain their classified retry boundaries.
+- Context compaction and resume preserve original requirements, user steering
+  and complete tool-call/result groups. Recovery and task state are observable
+  without injecting an additional supervising model.
+- Tool contracts and correction feedback expose actionable execution facts,
+  bounded error output and current validation evidence with less repeated work.
+
+### Fixed
+
+- Normalize provider completion, truncation and transport failure handling across
+  adapters, so incomplete responses continue without claiming task completion.
+- Avoid stale exploration obligations and redundant revalidation after verified
+  source-derived cache changes; retain verification after actual source edits.
+- Give direct and explicitly wrapped compound Shell commands consistent
+  validation semantics, bind checks to their working directory and Shell context,
+  and reject masked failures or background launch success as completed checks.
+- Treat Delete File followed by Add File at the same exact path as one atomic
+  replacement, retaining collision checks, batch validation and file permissions.
+- Preserve environment expansion in Shell commands and useful head/tail evidence
+  from long tool output; keep repeated-read results and execution timing observable.
+
+### Validation
+
+- Added real-process, provider-stream, outage-recovery, compaction, correction and
+  patch regressions, plus reproducible cross-domain coding comparisons.
+- Archived favorable and unfavorable samples. Short coding comparisons and a
+  120-second connection-outage test do not establish universal or multi-hour
+  superiority over other agents; see the dated research reports in `docs/`.
+
 ## [0.3.1] - 2026-09-19
 
 ### Fixed
@@ -117,7 +155,8 @@ This is the initial public development baseline. See the repository history
 and [architecture documentation](docs/ARCHITECTURE.md) for the implementation
 details and current compatibility boundaries.
 
-[unreleased]: https://github.com/golutra/golutra-agent/compare/v0.3.1...HEAD
+[unreleased]: https://github.com/golutra/golutra-agent/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/golutra/golutra-agent/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/golutra/golutra-agent/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/golutra/golutra-agent/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/golutra/golutra-agent/compare/v0.1.0...v0.2.0
