@@ -215,7 +215,7 @@ fn default_task_contract(request: &AgentTaskRequest) -> TaskContract {
 }
 
 fn open_task_contract(request: &AgentTaskRequest) -> TaskContract {
-    let mut contract = TaskContract::conversational(request.completion_criteria.clone());
+    let mut contract = TaskContract::open(request.completion_criteria.clone());
     if request.touched_code {
         contract.workspace_change = WorkspaceChangeRequirement::Required;
         contract.require_objective_validation = true;
@@ -500,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn open_mode_does_not_add_a_correction_round_for_workspace_changes() {
+    fn open_mode_checks_completion_with_bounded_correction() {
         let mut request = request();
         request.touched_code = true;
         let run =
@@ -511,7 +511,10 @@ mod tests {
             WorkspaceChangeRequirement::Required
         );
         assert!(run.task_contract.require_objective_validation);
-        assert_eq!(run.task_contract.max_correction_rounds, 0);
+        assert_eq!(
+            run.task_contract.max_correction_rounds,
+            golutra_agent_core::MAX_TASK_CORRECTION_ROUNDS
+        );
     }
 
     #[test]

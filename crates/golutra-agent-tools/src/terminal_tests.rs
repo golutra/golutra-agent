@@ -294,6 +294,10 @@ async fn read_terminal(
     args.as_object_mut()
         .unwrap()
         .extend(extra.as_object().unwrap().clone());
+    if args["action"] == "terminate" {
+        args.as_object_mut().unwrap().remove("wait_ms");
+        args.as_object_mut().unwrap().remove("wait_for_terminal");
+    }
     executor
         .execute(
             request_for_session(session, "shell_session", args),

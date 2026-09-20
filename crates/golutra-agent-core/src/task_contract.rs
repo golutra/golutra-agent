@@ -79,6 +79,17 @@ impl Default for TaskContract {
 }
 
 impl TaskContract {
+    /// 日常执行同样检查已观察到的交付证据；没有副作用的普通回答不产生额外模型调用。
+    /// 显式合同仍可设置零轮，自动纠偏另受全局预算与跨轮无进展窗口约束。
+    #[must_use]
+    pub fn open(completion_criteria: Vec<String>) -> Self {
+        Self {
+            completion_criteria,
+            max_correction_rounds: MAX_TASK_CORRECTION_ROUNDS,
+            ..Self::default()
+        }
+    }
+
     #[must_use]
     pub fn conversational(completion_criteria: Vec<String>) -> Self {
         Self {

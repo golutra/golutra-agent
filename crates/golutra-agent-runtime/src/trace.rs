@@ -105,6 +105,10 @@ pub enum AgentLoopTraceEvent {
         attempt: u32,
         reason: String,
     },
+    ProviderRecovery {
+        request_id: ProviderRequestId,
+        recovery: super::ProviderRecovery,
+    },
     ProviderFallback {
         from_provider: String,
         to_provider: String,

@@ -2036,10 +2036,11 @@ fn file_cards_show_numbered_diff_and_open_saved_multi_file_changes() {
     let new = (1..=100)
         .map(|n| format!("新行-{n:03}\n"))
         .collect::<String>();
-    std::fs::write(workspace.path().join("sample.txt"), &old).unwrap();
-    std::fs::write(workspace.path().join("gone.txt"), "remove me\n").unwrap();
+    // 纯展示夹具使用文档文件，不触发行为变更的独立验证；查看详情仍必须零额外模型请求。
+    std::fs::write(workspace.path().join("sample.md"), &old).unwrap();
+    std::fs::write(workspace.path().join("gone.md"), "remove me\n").unwrap();
     let patch = format!(
-        "*** Begin Patch\n*** Update File: sample.txt\n@@\n{}{}*** Add File: added.txt\n+hello world\n*** Delete File: gone.txt\n*** End Patch\n",
+        "*** Begin Patch\n*** Update File: sample.md\n@@\n{}{}*** Add File: added.md\n+hello world\n*** Delete File: gone.md\n*** End Patch\n",
         old.lines()
             .map(|line| format!("-{line}\n"))
             .collect::<String>(),
@@ -2078,7 +2079,7 @@ fn file_cards_show_numbered_diff_and_open_saved_multi_file_changes() {
         "added and removed backgrounds extend past the code"
     );
     assert_eq!(
-        std::fs::read_to_string(workspace.path().join("sample.txt")).unwrap(),
+        std::fs::read_to_string(workspace.path().join("sample.md")).unwrap(),
         new
     );
     pty.write(b"\x0f");

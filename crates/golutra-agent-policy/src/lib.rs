@@ -1107,6 +1107,8 @@ pub fn contains_shell_metacharacter(command: &str) -> bool {
             Some('"') => match character {
                 '"' => quote = None,
                 '\\' => escaped = true,
+                // 双引号只保护分词，不抑制变量和命令替换；不能把它们当作惰性 argv。
+                '$' | '`' => return true,
                 _ => {}
             },
             Some(_) => unreachable!("quote state only stores shell quote characters"),
@@ -1634,6 +1636,31 @@ mod tests {
             assert_eq!(
                 policy.evaluate_shell(command).block_disposition,
                 Some(PolicyBlockDisposition::Recoverable),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn guarded_quoted_expansions_require_an_explicit_shell() {
+        let workspace = tempdir().expect("workspace");
+        let policy = WorkspacePolicy::new(workspace.path()).expect("policy");
+        for command in [
+            r#"printf '%s' "$PWD""#,
+            r#"printf '%s' "$(pwd)""#,
+            r#"printf '%s' "`pwd`""#,
+        ] {
+            let evaluation = policy.evaluate_shell(command);
+            assert_eq!(evaluation.decision, PolicyDecision::Block, "{command}");
+            assert_eq!(
+                evaluation.block_disposition,
+                Some(PolicyBlockDisposition::Recoverable)
+            );
+        }
+        for command in [r#"printf '%s' '$PWD'"#, r#"printf '%s' "\$PWD""#] {
+            assert_ne!(
+                policy.evaluate_shell(command).decision,
+                PolicyDecision::Block,
                 "{command}"
             );
         }

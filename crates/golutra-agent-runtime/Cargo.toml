@@ -42,4 +42,4 @@ uuid.workspace = true
 
 [dev-dependencies]
 golutra-agent-sandbox.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

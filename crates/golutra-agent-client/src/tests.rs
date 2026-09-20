@@ -563,7 +563,7 @@ fn strict_wire_mode_builds_completion_contract_without_prompt_heuristics() {
 }
 
 #[test]
-fn open_wire_mode_uses_conversational_contract_without_implicit_correction() {
+fn open_wire_mode_checks_completion_without_requiring_unrequested_changes() {
     let contract = task_contract_from_payload(&json!({
         "execution_mode": "open",
         "prompt": "summarize the workspace",
@@ -575,7 +575,10 @@ fn open_wire_mode_uses_conversational_contract_without_implicit_correction() {
         contract.completion_criteria,
         vec!["include the key findings"]
     );
-    assert_eq!(contract.max_correction_rounds, 0);
+    assert_eq!(
+        contract.max_correction_rounds,
+        golutra_agent_core::MAX_TASK_CORRECTION_ROUNDS
+    );
     assert!(!contract.require_objective_validation);
     assert_eq!(
         contract.verification,
@@ -840,6 +843,38 @@ fn provider_transport_fallback_event_preserves_recovery_facts() {
     assert_eq!(payload["from_transport"], "streaming");
     assert_eq!(payload["to_transport"], "buffered");
     assert_eq!(payload["reason"], "stream idle for 300000 ms");
+}
+
+#[test]
+fn provider_recovery_boundary_is_required_and_preserves_request_identity() {
+    use golutra_agent_runtime::{ProviderRecovery, ProviderTransport, RecoveryPhase};
+    let request_id = golutra_agent_core::ProviderRequestId::new();
+    let event = RuntimeObservation::ProviderRecovery {
+        request_id,
+        recovery: ProviderRecovery {
+            phase: RecoveryPhase::Waiting,
+            attempt: 2,
+            delay_ms: 120_000,
+            waited_ms: 5000,
+            network: false,
+            reset_stream: true,
+            reason: "rate limited".into(),
+            transport: ProviderTransport::Streaming,
+            error_metadata: Some(golutra_agent_llm::ProviderErrorMetadata {
+                http_status: Some(429),
+                ..Default::default()
+            }),
+        },
+    };
+    let descriptor = observation_descriptor(&event);
+    assert_eq!(descriptor.integrity, ObservationIntegrityClass::Required);
+    let (kind, source, payload) = trace_event_payload(event).unwrap();
+    assert_eq!(kind, RuntimeEventType::RetryScheduled);
+    assert_eq!(source, RuntimeEventSource::Provider);
+    assert_eq!(payload["provider_request_id"], request_id.to_string());
+    assert_eq!(payload["recovery"]["error_metadata"]["http_status"], 429);
+    assert_eq!(payload["recovery"]["phase"], "waiting");
+    assert_eq!(payload["recovery"]["reset_stream"], true);
 }
 
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
@@ -1607,6 +1642,23 @@ async fn delegated_task_inherits_overrides_and_archives_an_isolated_child() {
         .expect("child thread");
     assert_eq!(inherited_thread.parent_thread_id, Some(parent_thread_id));
     assert!(inherited_thread.archived);
+    let visible_children =
+        golutra_agent_tools::TaskDelegationBackend::status(&backend, parent_session_id)
+            .await
+            .expect("bounded parent status");
+    assert!(
+        visible_children["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|child| child["child_session_id"] == json!(inherited_session_id))
+    );
+    assert!(!visible_children.to_string().contains("requested_model"));
+    let foreign_children =
+        golutra_agent_tools::TaskDelegationBackend::status(&backend, SessionId::new())
+            .await
+            .expect("unrelated session has no children");
+    assert_eq!(foreign_children["children"], json!([]));
     let inherited_events = host
         .storage
         .repositories
@@ -8480,7 +8532,7 @@ async fn persisted_ephemeral_runtime_retains_isolated_state_and_full_run_bundle(
         },
     };
     let checkpoint = RunBundleExporter::new(&runtime_transport)
-        .checkpoint(RunBundleExportRequest {
+        .checkpoint_fast(RunBundleExportRequest {
             destination: state_dir.clone(),
             selection: selection.clone(),
             terminal_outcome: RunBundleTerminalOutcome::InProgress {
@@ -8571,6 +8623,20 @@ async fn persisted_ephemeral_runtime_retains_isolated_state_and_full_run_bundle(
             .any(|event| event.event_type == RuntimeEventType::MemoryCandidateQuarantined)
     );
 
+    let delivery = RunBundleExporter::new(&runtime_transport)
+        .export_delivery(RunBundleExportRequest {
+            destination: state_dir.clone(),
+            selection: selection.clone(),
+            terminal_outcome: RunBundleTerminalOutcome::Result {
+                result: result.clone(),
+            },
+        })
+        .await
+        .expect("durable delivery without debug projection");
+    assert!(delivery.debug_export_path.is_none());
+    assert!(delivery.debug_export_error.is_none());
+    assert!(state_dir.join("state/runtime.sqlite").is_file());
+    assert!(!state_dir.join("debug-export").exists());
     let receipt = RunBundleExporter::new(&runtime_transport)
         .export(RunBundleExportRequest {
             destination: state_dir.clone(),

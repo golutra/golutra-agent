@@ -17,6 +17,60 @@ use super::*;
 mod terminal_tests;
 use crate::builtin::contract;
 
+#[test]
+fn only_typed_preflight_argument_errors_receive_the_admission_recovery_marker() {
+    let workspace = tempdir().unwrap();
+    let executor = executor(workspace.path());
+    let call = request("write_file", json!("invalid"));
+    let error = executor.evaluate(&call).unwrap_err();
+    let admission = executor.argument_rejection_report(call.clone(), &error);
+    assert_eq!(
+        admission.envelope.structured_facts["rejected_before_execution"],
+        true
+    );
+    let policy = executor.invalid_request_report(call.clone(), "profile forbids writes");
+    assert!(
+        policy
+            .envelope
+            .structured_facts
+            .get("rejected_before_execution")
+            .is_none()
+    );
+    let unknown =
+        executor.argument_rejection_report(call, &ToolError::UnknownTool("unregistered".into()));
+    assert!(
+        unknown
+            .envelope
+            .structured_facts
+            .get("rejected_before_execution")
+            .is_none()
+    );
+}
+
+#[test]
+fn duplicate_patch_paths_are_rejected_before_checkpoint_without_io_diagnostics() {
+    let workspace = tempdir().unwrap();
+    let executor = executor(workspace.path());
+    let call = request(
+        "apply_patch",
+        json!({"patch":"*** Begin Patch\n*** Add File: checkpoint.py\n+one\n*** Add File: checkpoint.py\n+two\n*** End Patch\n"}),
+    );
+    let error = executor.evaluate(&call).unwrap_err();
+    let report = executor.argument_rejection_report(call, &error);
+    assert_eq!(
+        report.envelope.structured_facts["rejected_before_execution"],
+        true
+    );
+    assert!(report.envelope.structured_facts.get("error_kind").is_none());
+    assert!(
+        report.envelope.structured_facts["error"]
+            .as_str()
+            .unwrap()
+            .contains("more than once")
+    );
+    assert!(!workspace.path().join("checkpoint.py").exists());
+}
+
 #[cfg(unix)]
 #[path = "shell_integration_tests.rs"]
 mod shell_integration_tests;
@@ -275,6 +329,7 @@ async fn registry_contains_p0_tools() {
             "apply_patch",
             "shell_session",
             "subagent",
+            "runtime_status",
         ]
     );
     assert!(registry.contract("list_dir").is_some());
@@ -490,7 +545,7 @@ fn shell_contract_explains_how_to_submit_compound_commands() {
     assert!(description.contains("bash -lc"));
     assert!(description.contains("pipes"));
     assert!(description.contains("heredoc"));
-    assert!(description.contains("prefer omitting argv"));
+    assert!(description.contains("Non-empty command"));
     let argv = contract.input_schema["properties"]["argv"]["description"]
         .as_str()
         .expect("argv description");
@@ -530,6 +585,197 @@ fn shell_contract_explains_how_to_submit_compound_commands() {
 #[test]
 fn background_start_default_is_non_blocking() {
     assert_eq!(super::process_supervisor::default_start_wait_ms(), 0);
+}
+
+#[tokio::test]
+async fn benchmark_shell_admission_regressions_preserve_effects_and_hard_limits() {
+    let root = tempdir().unwrap();
+    let executor = executor(root.path()).with_sandbox(SystemSandbox::process_only());
+    let report = execute_approved(
+        &executor,
+        request(
+            "shell",
+            json!({
+                "command":"", "argv":["printf", "hello"]
+            }),
+        ),
+        CancellationToken::new(),
+    )
+    .await;
+    assert_eq!(report.envelope.status, ToolResultStatus::Ok);
+    assert!(artifact_text(&report).contains("hello"));
+    for value in [30_001, 120_000, u64::MAX] {
+        let report = execute_approved(
+            &executor,
+            request(
+                "shell",
+                json!({
+                    "command":"printf done", "yield_time_ms":value
+                }),
+            ),
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(report.envelope.status, ToolResultStatus::Ok);
+        assert_eq!(
+            report.envelope.structured_facts["effective_yield_time_ms"],
+            30_000
+        );
+        let (header, _) =
+            parse_model_visible_tool_result(&model_visible_tool_result(&report.envelope));
+        assert_eq!(
+            header["structured_facts"]["effective_yield_time_ms"],
+            30_000
+        );
+    }
+    for script in [
+        "printf a; printf b",
+        "printf a\nprintf b",
+        "printf 'a b'",
+        "printf a",
+    ] {
+        let call = request(
+            "shell",
+            json!({
+                "command":"sh -c 'printf conflicting'", "argv":["sh", "-c", script]
+            }),
+        );
+        assert!(matches!(
+            executor.evaluate(&call),
+            Err(ToolError::InvalidArguments(_))
+        ));
+    }
+    for args in [
+        json!({"command":""}),
+        json!({"command":"printf nope", "timeout_ms":86_400_001}),
+        json!({"command":"printf nope", "yield_time_ms":-1}),
+    ] {
+        assert!(executor.evaluate(&request("shell", args)).is_err());
+    }
+    let report = executor
+        .execute(
+            request(
+                "shell_session",
+                json!({
+                    "action":"list", "process_id":"", "authoritative_pid":0,
+                    "cursor":0, "input":"", "max_output_bytes":10000,
+                    "wait_for_terminal":false, "wait_ms":0, "offset":0, "limit":64
+                }),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.envelope.status, ToolResultStatus::Ok);
+    assert_eq!(
+        report.envelope.structured_facts["ignored_arguments"],
+        json!([
+            "input",
+            "process_id",
+            "authoritative_pid",
+            "cursor",
+            "max_output_bytes",
+            "wait_ms",
+            "wait_for_terminal"
+        ])
+    );
+    for args in [
+        json!({"action":"write", "process_id":""}),
+        json!({"action":"terminate", "process_id":"proc", "authoritative_pid":0}),
+        json!({"action":"read", "process_id":"proc", "input":"danger\n"}),
+        json!({"action":"list", "process_id":"proc"}),
+        json!({"action":"list", "input":"danger\n"}),
+        json!({"action":"list", "limit":65}),
+    ] {
+        assert!(executor.evaluate(&request("shell_session", args)).is_err());
+    }
+}
+
+#[tokio::test]
+async fn checkpoint_filename_does_not_change_patch_error_origin() {
+    let root = tempdir().unwrap();
+    let content = "same\nother\nsame\n";
+    fs::write(root.path().join("checkpoint.py"), content).unwrap();
+    let executor = executor(root.path());
+    let call = request(
+        "apply_patch",
+        json!({"patch":
+        "*** Begin Patch\n*** Update File: checkpoint.py\n@@\n-same\n+changed\n*** End Patch"}),
+    );
+    let policy = executor.evaluate(&call).unwrap();
+    let error = executor
+        .execute(call.clone(), CancellationToken::new())
+        .await
+        .unwrap_err();
+    let report = executor
+        .execution_error_report_with_hints(call, policy, error.to_string())
+        .await;
+    let facts = &report.envelope.structured_facts;
+    assert_eq!(facts["error_kind"], "patch_context_ambiguous");
+    assert!(facts.get("action_required").is_none());
+    assert!(facts.get("error_origin").is_none());
+    assert_eq!(
+        fs::read_to_string(root.path().join("checkpoint.py")).unwrap(),
+        content
+    );
+}
+
+#[tokio::test]
+async fn runtime_status_is_session_scoped_and_wait_accepts_only_neutral_placeholders() {
+    let root = tempdir().unwrap();
+    let executor = executor(root.path()).with_sandbox(SystemSandbox::process_only());
+    let session = SessionId::new();
+    let start = execute_approved(
+        &executor,
+        request_for_session(
+            session,
+            "shell",
+            json!({
+                "command":"sleep 1", "background":true, "yield_time_ms":0
+            }),
+        ),
+        CancellationToken::new(),
+    )
+    .await;
+    let id = &start.envelope.structured_facts["process_id"];
+    for (query_session, expected) in [(session, 1), (SessionId::new(), 0)] {
+        let status = executor
+            .execute(
+                request_for_session(query_session, "runtime_status", json!({})),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            status.envelope.structured_facts["running_process_count"],
+            expected
+        );
+        assert!(!model_visible_tool_result(&status.envelope).contains("sleep 1"));
+    }
+    let waited = executor
+        .execute(
+            request_for_session(
+                session,
+                "shell_session",
+                json!({
+                    "action":"wait", "process_id":id, "input":"", "offset":0, "limit":4,
+                    "wait_for_terminal":true, "wait_ms":120000
+                }),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(waited.envelope.structured_facts["process_id"], *id);
+    assert_eq!(waited.envelope.structured_facts["effective_wait_ms"], 30000);
+    assert_eq!(
+        waited.envelope.structured_facts["ignored_arguments"],
+        json!(["offset", "limit", "input"])
+    );
+    assert_eq!(waited.envelope.status, ToolResultStatus::Ok);
+    for args in [json!({"session_id":session}), json!({"task_id":"other"})] {
+        assert!(executor.evaluate(&request("runtime_status", args)).is_err());
+    }
 }
 
 #[tokio::test]
@@ -1383,7 +1629,7 @@ fn checkpoint_failure_exposes_parent_action_without_hiding_raw_error() {
         json!({"path": "nested/deep/checkpoint.json", "content": "{}"}),
     );
     let policy = executor.evaluate(&request).expect("policy evaluates");
-    let report = executor.execution_error_report(
+    let report = executor.checkpoint_error_report(
         request,
         policy,
         "before-side-effect checkpoint failed: checkpoint persistence failed: checkpoint io failed: No such file or directory (os error 2)",
@@ -3560,7 +3806,7 @@ fn shell_parser_implicitly_wraps_compound_commands_only_for_unrestricted_executi
         .expect("unrestricted compound command");
 
     assert_eq!(command.program, "bash");
-    assert_eq!(command.args, ["-lc", "printf ok | tr o O"]);
+    assert_eq!(command.args, ["-c", "printf ok | tr o O"]);
     assert_eq!(command.stdin, None);
     assert!(matches!(
         CommandLine::parse_for_execution("printf ok | tr o O", false),
@@ -3579,6 +3825,87 @@ fn shell_parser_preserves_multiline_explicit_wrapper_scripts() {
     assert!(command.args[1].contains("python - <<'PY'"));
     assert!(command.args[1].contains("print('ok')"));
     assert_eq!(command.stdin, None);
+}
+
+#[cfg(unix)]
+#[test]
+fn implicit_shell_preserves_the_inherited_executable_search_path() {
+    // 复合脚本不应经登录配置把已选工具链换成系统旧版本；显式 -lc 的测试仍保留。
+    let parsed =
+        CommandLine::parse_for_execution("printf '%s' \"$PATH\"; printf '\\n'", true).unwrap();
+    let expected = "/golutra-agent-path-probe:/usr/bin:/bin";
+    let output = std::process::Command::new(parsed.program)
+        .args(parsed.args)
+        .env("PATH", expected)
+        .env_remove("BASH_ENV")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), expected);
+}
+
+#[cfg(unix)]
+#[test]
+fn implicit_shell_expands_double_quoted_variables_without_corrupting_literals() {
+    let workspace = tempdir().unwrap();
+    let expected = fs::canonicalize(workspace.path()).unwrap();
+    for (script, expected_output) in [
+        (
+            "printf '%s' \"$PWD\"",
+            expected.to_string_lossy().into_owned(),
+        ),
+        (
+            "printf '%s' \"${PWD}\"",
+            expected.to_string_lossy().into_owned(),
+        ),
+        ("printf '%s' \"$(printf value)\"", "value".into()),
+        ("printf '%s' '$PWD'", "$PWD".into()),
+        ("printf '%s' \"\\$PWD\"", "$PWD".into()),
+    ] {
+        let command = CommandLine::parse_for_execution(script, true).unwrap();
+        let output = std::process::Command::new(command.program)
+            .args(command.args)
+            .current_dir(workspace.path())
+            .env_remove("BASH_ENV")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{script}");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            expected_output,
+            "{script}"
+        );
+    }
+    // 受保护模式仍不隐式执行需要 shell 展开的代码。
+    assert!(CommandLine::parse_for_execution("printf '%s' \"$PWD\"", false).is_err());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn quoted_command_substitution_keeps_workspace_mutation_tracking() {
+    let workspace = tempdir().unwrap();
+    let runtime = ToolRuntime::new(
+        WorkspacePolicy::new(workspace.path())
+            .unwrap()
+            .with_unrestricted_access(true),
+    );
+    let arguments = json!({"command": "printf '%s' \"$(printf tracked > created.txt)\""});
+    assert!(!shell_request_is_strictly_read_only(&arguments));
+    let report = runtime
+        .execute(request("shell", arguments), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(report.envelope.status, ToolResultStatus::Ok);
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("created.txt")).unwrap(),
+        "tracked"
+    );
+    assert!(
+        report
+            .changed_files
+            .iter()
+            .any(|path| path.ends_with("created.txt"))
+    );
 }
 
 #[test]

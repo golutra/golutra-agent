@@ -1234,7 +1234,7 @@ pub(crate) fn task_contract_from_payload(payload: &Value) -> Result<TaskContract
                 execution_mode,
                 crate::task_mode::NormalizedExecutionMode::Open
             ) {
-                TaskContract::conversational(criteria)
+                TaskContract::open(criteria)
             } else {
                 TaskContract {
                     completion_criteria: criteria,

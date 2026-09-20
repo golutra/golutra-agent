@@ -690,6 +690,12 @@ pub(crate) fn observation_descriptor(observation: &RuntimeObservation) -> Observ
             RuntimeEventSource::User,
             ObservationIntegrityClass::Required,
         ),
+        RuntimeObservation::ProviderRecovery { .. } => (
+            RuntimeEventType::RetryScheduled,
+            RuntimeEventSource::Provider,
+            // 丢失此边界会导致重放时拼接不同尝试的正文，必须持久化。
+            ObservationIntegrityClass::Required,
+        ),
         RuntimeObservation::RetryScheduled { .. } => (
             RuntimeEventType::RetryScheduled,
             RuntimeEventSource::Runtime,
@@ -1125,6 +1131,18 @@ pub(crate) fn trace_event_payload(
                 "summary": format!("provider retry attempt {attempt}"),
                 "attempt": attempt,
                 "reason": reason,
+            }),
+        )),
+        AgentLoopTraceEvent::ProviderRecovery {
+            request_id,
+            recovery,
+        } => Some((
+            RuntimeEventType::RetryScheduled,
+            RuntimeEventSource::Provider,
+            json!({
+                "summary": "provider recovery state changed",
+                "provider_request_id": request_id,
+                "recovery": recovery,
             }),
         )),
         AgentLoopTraceEvent::ProviderFallback {

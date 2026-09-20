@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, HashSet, VecDeque},
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
@@ -25,13 +25,13 @@ use golutra_agent_core::{
     ToolRecoveryPolicy, ToolResultEnvelope, ToolResultStatus, TurnId, TurnState,
     UserQuestionPrompt, UserQuestionRequest, UserQuestionResolution, UserStep, UserStepId,
     UserStepKind, VerificationCheck, VerificationCheckKind, VerificationPlan, VerificationRecord,
-    VerificationResult, WorkspaceChangeRequirement, summarize_user_tool_batch,
-    user_step_tool_from_envelope,
+    VerificationRequirement, VerificationResult, WorkspaceChangeRequirement,
+    summarize_user_tool_batch, user_step_tool_from_envelope,
 };
 #[cfg(test)]
 use golutra_agent_core::{
-    RequiredFileContent, UserQuestionAnswer, VerificationRequirement,
-    infer_direct_legacy_write_path, infer_legacy_write_objective,
+    RequiredFileContent, UserQuestionAnswer, infer_direct_legacy_write_path,
+    infer_legacy_write_objective,
 };
 use golutra_agent_governor::{
     GoalLedger, GovernorAction, GovernorObservation, GovernorPhase, RuntimeGovernor,
@@ -201,11 +201,14 @@ use tokio_util::sync::CancellationToken;
 mod checkpoint;
 mod completion;
 mod context_guard;
+mod correction_feedback;
 mod harness;
 mod lane;
 mod objective_evidence;
+mod provider_recovery;
 mod provider_retry;
 mod provider_session;
+mod response_control;
 mod step_machine;
 mod trace;
 mod verification;
@@ -214,6 +217,7 @@ pub use checkpoint::{CheckpointError, WorkspaceCheckpointManager, checkpoint_fin
 pub use golutra_agent_protocol::UserProjection;
 pub use harness::{AgentHarness, AgentRun, ConfiguredAgentRun, RunningTurn};
 pub use lane::{RuntimeLaneError, RuntimeLaneManager, RuntimeTransition, is_active_status};
+pub use provider_recovery::{ProviderRecovery, RecoveryPhase};
 pub use provider_session::{ProviderSessionPolicy, ProviderTransport};
 pub(crate) use step_machine::{
     CorrectionProgressLimits, StepCheckpoint, StepCompletion, StepMachine, StepSnapshot,
@@ -904,6 +908,7 @@ pub struct AgentExecutionControl {
     approvals: mpsc::Receiver<ApprovalResolution>,
     questions: mpsc::Receiver<UserQuestionResolution>,
     approval_grants: Vec<ApprovalGrant>,
+    retry_wait_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1345,6 +1350,7 @@ pub fn agent_execution_channel_with_cancellation(
             approvals: approval_rx,
             questions: question_rx,
             approval_grants: Vec::new(),
+            retry_wait_ms: 0,
         },
     )
 }
@@ -1513,6 +1519,8 @@ where
             .validate()
             .map_err(AgentLoopError::TaskContract)?;
         let mut tool_reports = Vec::new();
+        let mut run_observation = runtime_observation::RunObservation::default();
+        let execution_started_at = Instant::now();
         let mut tool_attempts = Vec::<ToolAttemptMetadata>::new();
         let mut seen_read_facts = HashSet::<ReadFactIdentity>::new();
         let mut last_assistant_message = None;
@@ -1526,6 +1534,7 @@ where
         let mut repeated_failure_count = 0_u32;
         let mut failure_families = FailureFamilyLedger::default();
         let mut empty_response_count = 0_u32;
+        let mut response_control = response_control::ResponseControl::default();
         let default_max_elapsed_ms = self.governor.limits().max_elapsed_ms;
         let mut current_max_elapsed_ms = turn_overrides
             .max_elapsed_ms
@@ -1882,6 +1891,7 @@ where
                         goal_ledger.current_plan = current_completion_criteria.clone();
                         goal_ledger.completed_steps.clear();
                         goal_ledger.open_risks.clear();
+                        response_control = response_control::ResponseControl::default();
                     }
                     control
                         .set_active_execution_surface(current_execution_mode, current_tool_profile);
@@ -1928,6 +1938,7 @@ where
                     );
                 }
                 let step_snapshot = step_machine.begin(current_turn_id);
+                let retry_wait_before_step = control.retry_wait_ms;
                 let iteration = governor_usage
                     .iterations
                     .saturating_add(step_snapshot.step_no);
@@ -2185,6 +2196,12 @@ where
                         });
                     }
                 };
+                let step_wait_ms = control.retry_wait_ms.saturating_sub(retry_wait_before_step);
+                step_machine.exclude_recovery_wait(step_wait_ms);
+                if step_wait_ms >= 60_000 {
+                    // 长等待后允许重新读取先前已去重的事实，不将旧文件内容视为最新状态。
+                    seen_read_facts.clear();
+                }
                 let step_fingerprint = provider_response_fingerprint(&provider_response);
                 if let Some(message) = provider_response
                     .message
@@ -2205,6 +2222,7 @@ where
                         &plan.message_estimates,
                         &provider_tool_schema_digests,
                     );
+                run_observation.observe(&usage_record);
                 if usage_record.usage_source == "provider"
                     && let Some(input_tokens) = usage_record.input_tokens
                     && plan.messages == completed_request.messages
@@ -2258,6 +2276,27 @@ where
                     .to_owned(),
                 };
 
+                let continue_response = match response_control.observe(&provider_response) {
+                    Ok(should_continue) => should_continue,
+                    Err(error) => {
+                        trace(AgentLoopTraceEvent::ProviderFailed {
+                            request_id: completed_request.request_id,
+                            provider_id: completed_request.provider_id.clone(),
+                            model_id: completed_request.model_id.clone(),
+                            error: error.to_string(),
+                            metadata: None,
+                        });
+                        finish_runtime_step(
+                            &mut step_machine,
+                            step_snapshot.clone(),
+                            "provider-terminal-error",
+                            false,
+                            elapsed_millis(current_turn_started_at),
+                            &mut trace,
+                        );
+                        return Err(AgentLoopError::Provider(error));
+                    }
+                };
                 if let Some(content) = provider_response
                     .message
                     .as_ref()
@@ -2343,6 +2382,51 @@ where
                         break;
                     }
 
+                    if continue_response {
+                        // 续写沿用当前历史、任务预算和工具结果，不能当成新任务重置计数。
+                        if provider_response.finish_reason
+                            == golutra_agent_llm::ProviderFinishReason::Length
+                        {
+                            append_plan_message(
+                                &mut plan,
+                                ProviderMessage {
+                                    role: ProviderRole::User,
+                                    content: response_control::LENGTH_CONTINUATION_PROMPT.into(),
+                                    tool_call_id: None,
+                                    tool_name: None,
+                                    tool_calls: Vec::new(),
+                                    metadata: Default::default(),
+                                },
+                                ContextMessageSource {
+                                    contributor: "runtime_context".into(),
+                                    source_refs: vec!["runtime:response-continuation".into()],
+                                    origin: "runtime_recovery".into(),
+                                    visibility: ModelInputVisibility::ModelVisible,
+                                },
+                                &mut message_token_total,
+                            );
+                        }
+                        let completion = finish_runtime_step_with_material_progress(
+                            &mut step_machine,
+                            step_snapshot.clone(),
+                            step_fingerprint,
+                            false,
+                            false,
+                            elapsed_millis(current_turn_started_at),
+                            &mut trace,
+                        );
+                        if completion.should_stop {
+                            guard_reason = completion.stop_reason;
+                            trace(AgentLoopTraceEvent::LoopGuardTriggered {
+                                trigger: golutra_agent_core::LoopGuardTrigger::NoProgress,
+                                reason: guard_reason.clone().unwrap_or_else(|| {
+                                    "provider continuation made no progress".into()
+                                }),
+                            });
+                            break;
+                        }
+                        continue;
+                    }
                     let mut child_updates = false;
                     for notification in self
                         .tool_executor
@@ -2525,7 +2609,7 @@ where
                             let failure_family =
                                 semantic_failure_family(&tool_call.tool_name, &tool_call.arguments);
                             let blocked_family_failures =
-                                failure_families.failures(&failure_family);
+                                failure_families.failures(&failure_family, &failure_signature);
                             if blocked_family_failures > 0
                                 || !parallel_failure_signatures.insert(failure_signature.clone())
                             {
@@ -2756,7 +2840,7 @@ where
                             let failure_family =
                                 semantic_failure_family(&tool_call.tool_name, &tool_call.arguments);
                             let blocked_family_failures =
-                                failure_families.failures(&failure_family);
+                                failure_families.failures(&failure_family, &failure_signature);
                             let mut tool_request = ToolRequest {
                                 tool_call_id: golutra_agent_core::ToolCallId::new(),
                                 provider_tool_call_id: Some(provider_tool_call_id.clone()),
@@ -3061,14 +3145,13 @@ where
                                                     ),
                                                 RuntimeOperationOutcome::Completed(Err(error)) => self
                                                     .tool_executor
-                                                    .execution_error_report_with_hints(
+                                                    .checkpoint_error_report(
                                                         tool_request,
                                                         policy,
                                                         format!(
                                                             "before-side-effect checkpoint failed: {error}"
                                                         ),
-                                                    )
-                                                    .await,
+                                                    ),
                                                 RuntimeOperationOutcome::Completed(Ok(())) => {
                                                 control.wait_until_runnable().await?;
                                                 let max_elapsed_ms =
@@ -3090,12 +3173,18 @@ where
                                                 };
                                                 let error_request = tool_request.clone();
                                                 let error_policy = policy.clone();
+                                                let observation = (tool_request.tool_name == "runtime_status")
+                                                    .then(|| run_observation.snapshot(request.task_id,
+                                                        elapsed_millis(execution_started_at), &tool_reports, &tool_attempts));
                                                 let invocation = ToolInvocation::new(
                                                     tool_request,
                                                     policy,
                                                     approved,
                                                 )
                                                 .with_preparation(preparation);
+                                                let invocation = if let Some(observation) = observation {
+                                                    invocation.with_runtime_observation(observation)
+                                                } else { invocation };
                                                 let invocation =
                                                     if let Some(deadline) = runtime_deadline {
                                                         invocation.with_deadline(deadline)
@@ -3129,10 +3218,9 @@ where
                                     }
                                     }
                                     Err(error) => {
-                                        let report = self.tool_executor.invalid_request_report(
-                                            tool_request,
-                                            error.to_string(),
-                                        );
+                                        let report = self
+                                            .tool_executor
+                                            .argument_rejection_report(tool_request, &error);
                                         trace(AgentLoopTraceEvent::PolicyEvaluated(
                                             report.policy_evaluation.clone(),
                                         ));
@@ -3196,7 +3284,16 @@ where
                             &mut failed_tool_call_count,
                             &mut consecutive_failed_tool_call_count,
                         );
-                        failure_families.observe(&failure_family, report.envelope.status);
+                        if report.envelope.status == ToolResultStatus::Ok
+                            && !report.changed_files.is_empty()
+                        {
+                            failure_families.workspace_changed();
+                        }
+                        failure_families.observe(
+                            &failure_family,
+                            &failure_signature,
+                            report.envelope.status,
+                        );
                         if report.envelope.status == ToolResultStatus::Ok {
                             successful_signatures_this_step.insert(failure_signature);
                         } else {
@@ -3684,7 +3781,7 @@ where
                         evidence_refs: report.envelope.evidence_refs.clone(),
                         message: if recovered {
                             format!(
-                                "{} (recovered by a later equivalent retry; original error evidence retained)",
+                                "{} (recovered by a later successful correction; original error evidence retained)",
                                 report.envelope.summary
                             )
                         } else {
@@ -3771,6 +3868,20 @@ where
                 {
                     let (passed, recovered) =
                         objective_validation_check_status(report, &validation, &objective_recovery);
+                    // Open 的探索诊断不是新增交付义务；失败测试、显式合同和外部验收仍保留。
+                    if !passed
+                        && validation.kind
+                            == objective_evidence::ObjectiveValidationKind::Diagnostic
+                        && optional_open_attempt(
+                            report,
+                            current_execution_mode,
+                            &current_task_contract,
+                            &tool_attempts,
+                            &tool_reports,
+                        )
+                    {
+                        continue;
+                    }
                     command_checks.push(VerificationCheck {
                         kind: VerificationCheckKind::ObjectiveValidation,
                         name: format!(
@@ -3787,7 +3898,9 @@ where
                             .map(ToOwned::to_owned),
                         passed,
                         evidence_refs: report.envelope.evidence_refs.clone(),
-                        message: if recovered {
+                        message: if validation.passed && !passed {
+                            "validation predates later workspace changes; rerun the relevant check".to_owned()
+                        } else if recovered {
                             format!(
                                 "{} (recovered by a later equivalent retry; original error evidence retained)",
                                 validation.message
@@ -3994,7 +4107,11 @@ where
                     &mut plan,
                     ProviderMessage {
                         role: ProviderRole::User,
-                        content: correction.as_model_instruction(),
+                        content: correction_feedback::model_instruction(
+                            &correction,
+                            &verification,
+                            &tool_reports,
+                        ),
                         tool_call_id: None,
                         tool_name: None,
                         tool_calls: Vec::new(),
@@ -4158,7 +4275,11 @@ where
                     .saturating_add(cost),
             );
         }
-        if completed_contract.native_protocol == "in_memory" {
+        if completed_contract.native_protocol == "in_memory"
+            || response.finish_reason != golutra_agent_llm::ProviderFinishReason::Stop
+            || !response.tool_calls.is_empty()
+        {
+            // 摘要截断或要求续写时沿用已有本地摘要，不把半份交接信息安装进历史。
             return None;
         }
         response
@@ -4202,6 +4323,7 @@ where
         let request_id = request.request_id;
         let mut active_provider_id = request.provider_id.clone();
         let mut active_model_id = request.model_id.clone();
+        let mut recovery_wait_started = None;
         let mut on_event = |event| match event {
             provider_session::ProviderSessionEvent::Streamed {
                 provider_id,
@@ -4217,18 +4339,20 @@ where
                     });
                 }
             }
-            provider_session::ProviderSessionEvent::RetryScheduled {
-                attempt,
-                max_retries,
-                transport,
-                reason,
-            } => trace(AgentLoopTraceEvent::RetryScheduled {
-                attempt,
-                reason: format!(
-                    "{} transport retry {attempt}/{max_retries}: {reason}",
-                    transport.label()
-                ),
-            }),
+            provider_session::ProviderSessionEvent::Recovery(mut recovery) => {
+                if recovery.phase == RecoveryPhase::Waiting {
+                    recovery_wait_started = Some(tokio::time::Instant::now());
+                } else if let Some(started) = recovery_wait_started.take() {
+                    control.retry_wait_ms = control
+                        .retry_wait_ms
+                        .saturating_add(provider_recovery::duration_ms(started.elapsed()));
+                }
+                recovery.reset_stream &= emit_stream;
+                trace(AgentLoopTraceEvent::ProviderRecovery {
+                    request_id,
+                    recovery,
+                });
+            }
             provider_session::ProviderSessionEvent::TransportFallback {
                 provider_id,
                 from,
@@ -4264,7 +4388,10 @@ where
             self.fallback_provider.as_ref(),
             self.provider_session_policy,
         )
-        .with_deadline(deadline);
+        .with_deadline(deadline)
+        .with_input_budget(self.context_builder.budget_limit())
+        // 辅助摘要失败可使用本地压缩，不能为其无限等待而阻塞主任务。
+        .with_connection_wait(emit_stream);
         let result = session
             .complete(request, &control.cancellation, &mut on_event)
             .await;
@@ -4322,25 +4449,9 @@ fn update_tool_failure_counts(status: ToolResultStatus, total: &mut u32, consecu
     }
 }
 
-#[derive(Debug, Default)]
-struct FailureFamilyLedger {
-    failures: HashMap<String, u32>,
-}
-
-impl FailureFamilyLedger {
-    fn failures(&self, family: &str) -> u32 {
-        self.failures.get(family).copied().unwrap_or_default()
-    }
-
-    fn observe(&mut self, family: &str, status: ToolResultStatus) {
-        if status == ToolResultStatus::Ok {
-            self.failures.remove(family);
-        } else {
-            let count = self.failures.entry(family.to_owned()).or_default();
-            *count = count.saturating_add(1);
-        }
-    }
-}
+mod failure_guard;
+mod runtime_observation;
+use failure_guard::FailureFamilyLedger;
 
 fn semantic_failure_family(tool_name: &str, arguments: &Value) -> String {
     golutra_agent_core::semantic_tool_failure_family(tool_name, arguments)
@@ -4374,7 +4485,7 @@ fn canonical_json_value(value: &Value) -> Value {
     }
 }
 
-/// 只有后续等价成功才能覆盖一次失败的 provider 工具尝试。终态策略阻断、
+/// 默认只有后续等价成功才能覆盖一次失败的 provider 工具尝试。终态策略阻断、
 /// 取消、超时和不受信任的外部工具失败即使遇到其他工具成功，也仍是硬失败。
 fn tool_failure_is_recoverable(report: &ToolExecutionReport) -> bool {
     match report.envelope.status {
@@ -4409,8 +4520,70 @@ fn tool_failure_is_recoverable(report: &ToolExecutionReport) -> bool {
     }
 }
 
+/// Open 的探索事实不应变成永久交付义务；当前独立验收可替代过期的成功诊断。
+/// 原始记录不变，失败诊断、正式测试、Strict 和显式完成条件不走新增的替代路径。
+fn optional_open_attempt(
+    report: &ToolExecutionReport,
+    mode: Option<AgentExecutionMode>,
+    contract: &TaskContract,
+    attempts: &[ToolAttemptMetadata],
+    reports: &[ToolExecutionReport],
+) -> bool {
+    let successful_diagnostic = report.envelope.status == ToolResultStatus::Ok
+        && objective_validation_report(report).is_some_and(|check| {
+            check.passed && check.kind == objective_evidence::ObjectiveValidationKind::Diagnostic
+        });
+    // 独立验收仍必须真实通过且针对当前工作区；不能把旧探索假设强制套在新交付上。
+    let independently_superseded = contract.verification == VerificationRequirement::Independent
+        && contract.completion_criteria.is_empty()
+        && successful_diagnostic
+        && !validation_is_current(report, reports)
+        && reports.iter().any(|later| {
+            later.envelope.tool_name == "external_verifier"
+                && later.envelope.status == ToolResultStatus::Ok
+                && validation_is_current(later, reports)
+        });
+    let later_success = attempts
+        .iter()
+        .find(|attempt| attempt.tool_call_id == report.envelope.tool_call_id)
+        .is_some_and(|attempt| {
+            reports.iter().any(|later| {
+                later.envelope.status == ToolResultStatus::Ok
+                    && (later.envelope.tool_name == "external_verifier"
+                        || (objective_validation_report(later).is_some_and(|check| {
+                            check.passed
+                                && validation_is_current(later, reports)
+                                && (report.envelope.status != ToolResultStatus::Ok
+                                    || check.kind
+                                        == objective_evidence::ObjectiveValidationKind::Test)
+                        }) && attempts.iter().any(|candidate| {
+                            candidate.tool_call_id == later.envelope.tool_call_id
+                                && candidate.step_no > attempt.step_no
+                        })))
+            })
+        });
+    mode == Some(AgentExecutionMode::Open)
+        && ((contract.verification == VerificationRequirement::BestEffort
+            && !contract.require_objective_validation)
+            || independently_superseded)
+        && !matches!(
+            report.envelope.tool_name.as_str(),
+            "external_verifier" | CONTRACT_FILE_CONTENT_VERIFIER_TOOL | CONTRACT_PATH_VERIFIER_TOOL
+        )
+        && report
+            .envelope
+            .structured_facts
+            .get("workspace_changes_known")
+            != Some(&Value::Bool(false))
+        // 已成功的探索断言也不能因后续实现变成永久义务；仅当前正式测试可替代它。
+        // 这里只用于派生诊断检查，正式测试与显式合同仍由原有验收路径约束。
+        && (tool_failure_is_recoverable(report) || successful_diagnostic)
+        && later_success
+}
+
 /// 返回 provider 工具报告对应验收项的 `(passed, recovered)`。报告本身永不修改；
-/// 只有后续 provider 回合中的等价成功重试，才能覆盖派生验收结果。
+/// 执行前参数拒绝没有操作副作用，后续同名工具成功可证明调用格式已纠正；
+/// 实际执行失败仍要求参数等价。交付内容是否正确由独立的目标验收项判断。
 fn tool_execution_check_status(
     report: &ToolExecutionReport,
     attempts: &[ToolAttemptMetadata],
@@ -4428,10 +4601,19 @@ fn tool_execution_check_status(
     if !attempt.recoverable_failure {
         return (false, false);
     }
+    let admission_rejected = report.policy_evaluation.decision == PolicyDecision::Block
+        && report
+            .envelope
+            .structured_facts
+            .get("rejected_before_execution")
+            == Some(&Value::Bool(true));
     let recovered = attempts.iter().skip(index.saturating_add(1)).any(|later| {
         later.step_no > attempt.step_no
             && later.status == ToolResultStatus::Ok
-            && later.signature == attempt.signature
+            && (later.signature == attempt.signature
+                || (admission_rejected
+                    && later.signature.split_once(':').map(|(name, _)| name)
+                        == Some(report.envelope.tool_name.as_str())))
     });
     (recovered, recovered)
 }
@@ -4477,7 +4659,7 @@ fn objective_validation_check_status(
     validation: &ObjectiveValidationOutcome,
     context: &ObjectiveValidationRecoveryContext<'_>,
 ) -> (bool, bool) {
-    if validation.passed {
+    if validation.passed && validation_is_current(report, context.reports) {
         return (true, false);
     }
     let Some(attempt_index) = context
@@ -4488,7 +4670,7 @@ fn objective_validation_check_status(
         return (false, false);
     };
     let attempt = &context.attempts[attempt_index];
-    if !attempt.recoverable_failure {
+    if !validation.passed && !attempt.recoverable_failure {
         return (false, false);
     }
     let recovered = context.reports.iter().any(|later_report| {
@@ -4519,11 +4701,57 @@ fn objective_validation_check_status(
         });
         later_validation.is_some_and(|candidate| {
             candidate.passed
+                && validation_is_current(later_report, context.reports)
                 && candidate.kind == validation.kind
                 && candidate.identity == validation.identity
         })
     });
     (recovered, recovered)
+}
+
+/// 后续行为文件修改会使验证过期；文档编辑不会使代码测试失效。
+/// 没有依赖图时保守复验，不把旧成功当作当前工作区的证明。
+fn validation_is_current(report: &ToolExecutionReport, reports: &[ToolExecutionReport]) -> bool {
+    // 阅读证明的是一次已完成的观察，不是当前代码正确性的断言。
+    // 后续实现不能把前期阅读变成永久复读义务；测试与状态断言仍检查后续修改。
+    if matches!(report.envelope.tool_name.as_str(), "read_file" | "list_dir") {
+        return true;
+    }
+    let Some(index) = reports
+        .iter()
+        .position(|candidate| candidate.envelope.tool_call_id == report.envelope.tool_call_id)
+    else {
+        return false;
+    };
+    !reports[index + 1..].iter().any(|later| {
+        if only_test_bytecode_cache_changed(later) {
+            return false;
+        }
+        later
+            .changed_files
+            .iter()
+            .any(|path| !is_documentation_only_file(path))
+            || (later.envelope.structured_facts["workspace_mutation_detected"] == true
+                && later.envelope.structured_facts["workspace_changes_known"] != true)
+    })
+}
+
+/// 成功测试自动生成的 Python 缓存不应使前一项测试失效；仍保留完整变动事实。
+/// 只豁免已知且仅含缓存的测试结果，直接编辑、未知副作用和任意源文件变更仍须复验。
+fn only_test_bytecode_cache_changed(report: &ToolExecutionReport) -> bool {
+    report.envelope.status == ToolResultStatus::Ok
+        && report.envelope.structured_facts["workspace_changes_known"] == true
+        && !report.changed_files.is_empty()
+        && report.changed_files.iter().all(|path| {
+            path.extension().is_some_and(|extension| extension == "pyc")
+                && path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name == "__pycache__")
+        })
+        && objective_validation_report(report).is_some_and(|check| {
+            check.passed && check.kind == objective_evidence::ObjectiveValidationKind::Test
+        })
 }
 
 fn digest_value(value: &Value) -> String {
@@ -4984,7 +5212,7 @@ fn project_tool_for_profile(
             });
         }
     }
-    tool
+    registry.model_contract(tool)
 }
 
 /// 在单个执行线程内保持 provider 工具目录稳定。Coding profile 的八个已批准
@@ -5353,19 +5581,13 @@ async fn invoke_parallel_calls(
                 let error_request = request.clone();
                 let error_policy = policy.clone();
                 let report = match checkpoint {
-                    ParallelCheckpointOutcome::Ready => {
-                        tool_executor
-                            .execution_error_report_with_hints(
-                                error_request,
-                                error_policy,
-                                "a sibling side-effect checkpoint failed; no mutation was executed",
-                            )
-                            .await
-                    }
+                    ParallelCheckpointOutcome::Ready => tool_executor.checkpoint_error_report(
+                        error_request,
+                        error_policy,
+                        "a sibling side-effect checkpoint failed; no mutation was executed",
+                    ),
                     ParallelCheckpointOutcome::Error(error) => {
-                        tool_executor
-                            .execution_error_report_with_hints(error_request, error_policy, error)
-                            .await
+                        tool_executor.checkpoint_error_report(error_request, error_policy, error)
                     }
                     ParallelCheckpointOutcome::Cancelled => tool_executor
                         .cancelled_execution_report(

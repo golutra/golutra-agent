@@ -15,6 +15,19 @@ mod subagent_parallel_tests;
 #[path = "pending_batch_tests.rs"]
 mod pending_batch_tests;
 
+#[path = "long_task_recovery_tests.rs"]
+mod long_task_recovery_tests;
+
+#[path = "response_control_tests.rs"]
+mod response_control_tests;
+
+#[path = "correction_feedback_tests.rs"]
+mod correction_feedback_tests;
+#[path = "long_task_compaction_tests.rs"]
+mod long_task_compaction_tests;
+#[path = "long_task_correction_tests.rs"]
+mod long_task_correction_tests;
+
 use golutra_agent_context::{
     ContextBudgetPolicy, ContextBuilder, ContextContributor, ContextMessageSource,
     ContextWindowManager, estimate_message_tokens, estimate_tokens,
@@ -1073,12 +1086,15 @@ fn semantic_failure_families_survive_unrelated_successes() {
     assert_ne!(apt, diagnostic);
 
     let mut ledger = FailureFamilyLedger::default();
-    ledger.observe(&apt, ToolResultStatus::Timeout);
-    ledger.observe(&diagnostic, ToolResultStatus::Ok);
-    ledger.observe(&apt_variant, ToolResultStatus::Error);
+    ledger.observe(&apt, "original-arguments", ToolResultStatus::Timeout);
+    ledger.observe(&diagnostic, "diagnostic", ToolResultStatus::Ok);
+    ledger.observe(&apt_variant, "original-arguments", ToolResultStatus::Error);
 
-    assert_eq!(ledger.failures(&apt), 2);
-    assert_eq!(ledger.failures(&diagnostic), 0);
+    assert_eq!(ledger.failures(&apt, "original-arguments"), 2);
+    assert_eq!(ledger.failures(&apt, "corrected-arguments"), 0);
+    assert_eq!(ledger.failures(&diagnostic, "diagnostic"), 0);
+    ledger.workspace_changed();
+    assert_eq!(ledger.failures(&apt, "original-arguments"), 0);
 }
 
 #[derive(Debug, Clone)]
@@ -6500,7 +6516,7 @@ fn parallel_read_candidate_enforces_the_active_tool_profile() {
             .iter()
             .any(|tool| tool.tool_name == "external_hidden_read")
     );
-    assert_eq!(coding_tools.len(), 7);
+    assert_eq!(coding_tools.len(), 8);
 
     let none_tools = provider_tools_for_turn(
         &executor
@@ -6536,6 +6552,7 @@ fn coding_tool_surface_is_stable_across_objectives() {
         "apply_patch",
         "shell_session",
         "subagent",
+        "runtime_status",
     ];
     let selected = provider_tools_for_turn(
         &all_tools,
@@ -6552,6 +6569,13 @@ fn coding_tool_surface_is_stable_across_objectives() {
         expected
     );
     let selected_digest = provider_tool_snapshot(&selected).2;
+    let shell = selected
+        .iter()
+        .find(|tool| tool.tool_name == "shell")
+        .unwrap();
+    let wire = golutra_agent_llm::provider_tool_schema_projection(&shell.input_schema);
+    assert!(wire["properties"].get("argv").is_none());
+    assert_eq!(wire["required"], json!(["command"]));
     let mut reversed = selected.clone();
     reversed.reverse();
     assert_ne!(
@@ -6609,7 +6633,7 @@ fn coding_tool_surface_retains_declared_capabilities_without_keyword_matching() 
         executor.registry(),
         "implement the task and keep the code maintainable",
     );
-    assert_eq!(generic.len(), 7);
+    assert_eq!(generic.len(), 8);
 
     let long_task = provider_tools_for_turn(
         &all_tools,
@@ -6618,7 +6642,7 @@ fn coding_tool_surface_retains_declared_capabilities_without_keyword_matching() 
         executor.registry(),
         "complete this long-running task and keep the code maintainable",
     );
-    assert_eq!(long_task.len(), 7);
+    assert_eq!(long_task.len(), 8);
 
     let explicit = provider_tools_for_turn(
         &all_tools,
@@ -6627,7 +6651,7 @@ fn coding_tool_surface_retains_declared_capabilities_without_keyword_matching() 
         executor.registry(),
         "run the test suite as a background process and wait for the process state",
     );
-    assert_eq!(explicit.len(), 7);
+    assert_eq!(explicit.len(), 8);
 
     let server = provider_tools_for_turn(
         &all_tools,
@@ -6636,7 +6660,7 @@ fn coding_tool_surface_retains_declared_capabilities_without_keyword_matching() 
         executor.registry(),
         "start a long-running server and wait for the process state",
     );
-    assert_eq!(server.len(), 7);
+    assert_eq!(server.len(), 8);
 
     let read_only = provider_tools_for_turn(
         &all_tools,
@@ -6648,7 +6672,7 @@ fn coding_tool_surface_retains_declared_capabilities_without_keyword_matching() 
         executor.registry(),
         "inspect the workspace without changing it",
     );
-    assert_eq!(read_only.len(), 2);
+    assert_eq!(read_only.len(), 3);
     assert_eq!(read_only[0].tool_name, "read_file");
 }
 
@@ -6671,7 +6695,7 @@ fn stable_tool_surface_expands_once_and_does_not_shrink_with_objective_text() {
         executor.registry(),
         "update the ledger files",
     );
-    assert_eq!(initial.len(), 7);
+    assert_eq!(initial.len(), 8);
 
     let expanded_candidate = provider_tools_for_turn(
         &all_tools,
@@ -6688,7 +6712,7 @@ fn stable_tool_surface_expands_once_and_does_not_shrink_with_objective_text() {
         executor.registry(),
         true,
     );
-    assert_eq!(expanded.len(), 7);
+    assert_eq!(expanded.len(), 8);
     let expanded_digest = provider_tool_snapshot(&expanded).2;
 
     let narrowed_candidate = provider_tools_for_turn(
@@ -6706,7 +6730,7 @@ fn stable_tool_surface_expands_once_and_does_not_shrink_with_objective_text() {
         executor.registry(),
         true,
     );
-    assert_eq!(retained.len(), 7);
+    assert_eq!(retained.len(), 8);
     assert_eq!(provider_tool_snapshot(&retained).2, expanded_digest);
 
     let forbidden = TaskContract {

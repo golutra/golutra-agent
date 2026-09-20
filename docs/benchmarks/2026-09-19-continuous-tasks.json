@@ -1,0 +1,534 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-19",
+  "platform": "macOS arm64",
+  "golutra_base_commit": "6b71a74b7720dc138500ed6641822fc80c5e1d09",
+  "golutra_source": "Uncommitted local source on the base commit",
+  "codex_reference_source_commit": "fc269b66",
+  "limits": [
+    "Four user stages with process resume; not hours of autonomous coding.",
+    "One paired sample after fixes; no completion-rate or latency-distribution superiority claim.",
+    "Tool counts differ in granularity; Codex exec/code mode can group operations.",
+    "Controlled local HTTP/SSE protocol tests do not establish all live-provider compatibility.",
+    "Windows and Linux runtime acceptance not performed."
+  ],
+  "validation": {
+    "rust_workspace": {
+      "passed": 1931,
+      "ignored": 4,
+      "test_groups": 54,
+      "exit_code": 0
+    },
+    "pty": {
+      "passed": 27,
+      "included_in_workspace": true
+    },
+    "python_comparison_tests": {
+      "passed": 64
+    },
+    "clippy": "passed with -D warnings",
+    "format_and_whitespace": "passed"
+  },
+  "final_tool_ready_to_terminal_ms": {
+    "count": 28,
+    "total": 843,
+    "max": 153
+  },
+  "runs": [
+    {
+      "started_at": "2026-09-19T11:55:16.239643Z",
+      "finished_at": "2026-09-19T12:00:28.336548Z",
+      "versions": {
+        "golutra": "golutra-agent 0.3.1",
+        "codex": "codex-cli 0.154.0"
+      },
+      "model": "gpt-5.6-sol",
+      "reasoning_effort": "medium",
+      "protocol": "openai-responses",
+      "fixture_sha256": "99be54e3f414a59ba885ffbfeda525e351cd4f7405cbdc2fedec9e992f1657c3",
+      "benchmark_repair_turns": 0,
+      "codex_conventional_responses_override": null,
+      "coding_comparison_eligible": null,
+      "summary": {
+        "golutra": {
+          "workspace_verifier_passed": 4,
+          "runtime_terminal_successes": 4,
+          "strict_passed": 4,
+          "stages_total": 4,
+          "elapsed_total_ms": 277743.2,
+          "prompt_tokens": 675531,
+          "uncached_input_tokens": 44907,
+          "output_tokens": 18631,
+          "cache_hit_ratio": 0.9335,
+          "tool_call_count": 50,
+          "request_count": 29
+        },
+        "codex": {
+          "workspace_verifier_passed": 0,
+          "runtime_terminal_successes": 4,
+          "strict_passed": 0,
+          "stages_total": 4,
+          "elapsed_total_ms": 31422.9,
+          "prompt_tokens": 78119,
+          "uncached_input_tokens": 23874,
+          "output_tokens": 912,
+          "cache_hit_ratio": 0.6944,
+          "tool_call_count": 0,
+          "request_count": null
+        }
+      },
+      "stages": [
+        {
+          "stage": 1,
+          "order": [
+            "golutra",
+            "codex"
+          ],
+          "golutra": {
+            "strict_passed": true,
+            "workspace_verifier_pass": true,
+            "runtime_terminal_success": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "elapsed_ms": 97478,
+            "tool_ready_to_terminal_samples_ms": null
+          },
+          "codex": {
+            "strict_passed": false,
+            "workspace_verifier_pass": false,
+            "runtime_terminal_success": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "elapsed_ms": 10825.8,
+            "tool_ready_to_terminal_samples_ms": null
+          }
+        },
+        {
+          "stage": 2,
+          "order": [
+            "codex",
+            "golutra"
+          ],
+          "golutra": {
+            "strict_passed": true,
+            "workspace_verifier_pass": true,
+            "runtime_terminal_success": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "elapsed_ms": 47012,
+            "tool_ready_to_terminal_samples_ms": null
+          },
+          "codex": {
+            "strict_passed": false,
+            "workspace_verifier_pass": false,
+            "runtime_terminal_success": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "elapsed_ms": 5931.6,
+            "tool_ready_to_terminal_samples_ms": null
+          }
+        },
+        {
+          "stage": 3,
+          "order": [
+            "golutra",
+            "codex"
+          ],
+          "golutra": {
+            "strict_passed": true,
+            "workspace_verifier_pass": true,
+            "runtime_terminal_success": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "elapsed_ms": 78529.8,
+            "tool_ready_to_terminal_samples_ms": null
+          },
+          "codex": {
+            "strict_passed": false,
+            "workspace_verifier_pass": false,
+            "runtime_terminal_success": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "elapsed_ms": 7261.4,
+            "tool_ready_to_terminal_samples_ms": null
+          }
+        },
+        {
+          "stage": 4,
+          "order": [
+            "codex",
+            "golutra"
+          ],
+          "golutra": {
+            "strict_passed": true,
+            "workspace_verifier_pass": true,
+            "runtime_terminal_success": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "elapsed_ms": 54723.4,
+            "tool_ready_to_terminal_samples_ms": null
+          },
+          "codex": {
+            "strict_passed": false,
+            "workspace_verifier_pass": false,
+            "runtime_terminal_success": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "elapsed_ms": 7404.1,
+            "tool_ready_to_terminal_samples_ms": null
+          }
+        }
+      ],
+      "interpretation": "Ineligible: Codex exposed no usable tools through this gateway's Responses Lite route."
+    },
+    {
+      "started_at": "2026-09-19T12:07:37.810365Z",
+      "finished_at": "2026-09-19T12:27:51.398775Z",
+      "versions": {
+        "golutra": "golutra-agent 0.3.1",
+        "codex": "codex-cli 0.154.0"
+      },
+      "model": "gpt-5.6-sol",
+      "reasoning_effort": "medium",
+      "protocol": "openai-responses",
+      "fixture_sha256": "99be54e3f414a59ba885ffbfeda525e351cd4f7405cbdc2fedec9e992f1657c3",
+      "benchmark_repair_turns": 0,
+      "codex_conventional_responses_override": true,
+      "coding_comparison_eligible": null,
+      "summary": {
+        "golutra": {
+          "workspace_verifier_passed": 4,
+          "runtime_terminal_successes": 3,
+          "strict_passed": 3,
+          "stages_total": 4,
+          "elapsed_total_ms": 840433,
+          "prompt_tokens": null,
+          "uncached_input_tokens": null,
+          "output_tokens": null,
+          "cache_hit_ratio": null,
+          "tool_call_count": 121,
+          "request_count": 64
+        },
+        "codex": {
+          "workspace_verifier_passed": 4,
+          "runtime_terminal_successes": 4,
+          "strict_passed": 4,
+          "stages_total": 4,
+          "elapsed_total_ms": 369244.4,
+          "prompt_tokens": 1460729,
+          "uncached_input_tokens": 65888,
+          "output_tokens": 23017,
+          "cache_hit_ratio": 0.9549,
+          "tool_call_count": 26,
+          "request_count": null
+        }
+      },
+      "stages": [
+        {
+          "stage": 1,
+          "order": [
+            "golutra",
+            "codex"
+          ],
+          "golutra": {
+            "strict_passed": true,
+            "workspace_verifier_pass": true,
+            "runtime_terminal_success": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "elapsed_ms": 111838.9,
+            "tool_ready_to_terminal_samples_ms": null
+          },
+          "codex": {
+            "strict_passed": true,
+            "workspace_verifier_pass": true,
+            "runtime_terminal_success": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "elapsed_ms": 137152.6,
+            "tool_ready_to_terminal_samples_ms": null
+          }
+        },
+        {
+          "stage": 2,
+          "order": [
+            "codex",
+            "golutra"
+          ],
+          "golutra": {
+            "strict_passed": true,
+            "workspace_verifier_pass": true,
+            "runtime_terminal_success": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "elapsed_ms": 56317.8,
+            "tool_ready_to_terminal_samples_ms": null
+          },
+          "codex": {
+            "strict_passed": true,
+            "workspace_verifier_pass": true,
+            "runtime_terminal_success": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "elapsed_ms": 56098.6,
+            "tool_ready_to_terminal_samples_ms": null
+          }
+        },
+        {
+          "stage": 3,
+          "order": [
+            "golutra",
+            "codex"
+          ],
+          "golutra": {
+            "strict_passed": false,
+            "workspace_verifier_pass": true,
+            "runtime_terminal_success": false,
+            "process_return_code": 124,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "elapsed_ms": 600009.7,
+            "tool_ready_to_terminal_samples_ms": null
+          },
+          "codex": {
+            "strict_passed": true,
+            "workspace_verifier_pass": true,
+            "runtime_terminal_success": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "elapsed_ms": 105243.8,
+            "tool_ready_to_terminal_samples_ms": null
+          }
+        },
+        {
+          "stage": 4,
+          "order": [
+            "codex",
+            "golutra"
+          ],
+          "golutra": {
+            "strict_passed": true,
+            "workspace_verifier_pass": true,
+            "runtime_terminal_success": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "elapsed_ms": 72266.6,
+            "tool_ready_to_terminal_samples_ms": null
+          },
+          "codex": {
+            "strict_passed": true,
+            "workspace_verifier_pass": true,
+            "runtime_terminal_success": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "elapsed_ms": 70749.4,
+            "tool_ready_to_terminal_samples_ms": null
+          }
+        }
+      ],
+      "interpretation": "Pre-fix failure: Golutra artifacts passed 4/4, runtime passed 3/4; stage 3 timed out during unnecessary correction."
+    },
+    {
+      "started_at": "2026-09-19T12:34:32.346797Z",
+      "finished_at": "2026-09-19T12:46:00.934928Z",
+      "versions": {
+        "golutra": "golutra-agent 0.3.1",
+        "codex": "codex-cli 0.154.0"
+      },
+      "model": "gpt-5.6-sol",
+      "reasoning_effort": "medium",
+      "protocol": "openai-responses",
+      "fixture_sha256": "99be54e3f414a59ba885ffbfeda525e351cd4f7405cbdc2fedec9e992f1657c3",
+      "benchmark_repair_turns": 0,
+      "codex_conventional_responses_override": true,
+      "coding_comparison_eligible": true,
+      "summary": {
+        "golutra": {
+          "workspace_verifier_passed": 4,
+          "runtime_terminal_successes": 4,
+          "strict_passed": 4,
+          "stages_total": 4,
+          "elapsed_total_ms": 366612.5,
+          "prompt_tokens": 978390,
+          "uncached_input_tokens": 62082,
+          "output_tokens": 24648,
+          "cache_hit_ratio": 0.9365,
+          "tool_call_count": 65,
+          "request_count": 32
+        },
+        "codex": {
+          "workspace_verifier_passed": 4,
+          "runtime_terminal_successes": 4,
+          "strict_passed": 4,
+          "stages_total": 4,
+          "elapsed_total_ms": 318462.5,
+          "prompt_tokens": 1017016,
+          "uncached_input_tokens": 54150,
+          "output_tokens": 21949,
+          "cache_hit_ratio": 0.9468,
+          "tool_call_count": 27,
+          "request_count": null
+        }
+      },
+      "stages": [
+        {
+          "stage": 1,
+          "order": [
+            "golutra",
+            "codex"
+          ],
+          "golutra": {
+            "strict_passed": true,
+            "workspace_verifier_pass": true,
+            "runtime_terminal_success": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "elapsed_ms": 119085.2,
+            "tool_ready_to_terminal_samples_ms": [
+              144,
+              0,
+              2,
+              0,
+              7,
+              34,
+              2,
+              2,
+              5,
+              0
+            ]
+          },
+          "codex": {
+            "strict_passed": true,
+            "workspace_verifier_pass": true,
+            "runtime_terminal_success": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "elapsed_ms": 99947.8,
+            "tool_ready_to_terminal_samples_ms": []
+          }
+        },
+        {
+          "stage": 2,
+          "order": [
+            "codex",
+            "golutra"
+          ],
+          "golutra": {
+            "strict_passed": true,
+            "workspace_verifier_pass": true,
+            "runtime_terminal_success": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "elapsed_ms": 96861.9,
+            "tool_ready_to_terminal_samples_ms": [
+              70,
+              10,
+              85,
+              0,
+              20
+            ]
+          },
+          "codex": {
+            "strict_passed": true,
+            "workspace_verifier_pass": true,
+            "runtime_terminal_success": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "elapsed_ms": 89488.7,
+            "tool_ready_to_terminal_samples_ms": []
+          }
+        },
+        {
+          "stage": 3,
+          "order": [
+            "golutra",
+            "codex"
+          ],
+          "golutra": {
+            "strict_passed": true,
+            "workspace_verifier_pass": true,
+            "runtime_terminal_success": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "elapsed_ms": 71821.8,
+            "tool_ready_to_terminal_samples_ms": [
+              79,
+              0,
+              0,
+              8,
+              100
+            ]
+          },
+          "codex": {
+            "strict_passed": true,
+            "workspace_verifier_pass": true,
+            "runtime_terminal_success": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "elapsed_ms": 61239.1,
+            "tool_ready_to_terminal_samples_ms": []
+          }
+        },
+        {
+          "stage": 4,
+          "order": [
+            "codex",
+            "golutra"
+          ],
+          "golutra": {
+            "strict_passed": true,
+            "workspace_verifier_pass": true,
+            "runtime_terminal_success": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "elapsed_ms": 78843.6,
+            "tool_ready_to_terminal_samples_ms": [
+              0,
+              153,
+              0,
+              11,
+              111,
+              0,
+              0,
+              0
+            ]
+          },
+          "codex": {
+            "strict_passed": true,
+            "workspace_verifier_pass": true,
+            "runtime_terminal_success": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "elapsed_ms": 67786.9,
+            "tool_ready_to_terminal_samples_ms": []
+          }
+        }
+      ],
+      "interpretation": "Final: both passed 4/4; Golutra 15.1% slower in this single sample.",
+      "golutra_binary_sha256": "0b32474f6dad731333a4055f0752597bf4909729604cc296be188a314f8a1524"
+    }
+  ]
+}

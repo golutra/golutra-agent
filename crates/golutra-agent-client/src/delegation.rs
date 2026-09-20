@@ -358,6 +358,16 @@ impl RuntimeTaskDelegationBackend {
 
 #[async_trait]
 impl TaskDelegationBackend for RuntimeTaskDelegationBackend {
+    async fn status(&self, session_id: SessionId) -> Result<Value, ToolError> {
+        let host = self
+            .host
+            .upgrade()
+            .ok_or_else(|| ToolError::Execution("runtime host is shutting down".into()))?;
+        notifications::status(&host, session_id)
+            .await
+            .map_err(|error| ToolError::Execution(error.to_string()))
+    }
+
     async fn notifications(
         &self,
         session_id: SessionId,

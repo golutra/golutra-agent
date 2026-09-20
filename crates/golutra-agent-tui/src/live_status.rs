@@ -81,11 +81,13 @@ pub(crate) struct ActivitySnapshot {
     pub(crate) elapsed: Duration,
     pub(crate) output_rate: Option<OutputRate>,
     pub(crate) can_interrupt: bool,
+    pub(crate) recovery: Option<super::recovery_status::RecoverySnapshot>,
 }
 
 /// A replayable reducer for the current turn's ephemeral activity.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ActivityProjection {
+    pub(crate) recovery: super::recovery_status::RecoveryActivity,
     task_id: Option<TaskId>,
     turn_id: Option<TurnId>,
     active_elapsed: Duration,
@@ -127,7 +129,16 @@ impl ActivityProjection {
             self.reset_turn(event.turn_id, event.timestamp);
         }
 
+        self.recovery.apply(event);
         match event.event_type {
+            RuntimeEventType::RetryScheduled if event.payload.get("recovery").is_some() => {
+                if (event.payload["recovery"]["phase"] == "waiting"
+                    || event.payload["recovery"]["reset_stream"].as_bool() == Some(true))
+                    && let Some(provider) = self.provider_calls.last_mut()
+                {
+                    *provider = ProviderActivity::new();
+                }
+            }
             RuntimeEventType::TaskCreated | RuntimeEventType::TurnStarted => {
                 self.resume_at(event.timestamp);
             }
@@ -196,6 +207,7 @@ impl ActivityProjection {
     }
 
     fn reset_task(&mut self, task_id: TaskId, turn_id: Option<TurnId>, at: DateTime<Utc>) {
+        self.recovery = Default::default();
         self.task_id = Some(task_id);
         self.turn_id = turn_id;
         self.active_elapsed = Duration::ZERO;
@@ -205,6 +217,7 @@ impl ActivityProjection {
     }
 
     fn reset_turn(&mut self, turn_id: Option<TurnId>, at: DateTime<Utc>) {
+        self.recovery = Default::default();
         self.turn_id = turn_id;
         self.active_elapsed = Duration::ZERO;
         self.running_since = Some(at);
@@ -298,6 +311,7 @@ impl ActivityProjection {
             return None;
         }
         Some(ActivitySnapshot {
+            recovery: self.recovery.snapshot(now),
             elapsed: self.elapsed_at(now),
             output_rate: self.output_rate(now),
             can_interrupt: !matches!(status, TaskStatus::Aborting),
@@ -432,6 +446,79 @@ mod tests {
             .expect("completed rate");
         assert!((completed.tokens_per_second - 120.0).abs() < 0.01);
         assert!(!completed.estimated);
+    }
+
+    #[test]
+    fn recovery_status_counts_waits_replays_and_clears_after_progress() {
+        let base = Utc::now();
+        let task = TaskId::new();
+        let turn = TurnId::new();
+        let events = vec![
+            event(
+                1,
+                task,
+                Some(turn),
+                RuntimeEventType::TaskCreated,
+                base,
+                json!({}),
+            ),
+            event(
+                2,
+                task,
+                Some(turn),
+                RuntimeEventType::RetryScheduled,
+                base,
+                json!({"recovery": {"phase": "waiting", "network": true, "attempt": 1, "delay_ms": 5000}}),
+            ),
+            event(
+                3,
+                task,
+                Some(turn),
+                RuntimeEventType::RetryScheduled,
+                base + chrono::Duration::seconds(5),
+                json!({"recovery": {"phase": "retrying", "network": true, "attempt": 1}}),
+            ),
+            event(
+                4,
+                task,
+                Some(turn),
+                RuntimeEventType::ProviderStreamed,
+                base + chrono::Duration::seconds(6),
+                json!({"delta": {"kind": "text_delta", "text": "恢复"}}),
+            ),
+        ];
+        let mut projection = ActivityProjection::default();
+        projection.rebuild(&events[..2]);
+        let at = base + chrono::Duration::seconds(2);
+        let snapshot = projection.snapshot(Some(TaskStatus::Running), at).unwrap();
+        assert!(snapshot.can_interrupt);
+        let recovery = snapshot.recovery.unwrap();
+        assert_eq!(recovery.remaining_seconds, 3);
+        assert_eq!(recovery.waited_seconds, 2);
+        projection.apply(&events[2]);
+        assert!(projection.recovery.snapshot(at).unwrap().connecting);
+        projection.apply(&events[3]);
+        assert!(projection.recovery.snapshot(at).is_none());
+        let mut resumed = ActivityProjection::default();
+        resumed.rebuild(&events);
+        assert_eq!(
+            projection.recovery.details(at),
+            resumed.recovery.details(at)
+        );
+        assert!(resumed.recovery.details(at)[0].contains("retry wait 5s"));
+        projection.apply(&event(
+            5,
+            task,
+            Some(turn),
+            RuntimeEventType::TaskCompleted,
+            base + chrono::Duration::seconds(7),
+            json!({}),
+        ));
+        assert!(
+            projection
+                .snapshot(Some(TaskStatus::Completed), at)
+                .is_none()
+        );
     }
 
     #[test]

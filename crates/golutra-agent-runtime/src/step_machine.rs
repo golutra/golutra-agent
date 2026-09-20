@@ -141,6 +141,15 @@ impl StepMachine {
         self.correction_advisory_emitted = false;
     }
 
+    /// 等待恢复没有执行纠错动作，不能消耗无进展时限；任务总截止时间独立保持不变。
+    pub fn exclude_recovery_wait(&mut self, elapsed_ms: u64) {
+        if self.correction_active {
+            self.correction_last_material_progress_ms = self
+                .correction_last_material_progress_ms
+                .saturating_add(elapsed_ms);
+        }
+    }
+
     #[must_use]
     pub fn begin(&mut self, turn_id: TurnId) -> StepSnapshot {
         let snapshot = StepSnapshot {
@@ -344,6 +353,30 @@ mod tests {
 
         assert_eq!(completion.repeated_no_progress, 0);
         assert!(!completion.should_stop);
+    }
+
+    #[test]
+    fn connection_wait_does_not_consume_correction_progress_time() {
+        let mut machine = StepMachine::with_limits(
+            8,
+            10,
+            CorrectionProgressLimits {
+                step_limit: 16,
+                elapsed_ms_limit: 300_000,
+            },
+        );
+        machine.begin_correction(100);
+        let step = machine.begin(TurnId::new());
+        machine.exclude_recovery_wait(600_000);
+        let result = machine.complete_at(step, "read", false, 600_200);
+        assert_eq!(result.correction_no_progress_elapsed_ms, 100);
+        assert!(!result.should_stop);
+        let step = machine.begin(TurnId::new());
+        assert!(
+            machine
+                .complete_at(step, "read", false, 900_100)
+                .should_stop
+        );
     }
 
     #[test]

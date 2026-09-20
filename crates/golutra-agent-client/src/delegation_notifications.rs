@@ -84,6 +84,83 @@ async fn notification_facts(
     Ok(facts)
 }
 
+/// 沿用通知索引与投影，只返回属于该父线程的最近子任务；查询不会发布或消费通知。
+pub(super) async fn status(host: &RuntimeHost, session: SessionId) -> Result<Value, ClientError> {
+    let events = notification_facts(host, session).await?;
+    let parent = host
+        .storage
+        .repositories
+        .threads
+        .by_session(session)
+        .await?;
+    let mut seen = std::collections::HashSet::new();
+    let mut children = Vec::new();
+    // 子任务结果先发布、通知后落盘；先读当前操作，避免这个正常窗口漏掉仍在运行的子任务。
+    let mut active = host
+        .execution
+        .delegation_operations
+        .lock()
+        .await
+        .values()
+        .filter(|operation| operation.belongs_to(session))
+        .filter_map(|operation| {
+            control::operation_session(operation)
+                .map(|child| (operation.execution_finished(), operation.created_at, child))
+        })
+        .collect::<Vec<_>>();
+    active.sort_by_key(|(finished, created, _)| (*finished, std::cmp::Reverse(*created)));
+    let mut candidates = active
+        .into_iter()
+        .map(|(_, _, child)| child)
+        .collect::<Vec<_>>();
+    for event in events.iter().rev() {
+        let facts = if event.event_type == RuntimeEventType::SubagentUpdated {
+            &event.payload["facts"]
+        } else if event.event_type == RuntimeEventType::ToolCompleted
+            && event.payload["envelope"]["tool_name"] == "subagent"
+        {
+            &event.payload["envelope"]["structured_facts"]
+        } else {
+            continue;
+        };
+        let Some(child) = facts["child_session_id"]
+            .as_str()
+            .and_then(|id| id.parse::<SessionId>().ok())
+        else {
+            continue;
+        };
+        candidates.push(child);
+    }
+    for child in candidates {
+        if !seen.insert(child) || children.len() >= 16 {
+            continue;
+        }
+        let Some(thread) = host.storage.repositories.threads.by_session(child).await? else {
+            continue;
+        };
+        if parent
+            .as_ref()
+            .is_none_or(|parent| thread.parent_thread_id != Some(parent.thread_id))
+        {
+            continue;
+        }
+        let state = host
+            .storage
+            .repositories
+            .projections
+            .state(child, None)
+            .await?;
+        children.push(
+            json!({"child_session_id":child, "task_id":state.active_task_id,
+            "status":state.task_status}),
+        );
+    }
+    Ok(
+        json!({"available":true, "scope":"parent_session", "children":children,
+        "truncated":seen.len() > 16}),
+    )
+}
+
 pub(super) async fn publish(
     host: &RuntimeHost,
     request: &ToolRequest,

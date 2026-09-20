@@ -183,6 +183,7 @@ async fn exec_run_dir_retains_an_isolated_structured_runtime_bundle() {
             .arg("exec")
             .arg("--run-dir")
             .arg(&state_dir)
+            .arg("--full-run-export")
             .arg("--task-contract")
             .arg(&task_contract)
             .arg("--allow-network")
@@ -368,6 +369,20 @@ async fn failed_exec_run_dir_still_retains_verification_observations() {
     .expect("valid failed run bundle manifest");
     assert_eq!(manifest["terminal_outcome"]["kind"], "result");
     assert_eq!(manifest["terminal_outcome"]["result"]["status"], "failed");
+    assert_eq!(manifest["debug_export"]["state"], "deferred");
+    assert!(!state_dir.join("debug-export").exists());
+    let handoff = export_parent.path().join("explicit-debug");
+    let exported = Command::new(env!("CARGO_BIN_EXE_golutra-agent"))
+        .arg("--run-bundle")
+        .arg(&state_dir)
+        .arg("export")
+        .arg(&handoff)
+        .env("GOLUTRA_AGENT_HOME", home.path())
+        .output()
+        .await
+        .expect("explicit export");
+    assert!(exported.status.success(), "{exported:?}");
+    assert!(handoff.join("manifest.json").is_file());
     let observations: Value = serde_json::from_slice(
         &fs::read(state_dir.join("observations/manifest.json"))
             .expect("failed observation manifest"),

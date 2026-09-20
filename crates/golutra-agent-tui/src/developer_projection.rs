@@ -74,7 +74,17 @@ pub(crate) fn developer_facts_projection(
         context_count: count_events(&projection.events, RuntimeEventType::ContextBuilt),
         provider_count: count_events(&projection.events, RuntimeEventType::ProviderStarted),
         token_count: count_events(&projection.events, RuntimeEventType::TokenUsageRecorded),
-        retry_count: count_events(&projection.events, RuntimeEventType::RetryScheduled),
+        retry_count: projection
+            .events
+            .iter()
+            .filter(|event| {
+                event.event_type == RuntimeEventType::RetryScheduled
+                    && event
+                        .payload
+                        .get("recovery")
+                        .is_none_or(|recovery| recovery["phase"] == "waiting")
+            })
+            .count(),
         fallback_count: count_events(&projection.events, RuntimeEventType::ProviderFallback),
         transport_fallback_count: count_events(
             &projection.events,
