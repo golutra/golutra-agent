@@ -12,7 +12,9 @@
 
 本地运行时，模型选择立即用于当前会话，并保存到 `$GOLUTRA_AGENT_HOME/runtime.json`，重启后继续使用；若项目已存在 `.golutra-agent/runtime.json`，则更新该项目层，避免旧的项目覆盖使模型还原。显式切换 profile 时同时保存对应选择。保存复用锁、revision 校验和原子文件替换，只修改模型相关字段，不改写凭据、provider 定义或权限；失败时保留编辑框及草稿，不假报成功。`/model <model-id>` 使用同一机制。远程 TUI 保持会话覆盖，不写本地配置冒充修改远程主机。
 
-选择 `3 Custom Provider` 后，协议列表分别提供 `1 OpenAI Chat Completions`（`/chat/completions`）和 `2 OpenAI Responses`（`/responses`）。两者是独立协议，不自动互换；根据服务商支持的接口选择。确认页 Enter 只在本地校验并保存配置和凭据，不探测模型、不发送联网验证请求；保存成功后返回聊天输入，实际连通性由后续模型请求验证。`/auth login` 使用相同保存路径；本地保存失败则保留向导并在确认页顶部显示错误。保存的协议决定后续生成请求使用的接口。
+选择 `3 Custom Provider` 后，协议依次为 OpenAI Responses、Anthropic-compatible、Gemini-compatible、OpenAI Chat Completions、Vertex AI、rust-genai。Responses（`/responses`）与 Chat Completions（`/chat/completions`）是独立协议，不自动互换；根据服务商支持的接口选择。确认页 Enter 只在本地校验并保存配置和凭据，不探测模型、不发送联网验证请求；保存成功后返回聊天输入，实际连通性由后续模型请求验证。`/auth login` 使用相同保存路径；本地保存失败则保留向导并在确认页顶部显示错误。保存的协议决定后续生成请求使用的接口。
+
+API Key 配置默认直接进入密钥输入页，保存到 `$GOLUTRA_AGENT_HOME/credentials.json`，不再单独询问存储方式。在该页按 `Ctrl+E` 可切换到环境变量名称输入，再按一次切回本地 API Key；切换时清空密钥和旧确认计划。环境变量名称初始为空，不自动生成或补全，留空继续会提示填写；只保存用户输入的变量名，不创建或修改环境变量，须在启动 Agent 前设置。Esc 返回地址页，保留所选模式与手填变量名；从模型页返回时回到对应凭据输入页。确认页仍显示真实凭据来源，自定义配置共六步。
 
 Base URL 可填裸域名（默认 HTTPS）或完整基础地址。OpenAI Chat Completions、Responses、Anthropic 在没有路径时补 `/v1`，Gemini 补 `/v1beta`；已有版本号、自定义代理路径和 ChatGPT 的 `/backend-api/codex` 保持原样。按所选协议识别完整的 `/chat/completions`、`/responses`、`/messages` 或 Gemini `/models/<model>:generateContent` / `:streamGenerateContent` 地址，去掉操作后缀以避免重复拼接；实际模型仍以 Model 字段为准。带凭据、查询参数或 fragment 的地址拒绝保存。Vertex AI 需要明确的项目/区域基础路径，不能从裸域名猜测；rust-genai 按其已有模型路由为 OpenAI、Anthropic、Gemini、DeepSeek 补默认路径，其他路由要求明确 API 基础路径。确认页和保存内容显示规范化地址，运行时对已有配置及环境变量使用同一规则，不联网尝试多个端点。
 

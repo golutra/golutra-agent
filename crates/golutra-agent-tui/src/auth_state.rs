@@ -64,7 +64,6 @@ pub(crate) enum AuthDialogStep {
     AuthMethod,
     Protocol,
     BaseUrl,
-    CredentialStore,
     ApiKey,
     EnvKey,
     Model,
@@ -218,6 +217,27 @@ impl AuthDialogState {
             .unwrap_or(&[])
     }
 
+    pub(crate) fn toggle_credential_input(&mut self) {
+        match self.step {
+            AuthDialogStep::ApiKey => {
+                self.credential_store = AuthCredentialStore::Environment;
+                self.step = AuthDialogStep::EnvKey;
+            }
+            AuthDialogStep::EnvKey => {
+                self.credential_store = AuthCredentialStore::Disk;
+                self.step = AuthDialogStep::ApiKey;
+            }
+            _ => return,
+        }
+        // 切换来源后不能复用旧密钥或旧确认计划，避免无意保存已放弃的凭据。
+        self.api_key.clear();
+        self.review = None;
+        self.error = None;
+        self.selected = 0;
+        self.scroll = 0;
+        self.manual_scroll = false;
+    }
+
     pub(crate) fn oauth_methods(&self) -> Vec<BuiltinOAuthMethod> {
         self.provider
             .and_then(|provider| provider.oauth_provider_id)
@@ -307,7 +327,6 @@ impl AuthDialogState {
                 | AuthDialogStep::ThirdPartyChoice
                 | AuthDialogStep::AuthMethod
                 | AuthDialogStep::Protocol
-                | AuthDialogStep::CredentialStore
                 | AuthDialogStep::Model
                 | AuthDialogStep::AdvancedConfig
         )
@@ -346,7 +365,6 @@ impl AuthDialogState {
             }
             AuthDialogStep::AuthMethod => self.auth_method_count().saturating_sub(1),
             AuthDialogStep::Protocol => self.protocol_options().len().saturating_sub(1),
-            AuthDialogStep::CredentialStore => 1,
             AuthDialogStep::Model => self.custom_model_index(),
             AuthDialogStep::AdvancedConfig => AUTH_ADVANCED_ITEMS.saturating_sub(1),
             AuthDialogStep::BaseUrl
@@ -372,7 +390,6 @@ impl AuthDialogState {
             | AuthDialogStep::ThirdPartyChoice
             | AuthDialogStep::AuthMethod
             | AuthDialogStep::Protocol
-            | AuthDialogStep::CredentialStore
             | AuthDialogStep::Model
             | AuthDialogStep::Review => None,
         }
@@ -416,15 +433,7 @@ impl AuthDialogState {
                 Some(AuthProviderSource::ThirdParty) => AuthDialogStep::ThirdPartyChoice,
                 _ => AuthDialogStep::GroupChoice,
             },
-            AuthDialogStep::CredentialStore => AuthDialogStep::BaseUrl,
-            AuthDialogStep::ApiKey => {
-                if self.credential_store == AuthCredentialStore::Ephemeral {
-                    AuthDialogStep::BaseUrl
-                } else {
-                    AuthDialogStep::CredentialStore
-                }
-            }
-            AuthDialogStep::EnvKey => AuthDialogStep::CredentialStore,
+            AuthDialogStep::ApiKey | AuthDialogStep::EnvKey => AuthDialogStep::BaseUrl,
             AuthDialogStep::Model => {
                 if self.credential_store == AuthCredentialStore::Environment {
                     AuthDialogStep::EnvKey
@@ -451,10 +460,10 @@ impl AuthDialogState {
 pub(crate) const AUTH_ADVANCED_ITEMS: usize = 5;
 pub(crate) const OPENAI_PROTOCOL_ONLY: &[ProviderProtocol] = &[ProviderProtocol::OpenAiCompatible];
 pub(crate) const CUSTOM_PROTOCOL_OPTIONS: &[ProviderProtocol] = &[
-    ProviderProtocol::OpenAiCompatible,
     ProviderProtocol::OpenAiResponses,
     ProviderProtocol::Anthropic,
     ProviderProtocol::Gemini,
+    ProviderProtocol::OpenAiCompatible,
     ProviderProtocol::VertexAi,
     ProviderProtocol::Genai,
 ];

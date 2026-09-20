@@ -31,9 +31,9 @@ use golutra_agent_client::{
 use golutra_agent_config::{
     BuiltinOAuthMethod, ProviderConfigPaths, ProviderConfigScope, ProviderInstallPlan,
     ProviderProfile, apply_oauth_provider_install_plan_verified, apply_provider_install_plan,
-    generate_custom_provider_api_key_env, load_non_secret_runtime_settings, load_provider_settings,
-    logout_provider_profile_verified, provider_auth_service, provider_onboarding_state,
-    provider_protocol_has_runtime_adapter, update_provider_settings_verified,
+    load_non_secret_runtime_settings, load_provider_settings, logout_provider_profile_verified,
+    provider_auth_service, provider_onboarding_state, provider_protocol_has_runtime_adapter,
+    update_provider_settings_verified,
 };
 use golutra_agent_core::{
     ActorKind, ApprovalRequest, ApprovalScope, EventId, QueryId, SessionId, TaskId, ThreadId,
