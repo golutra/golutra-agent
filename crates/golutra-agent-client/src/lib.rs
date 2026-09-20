@@ -57,8 +57,7 @@ use golutra_agent_runtime::{
     RuntimeLaneError, RuntimeLaneManager, RuntimeObservation, RuntimeObservationSink,
     RuntimeVerificationService, WorkspaceCheckpointManager,
     agent_execution_channel_with_cancellation, auxiliary_provider_usage_record,
-    compaction_summary_context_snapshot, compaction_summary_request, default_agent_max_elapsed_ms,
-    is_active_status,
+    compaction_summary_context_snapshot, compaction_summary_request, is_active_status,
 };
 use golutra_agent_store::{
     CommandClaim, RuntimeRepositories, RuntimeStore, StoreError, ThreadRecord,
@@ -855,6 +854,10 @@ fn delegation_recovery_from_metadata(
             ))
         })
     };
+    let optional_budget = |key: &str| match budget.get(key) {
+        Some(Value::Null) => Ok(None),
+        _ => parse_budget(key).map(Some),
+    };
     let optional_id = |key: &str| -> Result<Option<Uuid>, ClientError> {
         match metadata.get(key) {
             None | Some(Value::Null) => Ok(None),
@@ -885,7 +888,7 @@ fn delegation_recovery_from_metadata(
     let reserved_tokens = parse_budget("reserved_tokens")?;
     let reserved_cost_microusd = parse_budget("reserved_cost_microusd")?;
     let active_children = parse_budget("active_children")?;
-    let max_tokens = parse_budget("max_tokens")?;
+    let max_tokens = optional_budget("max_tokens")?;
     let spent_tokens = parse_budget("spent_tokens")?;
     let spent_output_tokens = match budget.get("spent_output_tokens") {
         None => None,
@@ -927,7 +930,7 @@ fn delegation_recovery_from_metadata(
                 "delegation recovery metadata depth is out of range".to_owned(),
             )
         })?,
-        remaining_elapsed_ms: parse_budget("remaining_elapsed_ms")?,
+        remaining_elapsed_ms: optional_budget("remaining_elapsed_ms")?,
         local_remaining_elapsed_ms: metadata
             .get("local_remaining_elapsed_ms")
             .and_then(Value::as_u64),
@@ -945,13 +948,19 @@ fn delegation_recovery_from_metadata(
         // 活动 reservation 代表旧进程可能已经执行但尚未完成结算。恢复时必须先耗尽
         // 对应上限，只有新的 durable checkpoint 才能用实际 usage 替换这个保守状态。
         spent_tokens: if has_unsettled_reservation {
-            spent_tokens.max(max_tokens)
+            max_tokens.map_or_else(
+                || spent_tokens.saturating_add(reserved_tokens),
+                |max| spent_tokens.max(max),
+            )
         } else {
             spent_tokens.saturating_add(reserved_tokens)
         },
         spent_output_tokens: spent_output_tokens.map(|spent| {
             if has_unsettled_reservation {
-                spent.max(max_tokens)
+                max_tokens.map_or_else(
+                    || spent.saturating_add(reserved_tokens),
+                    |max| spent.max(max),
+                )
             } else {
                 spent.saturating_add(reserved_tokens)
             }
@@ -1213,9 +1222,11 @@ fn materialize_recovered_leading_steer(
     inherit_steering_execution_surface(&active_surface.payload, steering_payload)?;
     match active_surface.payload.get("max_elapsed_ms") {
         None | Some(Value::Null) => {
-            let budget_ms = default_agent_max_elapsed_ms();
-            let elapsed_ms = recovered_elapsed_ms(active_surface.budget_started_at, recovered_at);
-            steering_payload["max_elapsed_ms"] = json!(budget_ms.saturating_sub(elapsed_ms).max(1));
+            // 未设置预算的恢复不能凭空生成截止时间。
+            steering_payload
+                .as_object_mut()
+                .expect("normalized payload")
+                .remove("max_elapsed_ms");
         }
         Some(value) if value.as_u64().is_some_and(|value| value > 0) => {
             let budget_ms = value.as_u64().expect("positive elapsed budget");
@@ -1248,8 +1259,7 @@ fn recovered_steer_has_materialized_surface(payload: &Value) -> bool {
         )
         && payload
             .get("max_elapsed_ms")
-            .and_then(Value::as_u64)
-            .is_some_and(|value| value > 0)
+            .is_none_or(|value| value.is_null() || value.as_u64().is_some_and(|value| value > 0))
 }
 
 fn recovered_elapsed_ms(

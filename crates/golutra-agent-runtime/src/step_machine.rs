@@ -8,7 +8,7 @@ use golutra_agent_core::TurnId;
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_NO_PROGRESS_ADVISORY_LIMIT: u32 = 3;
-pub const DEFAULT_NO_PROGRESS_LIMIT: u32 = 6;
+pub const DEFAULT_NO_PROGRESS_LIMIT: u32 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CorrectionProgressLimits {
@@ -107,12 +107,15 @@ impl StepMachine {
         stop_limit: u32,
         correction_limits: CorrectionProgressLimits,
     ) -> Self {
-        let stop_limit = stop_limit.max(1);
         Self {
             next_step_no: 0,
             last_fingerprint: None,
             repeated_no_progress: 0,
-            no_progress_advisory_limit: advisory_limit.clamp(1, stop_limit),
+            no_progress_advisory_limit: if stop_limit == 0 {
+                advisory_limit.max(1)
+            } else {
+                advisory_limit.clamp(1, stop_limit)
+            },
             no_progress_limit: stop_limit,
             correction_limits,
             correction_active: false,
@@ -139,6 +142,15 @@ impl StepMachine {
         self.correction_no_progress_steps = 0;
         self.correction_no_progress_elapsed_ms = 0;
         self.correction_advisory_emitted = false;
+    }
+
+    /// 等待恢复没有执行纠错动作，不能消耗无进展时限；任务总截止时间独立保持不变。
+    pub fn exclude_recovery_wait(&mut self, elapsed_ms: u64) {
+        if self.correction_active {
+            self.correction_last_material_progress_ms = self
+                .correction_last_material_progress_ms
+                .saturating_add(elapsed_ms);
+        }
     }
 
     #[must_use]
@@ -190,11 +202,11 @@ impl StepMachine {
         let semantic_advisory =
             (self.repeated_no_progress == self.no_progress_advisory_limit).then(|| {
                 format!(
-                    "runtime has made no observable progress for {} semantically equivalent steps; execution remains active until the hard limit of {}",
-                    self.repeated_no_progress, self.no_progress_limit
+                    "runtime has made no observable progress for {} semantically equivalent steps; inspect the results and reconsider the approach",
+                    self.repeated_no_progress
                 )
             });
-        let semantic_stop = self.repeated_no_progress >= self.no_progress_limit;
+        let semantic_stop = limit_reached(self.repeated_no_progress, self.no_progress_limit);
         let mut correction_advisory = None;
         let mut correction_stop = false;
         if self.correction_active {
@@ -347,19 +359,43 @@ mod tests {
     }
 
     #[test]
-    fn default_policy_advises_before_it_stops() {
+    fn connection_wait_does_not_consume_correction_progress_time() {
+        let mut machine = StepMachine::with_limits(
+            8,
+            10,
+            CorrectionProgressLimits {
+                step_limit: 16,
+                elapsed_ms_limit: 300_000,
+            },
+        );
+        machine.begin_correction(100);
+        let step = machine.begin(TurnId::new());
+        machine.exclude_recovery_wait(600_000);
+        let result = machine.complete_at(step, "read", false, 600_200);
+        assert_eq!(result.correction_no_progress_elapsed_ms, 100);
+        assert!(!result.should_stop);
+        let step = machine.begin(TurnId::new());
+        assert!(
+            machine
+                .complete_at(step, "read", false, 900_100)
+                .should_stop
+        );
+    }
+
+    #[test]
+    fn default_policy_advises_without_stopping() {
         let turn_id = TurnId::new();
         let mut machine = StepMachine::default();
         let mut completions = Vec::new();
 
-        for _ in 0..DEFAULT_NO_PROGRESS_LIMIT {
+        for _ in 0..100 {
             let step = machine.begin(turn_id);
             completions.push(machine.complete(step, "same-action", false));
         }
 
         assert!(completions[2].advisory.is_some());
         assert!(!completions[2].should_stop);
-        assert!(completions[5].should_stop);
+        assert!(completions.iter().all(|completion| !completion.should_stop));
     }
 
     #[test]

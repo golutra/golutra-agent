@@ -2,7 +2,7 @@
 
 ## 目标
 
-Golutra 的长任务稳定性不是靠无限重试，而是靠可恢复的事实链和明确的不变量：
+Golutra 的长任务稳定性由可恢复的事实链、明确的不变量和分类恢复共同保证。已确认的连接故障可以持续等待；普通服务错误仍有限重试，所有等待服从取消和任务截止时间。详见 [长任务连接恢复](long-task-recovery.md)。
 
 ```text
 SessionCommand
@@ -34,7 +34,7 @@ CLI、TUI、App Server、SDK 和 MCP 只改变 transport 与展示方式，不�
 | --- | --- | --- |
 | `StepMachine` | step checkpoint、无进展检测、总预算 | 不使用固定的短轮数上限；重复无进展或预算耗尽后结构化停止 |
 | Context guard | token 预算、自动 compaction、tool pair 保留 | 无法保留最低上下文时阻断，不发送截断后语义不完整的请求 |
-| `ProviderSession` | request timeout、stream idle timeout、retry、transport fallback、provider fallback | retry 带退避且可取消；只在契约允许时 fallback |
+| `ProviderSession` | request timeout、stream idle timeout、连接等待、retry、transport fallback、provider fallback | 连接等待与普通重试分开；中断预览有持久边界，完整响应后才执行工具；等待可取消且服从总截止时间 |
 | Tool executor | policy、approval、JSON Schema、artifact/evidence | 所有成功、失败、timeout、cancel 都写 terminal tool fact |
 | `ProcessSupervisor` | process id、bounded output journal、poll/stdin/terminate、process group | host drop、timeout 和 cancel 终止进程组；cursor loss 显式返回 |
 | Runtime recovery | orphan task 分析、pending turn 恢复 | 自动恢复只针对从未启动的 pending turn；未知副作用必须人工对账 |

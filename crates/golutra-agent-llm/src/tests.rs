@@ -150,7 +150,7 @@ async fn provider_request_transport_failure_is_retryable() {
 
     assert!(matches!(
         provider_transport_error(error),
-        ProviderError::Unavailable { .. }
+        ProviderError::ConnectionFailed { .. }
     ));
 }
 
@@ -291,13 +291,12 @@ fn openai_tool_parameters_come_from_the_runtime_tool_contract() {
 fn shell_provider_description_explains_parallel_dispatch_and_continuation() {
     let description = provider_tool_description("shell");
 
-    assert!(description.contains("argv"));
+    assert!(!description.contains("argv"));
     assert!(description.contains("command"));
     assert!(description.contains("bash -lc"));
     assert!(description.contains("heredoc"));
     assert!(description.contains("timeout_ms"));
     assert!(description.contains("background"));
-    assert!(description.contains("prefer only one"));
     assert!(description.contains("independent background=true calls"));
     assert!(description.contains("one response for parallel execution"));
     assert!(description.contains("sequence dependent commands"));
@@ -377,7 +376,7 @@ fn provider_surface_descriptions_are_bounded_without_dropping_capability_terms()
                 "multi-file",
             ][..],
         ),
-        ("shell", &["argv", "command", "heredoc", "background"][..]),
+        ("shell", &["command", "heredoc", "background"][..]),
         (
             "shell_session",
             &[

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Component, Path};
 
 pub const TASK_CONTRACT_SCHEMA_VERSION: u32 = 1;
-pub const MAX_TASK_CORRECTION_ROUNDS: u32 = 8;
+
 const MAX_TASK_CONTRACT_PATH_CHARS: usize = 1_024;
 const MAX_TASK_CONTRACT_CRITERION_CHARS: usize = 4_096;
 const MAX_REQUIRED_FILE_CONTENT_BYTES: usize = 1024 * 1024;
@@ -51,16 +51,13 @@ pub struct TaskContract {
     pub require_objective_validation: bool,
     #[serde(default)]
     pub verification: VerificationRequirement,
-    #[serde(default = "default_correction_rounds")]
-    pub max_correction_rounds: u32,
+    /// 未设置时持续纠偏；显式零值表示禁止自动纠偏。
+    #[serde(default)]
+    pub max_correction_rounds: Option<u32>,
 }
 
 const fn default_task_contract_schema_version() -> u32 {
     TASK_CONTRACT_SCHEMA_VERSION
-}
-
-const fn default_correction_rounds() -> u32 {
-    1
 }
 
 impl Default for TaskContract {
@@ -73,17 +70,27 @@ impl Default for TaskContract {
             completion_criteria: Vec::new(),
             require_objective_validation: false,
             verification: VerificationRequirement::BestEffort,
-            max_correction_rounds: default_correction_rounds(),
+            max_correction_rounds: None,
         }
     }
 }
 
 impl TaskContract {
+    /// 日常执行同样检查已观察到的交付证据；没有副作用的普通回答不产生额外模型调用。
+    /// 仅显式合同限制纠偏轮数，默认不因轮数终止长任务。
+    #[must_use]
+    pub fn open(completion_criteria: Vec<String>) -> Self {
+        Self {
+            completion_criteria,
+            ..Self::default()
+        }
+    }
+
     #[must_use]
     pub fn conversational(completion_criteria: Vec<String>) -> Self {
         Self {
             completion_criteria,
-            max_correction_rounds: 0,
+            max_correction_rounds: Some(0),
             ..Self::default()
         }
     }
@@ -102,7 +109,8 @@ impl TaskContract {
 
     #[must_use]
     pub fn allows_correction(&self, attempt: u32) -> bool {
-        attempt < self.max_correction_rounds
+        self.max_correction_rounds
+            .is_none_or(|limit| attempt < limit)
     }
 
     /// Reject malformed adapter input before it reaches the execution loop.
@@ -111,11 +119,6 @@ impl TaskContract {
             return Err(format!(
                 "unsupported task contract schema_version {}; expected {TASK_CONTRACT_SCHEMA_VERSION}",
                 self.schema_version
-            ));
-        }
-        if self.max_correction_rounds > MAX_TASK_CORRECTION_ROUNDS {
-            return Err(format!(
-                "task contract max_correction_rounds exceeds {MAX_TASK_CORRECTION_ROUNDS}"
             ));
         }
         if self.required_paths.len() > 64 {
@@ -193,12 +196,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn omitted_correction_budget_is_unlimited_but_explicit_zero_is_not() {
+        let implicit: TaskContract = serde_json::from_str("{}").unwrap();
+        assert_eq!(implicit.max_correction_rounds, None);
+        assert!(implicit.allows_correction(u32::MAX));
+        let explicit: TaskContract =
+            serde_json::from_str(r#"{"max_correction_rounds":0}"#).unwrap();
+        assert!(!explicit.allows_correction(0));
+        let large: TaskContract = serde_json::from_str(r#"{"max_correction_rounds":100}"#).unwrap();
+        assert!(large.validate().is_ok());
+        assert!(!large.allows_correction(100));
+    }
+
+    #[test]
     fn contract_makes_workspace_and_correction_policy_explicit() {
         let contract = TaskContract {
             workspace_change: WorkspaceChangeRequirement::Required,
             required_paths: vec!["src/main.rs".to_owned()],
             verification: VerificationRequirement::Independent,
-            max_correction_rounds: 2,
+            max_correction_rounds: Some(2),
             ..TaskContract::default()
         };
 
@@ -232,10 +248,10 @@ mod tests {
         assert!(future_schema.validate().is_err());
 
         let unbounded_correction = TaskContract {
-            max_correction_rounds: MAX_TASK_CORRECTION_ROUNDS + 1,
+            max_correction_rounds: Some(100),
             ..TaskContract::default()
         };
-        assert!(unbounded_correction.validate().is_err());
+        assert!(unbounded_correction.validate().is_ok());
     }
 
     #[test]

@@ -1,0 +1,824 @@
+{
+  "schema_version": 1,
+  "notes": [
+    "Provider model identity is requested, not independently verified behind the gateway.",
+    "CLI completed items and runtime tool calls are different counters.",
+    "Recovery is backfilled from immutable stdout; successful adapter attempt_count excludes earlier session retries.",
+    "All attempts are retained; no timing excluded due to upstream errors.",
+    "Usage from failed HTTP attempts without returned usage is unknown; reported tokens are not a complete billing claim."
+  ],
+  "experiments": [
+    {
+      "started_at": "2026-09-20T09:39:29.515717Z",
+      "finished_at": "2026-09-20T09:41:32.879303Z",
+      "model": "gpt-5.6-sol",
+      "reasoning_effort": "medium",
+      "base_url": "https://api.golutra.cn",
+      "task_digests": {
+        "parser_fix": "e1b75b4b94fec84d2e6c051120a0becc925d35405a92c88612ed6bc94ff52236",
+        "multi_file": "29bd2838994c03c6c59c45c5059cf2547b05c58c69b67895bd72fd9c7c2145a5"
+      },
+      "versions": {
+        "baseline": "golutra-agent 0.3.1",
+        "candidate": "golutra-agent 0.3.1"
+      },
+      "binary_or_launcher_sha256": {
+        "baseline": "c961c0651e7d6e7404382d8d8b0512e397a8a1ba383b966af820caf3cfcf7967",
+        "candidate": "061cddc7a2315e033673f28cced39496c98879f2ec4621df450739cd963c77c2"
+      },
+      "scope": "Autonomous coding tasks across domains; no multi-hour claim; no repair prompts.",
+      "name": "development",
+      "attempts": [
+        {
+          "variant": "baseline",
+          "task": "parser_fix",
+          "repeat": 0,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "independent acceptance passed",
+          "metrics": {
+            "elapsed_ms": 32410.6,
+            "request_count": 5,
+            "raw_input_tokens": 21206,
+            "uncached_input_tokens": 6967,
+            "output_tokens": 1677,
+            "cache_read_tokens": 14239,
+            "tool_call_count": 8,
+            "tool_count_source": "runtime_tool_calls",
+            "runtime_terminal_success": true,
+            "return_code": 0,
+            "runtime_recovery": {
+              "retry_attempts": 0,
+              "network_retry_attempts": 0,
+              "http_statuses": []
+            }
+          }
+        },
+        {
+          "variant": "candidate",
+          "task": "parser_fix",
+          "repeat": 0,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "independent acceptance passed",
+          "metrics": {
+            "elapsed_ms": 35675.7,
+            "request_count": 6,
+            "raw_input_tokens": 21815,
+            "uncached_input_tokens": 5482,
+            "output_tokens": 1772,
+            "cache_read_tokens": 16333,
+            "tool_call_count": 9,
+            "tool_count_source": "runtime_tool_calls",
+            "runtime_terminal_success": true,
+            "return_code": 0,
+            "runtime_recovery": {
+              "retry_attempts": 0,
+              "network_retry_attempts": 0,
+              "http_statuses": []
+            }
+          }
+        },
+        {
+          "variant": "candidate",
+          "task": "multi_file",
+          "repeat": 0,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "independent acceptance passed",
+          "metrics": {
+            "elapsed_ms": 27878.6,
+            "request_count": 5,
+            "raw_input_tokens": 16061,
+            "uncached_input_tokens": 4764,
+            "output_tokens": 1375,
+            "cache_read_tokens": 11297,
+            "tool_call_count": 8,
+            "tool_count_source": "runtime_tool_calls",
+            "runtime_terminal_success": true,
+            "return_code": 0,
+            "runtime_recovery": {
+              "retry_attempts": 0,
+              "network_retry_attempts": 0,
+              "http_statuses": []
+            }
+          }
+        },
+        {
+          "variant": "baseline",
+          "task": "multi_file",
+          "repeat": 0,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "independent acceptance passed",
+          "metrics": {
+            "elapsed_ms": 25969.4,
+            "request_count": 5,
+            "raw_input_tokens": 16049,
+            "uncached_input_tokens": 4723,
+            "output_tokens": 1320,
+            "cache_read_tokens": 11326,
+            "tool_call_count": 8,
+            "tool_count_source": "runtime_tool_calls",
+            "runtime_terminal_success": true,
+            "return_code": 0,
+            "runtime_recovery": {
+              "retry_attempts": 0,
+              "network_retry_attempts": 0,
+              "http_statuses": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "started_at": "2026-09-20T09:42:07.624627Z",
+      "finished_at": "2026-09-20T10:04:02.534469Z",
+      "model": "gpt-5.6-sol",
+      "reasoning_effort": "medium",
+      "base_url": "https://api.golutra.cn",
+      "task_digests": {
+        "config_layers": "3b6dc8c34787ba6bf9d8e25ea4b0bdd6b9c2edf923b125da961952d2dab1dd00",
+        "dependency_graph": "57c5db7b92aee407b48acad4688366f674559ccc87741dbdb99ebd9dfb90fcb3",
+        "sqlite_transfers": "fe6d74972ee0462fbdfbf92b900c6ba4ab14f3974b79db647bbf66504246c3b4"
+      },
+      "versions": {
+        "candidate": "golutra-agent 0.3.1",
+        "codex": "codex-cli 0.155.1"
+      },
+      "binary_or_launcher_sha256": {
+        "candidate": "061cddc7a2315e033673f28cced39496c98879f2ec4621df450739cd963c77c2",
+        "codex": "61b0194f3bb6534439c8d26a3ed57d0805f84b884588b761795323eeb92fcf70"
+      },
+      "scope": "Autonomous coding tasks across domains; no multi-hour claim; no repair prompts.",
+      "name": "holdout",
+      "attempts": [
+        {
+          "variant": "candidate",
+          "task": "config_layers",
+          "repeat": 0,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "independent acceptance passed",
+          "metrics": {
+            "elapsed_ms": 82528.0,
+            "request_count": 7,
+            "raw_input_tokens": 36871,
+            "uncached_input_tokens": 8955,
+            "output_tokens": 5568,
+            "cache_read_tokens": 27916,
+            "tool_call_count": 11,
+            "tool_count_source": "runtime_tool_calls",
+            "runtime_terminal_success": true,
+            "return_code": 0,
+            "runtime_recovery": {
+              "retry_attempts": 0,
+              "network_retry_attempts": 0,
+              "http_statuses": []
+            }
+          }
+        },
+        {
+          "variant": "codex",
+          "task": "config_layers",
+          "repeat": 0,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "independent acceptance passed",
+          "metrics": {
+            "elapsed_ms": 98703.0,
+            "request_count": null,
+            "raw_input_tokens": 122022,
+            "uncached_input_tokens": 19843,
+            "output_tokens": 6414,
+            "cache_read_tokens": 102179,
+            "tool_call_count": 8,
+            "tool_count_source": "completed_cli_items",
+            "runtime_terminal_success": true,
+            "return_code": 0,
+            "runtime_recovery": null
+          }
+        },
+        {
+          "variant": "codex",
+          "task": "dependency_graph",
+          "repeat": 0,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "independent acceptance passed",
+          "metrics": {
+            "elapsed_ms": 128784.4,
+            "request_count": null,
+            "raw_input_tokens": 169418,
+            "uncached_input_tokens": 23012,
+            "output_tokens": 9027,
+            "cache_read_tokens": 146406,
+            "tool_call_count": 9,
+            "tool_count_source": "completed_cli_items",
+            "runtime_terminal_success": true,
+            "return_code": 0,
+            "runtime_recovery": null
+          }
+        },
+        {
+          "variant": "candidate",
+          "task": "dependency_graph",
+          "repeat": 0,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "independent acceptance passed",
+          "metrics": {
+            "elapsed_ms": 86635.4,
+            "request_count": 7,
+            "raw_input_tokens": 36430,
+            "uncached_input_tokens": 8573,
+            "output_tokens": 6492,
+            "cache_read_tokens": 27857,
+            "tool_call_count": 9,
+            "tool_count_source": "runtime_tool_calls",
+            "runtime_terminal_success": true,
+            "return_code": 0,
+            "runtime_recovery": {
+              "retry_attempts": 0,
+              "network_retry_attempts": 0,
+              "http_statuses": []
+            }
+          }
+        },
+        {
+          "variant": "candidate",
+          "task": "sqlite_transfers",
+          "repeat": 0,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "independent acceptance passed",
+          "metrics": {
+            "elapsed_ms": 188197.0,
+            "request_count": 7,
+            "raw_input_tokens": 44687,
+            "uncached_input_tokens": 10085,
+            "output_tokens": 9414,
+            "cache_read_tokens": 34602,
+            "tool_call_count": 10,
+            "tool_count_source": "runtime_tool_calls",
+            "runtime_terminal_success": true,
+            "return_code": 0,
+            "runtime_recovery": {
+              "retry_attempts": 1,
+              "network_retry_attempts": 0,
+              "http_statuses": [
+                504
+              ]
+            }
+          }
+        },
+        {
+          "variant": "codex",
+          "task": "sqlite_transfers",
+          "repeat": 0,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "independent acceptance passed",
+          "metrics": {
+            "elapsed_ms": 147064.5,
+            "request_count": null,
+            "raw_input_tokens": 193526,
+            "uncached_input_tokens": 23455,
+            "output_tokens": 8949,
+            "cache_read_tokens": 170071,
+            "tool_call_count": 11,
+            "tool_count_source": "completed_cli_items",
+            "runtime_terminal_success": true,
+            "return_code": 0,
+            "runtime_recovery": null
+          }
+        },
+        {
+          "variant": "codex",
+          "task": "config_layers",
+          "repeat": 1,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "independent acceptance passed",
+          "metrics": {
+            "elapsed_ms": 94823.7,
+            "request_count": null,
+            "raw_input_tokens": 143517,
+            "uncached_input_tokens": 19552,
+            "output_tokens": 6745,
+            "cache_read_tokens": 123965,
+            "tool_call_count": 9,
+            "tool_count_source": "completed_cli_items",
+            "runtime_terminal_success": true,
+            "return_code": 0,
+            "runtime_recovery": null
+          }
+        },
+        {
+          "variant": "candidate",
+          "task": "config_layers",
+          "repeat": 1,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "independent acceptance passed",
+          "metrics": {
+            "elapsed_ms": 88803.7,
+            "request_count": 6,
+            "raw_input_tokens": 27396,
+            "uncached_input_tokens": 7059,
+            "output_tokens": 5553,
+            "cache_read_tokens": 20337,
+            "tool_call_count": 9,
+            "tool_count_source": "runtime_tool_calls",
+            "runtime_terminal_success": true,
+            "return_code": 0,
+            "runtime_recovery": {
+              "retry_attempts": 0,
+              "network_retry_attempts": 0,
+              "http_statuses": []
+            }
+          }
+        },
+        {
+          "variant": "candidate",
+          "task": "dependency_graph",
+          "repeat": 1,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "independent acceptance passed",
+          "metrics": {
+            "elapsed_ms": 81428.1,
+            "request_count": 6,
+            "raw_input_tokens": 25662,
+            "uncached_input_tokens": 6646,
+            "output_tokens": 5341,
+            "cache_read_tokens": 19016,
+            "tool_call_count": 8,
+            "tool_count_source": "runtime_tool_calls",
+            "runtime_terminal_success": true,
+            "return_code": 0,
+            "runtime_recovery": {
+              "retry_attempts": 0,
+              "network_retry_attempts": 0,
+              "http_statuses": []
+            }
+          }
+        },
+        {
+          "variant": "codex",
+          "task": "dependency_graph",
+          "repeat": 1,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "independent acceptance passed",
+          "metrics": {
+            "elapsed_ms": 64055.8,
+            "request_count": null,
+            "raw_input_tokens": 101749,
+            "uncached_input_tokens": 16989,
+            "output_tokens": 3894,
+            "cache_read_tokens": 84760,
+            "tool_call_count": 6,
+            "tool_count_source": "completed_cli_items",
+            "runtime_terminal_success": true,
+            "return_code": 0,
+            "runtime_recovery": null
+          }
+        },
+        {
+          "variant": "codex",
+          "task": "sqlite_transfers",
+          "repeat": 1,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "independent acceptance passed",
+          "metrics": {
+            "elapsed_ms": 121512.4,
+            "request_count": null,
+            "raw_input_tokens": 131048,
+            "uncached_input_tokens": 21636,
+            "output_tokens": 8215,
+            "cache_read_tokens": 109412,
+            "tool_call_count": 9,
+            "tool_count_source": "completed_cli_items",
+            "runtime_terminal_success": true,
+            "return_code": 0,
+            "runtime_recovery": null
+          }
+        },
+        {
+          "variant": "candidate",
+          "task": "sqlite_transfers",
+          "repeat": 1,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "independent acceptance passed",
+          "metrics": {
+            "elapsed_ms": 127001.8,
+            "request_count": 8,
+            "raw_input_tokens": 55982,
+            "uncached_input_tokens": 11316,
+            "output_tokens": 8947,
+            "cache_read_tokens": 44666,
+            "tool_call_count": 12,
+            "tool_count_source": "runtime_tool_calls",
+            "runtime_terminal_success": true,
+            "return_code": 0,
+            "runtime_recovery": {
+              "retry_attempts": 0,
+              "network_retry_attempts": 0,
+              "http_statuses": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "started_at": "2026-09-20T10:18:54.124698Z",
+      "finished_at": "2026-09-20T10:24:39.433513Z",
+      "model": "gpt-5.6-sol",
+      "reasoning_effort": "medium",
+      "base_url": "https://api.golutra.cn",
+      "task_digests": {
+        "interval_ranges": "e24ff4433331dd015b4db3d0577342769c46df63324c8bc35f7cefc4dc3a4c8b"
+      },
+      "versions": {
+        "candidate2": "golutra-agent 0.3.1",
+        "codex": "codex-cli 0.155.1"
+      },
+      "binary_or_launcher_sha256": {
+        "candidate2": "e4d184cc18cb37df92a5d0cfb00bd314930f74fab9a9fd36cbf0b871296a8cd1",
+        "codex": "61b0194f3bb6534439c8d26a3ed57d0805f84b884588b761795323eeb92fcf70"
+      },
+      "scope": "Autonomous coding tasks across domains; no multi-hour claim; no repair prompts.",
+      "name": "replacement_holdout",
+      "attempts": [
+        {
+          "variant": "candidate2",
+          "task": "interval_ranges",
+          "repeat": 0,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "independent acceptance passed",
+          "metrics": {
+            "elapsed_ms": 81310.1,
+            "request_count": 6,
+            "raw_input_tokens": 28731,
+            "uncached_input_tokens": 7965,
+            "output_tokens": 5705,
+            "cache_read_tokens": 20766,
+            "tool_call_count": 10,
+            "tool_count_source": "runtime_tool_calls",
+            "runtime_terminal_success": true,
+            "return_code": 0,
+            "runtime_recovery": {
+              "retry_attempts": 0,
+              "network_retry_attempts": 0,
+              "http_statuses": []
+            }
+          }
+        },
+        {
+          "variant": "codex",
+          "task": "interval_ranges",
+          "repeat": 0,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "independent acceptance passed",
+          "metrics": {
+            "elapsed_ms": 105945,
+            "request_count": null,
+            "raw_input_tokens": 144513,
+            "uncached_input_tokens": 20112,
+            "output_tokens": 6757,
+            "cache_read_tokens": 124401,
+            "tool_call_count": 8,
+            "tool_count_source": "completed_cli_items",
+            "runtime_terminal_success": true,
+            "return_code": 0,
+            "runtime_recovery": null
+          }
+        },
+        {
+          "variant": "codex",
+          "task": "interval_ranges",
+          "repeat": 1,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "independent acceptance passed",
+          "metrics": {
+            "elapsed_ms": 75387.6,
+            "request_count": null,
+            "raw_input_tokens": 86886,
+            "uncached_input_tokens": 17462,
+            "output_tokens": 5170,
+            "cache_read_tokens": 69424,
+            "tool_call_count": 5,
+            "tool_count_source": "completed_cli_items",
+            "runtime_terminal_success": true,
+            "return_code": 0,
+            "runtime_recovery": null
+          }
+        },
+        {
+          "variant": "candidate2",
+          "task": "interval_ranges",
+          "repeat": 1,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "independent acceptance passed",
+          "metrics": {
+            "elapsed_ms": 79212.5,
+            "request_count": 8,
+            "raw_input_tokens": 47879,
+            "uncached_input_tokens": 9724,
+            "output_tokens": 5774,
+            "cache_read_tokens": 38155,
+            "tool_call_count": 13,
+            "tool_count_source": "runtime_tool_calls",
+            "runtime_terminal_success": true,
+            "return_code": 0,
+            "runtime_recovery": {
+              "retry_attempts": 0,
+              "network_retry_attempts": 0,
+              "http_statuses": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "started_at": "2026-09-20T10:26:01.185063Z",
+      "finished_at": "2026-09-20T10:31:06.874475Z",
+      "model": "gpt-5.6-sol",
+      "reasoning_effort": "medium",
+      "base_url": "https://api.golutra.cn",
+      "versions": {
+        "golutra": "golutra-agent 0.3.1",
+        "codex": "codex-cli 0.155.1"
+      },
+      "scope": "One autonomous four-phase coding task; measured duration, not a multi-hour claim.",
+      "fixture_sha256": "99be54e3f414a59ba885ffbfeda525e351cd4f7405cbdc2fedec9e992f1657c3",
+      "golutra_binary_sha256": "e4d184cc18cb37df92a5d0cfb00bd314930f74fab9a9fd36cbf0b871296a8cd1",
+      "name": "replacement_continuous_compatibility",
+      "attempts": [
+        {
+          "variant": "golutra",
+          "task": "four_phase_continuous",
+          "repeat": 0,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "verification": {
+            "passed": true,
+            "error": null,
+            "stages": [
+              {
+                "stage": 1,
+                "passed": true,
+                "error": null
+              },
+              {
+                "stage": 2,
+                "passed": true,
+                "error": null
+              },
+              {
+                "stage": 3,
+                "passed": true,
+                "error": null
+              },
+              {
+                "stage": 4,
+                "passed": true,
+                "error": null
+              }
+            ]
+          },
+          "metrics": {
+            "elapsed_ms": 139646.7,
+            "request_count": 12,
+            "raw_input_tokens": 135302,
+            "uncached_input_tokens": 18050,
+            "output_tokens": 10203,
+            "cache_read_tokens": 117252,
+            "tool_call_count": 25,
+            "runtime_terminal_success": true,
+            "return_code": 0,
+            "tool_count_source": "runtime_tool_calls",
+            "runtime_recovery": {
+              "retry_attempts": 0,
+              "network_retry_attempts": 0,
+              "http_statuses": []
+            }
+          },
+          "checkpoint_timing": {
+            "last_edit_relative_to_probe_start_s": 58.624738714,
+            "last_edit_relative_to_probe_end_s": -37.143915286
+          }
+        },
+        {
+          "variant": "codex",
+          "task": "four_phase_continuous",
+          "repeat": 0,
+          "strict_pass": false,
+          "independent_pass": false,
+          "immutable_inputs_preserved": true,
+          "verification": {
+            "passed": false,
+            "error": "checkpoint.py was not modified while the probe was running",
+            "stages": [
+              {
+                "stage": 1,
+                "passed": true,
+                "error": null
+              },
+              {
+                "stage": 2,
+                "passed": true,
+                "error": null
+              },
+              {
+                "stage": 3,
+                "passed": true,
+                "error": null
+              },
+              {
+                "stage": 4,
+                "passed": false,
+                "error": "checkpoint.py was not modified while the probe was running"
+              }
+            ]
+          },
+          "metrics": {
+            "elapsed_ms": 164577.9,
+            "request_count": null,
+            "raw_input_tokens": 230711,
+            "uncached_input_tokens": 26120,
+            "output_tokens": 12106,
+            "cache_read_tokens": 204591,
+            "tool_call_count": 11,
+            "runtime_terminal_success": true,
+            "return_code": 0,
+            "tool_count_source": "completed_cli_items",
+            "runtime_recovery": null
+          },
+          "checkpoint_timing": {
+            "last_edit_relative_to_probe_start_s": 134.782026153,
+            "last_edit_relative_to_probe_end_s": 62.570477153
+          }
+        }
+      ]
+    },
+    {
+      "name": "final_continuous_compatibility",
+      "started_at": "2026-09-20T10:56:43.476043Z",
+      "finished_at": "2026-09-20T11:02:18.293606Z",
+      "model": "gpt-5.6-sol",
+      "reasoning_effort": "medium",
+      "base_url": "https://api.golutra.cn",
+      "versions": {
+        "golutra": "golutra-agent 0.3.1",
+        "codex": "codex-cli 0.155.1"
+      },
+      "golutra_binary_sha256": "9b859e19e184de1067d5370d51837e30f41c3b1b5a7063c31d7c107a01c6f700",
+      "codex_native_binary_sha256": "8eaf1ad12fe6bf89b1710330f58900014322c7c5af677e43be116d8ac5fc0a9e",
+      "fixture_sha256": "99be54e3f414a59ba885ffbfeda525e351cd4f7405cbdc2fedec9e992f1657c3",
+      "scope": "One autonomous four-phase coding task; measured duration, not a multi-hour claim.",
+      "codex_conventional_responses_override": true,
+      "order": [
+        "codex",
+        "golutra"
+      ],
+      "benchmark_repair_turns": 0,
+      "attempts": [
+        {
+          "variant": "codex",
+          "task": "four_phase_continuous",
+          "repeat": 1,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "verification": {
+            "passed": true,
+            "error": null,
+            "stages": [
+              {
+                "stage": 1,
+                "passed": true,
+                "error": null
+              },
+              {
+                "stage": 2,
+                "passed": true,
+                "error": null
+              },
+              {
+                "stage": 3,
+                "passed": true,
+                "error": null
+              },
+              {
+                "stage": 4,
+                "passed": true,
+                "error": null
+              }
+            ]
+          },
+          "metrics": {
+            "elapsed_ms": 192920.4,
+            "request_count": null,
+            "raw_input_tokens": 302936,
+            "uncached_input_tokens": 26508,
+            "output_tokens": 12292,
+            "cache_read_tokens": 276428,
+            "tool_call_count": 12,
+            "runtime_terminal_success": true,
+            "return_code": 0,
+            "tool_count_source": "completed_cli_items",
+            "runtime_recovery": null
+          },
+          "checkpoint_timing": {
+            "last_edit_relative_to_probe_start_s": 60.405349452,
+            "last_edit_relative_to_probe_end_s": -74.570613548
+          }
+        },
+        {
+          "variant": "golutra",
+          "task": "four_phase_continuous",
+          "repeat": 1,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "verification": {
+            "passed": true,
+            "error": null,
+            "stages": [
+              {
+                "stage": 1,
+                "passed": true,
+                "error": null
+              },
+              {
+                "stage": 2,
+                "passed": true,
+                "error": null
+              },
+              {
+                "stage": 3,
+                "passed": true,
+                "error": null
+              },
+              {
+                "stage": 4,
+                "passed": true,
+                "error": null
+              }
+            ]
+          },
+          "metrics": {
+            "elapsed_ms": 139085.6,
+            "request_count": 10,
+            "raw_input_tokens": 105109,
+            "uncached_input_tokens": 17720,
+            "output_tokens": 11086,
+            "cache_read_tokens": 87389,
+            "tool_call_count": 26,
+            "runtime_terminal_success": true,
+            "return_code": 0,
+            "tool_count_source": "runtime_tool_calls",
+            "runtime_recovery": {
+              "retry_attempts": 0,
+              "network_retry_attempts": 0,
+              "http_statuses": []
+            }
+          },
+          "checkpoint_timing": {
+            "last_edit_relative_to_probe_start_s": 43.282332711,
+            "last_edit_relative_to_probe_end_s": -28.500752289
+          }
+        }
+      ]
+    }
+  ]
+}

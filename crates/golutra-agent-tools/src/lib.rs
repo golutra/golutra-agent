@@ -26,6 +26,9 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
+mod runtime_observation;
+mod shell_contract;
+
 const DEFAULT_EXCERPT_LIMIT: usize = 2048;
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
 /// Maximum raw content retained by a built-in tool artifact.
@@ -125,7 +128,7 @@ pub use project_verifier::{DiscoveredProjectVerifier, discover_project_verifiers
 use builtin::BuiltinTool;
 
 /// 面向 provider 的稳定契约，保持默认模型工具面足够小。
-pub const PI_PLUS_TOOL_NAMES: [&str; 7] = [
+pub const PI_PLUS_TOOL_NAMES: [&str; 8] = [
     "read_file",
     "shell",
     "edit_file",
@@ -133,6 +136,7 @@ pub const PI_PLUS_TOOL_NAMES: [&str; 7] = [
     "apply_patch",
     "shell_session",
     "subagent",
+    "runtime_status",
 ];
 
 #[must_use]
@@ -223,6 +227,7 @@ pub struct ToolInvocation {
     preparation: Option<SideEffectPreparation>,
     deadline: Option<tokio::time::Instant>,
     pre_execution_stop: Option<ToolInvocationStop>,
+    runtime_observation: Option<Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -247,6 +252,7 @@ impl ToolInvocation {
             preparation: None,
             deadline: None,
             pre_execution_stop: None,
+            runtime_observation: None,
         }
     }
 
@@ -259,6 +265,13 @@ impl ToolInvocation {
     #[must_use]
     pub fn with_deadline(mut self, deadline: tokio::time::Instant) -> Self {
         self.deadline = Some(deadline);
+        self
+    }
+
+    /// 由当前运行循环注入只读摘要，不能从模型参数注入或选择其他会话。
+    #[must_use]
+    pub fn with_runtime_observation(mut self, summary: Value) -> Self {
+        self.runtime_observation = Some(summary);
         self
     }
 }
@@ -286,6 +299,11 @@ pub struct TaskDelegationOutput {
 
 #[async_trait]
 pub trait TaskDelegationBackend: std::fmt::Debug + Send + Sync {
+    /// 只读取该父会话的有界子任务状态，不消费通知、不接管子任务。
+    async fn status(&self, _session_id: SessionId) -> Result<Value, ToolError> {
+        Ok(json!({"available": false}))
+    }
+
     async fn notifications(
         &self,
         _session_id: SessionId,
@@ -407,6 +425,19 @@ impl ToolRegistry {
         self.capabilities.get(tool_name)
     }
 
+    /// 模型侧 shell 只有一种权威表示；内部 argv 仍受原始合同校验，不属于权限禁用参数。
+    #[must_use]
+    pub fn model_contract(&self, mut contract: ToolContract) -> ToolContract {
+        if contract.tool_name == "shell" {
+            if let Some(properties) = contract.input_schema["properties"].as_object_mut() {
+                properties.remove("argv");
+            }
+            contract.input_schema["required"] = json!(["command"]);
+            contract.input_schema["properties"]["command"]["minLength"] = json!(1);
+        }
+        contract
+    }
+
     fn validate_tool_arguments(
         &self,
         contract: &ToolContract,
@@ -466,7 +497,7 @@ impl ToolRegistry {
             })
             .collect::<Vec<_>>();
         if errors.is_empty() {
-            Ok(())
+            shell_contract::validate_action_arguments(&contract.tool_name, arguments)
         } else {
             Err(ToolError::InvalidArguments(format!(
                 "tool `{}` arguments do not match its contract: {}",
@@ -1174,6 +1205,11 @@ impl ToolRuntime {
                 true,
             ),
             Some(BuiltinTool::ApplyPatch) => {
+                // 模型补丁的结构校验不读写文件，提前反馈，避免进入 checkpoint 后误归类为执行失败。
+                let patch = string_arg(&request.arguments, "patch")?;
+                if model_patch::looks_like_model_patch(&patch) {
+                    model_patch::parse(&patch).map_err(ToolError::InvalidArguments)?;
+                }
                 self.policy
                     .evaluate_path(BuiltinTool::ApplyPatch.name(), ".", true)
             }
@@ -1203,6 +1239,11 @@ impl ToolRuntime {
             }
             Some(BuiltinTool::ShellSession) => process_control_policy(request),
             Some(BuiltinTool::ProcessList) => process_list_policy(request),
+            Some(BuiltinTool::RuntimeStatus) => execution_policy(
+                request,
+                PolicyDecision::Allow,
+                "read-only current runtime observation",
+            ),
             Some(
                 BuiltinTool::ProcessPoll
                 | BuiltinTool::ProcessWrite
@@ -1458,6 +1499,7 @@ impl ToolRuntime {
             preparation,
             deadline,
             pre_execution_stop,
+            runtime_observation,
         } = invocation;
         let Some(preparation) = preparation else {
             return Err(ToolError::Execution(
@@ -1620,6 +1662,10 @@ impl ToolRuntime {
                         .await
                     }
                     Some(BuiltinTool::ProcessList) => self.process_list(request, policy).await,
+                    Some(BuiltinTool::RuntimeStatus) => {
+                        self.runtime_status(request, policy, runtime_observation)
+                            .await
+                    }
                     Some(BuiltinTool::ProcessPoll) => self.process_poll(request, policy).await,
                     Some(BuiltinTool::ProcessWrite) => self.process_write(request, policy).await,
                     Some(BuiltinTool::ProcessTerminate) => {
@@ -1737,6 +1783,20 @@ impl ToolRuntime {
         )
     }
 
+    /// 仅执行前参数校验失败可由同名工具的合法调用恢复；策略与执行错误不能获得此标记。
+    #[must_use]
+    pub fn argument_rejection_report(
+        &self,
+        request: ToolRequest,
+        error: &ToolError,
+    ) -> ToolExecutionReport {
+        let mut report = self.invalid_request_report(request, error.to_string());
+        if matches!(error, ToolError::InvalidArguments(_)) {
+            report.envelope.structured_facts["rejected_before_execution"] = json!(true);
+        }
+        report
+    }
+
     #[must_use]
     pub fn execution_error_report(
         &self,
@@ -1750,6 +1810,29 @@ impl ToolRuntime {
             request,
             "tool execution failed",
             structured_facts,
+            reason,
+            policy,
+        )
+    }
+
+    /// 仅检查点持久化调用点可使用此入口；文件名和工具错误文本不能决定恢复动作。
+    #[must_use]
+    pub fn checkpoint_error_report(
+        &self,
+        request: ToolRequest,
+        policy: PolicyEvaluation,
+        error: impl Into<String>,
+    ) -> ToolExecutionReport {
+        let reason = bounded_text(&error.into(), MAX_TOOL_ERROR_CHARS);
+        let mut facts = execution_error_facts(&request, &reason);
+        if let Some(object) = facts.as_object_mut() {
+            object.insert("error_origin".into(), json!("checkpoint_persistence"));
+            add_checkpoint_error_facts(&request, &reason, object);
+        }
+        error_report(
+            request,
+            "side-effect checkpoint failed",
+            facts,
             reason,
             policy,
         )
@@ -2566,6 +2649,7 @@ impl ToolRuntime {
                 file.kind,
                 model_patch::ModelPatchFileKind::Update(_)
                     | model_patch::ModelPatchFileKind::Delete
+                    | model_patch::ModelPatchFileKind::Replace { .. }
             );
             let source_path =
                 self.resolve_tool_path("apply_patch", &file.path, source_requires_existing)?;
@@ -3061,6 +3145,7 @@ impl ToolRuntime {
         let mut report = supervised_process_report(request, policy, snapshot);
         report.envelope.structured_facts["requested_timeout_ms"] = json!(timeout_ms);
         report.envelope.structured_facts["effective_timeout_ms"] = json!(effective_timeout_ms);
+        report.envelope.structured_facts["effective_yield_time_ms"] = json!(wait_ms);
         self.process_supervisor
             .acknowledge_output(
                 session_id,
@@ -3328,8 +3413,13 @@ impl ToolRuntime {
         execution_cancellation: CancellationToken,
     ) -> Result<ToolExecutionReport, ToolError> {
         let action = string_arg(&request.arguments, "action")?;
+        let ignored_arguments = shell_contract::ignored_arguments(&request.arguments);
         if action == "list" {
-            return self.process_list(request, policy).await;
+            let mut report = self.process_list(request, policy).await?;
+            if !ignored_arguments.is_empty() {
+                report.envelope.structured_facts["ignored_arguments"] = json!(ignored_arguments);
+            }
+            return Ok(report);
         }
         let process_id = string_arg(&request.arguments, "process_id")?;
         self.validate_authoritative_pid(&request, &process_id)
@@ -3401,7 +3491,16 @@ impl ToolRuntime {
             }
         };
         let session_id = request.session_id;
-        let report = supervised_process_report(request, policy, snapshot);
+        let effective_wait_ms = match action.as_str() {
+            "wait" => process_wait_ms(&request.arguments, default_poll_wait_ms()),
+            "write" => process_wait_ms(&request.arguments, 250),
+            _ => 0,
+        };
+        let mut report = supervised_process_report(request, policy, snapshot);
+        report.envelope.structured_facts["effective_wait_ms"] = json!(effective_wait_ms);
+        if !ignored_arguments.is_empty() {
+            report.envelope.structured_facts["ignored_arguments"] = json!(ignored_arguments);
+        }
         self.process_supervisor
             .acknowledge_output(
                 session_id,
@@ -3900,9 +3999,6 @@ fn error_report(
 fn execution_error_facts(request: &ToolRequest, reason: &str) -> Value {
     let mut facts = serde_json::Map::new();
     facts.insert("error".to_owned(), Value::String(reason.to_owned()));
-    if mutation_tool_name(&request.tool_name) && reason.contains("checkpoint") {
-        add_checkpoint_error_facts(request, reason, &mut facts);
-    }
     if request.tool_name == "read_file"
         && let Some(path) = request.arguments.get("path").and_then(Value::as_str)
     {
@@ -4796,6 +4892,7 @@ fn supervised_process_report(
         ProcessState::Cancelled | ProcessState::Terminated => ToolResultStatus::Cancelled,
     };
     let workspace_changes_known = snapshot.workspace_changes_known;
+    let effective_output_bytes = process_output_budget(&request.arguments);
     let terminal = snapshot.state.is_terminal();
     let next_action = process_next_action(
         snapshot.state,
@@ -4842,10 +4939,12 @@ fn supervised_process_report(
             "output_lost": snapshot.output_lost,
             "terminal_event_id": snapshot.terminal_event_id,
             "workspace_changes_known": workspace_changes_known,
+            "workspace_only_derived_changes": snapshot.workspace_only_derived_changes,
             "process_lifetime_scope": "runtime",
             "survives_runtime_exit": false,
             "terminal": terminal,
             "wait_strategy": "event_driven_cursor",
+            "effective_output_bytes": effective_output_bytes,
             "next_action": next_action,
             "workspace_change_count": if workspace_changes_known {
                 snapshot.changed_files.len()
@@ -5172,12 +5271,21 @@ pub fn model_visible_tool_result_with_limit(
             object.insert("model_visible_excerpt".to_owned(), Value::String(excerpt));
         }
     }
+    // 为进程最小重读页保留正文空间；否则新增诊断字段挤占 256 字节页，
+    // 每次投影都回退到同一 cursor，形成永远无法前进的重读循环。
+    let header_budget = if matches!(envelope.tool_name.as_str(), "shell" | "shell_session")
+        && inline_excerpt.is_some()
+    {
+        max_bytes.saturating_sub(MODEL_OUTPUT_SEPARATOR.len() + 256)
+    } else {
+        max_bytes
+    };
     let mut header = serialize_model_tool_projection(
         projection.clone(),
         &envelope.tool_name,
         envelope.status,
         &summary,
-        max_bytes,
+        header_budget,
     );
     if let Some(excerpt) = inline_excerpt.as_deref().filter(|value| !value.is_empty())
         && header.len() + MODEL_OUTPUT_SEPARATOR.len() + excerpt.len() > max_bytes
@@ -5208,7 +5316,7 @@ pub fn model_visible_tool_result_with_limit(
             &envelope.tool_name,
             envelope.status,
             &summary,
-            max_bytes,
+            header_budget,
         );
     }
     append_model_visible_excerpt(header, inline_excerpt.as_deref(), max_bytes)
@@ -5352,6 +5460,10 @@ const PROCESS_MODEL_FACTS: &[&str] = &[
     "survives_runtime_exit",
     "terminal",
     "wait_strategy",
+    "effective_yield_time_ms",
+    "effective_wait_ms",
+    "effective_output_bytes",
+    "ignored_arguments",
     "wait_for_terminal",
     "next_action",
     "error",
@@ -6561,7 +6673,8 @@ fn string_arg(arguments: &Value, key: &str) -> Result<String, ToolError> {
 }
 
 fn shell_command_for_request(arguments: &Value) -> Result<String, ToolError> {
-    let command = optional_string_arg(arguments, "command");
+    let command =
+        optional_string_arg(arguments, "command").filter(|command| !command.trim().is_empty());
     let argv = arguments
         .get("argv")
         .and_then(Value::as_array)

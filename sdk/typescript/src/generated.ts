@@ -959,7 +959,10 @@ export interface ExternalVerificationSpec {
 }
 export interface TaskContract {
   completion_criteria?: string[];
-  max_correction_rounds?: number;
+  /**
+   * 未设置时持续纠偏；显式零值表示禁止自动纠偏。
+   */
+  max_correction_rounds?: number | null;
   require_objective_validation?: boolean;
   required_file_contents?: RequiredFileContent[];
   required_paths?: string[];

@@ -642,6 +642,7 @@ fn estimate_observation_bytes(observation: &RuntimeObservation) -> usize {
         RuntimeObservation::ApprovalResolved(resolution) => structured_bytes(resolution),
         RuntimeObservation::UserQuestionRequested(request) => structured_bytes(request),
         RuntimeObservation::UserQuestionResolved(resolution) => structured_bytes(resolution),
+        RuntimeObservation::ProviderRecovery { recovery, .. } => structured_bytes(recovery),
         RuntimeObservation::RetryScheduled { attempt, reason } => {
             structured_bytes(&(attempt, reason))
         }
@@ -1033,6 +1034,50 @@ mod tests {
                 ..
             } if text == "当前项目是一个编程代理"
         ));
+    }
+
+    #[tokio::test]
+    async fn recovery_boundary_flushes_partial_deltas_before_the_next_attempt() {
+        use golutra_agent_runtime::{ProviderRecovery, ProviderTransport, RecoveryPhase};
+        let (sender, receiver) = channel();
+        let request_id = ProviderRequestId::new();
+        sender
+            .send(streamed_with_request(request_id, "旧片段"))
+            .unwrap();
+        sender
+            .send(RuntimeObservation::ProviderRecovery {
+                request_id,
+                recovery: ProviderRecovery {
+                    phase: RecoveryPhase::Waiting,
+                    attempt: 1,
+                    delay_ms: 5000,
+                    waited_ms: 0,
+                    network: true,
+                    reset_stream: true,
+                    reason: "offline".into(),
+                    transport: ProviderTransport::Streaming,
+                    error_metadata: None,
+                },
+            })
+            .unwrap();
+        sender
+            .send(streamed_with_request(request_id, "新回答"))
+            .unwrap();
+        sender.close().unwrap();
+        let mut observations = Vec::new();
+        while let Some(ObservationCommand::Event { observation, .. }) = receiver.next().await {
+            observations.push(*observation);
+        }
+        assert_eq!(observations.len(), 3);
+        assert!(
+            matches!(&observations[0], RuntimeObservation::ProviderStreamed { event: ProviderStreamEvent::TextDelta { text }, .. } if text == "旧片段")
+        );
+        assert!(
+            matches!(&observations[1], RuntimeObservation::ProviderRecovery { recovery, .. } if recovery.reset_stream)
+        );
+        assert!(
+            matches!(&observations[2], RuntimeObservation::ProviderStreamed { event: ProviderStreamEvent::TextDelta { text }, .. } if text == "新回答")
+        );
     }
 
     #[tokio::test]

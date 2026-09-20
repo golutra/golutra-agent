@@ -249,7 +249,6 @@ async fn a_new_parent_turn_cannot_exceed_slots_held_by_earlier_background_childr
                 parent,
                 None,
                 None,
-                None,
                 host.execution.shutdown.child_token(),
             )),
             _session_lease: None,

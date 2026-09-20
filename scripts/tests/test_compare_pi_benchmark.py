@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -1208,6 +1209,21 @@ class CompareBenchmarkTest(unittest.TestCase):
             stderr=benchmark.subprocess.DEVNULL,
             timeout=benchmark.PROCESS_STOP_TIMEOUT_SECONDS,
         )
+
+    def test_timeout_keeps_output_when_host_rejects_cleanup(self) -> None:
+        process = mock.Mock()
+        process.stdout = io.StringIO('{"type":"turn.failed"}\n')
+        process.stderr = io.StringIO("original failure\n")
+        process.wait.side_effect = benchmark.subprocess.TimeoutExpired(["agent"], 1)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(benchmark.subprocess, "Popen", return_value=process), \
+                    mock.patch.object(benchmark, "stop_timed_out_process", side_effect=PermissionError("signal denied")):
+                result = benchmark.run_process(["agent"], root, {}, 1, root / "out", root / "err")
+            self.assertEqual(result.return_code, 124)
+            self.assertIn("turn.failed", (root / "out").read_text())
+            self.assertIn("original failure", result.stderr)
+            self.assertIn("process cleanup failed: PermissionError", (root / "err").read_text())
 
     def test_pipe_reader_join_closes_stream_after_deadline(self) -> None:
         class StuckThread:

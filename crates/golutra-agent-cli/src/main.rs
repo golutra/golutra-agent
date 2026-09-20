@@ -260,6 +260,9 @@ struct ExecArgs {
         value_name = "DIR"
     )]
     run_dir: Option<std::path::PathBuf>,
+    /// Also generate the complete redacted debug bundle before exit (otherwise export on demand).
+    #[arg(long)]
+    full_run_export: bool,
     /// JSON Schema file for the final response.
     #[arg(long, value_name = "FILE")]
     output_schema: Option<std::path::PathBuf>,
@@ -878,7 +881,7 @@ async fn main() -> miette::Result<()> {
     };
     if cli.run_bundle.is_some() && !command_allows_persisted_run(&cli.command) {
         return Err(miette::miette!(
-            "--run-bundle only supports status, trace, diagnose, compare, and eval ingest/results commands"
+            "--run-bundle supports status, trace, diagnose, compare, export, exec resume, and eval ingest/results commands"
         ));
     }
     if ephemeral_exec && (cli.daemon || cli.connect.is_some()) {
@@ -2190,6 +2193,7 @@ fn command_allows_persisted_run(command: &Command) -> bool {
         command,
         Command::Status
             | Command::Trace { .. }
+            | Command::Export { .. }
             | Command::Diagnose { .. }
             | Command::Compare { .. }
             | Command::Eval {
@@ -2694,6 +2698,11 @@ async fn run_exec(
     let run_dir = args
         .run_dir
         .or_else(|| opened_run_bundle.map(std::path::Path::to_path_buf));
+    if args.full_run_export && run_dir.is_none() {
+        return Err(miette::miette!(
+            "--full-run-export requires --run-dir or --run-bundle"
+        ));
+    }
     let approval_mode = if args.yolo {
         ExecApprovalModeArg::Auto
     } else {
@@ -2850,9 +2859,14 @@ async fn run_exec(
                 error: error.to_string(),
             },
         };
-        let terminal_export =
-            export_exec_run_bundle(transport, thread.thread_id(), destination, terminal_outcome)
-                .await;
+        let terminal_export = export_exec_run_bundle(
+            transport,
+            thread.thread_id(),
+            destination,
+            terminal_outcome,
+            args.full_run_export,
+        )
+        .await;
         match checkpoint_result {
             Ok(()) => terminal_export,
             Err(checkpoint_error) => match terminal_export {
@@ -2905,27 +2919,36 @@ async fn export_exec_run_bundle(
     thread_id: ThreadId,
     destination: std::path::PathBuf,
     terminal_outcome: RunBundleTerminalOutcome,
+    full_export: bool,
 ) -> Result<(), golutra_agent_client::ClientError> {
-    let receipt = RunBundleExporter::new(transport)
-        // 终态导出是用户可见的交付物，必须包含完整的脱敏 debug-export。
-        // 运行中的 checkpoint 仍走 fast 路径，因此不会拖慢首个 provider 事件。
-        .export(RunBundleExportRequest {
-            destination: destination.clone(),
-            selection: golutra_agent_client::SessionWindowRequest {
-                anchor_thread_id: thread_id,
-                range: golutra_agent_client::SessionRangeSpec {
-                    direction: golutra_agent_client::SessionRangeDirection::Single,
-                    count: 1,
-                },
+    let request = RunBundleExportRequest {
+        destination: destination.clone(),
+        selection: golutra_agent_client::SessionWindowRequest {
+            anchor_thread_id: thread_id,
+            range: golutra_agent_client::SessionRangeSpec {
+                direction: golutra_agent_client::SessionRangeDirection::Single,
+                count: 1,
             },
-            terminal_outcome,
-        })
-        .await?;
+        },
+        terminal_outcome,
+    };
+    let exporter = RunBundleExporter::new(transport);
+    let started = std::time::Instant::now();
+    let receipt = if full_export {
+        exporter.export(request).await?
+    } else {
+        exporter.export_delivery(request).await?
+    };
+    eprintln!(
+        "golutra terminal export: mode={}, elapsed_ms={}",
+        if full_export { "full" } else { "delivery" },
+        started.elapsed().as_millis()
+    );
     let debug_export = receipt
         .debug_export_path
         .as_deref()
         .map(|path| destination.join(path).display().to_string())
-        .unwrap_or_else(|| "unavailable".to_owned());
+        .unwrap_or_else(|| "deferred; request export when needed".to_owned());
     eprintln!(
         "golutra run bundle retained at {}; observations: {}; redacted debug export: {}; complete: {}",
         destination.display(),

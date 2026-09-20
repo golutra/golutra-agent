@@ -104,6 +104,7 @@ mod pending_recovery;
 mod preferences;
 mod provider_status;
 mod question_dialog;
+mod recovery_status;
 mod render;
 mod rich_text;
 mod runtime_controller;
@@ -2771,27 +2772,30 @@ impl TuiApp {
                     .as_ref()
                     .map(|projection| format!("{:?}", projection.status))
                     .unwrap_or_else(|| "loading".to_owned());
-                self.push_system_message(
-                    "Status",
-                    vec![
-                        format!("thread {}", self.thread_id),
-                        format!("session {}", self.session_id),
-                        format!(
-                            "task {}",
-                            self.task_id
-                                .map(|id| id.to_string())
-                                .unwrap_or_else(|| "auto".to_owned())
-                        ),
-                        format!("status {status}"),
-                        format!("events {}", self.events.len()),
-                        format!(
-                            "provider {} · effort {} · permissions {}",
-                            self.runtime_controls.effective_model(),
-                            effort_label(self.runtime_controls.reasoning_effort),
-                            self.runtime_controls.permission_mode.label()
-                        ),
-                    ],
+                let mut details = vec![
+                    format!("thread {}", self.thread_id),
+                    format!("session {}", self.session_id),
+                    format!(
+                        "task {}",
+                        self.task_id
+                            .map(|id| id.to_string())
+                            .unwrap_or_else(|| "auto".to_owned())
+                    ),
+                    format!("status {status}"),
+                    format!("events {}", self.events.len()),
+                    format!(
+                        "provider {} · effort {} · permissions {}",
+                        self.runtime_controls.effective_model(),
+                        effort_label(self.runtime_controls.reasoning_effort),
+                        self.runtime_controls.permission_mode.label()
+                    ),
+                ];
+                details.extend(
+                    self.activity_projection
+                        .recovery
+                        .details(chrono::Utc::now()),
                 );
+                self.push_system_message("Status", details);
             }
             SlashCommand::Plan => {
                 self.dashboard = Some(DashboardState::new(DashboardTab::Plan));

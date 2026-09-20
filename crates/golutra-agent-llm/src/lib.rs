@@ -27,6 +27,8 @@ use thiserror::Error;
 mod genai_adapter;
 mod openai_responses;
 mod provider_config;
+mod response_contract;
+mod transport_error;
 
 pub use genai_adapter::{GenaiProviderAdapter, GenaiProviderConfig};
 pub use openai_responses::{OpenAiResponsesProvider, OpenAiResponsesProviderConfig};
@@ -441,6 +443,9 @@ impl ProviderErrorMetadata {
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ProviderError {
+    /// 已确认的连接故障可等待网络恢复；HTTP、TLS 与解析错误不能进入此分支。
+    #[error("provider connection failed: {message}")]
+    ConnectionFailed { message: String },
     #[error("provider failed: {message}")]
     Failed { message: String },
     #[error("provider is temporarily unavailable: {message}")]
@@ -739,6 +744,9 @@ pub struct ProviderTransportDiagnostics {
     pub first_business_event_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_event_ms: Option<u64>,
+    /// 首个完整工具项到响应终止的间隔，用于评估提前调度的潜在收益；不是已实现的提速。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_ready_to_terminal_ms: Option<u64>,
     #[serde(default)]
     pub credential_refresh_attempted: bool,
 }
@@ -804,6 +812,7 @@ impl ProviderTransportDiagnostics {
             first_stream_event_ms,
             first_business_event_ms,
             terminal_event_ms,
+            tool_ready_to_terminal_ms: duration("tool_ready_to_terminal_ms"),
             credential_refresh_attempted,
         })
     }
@@ -855,6 +864,8 @@ pub enum ProviderStreamEvent {
 #[serde(rename_all = "snake_case")]
 pub enum ProviderFinishReason {
     Stop,
+    /// 上游明确要求继续当前轮；不能作为最终答案进入完成验证。
+    Continue,
     ToolCalls,
     Length,
     ContentFilter,
@@ -2461,6 +2472,9 @@ pub fn provider_tool_description(tool_name: &str) -> &'static str {
         "shell_session" => {
             "Wait for running processes; read available output only as needed, or write/terminate/list by process_id; automatic cursor. Parallel waits for different processes; sequence same-process calls. output_has_more is not running. Never restart to read."
         }
+        "runtime_status" => {
+            "Read a bounded current-task summary: active processes and children, recent unresolved tool failures, validation, request usage and elapsed time. No arguments; no polling required when existing completion notifications suffice."
+        }
         "subagent" => {
             "Spawn returns child_session_id; omit it on spawn. run_in_background runs concurrently; completion reported. Use returned handles for status/wait/send_input/resume/cancel; wait accepts child_session_ids. explore: read-only. Children cannot delegate."
         }
@@ -2475,7 +2489,7 @@ pub fn provider_tool_description(tool_name: &str) -> &'static str {
             "Delegate one complete, self-contained task to an isolated child agent and wait for its result. The child does not receive this conversation. Omit model and reasoning_effort to inherit the current agent settings; specify either field only when the task benefits from an explicit override."
         }
         "shell" => {
-            "Run argv or command; prefer only one. Use bash -lc for pipes/heredoc. Issue independent background=true calls together in one response for parallel execution; sequence dependent commands. Continue via shell_session. See yield_time_ms and timeout_ms."
+            "Run a command. Use bash -lc for pipes/heredoc. Issue independent background=true calls together in one response for parallel execution; sequence dependent commands. Continue via shell_session. See yield_time_ms and timeout_ms."
         }
         "process_list" => {
             "List managed background processes owned by the current session, including redacted commands, states, exit codes, and output statistics. This does not consume process output or advance a cursor."
@@ -3030,7 +3044,7 @@ async fn provider_response_from_openai_stream(
             continue;
         };
         if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
-            finish_reason = Some(finish_reason_from_openai(reason));
+            finish_reason = Some(response_contract::from_openai(reason));
             stream_terminated = true;
         }
         let Some(delta) = choice.get("delta") else {
@@ -3138,13 +3152,9 @@ async fn provider_response_from_openai_stream(
         tool_calls: Vec::new(),
         metadata: ProviderMessageMetadata::default(),
     });
-    let finish_reason = finish_reason.unwrap_or({
-        if tool_calls.is_empty() {
-            ProviderFinishReason::Unknown
-        } else {
-            ProviderFinishReason::ToolCalls
-        }
-    });
+    let finish_reason = finish_reason
+        .unwrap_or(ProviderFinishReason::Unknown)
+        .with_tool_calls(!tool_calls.is_empty());
     Ok(ProviderResponse {
         response_id: ProviderResponseId::new(),
         message,
@@ -3214,17 +3224,19 @@ fn provider_response_from_openai(
         .unwrap_or_default();
     let usage_value = value.get("usage").cloned().unwrap_or_else(|| json!({}));
 
+    let finish_reason = response_contract::from_openai(
+        choice
+            .get("finish_reason")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    )
+    .with_tool_calls(!tool_calls.is_empty());
     Ok(ProviderResponse {
         response_id: ProviderResponseId::new(),
         message: content,
         tool_calls,
         usage: provider_usage_from_openai_value(usage_value),
-        finish_reason: finish_reason_from_openai(
-            choice
-                .get("finish_reason")
-                .and_then(Value::as_str)
-                .unwrap_or_default(),
-        ),
+        finish_reason,
         raw_metadata: value,
     })
 }
@@ -3344,11 +3356,7 @@ fn provider_tool_call_from_openai(value: &Value) -> Result<ProviderToolCall, Pro
         .ok_or_else(|| ProviderError::Malformed {
             message: "tool call arguments is not a JSON string".to_owned(),
         })
-        .and_then(|arguments| {
-            serde_json::from_str(arguments).map_err(|error| ProviderError::Malformed {
-                message: format!("tool call arguments is invalid JSON: {error}"),
-            })
-        })?;
+        .map(response_contract::parse_tool_arguments)?;
     let serialized_argument_size = serde_json::to_vec(&arguments)
         .map_err(|error| ProviderError::Malformed {
             message: format!("tool call arguments could not be serialized: {error}"),
@@ -3390,16 +3398,6 @@ fn provider_tool_call_from_openai(value: &Value) -> Result<ProviderToolCall, Pro
         tool_name: restore_provider_tool_wire_name(tool_name),
         arguments,
     })
-}
-
-fn finish_reason_from_openai(value: &str) -> ProviderFinishReason {
-    match value {
-        "stop" => ProviderFinishReason::Stop,
-        "tool_calls" | "function_call" => ProviderFinishReason::ToolCalls,
-        "length" => ProviderFinishReason::Length,
-        "content_filter" => ProviderFinishReason::ContentFilter,
-        _ => ProviderFinishReason::Unknown,
-    }
 }
 
 fn provider_error_message(value: &Value) -> String {
@@ -3636,7 +3634,11 @@ fn provider_credential_error(error: golutra_agent_auth::AuthError) -> ProviderEr
 }
 
 fn provider_transport_error(error: reqwest::Error) -> ProviderError {
-    if error.is_timeout() {
+    if error.is_connect() && !transport_error::has_permanent_transport_cause(&error) {
+        ProviderError::ConnectionFailed {
+            message: sanitize_provider_error(&error.to_string()),
+        }
+    } else if error.is_timeout() {
         ProviderError::Timeout {
             message: sanitize_provider_error(&error.to_string()),
         }

@@ -3,8 +3,7 @@
 use super::*;
 use golutra_agent_context::{estimate_tokens, fit_compaction_context_content};
 use golutra_agent_llm::{
-    LlmProvider, PromptCacheScope, ProviderGenerationConfig, ProviderMessage, ProviderRequest,
-    ProviderRole,
+    LlmProvider, PromptCacheScope, ProviderMessage, ProviderRequest, ProviderRole,
 };
 use tokio::{runtime::Handle, task::JoinHandle};
 
@@ -75,14 +74,6 @@ struct ChannelObservationSink {
     sender: observation_recorder::ObservationSender,
     send_error: Arc<StdMutex<Option<observation_recorder::ObservationSendError>>>,
     cancellation: CancellationToken,
-}
-
-fn provider_max_tokens(settings: &ProviderTurnSettings) -> Option<u64> {
-    settings
-        .generation_config
-        .as_ref()
-        .and_then(|value| serde_json::from_value::<ProviderGenerationConfig>(value.clone()).ok())
-        .and_then(|config| config.max_tokens)
 }
 
 impl RuntimeObservationSink for ChannelObservationSink {
@@ -182,7 +173,11 @@ impl RuntimeHost {
             objective,
         );
         Ok(Some(match replay_messages {
-            Some(messages) => AgentReplayContext::for_resume(messages, previous.tools),
+            Some(messages) => {
+                let mut replay = AgentReplayContext::for_resume(messages, previous.tools);
+                replay.message_manifest = snapshot.message_manifest;
+                replay
+            }
             // 已通过身份与 wire 校验；追加目标越过宿主消息上限时，只继承
             // 工具面并重建历史。普通 token 超预算由 runtime 统一摘要。
             None => AgentReplayContext::for_resume_tool_surface(previous.tools),
@@ -1090,7 +1085,6 @@ impl RuntimeHost {
                 let context = delegation_policy::DelegationContext::configured(
                     task.session_id,
                     task.payload.get("max_elapsed_ms").and_then(Value::as_u64),
-                    provider_max_tokens(&provider_settings),
                     max_cost_microusd,
                     self.execution.shutdown.child_token(),
                     max_concurrent,

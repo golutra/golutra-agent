@@ -75,6 +75,11 @@ API keys, tokens, proxy settings and host CLI context such as
 `GOLUTRA_COMMAND_IPC_ADDR` are inherited without special opt-in. In daemon mode,
 this is the daemon's environment, not a newly attached client's environment.
 
+In unrestricted mode, implicit compound commands use `bash -c`, preserving the
+same inherited `PATH` as direct commands. They do not silently reload login
+configuration or select a different toolchain. An explicit `bash -lc` request
+still loads login configuration as requested.
+
 The runtime always removes its internal `GOLUTRA_AGENT_TRANSPORT_TOKEN`,
 `GOLUTRA_AGENT_PROVIDER_API_KEY`, `GOLUTRA_AGENT_PROVIDER_CUSTOM_HEADERS` and generated
 `GOLUTRA_AGENT_CUSTOM_PROVIDER_API_KEY_*` variables. MCP declarations cannot restore
@@ -247,7 +252,7 @@ Golutra writes this layout:
       events.jsonl
       conversation.jsonl
       tasks/<task-id>/trace.json
-  debug-export/
+  debug-export/                 # only with --full-run-export or explicit refresh
     manifest.json
     ... redacted handoff files
 ```
@@ -261,10 +266,13 @@ record, post-task jobs, evaluation and integrity facts. Its manifest lists
 file checksums and explains incomplete or retained-away data. This lets a test
 harness consume structured observations without querying SQLite.
 
-`debug-export/` is separately redacted and suitable for handoff. Failure to
-build that optional portable export is recorded in the top-level manifest but
-does not discard the raw state or structured observations. Before freezing a
-run bundle, Golutra gives each discovered durable post-task evaluation a
+`debug-export/` is separately redacted and suitable for handoff. Ordinary terminal
+delivery leaves `debug_export.state=deferred`; this is not an export error.
+Use `exec --run-dir <DIR> --full-run-export ...` to generate it before exit,
+or `golutra-agent --run-bundle <DIR> export <NEW_DESTINATION>` after execution.
+Failure to build an explicitly requested portable export is recorded but does
+not discard the raw state or observations. Only a full export/refresh gives
+each discovered durable post-task evaluation a
 bounded opportunity to reach a terminal state, then reloads the event boundary
 and task trace. A job that exceeds that bound remains explicitly pending and
 marks the observation manifest incomplete.
@@ -276,8 +284,10 @@ raw state needed for recovery. The normal terminal export replaces it with a
 `result` or `error` outcome. The terminal path writes only the raw state and
 owner-only observations needed by callers, so a large redacted debug export or
 post-task evaluation cannot delay the user-visible result. Use an explicit
-bundle refresh (for example, `golutra-agent --run-bundle <DIR> eval ingest ...`) when
-the portable debug projection is needed. If a supervisor or benchmark harness
+export (`golutra-agent --run-bundle <DIR> export <NEW_DESTINATION>`) when
+the portable debug projection is needed. A delivery refresh after an earlier
+full export may leave that old directory on disk; the manifest's `deferred`
+state means it is not the current report. If a supervisor or benchmark harness
 kills the CLI before the terminal export, the checkpoint remains reopenable
 through `--run-bundle`; runtime recovery may append interruption facts, and a
 later evaluator can refresh the observations without guessing the missing

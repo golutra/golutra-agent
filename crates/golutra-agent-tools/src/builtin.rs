@@ -26,6 +26,7 @@ pub(super) enum BuiltinTool {
     AskUser,
     Shell,
     ShellSession,
+    RuntimeStatus,
     Subagent,
     ProcessList,
     ProcessPoll,
@@ -37,7 +38,7 @@ pub(super) enum BuiltinTool {
 
 impl BuiltinTool {
     /// 稳定的 provider 工具面；其他变体仅供 runtime 内部或回放使用。
-    pub(super) const P0_DEFAULT: [Self; 7] = [
+    pub(super) const P0_DEFAULT: [Self; 8] = [
         Self::ReadFile,
         Self::WriteFile,
         Self::EditFile,
@@ -45,6 +46,7 @@ impl BuiltinTool {
         Self::Shell,
         Self::ShellSession,
         Self::Subagent,
+        Self::RuntimeStatus,
     ];
 
     /// 为验证和回放保留的 runtime 能力，不得投影给 provider。
@@ -74,6 +76,7 @@ impl BuiltinTool {
             "ask_user" => Self::AskUser,
             "shell" => Self::Shell,
             "shell_session" => Self::ShellSession,
+            "runtime_status" => Self::RuntimeStatus,
             "subagent" => Self::Subagent,
             "process_list" => Self::ProcessList,
             "process_poll" => Self::ProcessPoll,
@@ -98,6 +101,7 @@ impl BuiltinTool {
             Self::AskUser => "ask_user",
             Self::Shell => "shell",
             Self::ShellSession => "shell_session",
+            Self::RuntimeStatus => "runtime_status",
             Self::Subagent => "subagent",
             Self::ProcessList => "process_list",
             Self::ProcessPoll => "process_poll",
@@ -118,6 +122,7 @@ impl BuiltinTool {
             | Self::ProcessTerminate
             | Self::DelegateTask => SideEffectType::Process,
             Self::ReadFile
+            | Self::RuntimeStatus
             | Self::ListDir
             | Self::RgSearch
             | Self::SymbolSearch
@@ -145,6 +150,7 @@ impl BuiltinTool {
                     | Self::Shell
                     | Self::ShellSession
                     | Self::Subagent
+                    | Self::RuntimeStatus
             ),
             parallel_read_safe: matches!(
                 self,
@@ -333,9 +339,9 @@ pub(super) fn contract(tool_name: &str, side_effect_type: SideEffectType) -> Too
             "properties": {
                 "command": {
                     "type": "string",
-                    "minLength": 1,
+                    "minLength": 0,
                     "maxLength": MAX_SHELL_COMMAND_CHARS,
-                    "description": "Command string; prefer omitting argv. Use bash -lc for pipes, redirects, compound commands, or heredoc."
+                    "description": "Non-empty command to execute. Use bash -lc for pipes, redirects, compound commands, or heredoc."
                 },
                 "argv": {
                     "type": "array",
@@ -358,7 +364,7 @@ pub(super) fn contract(tool_name: &str, side_effect_type: SideEffectType) -> Too
                     "type": "integer",
                     "minimum": 1,
                     "maximum": MAX_BACKGROUND_PROCESS_TIMEOUT_MS,
-                    "description": "Hard process lifetime in ms; omit normally, set only to intentionally terminate."
+                    "description": format!("Hard process lifetime in ms, 1..={MAX_BACKGROUND_PROCESS_TIMEOUT_MS}; omit normally, set only to intentionally terminate.")
                 },
                 "background": {
                     "type": "boolean",
@@ -368,15 +374,14 @@ pub(super) fn contract(tool_name: &str, side_effect_type: SideEffectType) -> Too
                 "yield_time_ms": {
                     "type": "integer",
                     "minimum": 0,
-                    "maximum": max_poll_wait_ms(),
-                    "description": "Initial wait before returning a running process ID; default 10000, or 0 with background=true. Does not set or extend process lifetime."
+                    "description": format!("Initial wait in ms, capped at {}; default 10000, or 0 with background=true. Does not set or extend process lifetime.", max_poll_wait_ms())
                 },
                 "max_output_bytes": {"type": "integer", "minimum": 256, "description": "Optional preview budget in bytes (minimum 256); normally omit. Default 12288; larger requests are capped by runtime/context policy. Continue only if more output is needed."}
             },
             "required": []
         }),
         "shell_session" => shell_session_schema(),
-        "process_list" => object_schema(&[], &[], &[]),
+        "process_list" | "runtime_status" => object_schema(&[], &[], &[]),
         "process_poll" => process_session_schema(false, true),
         "process_write" => process_session_schema(true, true),
         "process_terminate" => process_session_schema(false, false),
@@ -425,15 +430,15 @@ fn shell_session_schema() -> Value {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "action": {"type": "string", "enum": ["wait", "read", "write", "terminate", "list"], "description": "Wait for execution, read available output without waiting, write stdin, terminate, or list processes. Unread output does not mean execution is still running."},
+            "action": {"type": "string", "enum": ["wait", "read", "write", "terminate", "list"], "description": "Wait, read available output, write stdin, terminate, or list processes. Unused read/list/wait hints are ignored and reported. Non-empty input is write-only; list has no process target. Unread output does not mean still running."},
             "offset": {"type":"integer", "minimum":0, "description":"List offset; follow next_offset while has_more."},
-            "limit": {"type":"integer", "minimum":1, "maximum":64, "description":"Processes per list page; default 4."},
-            "process_id": {"type": "string", "minLength": 1, "maxLength": 128, "description": "ID returned by shell; required except for list."},
-            "authoritative_pid": {"type": "integer", "minimum": 1, "maximum": u32::MAX, "description": "Optional extra OS PID check; must match start if supplied."},
+            "limit": {"type":"integer", "minimum":1, "maximum":64, "description":"For list only: 1..64 processes per page; default 4. Omit for other actions."},
+            "process_id": {"type": "string", "maxLength": 128, "description": "Non-empty ID returned by shell; required for wait/read/write/terminate. Omit for list."},
+            "authoritative_pid": {"type": "integer", "minimum": 0, "maximum": u32::MAX, "description": "Optional positive OS PID check; must match start if supplied. Omit for list."},
             "cursor": {"type": "integer", "minimum": 0, "description": "Optional byte cursor for repeatable reads; omitted continues after the last delivered page."},
             "max_output_bytes": {"type": "integer", "minimum": 256, "description": "Optional preview budget in bytes (minimum 256); normally omit. Default 12288; larger requests are capped by runtime/context policy. Continue only if more output is needed."},
             "input": {"type": "string", "maxLength": MAX_PROCESS_INPUT_CHARS, "description": "Stdin text for write."},
-            "wait_ms": {"type": "integer", "minimum": 0, "maximum": max_poll_wait_ms(), "description": "Bounded event-driven wait in ms. Reaching this deadline does not stop the process."},
+            "wait_ms": {"type": "integer", "minimum": 0, "description": format!("Event-driven wait in ms, capped at {}. Reaching this deadline does not stop the process. read always returns immediately; omit on terminate/list.", max_poll_wait_ms())},
             "wait_for_terminal": {"type": "boolean", "description": "Wait for one terminal state or deadline."}
         },
         "required": ["action"]

@@ -808,6 +808,23 @@ fn event_operation_entries_with_boundary(
             }
         }
         match event.event_type {
+            RuntimeEventType::RetryScheduled if event.payload.get("recovery").is_some() => {
+                if event.payload["recovery"]["reset_stream"].as_bool() == Some(true)
+                    && let Some(index) = event
+                        .turn_id
+                        .and_then(|id| indexes.streamed_assistant_items.remove(&id))
+                    && let Some(record) = items.get_mut(index)
+                {
+                    // 已进入终端滚动历史的片段不能撤回，明确标记中断并让新尝试另起一条。
+                    record
+                        .projection
+                        .item_mut()
+                        .body
+                        .push("[Response interrupted; retrying]".to_owned());
+                    record.stable = true;
+                }
+            }
+            RuntimeEventType::ProviderTransportFallback => {}
             RuntimeEventType::ProviderFailed => {
                 if let Some(task_id) = event.task_id {
                     provider_failures.insert(task_id, event);
@@ -2499,6 +2516,12 @@ pub(crate) fn assistant_event_transcript_item(event: &RuntimeEvent) -> Option<Tr
 }
 
 pub(crate) fn status_event_transcript_item(event: &RuntimeEvent) -> Option<TranscriptItem> {
+    if event.event_type == RuntimeEventType::ProviderTransportFallback
+        || event.event_type == RuntimeEventType::RetryScheduled
+            && event.payload.get("recovery").is_some()
+    {
+        return None;
+    }
     if event.event_type == RuntimeEventType::ApprovalRequested {
         // 审批走独立对话框，不在 transcript 再铺一张卡。
         return None;
@@ -2828,12 +2851,14 @@ fn failure_event_error(event: &RuntimeEvent) -> Option<&str> {
 }
 
 fn visible_failure_detail(mut text: &str) -> &str {
-    // Strip only known error wrappers, never arbitrary provider message text.
+    // 仅移除已知错误类型的包装，保留完整上游原因；类型细分不应泄漏冗余前缀。
     loop {
         let Some(detail) = [
             "runtime task execution failed: ",
             "provider call failed: ",
             "provider failed: ",
+            "provider connection failed: ",
+            "provider response is malformed: ",
             "provider is temporarily unavailable: ",
         ]
         .into_iter()
@@ -4039,6 +4064,54 @@ mod tests {
             RuntimeEventType::ProviderStreamed,
             json!({"delta": {"kind": "text_delta", "text": text}}),
         )
+    }
+
+    #[test]
+    fn recovery_boundary_never_joins_partial_text_to_the_next_attempt() {
+        let turn = TurnId::new();
+        let events = vec![
+            assistant_delta(1, turn, "旧的中文半句"),
+            tool_event_on_turn(
+                2,
+                Some(turn),
+                RuntimeEventType::RetryScheduled,
+                json!({"recovery": {"phase": "waiting", "reset_stream": true}}),
+            ),
+            tool_event_on_turn(
+                3,
+                Some(turn),
+                RuntimeEventType::RetryScheduled,
+                json!({"recovery": {"phase": "retrying", "reset_stream": false}}),
+            ),
+            assistant_delta(4, turn, "新的完整"),
+            assistant_delta(5, turn, "回答。"),
+            tool_event_on_turn(
+                6,
+                Some(turn),
+                RuntimeEventType::AssistantMessage,
+                json!({"content": "新的完整回答。"}),
+            ),
+        ];
+        let items = event_operation_projections(&events)
+            .into_iter()
+            .map(|item| item.item(false))
+            .collect::<Vec<_>>();
+        assert_eq!(items.len(), 2, "retry events do not become history cards");
+        assert_eq!(
+            items[0].body,
+            vec!["旧的中文半句", "[Response interrupted; retrying]"]
+        );
+        assert_eq!(items[1].body, vec!["新的完整回答。"]);
+        let committed = HashSet::from([events[0].id]);
+        let replayed = event_operation_entries_with_boundary(
+            &events,
+            &committed,
+            &HashSet::new(),
+            false,
+            &HashSet::new(),
+        );
+        assert!(replayed.iter().all(|item| item.stable));
+        assert_eq!(replayed.len(), 2);
     }
 
     fn completed_read(sequence_no: u64, turn_id: TurnId, path: &str) -> Vec<RuntimeEvent> {

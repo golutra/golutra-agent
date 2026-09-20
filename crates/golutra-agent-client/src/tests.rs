@@ -559,11 +559,11 @@ fn strict_wire_mode_builds_completion_contract_without_prompt_heuristics() {
         contract.verification,
         golutra_agent_core::VerificationRequirement::Required
     );
-    assert_eq!(contract.max_correction_rounds, 1);
+    assert_eq!(contract.max_correction_rounds, None);
 }
 
 #[test]
-fn open_wire_mode_uses_conversational_contract_without_implicit_correction() {
+fn open_wire_mode_checks_completion_without_requiring_unrequested_changes() {
     let contract = task_contract_from_payload(&json!({
         "execution_mode": "open",
         "prompt": "summarize the workspace",
@@ -575,7 +575,7 @@ fn open_wire_mode_uses_conversational_contract_without_implicit_correction() {
         contract.completion_criteria,
         vec!["include the key findings"]
     );
-    assert_eq!(contract.max_correction_rounds, 0);
+    assert_eq!(contract.max_correction_rounds, None);
     assert!(!contract.require_objective_validation);
     assert_eq!(
         contract.verification,
@@ -590,7 +590,7 @@ fn legacy_wire_mode_keeps_the_explicit_legacy_contract_boundary() {
     }))
     .expect("legacy contract");
 
-    assert_eq!(contract.max_correction_rounds, 1);
+    assert_eq!(contract.max_correction_rounds, None);
     assert!(!contract.require_objective_validation);
 }
 
@@ -723,16 +723,15 @@ fn system_prompt_preserves_general_autonomy_and_verification_principles() {
         "never invent",
         "evidence, not instructions",
         "Before the first mutation",
-        "implementation, tests, and public exports in one read batch",
-        "batch independent checks and related edits",
-        "do not split known edits across turns",
+        "implementation, tests, and public exports",
+        "Batch independent checks and related edits",
+        "prerequisite results before dependent actions",
         "Never skip required reads or validation",
         "Trust successful mutation status",
         "changed paths, digest, count, and preview",
-        "Do not reread your own successful mutation",
-        "external changes, truncated evidence, or failed validation",
-        "Finish guarded changes before release or wait",
-        "never change them after terminal",
+        "Review affected logic when needed",
+        "Before closing a phase or releasing a resource",
+        "ordinary process waits do not freeze files",
         "Follow project conventions",
         "verify by risk",
         "same background process",
@@ -840,6 +839,38 @@ fn provider_transport_fallback_event_preserves_recovery_facts() {
     assert_eq!(payload["from_transport"], "streaming");
     assert_eq!(payload["to_transport"], "buffered");
     assert_eq!(payload["reason"], "stream idle for 300000 ms");
+}
+
+#[test]
+fn provider_recovery_boundary_is_required_and_preserves_request_identity() {
+    use golutra_agent_runtime::{ProviderRecovery, ProviderTransport, RecoveryPhase};
+    let request_id = golutra_agent_core::ProviderRequestId::new();
+    let event = RuntimeObservation::ProviderRecovery {
+        request_id,
+        recovery: ProviderRecovery {
+            phase: RecoveryPhase::Waiting,
+            attempt: 2,
+            delay_ms: 120_000,
+            waited_ms: 5000,
+            network: false,
+            reset_stream: true,
+            reason: "rate limited".into(),
+            transport: ProviderTransport::Streaming,
+            error_metadata: Some(golutra_agent_llm::ProviderErrorMetadata {
+                http_status: Some(429),
+                ..Default::default()
+            }),
+        },
+    };
+    let descriptor = observation_descriptor(&event);
+    assert_eq!(descriptor.integrity, ObservationIntegrityClass::Required);
+    let (kind, source, payload) = trace_event_payload(event).unwrap();
+    assert_eq!(kind, RuntimeEventType::RetryScheduled);
+    assert_eq!(source, RuntimeEventSource::Provider);
+    assert_eq!(payload["provider_request_id"], request_id.to_string());
+    assert_eq!(payload["recovery"]["error_metadata"]["http_status"], 429);
+    assert_eq!(payload["recovery"]["phase"], "waiting");
+    assert_eq!(payload["recovery"]["reset_stream"], true);
 }
 
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
@@ -1223,7 +1254,6 @@ async fn runtime_host_reuses_one_process_supervisor_across_tool_executors() {
     let root_context = crate::delegation_policy::DelegationContext::root(
         session_id,
         Some(10_000),
-        Some(1_024),
         None,
         execution.cancellation_token(),
     );
@@ -1550,7 +1580,6 @@ async fn delegated_task_inherits_overrides_and_archives_an_isolated_child() {
             delegation: Some(crate::delegation_policy::DelegationContext::root(
                 parent_session_id,
                 Some(DELEGATION_FIXTURE_BUDGET_MS),
-                Some(2_000),
                 None,
                 execution_cancellation,
             )),
@@ -1607,6 +1636,23 @@ async fn delegated_task_inherits_overrides_and_archives_an_isolated_child() {
         .expect("child thread");
     assert_eq!(inherited_thread.parent_thread_id, Some(parent_thread_id));
     assert!(inherited_thread.archived);
+    let visible_children =
+        golutra_agent_tools::TaskDelegationBackend::status(&backend, parent_session_id)
+            .await
+            .expect("bounded parent status");
+    assert!(
+        visible_children["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|child| child["child_session_id"] == json!(inherited_session_id))
+    );
+    assert!(!visible_children.to_string().contains("requested_model"));
+    let foreign_children =
+        golutra_agent_tools::TaskDelegationBackend::status(&backend, SessionId::new())
+            .await
+            .expect("unrelated session has no children");
+    assert_eq!(foreign_children["children"], json!([]));
     let inherited_events = host
         .storage
         .repositories
@@ -2043,7 +2089,6 @@ async fn assert_parent_interrupt_child(background: bool) {
     let root_context = crate::delegation_policy::DelegationContext::root(
         parent_session_id,
         Some(60_000),
-        Some(1_024),
         None,
         host.execution.shutdown.child_token(),
     );
@@ -2206,7 +2251,6 @@ async fn delegated_payload_rejects_a_forged_runtime_actor() {
     let root = crate::delegation_policy::DelegationContext::root(
         parent_session_id,
         Some(10_000),
-        Some(1_024),
         None,
         cancellation.clone(),
     );
@@ -2298,7 +2342,6 @@ async fn delegated_child_session_rejects_plain_prompt_between_create_and_start()
     let root = crate::delegation_policy::DelegationContext::root(
         parent_session_id,
         Some(10_000),
-        Some(1_024),
         None,
         cancellation.clone(),
     );
@@ -6916,7 +6959,7 @@ async fn first_prompt_sets_thread_title_from_prompt() {
     let default_thread_id = transport.default_thread_id();
 
     transport
-        .send_command(command_with_payload(
+        .send_command(bounded_mock_command(
             transport.default_session_id(),
             json!({
                 "prompt": "write file chain.txt with content ok",
@@ -6946,7 +6989,7 @@ async fn resumed_session_context_includes_previous_conversation_summary() {
         .expect("transport");
 
     transport
-        .send_command(command_with_payload(
+        .send_command(bounded_mock_command(
             transport.default_session_id(),
             json!({
                 "prompt": "write file first.txt with content done",
@@ -7638,7 +7681,7 @@ async fn prompt_with_explicit_thread_id_does_not_persist_bootstrap_default() {
     let tui_session_id = SessionId::new();
 
     transport
-        .send_command(command_with_payload(
+        .send_command(bounded_mock_command(
             tui_session_id,
             json!({
                 "prompt": "write file tui.txt with content ok",
@@ -8081,7 +8124,7 @@ async fn approval_command_unblocks_waiting_tool_and_records_resolution() {
     let session_id = transport.default_session_id();
 
     transport
-        .send_command(command(session_id, "sleep"))
+        .send_command(bounded_mock_command(session_id, json!({"prompt":"sleep"})))
         .await
         .expect("command");
     let waiting = wait_for_status(&transport, session_id, TaskStatus::WaitingApproval).await;
@@ -8234,7 +8277,7 @@ async fn observer_must_take_over_before_controlling_or_approving_a_task() {
     let transport = EmbeddedTransport::in_memory().await.expect("transport");
     let session_id = transport.default_session_id();
     transport
-        .send_command(command(session_id, "sleep"))
+        .send_command(bounded_mock_command(session_id, json!({"prompt":"sleep"})))
         .await
         .expect("task");
     let waiting = wait_for_status(&transport, session_id, TaskStatus::WaitingApproval).await;
@@ -8480,7 +8523,7 @@ async fn persisted_ephemeral_runtime_retains_isolated_state_and_full_run_bundle(
         },
     };
     let checkpoint = RunBundleExporter::new(&runtime_transport)
-        .checkpoint(RunBundleExportRequest {
+        .checkpoint_fast(RunBundleExportRequest {
             destination: state_dir.clone(),
             selection: selection.clone(),
             terminal_outcome: RunBundleTerminalOutcome::InProgress {
@@ -8571,6 +8614,20 @@ async fn persisted_ephemeral_runtime_retains_isolated_state_and_full_run_bundle(
             .any(|event| event.event_type == RuntimeEventType::MemoryCandidateQuarantined)
     );
 
+    let delivery = RunBundleExporter::new(&runtime_transport)
+        .export_delivery(RunBundleExportRequest {
+            destination: state_dir.clone(),
+            selection: selection.clone(),
+            terminal_outcome: RunBundleTerminalOutcome::Result {
+                result: result.clone(),
+            },
+        })
+        .await
+        .expect("durable delivery without debug projection");
+    assert!(delivery.debug_export_path.is_none());
+    assert!(delivery.debug_export_error.is_none());
+    assert!(state_dir.join("state/runtime.sqlite").is_file());
+    assert!(!state_dir.join("debug-export").exists());
     let receipt = RunBundleExporter::new(&runtime_transport)
         .export(RunBundleExportRequest {
             destination: state_dir.clone(),
@@ -9413,7 +9470,10 @@ async fn natural_language_mock_write_preserves_delivery_without_claiming_unverif
     let session_id = transport.default_session_id();
 
     let ack = transport
-        .send_command(command(session_id, "write file smoke.txt with content ok"))
+        .send_command(bounded_mock_command(
+            session_id,
+            json!({"prompt":"write file smoke.txt with content ok"}),
+        ))
         .await
         .expect("command");
     let state = wait_for_status(&transport, session_id, TaskStatus::Partial).await;
@@ -9438,7 +9498,7 @@ async fn natural_language_quoted_write_preserves_content_without_inventing_verif
     let prompt = "Create a file called hello.txt in the current directory. Write \"Hello, world!\" to it. Make sure it ends in a newline. Don't make any other files or folders.";
 
     let ack = transport
-        .send_command(command(session_id, prompt))
+        .send_command(bounded_mock_command(session_id, json!({"prompt":prompt})))
         .await
         .expect("command");
     let state = wait_for_status(&transport, session_id, TaskStatus::Partial).await;
@@ -10199,11 +10259,7 @@ async fn recovery_transfer_preserves_the_surface_after_a_later_turn_started() {
         recovered[0].payload["task_contract"]["completion_criteria"],
         json!(["second"])
     );
-    assert!(
-        recovered[0].payload["max_elapsed_ms"]
-            .as_u64()
-            .is_some_and(|remaining| (1..=default_agent_max_elapsed_ms()).contains(&remaining))
-    );
+    assert!(recovered[0].payload.get("max_elapsed_ms").is_none());
 }
 
 #[tokio::test]
@@ -10222,9 +10278,9 @@ async fn recovery_transfer_carries_cumulative_governor_and_delegation_state() {
             parent_task_id: None,
             parent_thread_id: None,
             depth: 0,
-            remaining_elapsed_ms: 10_000,
+            remaining_elapsed_ms: Some(10_000),
             local_remaining_elapsed_ms: None,
-            max_tokens: delegation_policy::MIN_DELEGATED_TOKEN_BUDGET,
+            max_tokens: Some(8_192),
             max_cost_microusd: Some(500),
             started_children: 2,
             spent_tokens: 7_000,
@@ -10290,7 +10346,7 @@ async fn recovery_transfer_carries_cumulative_governor_and_delegation_state() {
     let delegation = continuation.delegation.as_ref().expect("delegation state");
     assert_eq!(delegation.state.started_children, 2);
     assert_eq!(delegation.state.spent_cost_microusd, 125);
-    assert!(delegation.state.remaining_elapsed_ms < 10_000);
+    assert!(delegation.state.remaining_elapsed_ms.unwrap() < 10_000);
 }
 
 fn governor_recovery_transfer_event(
@@ -10753,9 +10809,9 @@ fn recovery_transfer_does_not_get_overwritten_by_stale_restarted_turn_metadata()
                 parent_task_id: None,
                 parent_thread_id: None,
                 depth: 0,
-                remaining_elapsed_ms: 10_000,
+                remaining_elapsed_ms: Some(10_000),
                 local_remaining_elapsed_ms: None,
-                max_tokens: delegation_policy::MIN_DELEGATED_TOKEN_BUDGET,
+                max_tokens: Some(8_192),
                 max_cost_microusd: Some(500),
                 started_children: 3,
                 spent_tokens: 8_000,
@@ -10772,7 +10828,7 @@ fn recovery_transfer_does_not_get_overwritten_by_stale_restarted_turn_metadata()
         "depth": 0,
         "budget": {
             "remaining_elapsed_ms": 30_000,
-            "max_tokens": delegation_policy::MIN_DELEGATED_TOKEN_BUDGET,
+            "max_tokens": 8_192,
             "max_cost_microusd": 500,
             "started_children": 0,
             "spent_tokens": 0,
@@ -10829,9 +10885,9 @@ fn canonical_delegation_recovery_state(
             parent_task_id: None,
             parent_thread_id: None,
             depth: 0,
-            remaining_elapsed_ms: 10_000,
+            remaining_elapsed_ms: Some(10_000),
             local_remaining_elapsed_ms: Some(10_000),
-            max_tokens,
+            max_tokens: Some(max_tokens),
             max_cost_microusd,
             started_children,
             spent_tokens,
@@ -10871,7 +10927,7 @@ fn delegation_metadata_requires_numeric_reservation_fields() {
         "depth": 0,
         "budget": {
             "remaining_elapsed_ms": 10_000,
-            "max_tokens": delegation_policy::MIN_DELEGATED_TOKEN_BUDGET,
+            "max_tokens": 8_192,
             "max_cost_microusd": null,
             "active_children": 0,
             "started_children": 0,
@@ -10908,13 +10964,7 @@ fn delegation_metadata_requires_numeric_reservation_fields() {
 fn canonical_delegation_checkpoint_rejects_foreign_or_child_state() {
     let session_id = SessionId::new();
     let task_id = TaskId::new();
-    let foreign = canonical_delegation_recovery_state(
-        SessionId::new(),
-        delegation_policy::MIN_DELEGATED_TOKEN_BUDGET,
-        None,
-        1,
-        0,
-    );
+    let foreign = canonical_delegation_recovery_state(SessionId::new(), 8_192, None, 1, 0);
     let error = recovered_task_continuation(
         &[delegation_recovery_checkpoint_event(
             1, session_id, task_id, &foreign,
@@ -10943,13 +10993,7 @@ fn canonical_delegation_checkpoint_rejects_foreign_or_child_state() {
         .expect_err("foreign root transfer state must be rejected");
     assert!(error.to_string().contains("does not match event session"));
 
-    let mut child = canonical_delegation_recovery_state(
-        session_id,
-        delegation_policy::MIN_DELEGATED_TOKEN_BUDGET,
-        None,
-        1,
-        0,
-    );
+    let mut child = canonical_delegation_recovery_state(session_id, 8_192, None, 1, 0);
     child.state.depth = 1;
     child.state.parent_session_id = Some(SessionId::new());
     let error = recovered_task_continuation(
@@ -10966,15 +11010,9 @@ fn canonical_delegation_checkpoint_rejects_foreign_or_child_state() {
 fn canonical_delegation_checkpoint_rejects_budget_or_child_count_drift() {
     let session_id = SessionId::new();
     let task_id = TaskId::new();
-    let baseline = canonical_delegation_recovery_state(
-        session_id,
-        delegation_policy::MIN_DELEGATED_TOKEN_BUDGET,
-        Some(1_000),
-        2,
-        100,
-    );
+    let baseline = canonical_delegation_recovery_state(session_id, 8_192, Some(1_000), 2, 100);
     let mut changed_token_cap = baseline.clone();
-    changed_token_cap.state.max_tokens += 1;
+    changed_token_cap.state.max_tokens = changed_token_cap.state.max_tokens.map(|max| max + 1);
     let mut changed_cost_cap = baseline.clone();
     changed_cost_cap.state.max_cost_microusd = Some(999);
     let mut regressed_children = baseline.clone();
@@ -11000,13 +11038,7 @@ fn canonical_delegation_checkpoint_rejects_budget_or_child_count_drift() {
 fn canonical_delegation_checkpoint_allows_reservation_settlement_usage_drop() {
     let session_id = SessionId::new();
     let task_id = TaskId::new();
-    let reservation = canonical_delegation_recovery_state(
-        session_id,
-        delegation_policy::MIN_DELEGATED_TOKEN_BUDGET,
-        Some(1_000),
-        1,
-        delegation_policy::MIN_DELEGATED_TOKEN_BUDGET,
-    );
+    let reservation = canonical_delegation_recovery_state(session_id, 8_192, Some(1_000), 1, 8_192);
     let mut settlement = reservation.clone();
     settlement.state.spent_tokens = 100;
     settlement.state.spent_cost_microusd = 10;
@@ -11028,7 +11060,7 @@ fn delegation_metadata_depth_is_decoded_from_top_level_and_legacy_budget_locatio
     let session_id = SessionId::new();
     let base_budget = json!({
         "remaining_elapsed_ms": 10_000,
-        "max_tokens": delegation_policy::MIN_DELEGATED_TOKEN_BUDGET,
+        "max_tokens": 8_192,
         "max_cost_microusd": null,
         "active_children": 1,
         "started_children": 1,
@@ -11048,10 +11080,7 @@ fn delegation_metadata_depth_is_decoded_from_top_level_and_legacy_budget_locatio
     let current =
         delegation_recovery_from_metadata(&current, chrono::Utc::now()).expect("current metadata");
     assert_eq!(current.state.depth, 1);
-    assert_eq!(
-        current.state.spent_tokens,
-        delegation_policy::MIN_DELEGATED_TOKEN_BUDGET
-    );
+    assert_eq!(current.state.spent_tokens, 8_192);
 
     let settled = json!({
         "root_session_id": session_id,
@@ -11061,7 +11090,7 @@ fn delegation_metadata_depth_is_decoded_from_top_level_and_legacy_budget_locatio
         "depth": 1,
         "budget": {
             "remaining_elapsed_ms": 10_000,
-            "max_tokens": delegation_policy::MIN_DELEGATED_TOKEN_BUDGET,
+            "max_tokens": 8_192,
             "max_cost_microusd": null,
             "active_children": 0,
             "started_children": 1,
@@ -11083,7 +11112,7 @@ fn delegation_metadata_depth_is_decoded_from_top_level_and_legacy_budget_locatio
         "budget": {
             "depth": 2,
             "remaining_elapsed_ms": 10_000,
-            "max_tokens": delegation_policy::MIN_DELEGATED_TOKEN_BUDGET,
+            "max_tokens": 8_192,
             "max_cost_microusd": null,
             "active_children": 0,
             "started_children": 2,
@@ -12036,7 +12065,7 @@ async fn forbidden_workspace_contract_blocks_provider_side_effects() {
         .expect("transport");
     let session_id = transport.default_session_id();
     let ack = transport
-        .send_command(command_with_payload(
+        .send_command(bounded_mock_command(
             session_id,
             json!({
                 "prompt": "write file blocked.txt with content must-not-write",
@@ -13582,6 +13611,18 @@ async fn abort_cancels_an_unlocked_orphan_without_an_in_memory_task_handle() {
     assert!(ack.accepted);
     assert_eq!(state.task_status, TaskStatus::Cancelled);
     assert_eq!(state.active_task_id, Some(orphaned_task_id));
+}
+
+// 固定响应的 mock 不会自行修复；只在断言有限失败终态的夹具中显式限制纠偏。
+fn bounded_mock_command(session_id: SessionId, mut payload: Value) -> SessionCommand {
+    let mut contract = task_contract_from_payload(&payload).expect("fixture contract");
+    if !explicit_task_contract(&payload) {
+        let prompt = payload["prompt"].as_str().unwrap_or_default();
+        LegacyTaskAdapter::new(&payload, prompt).apply_to(&mut contract);
+    }
+    contract.max_correction_rounds = Some(1);
+    payload["task_contract"] = serde_json::to_value(contract).unwrap();
+    command_with_payload(session_id, payload)
 }
 
 fn command(session_id: SessionId, prompt: &str) -> SessionCommand {

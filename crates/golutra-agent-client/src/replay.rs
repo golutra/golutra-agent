@@ -2883,7 +2883,7 @@ mod tests {
             golutra_agent_core::VerificationRequirement::Independent
         );
         assert!(contract.require_objective_validation);
-        assert_eq!(contract.max_correction_rounds, 0);
+        assert_eq!(contract.max_correction_rounds, Some(0));
     }
 
     #[test]

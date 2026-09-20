@@ -24,6 +24,90 @@ use tokio::{
 
 const TEST_API_KEY: &str = "golden-test-key";
 
+fn shell_contract_request(model: &str) -> ProviderRequest {
+    let registry = golutra_agent_tools::ToolRegistry::p0_default();
+    let mut request = simple_request(model);
+    request.tools = ["shell", "shell_session", "runtime_status"]
+        .into_iter()
+        .map(|name| registry.model_contract(registry.contract(name).unwrap().clone()))
+        .collect();
+    request
+}
+
+fn assert_shell_wire(body: &Value) {
+    // 检查实际 HTTP 请求中的合同，而不是投影之前的运行时快照。
+    fn schemas(value: &Value, found: &mut Vec<Value>) {
+        match value {
+            Value::Object(fields) => {
+                if fields
+                    .get("properties")
+                    .and_then(|properties| properties.get("command"))
+                    .is_some()
+                {
+                    found.push(value.clone());
+                }
+                for child in fields.values() {
+                    schemas(child, found);
+                }
+            }
+            Value::Array(values) => {
+                for child in values {
+                    schemas(child, found);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut found = Vec::new();
+    schemas(body, &mut found);
+    assert_eq!(found.len(), 1);
+    let shell = &found[0];
+    assert_eq!(shell["required"], json!(["command"]));
+    assert!(shell["properties"].get("argv").is_none());
+    assert!(
+        shell["properties"]["yield_time_ms"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("30000")
+    );
+    assert!(body.to_string().contains("runtime_status"));
+}
+
+#[tokio::test]
+async fn built_in_shell_contract_survives_all_protocol_wire_adapters() {
+    for case in cases() {
+        let (url, captured) = spawn_provider(200, case.text_response_fixture).await;
+        provider(case, url)
+            .complete(shell_contract_request(case.model))
+            .await
+            .unwrap();
+        assert_shell_wire(&captured.await.unwrap().body);
+    }
+    let (url, captured) = spawn_provider(
+        200,
+        include_str!("fixtures/openai-compatible/text_response.json"),
+    )
+    .await;
+    OpenAiCompatibleProvider::new(TEST_API_KEY, url, "gpt-golden")
+        .complete(shell_contract_request("gpt-golden"))
+        .await
+        .unwrap();
+    assert_shell_wire(&captured.await.unwrap().body);
+    let (url, captured) = spawn_provider_sequence(vec![TestProviderResponse::sse(
+        200,
+        include_str!("fixtures/openai-responses/text-response.sse"),
+    )])
+    .await;
+    openai_responses_provider(url)
+        .complete_stream(shell_contract_request("gpt-golden"), &mut |_| {})
+        .await
+        .unwrap();
+    assert_shell_wire(&captured.await.unwrap()[0].body);
+}
+
+#[path = "provider_golden/terminal_contract.rs"]
+mod terminal_contract;
+
 #[derive(Debug, Clone, Copy)]
 struct ProtocolCase {
     protocol: ProviderProtocol,
@@ -851,7 +935,7 @@ async fn openai_responses_provider_matches_sse_goldens_and_auth_headers() {
         .complete(simple_request("gpt-golden"))
         .await
         .expect_err("Responses SSE error");
-    assert!(matches!(error, ProviderError::Failed { .. }));
+    assert!(matches!(error, ProviderError::Malformed { .. }));
     assert!(error.to_string().contains("golden responses failure"));
 }
 
@@ -1167,6 +1251,83 @@ async fn openai_responses_rejects_stream_without_completed_response_id() {
 }
 
 #[tokio::test]
+async fn responses_terminal_semantics_survive_the_generic_adapter() {
+    for (kind, status, details, end_turn, expected) in [
+        (
+            "response.completed",
+            "completed",
+            Value::Null,
+            json!(false),
+            ProviderFinishReason::Continue,
+        ),
+        (
+            "response.completed",
+            "completed",
+            Value::Null,
+            json!(true),
+            ProviderFinishReason::Stop,
+        ),
+        (
+            "response.incomplete",
+            "incomplete",
+            json!({"reason":"max_output_tokens"}),
+            Value::Null,
+            ProviderFinishReason::Length,
+        ),
+        (
+            "response.incomplete",
+            "incomplete",
+            json!({"reason":"content_filter"}),
+            Value::Null,
+            ProviderFinishReason::ContentFilter,
+        ),
+        (
+            "response.incomplete",
+            "incomplete",
+            json!({"reason":"unknown"}),
+            Value::Null,
+            ProviderFinishReason::Error,
+        ),
+    ] {
+        let terminal = json!({"type":kind,"response":{
+            "id":"terminal-test", "status":status, "model":"gpt-golden", "output":[],
+            "incomplete_details":details, "end_turn":end_turn
+        }});
+        let body = format!(
+            "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"partial text\"}}\n\nevent: {kind}\ndata: {terminal}\n\n"
+        );
+        let (base_url, _) =
+            spawn_provider_sequence(vec![TestProviderResponse::sse(200, body)]).await;
+        let response = openai_responses_provider(base_url)
+            .complete(simple_request("gpt-golden"))
+            .await
+            .unwrap();
+        assert_eq!(response.finish_reason, expected);
+        assert_eq!(response.message.unwrap().content, "partial text");
+    }
+}
+
+#[tokio::test]
+async fn anthropic_pause_and_truncation_remain_distinct_from_completion() {
+    let case = cases()[0];
+    assert_eq!(case.protocol, ProviderProtocol::Anthropic);
+    for (reason, expected) in [
+        ("pause_turn", ProviderFinishReason::Continue),
+        ("max_tokens", ProviderFinishReason::Length),
+        ("end_turn", ProviderFinishReason::Stop),
+    ] {
+        let mut body: Value = serde_json::from_str(case.text_response_fixture).unwrap();
+        body["stop_reason"] = json!(reason);
+        let (base_url, _) = spawn_provider(200, body.to_string()).await;
+        let response = provider(case, base_url)
+            .complete(comprehensive_request(case.model))
+            .await
+            .unwrap();
+        assert_eq!(response.finish_reason, expected);
+    }
+}
+
+#[tokio::test]
 async fn openai_responses_rejects_oversized_text_before_streaming_it() {
     const PROVIDER_MESSAGE_LIMIT: usize = 128 * 1024;
     let response = format!(
@@ -1190,6 +1351,60 @@ async fn openai_responses_rejects_oversized_text_before_streaming_it() {
     assert!(matches!(error, ProviderError::Malformed { .. }));
     assert!(error.to_string().contains("assistant message exceeds"));
     assert!(events.is_empty(), "oversized text must not reach consumers");
+}
+
+#[tokio::test]
+async fn responses_measure_tool_ready_wait_without_executing_partial_calls() {
+    let fixture = include_str!("fixtures/openai-responses/tool-response.sse");
+    let (prefix, suffix) = fixture.split_once("event: response.completed").unwrap();
+    let prefix = format!(
+        "{prefix}event: response.output_item.done\ndata: {{\"type\":\"response.output_item.done\",\"item\":{{\"type\":\"function_call\",\"status\":\"completed\",\"call_id\":\"call_read_1\",\"name\":\"read_file\",\"arguments\":\"{{\\\"path\\\":\\\"README.md\\\"}}\"}}}}\n\n"
+    );
+    let suffix = format!("event: response.completed{suffix}");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_request(&mut socket).await;
+        socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{prefix}", prefix.len() + suffix.len()).as_bytes()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        socket.write_all(suffix.as_bytes()).await.unwrap();
+    });
+    let response = openai_responses_provider(format!("http://{address}"))
+        .complete(simple_request("gpt-golden"))
+        .await
+        .unwrap();
+    server.await.unwrap();
+    assert_eq!(response.tool_calls.len(), 1);
+    assert_eq!(response.finish_reason, ProviderFinishReason::ToolCalls);
+    let diagnostics =
+        ProviderTransportDiagnostics::from_raw_metadata(&response.raw_metadata).unwrap();
+    let delay = diagnostics
+        .tool_ready_to_terminal_ms
+        .expect("complete tool item timing");
+    assert!(
+        delay >= 200,
+        "expected controlled stream tail delay, observed {delay} ms"
+    );
+    eprintln!("controlled tool-ready-to-terminal delay: {delay} ms");
+}
+
+#[tokio::test]
+async fn responses_truncated_tool_does_not_override_the_incomplete_reason() {
+    let fixture = include_str!("fixtures/openai-responses/tool-response.sse")
+        .replace("response.completed", "response.incomplete")
+        .replace(
+            "\"status\":\"completed\"",
+            "\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}",
+        );
+    let (base_url, _) =
+        spawn_provider_sequence(vec![TestProviderResponse::sse(200, fixture)]).await;
+    let error = openai_responses_provider(base_url)
+        .complete(simple_request("gpt-golden"))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ProviderError::Malformed { .. }));
+    assert!(error.to_string().contains("truncated tool arguments"));
 }
 
 #[tokio::test]

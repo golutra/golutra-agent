@@ -171,6 +171,7 @@ pub(crate) struct ProcessSnapshot {
     pub(crate) before_images: Vec<super::FileBeforeImage>,
     pub(crate) after_images: Vec<super::FileBeforeImage>,
     pub(crate) workspace_changes_known: bool,
+    pub(crate) workspace_only_derived_changes: bool,
     /// 该进程唯一终态发布事件的稳定身份。子进程仍在运行、回收或记账时为 `None`。
     pub(crate) terminal_event_id: Option<u64>,
 }
@@ -2018,6 +2019,11 @@ async fn snapshot_page(entry: &ManagedProcess, cursor: u64, limit: usize) -> Pro
         before_images,
         after_images,
         workspace_changes_known,
+        workspace_only_derived_changes: workspace_changes_known
+            && state
+                .workspace_scan
+                .as_ref()
+                .is_some_and(|scan| scan.only_derived_changes),
         terminal_event_id: state.terminal_event_id,
     }
 }

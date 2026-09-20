@@ -1,0 +1,324 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-20",
+  "source_baseline": "9bbb87b8891771647084060503794504e26ef518",
+  "scope": "One autonomous four-phase coding task per engine per run. Same upstream, model and effort; isolated workspaces and homes; no injected repair turns.",
+  "runtime_limits": "No Golutra task deadline; external benchmark harness timeout is 600 seconds.",
+  "scoring": "All four independent stage verifiers plus native runtime success, exit code zero and immutable test/probe inputs. First pair was rejudged without rerunning agents after discovering that the original stage-4 verifier does not cover stages 1-3.",
+  "limitations": [
+    "Two paired samples on macOS arm64, one Responses upstream. Not a multi-hour coding test or proof of general superiority.",
+    "Native tool-call counts have different granularity across products; do not equate a bundled shell call with one file read.",
+    "The failed Golutra sample counts as failure and is not credited as a successful speedup."
+  ],
+  "runs": [
+    {
+      "label": "codex-first",
+      "started_at": "2026-09-20T04:18:02.501307Z",
+      "finished_at": "2026-09-20T04:23:36.639852Z",
+      "order": [
+        "codex",
+        "golutra"
+      ],
+      "versions": {
+        "golutra": "golutra-agent 0.3.1",
+        "codex": "codex-cli 0.155.1"
+      },
+      "model": "gpt-5.6-sol",
+      "reasoning_effort": "medium",
+      "protocol": "openai-responses",
+      "base_url": "https://api.golutra.cn",
+      "golutra_binary_sha256": "b3f34437262a0e627c6ab34ad9ee53867d3f6eed5fff1ca63fbde8645bf159ba",
+      "fixture_sha256": "99be54e3f414a59ba885ffbfeda525e351cd4f7405cbdc2fedec9e992f1657c3",
+      "all_stages_rejudged_after_initial_stage4_only_scoring": true,
+      "engines": {
+        "golutra": {
+          "strict_passed": false,
+          "workspace_verifier_pass": false,
+          "runtime_terminal_success": true,
+          "immutable_inputs_preserved": true,
+          "repair_attempts": 0,
+          "prompt": {
+            "sha256": "286d222a450fd59ccbb5058adcba688c2cca7988f0cbac3b4d2b66b48d1cfa68",
+            "bytes": 4095,
+            "characters": 4095,
+            "tokens_estimated": 1024
+          },
+          "verification": [
+            {
+              "stage": 1,
+              "passed": true,
+              "error": null,
+              "checks": [
+                "stage_1"
+              ]
+            },
+            {
+              "stage": 2,
+              "passed": true,
+              "error": null,
+              "checks": [
+                "stage_2"
+              ]
+            },
+            {
+              "stage": 3,
+              "passed": true,
+              "error": null,
+              "checks": [
+                "stage_3"
+              ]
+            },
+            {
+              "stage": 4,
+              "passed": false,
+              "error": "checkpoint.py was not modified while the probe was running",
+              "checks": []
+            }
+          ],
+          "metrics": {
+            "elapsed_ms": 156688,
+            "first_token_ms": 3487.5,
+            "prompt_tokens": 103097,
+            "uncached_input_tokens": 16841,
+            "cache_read_tokens": 86256,
+            "output_tokens": 10841,
+            "provider_total_tokens": 113938,
+            "tool_call_count": 24,
+            "request_count": 10,
+            "return_code": 0,
+            "runtime_terminal_success": true,
+            "tool_ready_to_terminal_samples_ms": [
+              134,
+              81,
+              2,
+              27,
+              1,
+              0,
+              92,
+              0,
+              80
+            ]
+          }
+        },
+        "codex": {
+          "strict_passed": true,
+          "workspace_verifier_pass": true,
+          "runtime_terminal_success": true,
+          "immutable_inputs_preserved": true,
+          "repair_attempts": 0,
+          "prompt": {
+            "sha256": "286d222a450fd59ccbb5058adcba688c2cca7988f0cbac3b4d2b66b48d1cfa68",
+            "bytes": 4095,
+            "characters": 4095,
+            "tokens_estimated": 1024
+          },
+          "verification": [
+            {
+              "stage": 1,
+              "passed": true,
+              "error": null,
+              "checks": [
+                "stage_1"
+              ]
+            },
+            {
+              "stage": 2,
+              "passed": true,
+              "error": null,
+              "checks": [
+                "stage_2"
+              ]
+            },
+            {
+              "stage": 3,
+              "passed": true,
+              "error": null,
+              "checks": [
+                "stage_3"
+              ]
+            },
+            {
+              "stage": 4,
+              "passed": true,
+              "error": null,
+              "checks": [
+                "stage_4"
+              ]
+            }
+          ],
+          "metrics": {
+            "elapsed_ms": 176009.6,
+            "first_token_ms": 5475.1,
+            "prompt_tokens": 310851,
+            "uncached_input_tokens": 25755,
+            "cache_read_tokens": 285096,
+            "output_tokens": 12108,
+            "provider_total_tokens": 322959,
+            "tool_call_count": 13,
+            "request_count": null,
+            "return_code": 0,
+            "runtime_terminal_success": true,
+            "tool_ready_to_terminal_samples_ms": []
+          }
+        }
+      }
+    },
+    {
+      "label": "golutra-first",
+      "started_at": "2026-09-20T04:30:12.624380Z",
+      "finished_at": "2026-09-20T04:36:10.479311Z",
+      "order": [
+        "golutra",
+        "codex"
+      ],
+      "versions": {
+        "golutra": "golutra-agent 0.3.1",
+        "codex": "codex-cli 0.155.1"
+      },
+      "model": "gpt-5.6-sol",
+      "reasoning_effort": "medium",
+      "protocol": "openai-responses",
+      "base_url": "https://api.golutra.cn",
+      "golutra_binary_sha256": "b3f34437262a0e627c6ab34ad9ee53867d3f6eed5fff1ca63fbde8645bf159ba",
+      "fixture_sha256": "99be54e3f414a59ba885ffbfeda525e351cd4f7405cbdc2fedec9e992f1657c3",
+      "all_stages_rejudged_after_initial_stage4_only_scoring": false,
+      "engines": {
+        "golutra": {
+          "strict_passed": true,
+          "workspace_verifier_pass": true,
+          "runtime_terminal_success": true,
+          "immutable_inputs_preserved": true,
+          "repair_attempts": 0,
+          "prompt": {
+            "sha256": "286d222a450fd59ccbb5058adcba688c2cca7988f0cbac3b4d2b66b48d1cfa68",
+            "bytes": 4095,
+            "characters": 4095,
+            "tokens_estimated": 1024
+          },
+          "verification": [
+            {
+              "stage": 1,
+              "passed": true,
+              "error": null,
+              "checks": [
+                "stage_1"
+              ]
+            },
+            {
+              "stage": 2,
+              "passed": true,
+              "error": null,
+              "checks": [
+                "stage_2"
+              ]
+            },
+            {
+              "stage": 3,
+              "passed": true,
+              "error": null,
+              "checks": [
+                "stage_3"
+              ]
+            },
+            {
+              "stage": 4,
+              "passed": true,
+              "error": null,
+              "checks": [
+                "stage_4"
+              ]
+            }
+          ],
+          "metrics": {
+            "elapsed_ms": 189816.6,
+            "first_token_ms": 5399,
+            "prompt_tokens": 144530,
+            "uncached_input_tokens": 16850,
+            "cache_read_tokens": 127680,
+            "output_tokens": 13645,
+            "provider_total_tokens": 158175,
+            "tool_call_count": 23,
+            "request_count": 14,
+            "return_code": 0,
+            "runtime_terminal_success": true,
+            "tool_ready_to_terminal_samples_ms": [
+              0,
+              139,
+              2,
+              0,
+              68,
+              0,
+              0,
+              0,
+              76,
+              0,
+              4,
+              0
+            ]
+          }
+        },
+        "codex": {
+          "strict_passed": true,
+          "workspace_verifier_pass": true,
+          "runtime_terminal_success": true,
+          "immutable_inputs_preserved": true,
+          "repair_attempts": 0,
+          "prompt": {
+            "sha256": "286d222a450fd59ccbb5058adcba688c2cca7988f0cbac3b4d2b66b48d1cfa68",
+            "bytes": 4095,
+            "characters": 4095,
+            "tokens_estimated": 1024
+          },
+          "verification": [
+            {
+              "stage": 1,
+              "passed": true,
+              "error": null,
+              "checks": [
+                "stage_1"
+              ]
+            },
+            {
+              "stage": 2,
+              "passed": true,
+              "error": null,
+              "checks": [
+                "stage_2"
+              ]
+            },
+            {
+              "stage": 3,
+              "passed": true,
+              "error": null,
+              "checks": [
+                "stage_3"
+              ]
+            },
+            {
+              "stage": 4,
+              "passed": true,
+              "error": null,
+              "checks": [
+                "stage_4"
+              ]
+            }
+          ],
+          "metrics": {
+            "elapsed_ms": 166642.6,
+            "first_token_ms": 5025.3,
+            "prompt_tokens": 299494,
+            "uncached_input_tokens": 24567,
+            "cache_read_tokens": 274927,
+            "output_tokens": 11054,
+            "provider_total_tokens": 310548,
+            "tool_call_count": 13,
+            "request_count": null,
+            "return_code": 0,
+            "runtime_terminal_success": true,
+            "tool_ready_to_terminal_samples_ms": []
+          }
+        }
+      }
+    }
+  ]
+}
