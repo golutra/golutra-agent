@@ -8734,9 +8734,13 @@
           }
         },
         "max_correction_rounds": {
-          "type": "integer",
+          "description": "未设置时持续纠偏；显式零值表示禁止自动纠偏。",
+          "type": [
+            "integer",
+            "null"
+          ],
           "format": "uint32",
-          "default": 1,
+          "default": null,
           "minimum": 0
         },
         "require_objective_validation": {

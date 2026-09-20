@@ -80,6 +80,8 @@ pub(crate) struct WorkspaceMutationScan {
     pub(crate) before_images: Vec<FileBeforeImage>,
     pub(crate) after_images: Vec<FileBeforeImage>,
     pub(crate) complete: bool,
+    /// 完整快照证明只有源文件未变的派生缓存发生变化；不省略原始变动记录。
+    pub(crate) only_derived_changes: bool,
 }
 
 pub(crate) async fn capture(root: &Path) -> WorkspaceSnapshot {
@@ -389,7 +391,54 @@ fn compare_snapshots(before: WorkspaceSnapshot, after: WorkspaceSnapshot) -> Wor
             metadata: new.map(|sample| sample.metadata.clone()),
         });
     }
+    scan.only_derived_changes = scan.complete
+        && !scan.changed_files.is_empty()
+        && scan.changed_files.iter().all(|path| {
+            let Some(source) = derived_source_path(path) else {
+                return false;
+            };
+            match (before.files.get(&source), after.files.get(&source)) {
+                (Some(old), Some(new)) => {
+                    old.metadata.checksum.is_some()
+                        && new.metadata.checksum.is_some()
+                        && samples_match(Some(old), Some(new))
+                }
+                _ => false,
+            }
+        });
     scan
+}
+
+/// 只识别具有标准源文件映射的派生产物，不按命令名、测试名或整个目录豁免。
+/// PEP 3147/488 的缓存必须有同目录树中的稳定 .py 源文件；孤立字节码仍是行为输入。
+fn derived_source_path(path: &Path) -> Option<PathBuf> {
+    let directory = path.parent()?;
+    if directory.file_name()? != "__pycache__" || path.extension()? != "pyc" {
+        return None;
+    }
+    let stem = path.file_stem()?.to_str()?;
+    let (stem, tag) = stem.rsplit_once('.')?;
+    let (source, tag) = if let Some(optimization) = tag.strip_prefix("opt-") {
+        if optimization.is_empty()
+            || !optimization
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric())
+        {
+            return None;
+        }
+        stem.rsplit_once('.')?
+    } else {
+        (stem, tag)
+    };
+    if source.is_empty()
+        || tag.is_empty()
+        || !tag
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return None;
+    }
+    Some(directory.parent()?.join(format!("{source}.py")))
 }
 
 fn samples_match(left: Option<&FileSample>, right: Option<&FileSample>) -> bool {
@@ -637,6 +686,75 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[tokio::test]
+    async fn derived_changes_require_complete_unchanged_source_evidence() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("module.py");
+        let cache_dir = root.path().join("__pycache__");
+        fs::create_dir(&cache_dir).unwrap();
+        fs::write(&source, "value = 1\n").unwrap();
+        let baseline = capture(root.path()).await;
+        let cache = cache_dir.join("module.cpython-314.pyc");
+        fs::write(&cache, b"derived output").unwrap();
+        let after = capture(root.path()).await;
+        let derived = compare_snapshots(baseline.clone(), after.clone());
+        assert!(derived.only_derived_changes);
+        assert_eq!(derived.changed_files, vec![cache.clone()]);
+        assert_eq!(derived.before_images.len(), 1);
+        assert_eq!(derived.after_images.len(), 1);
+
+        let mut incomplete = baseline.clone();
+        incomplete.scan_complete = false;
+        assert!(!compare_snapshots(incomplete, after.clone()).only_derived_changes);
+        let mut unknown_source = baseline.clone();
+        unknown_source
+            .files
+            .get_mut(&source)
+            .unwrap()
+            .metadata
+            .checksum = None;
+        assert!(!compare_snapshots(unknown_source, after).only_derived_changes);
+
+        fs::write(&source, "value = 2\n").unwrap();
+        assert!(
+            !compare(root.path(), baseline.clone())
+                .await
+                .only_derived_changes
+        );
+        fs::write(&source, "value = 1\n").unwrap();
+        fs::write(cache_dir.join("orphan.cpython-314.pyc"), b"unknown source").unwrap();
+        assert!(!compare(root.path(), baseline).await.only_derived_changes);
+    }
+
+    #[test]
+    fn derived_source_mapping_is_not_a_directory_wide_exemption() {
+        for (cache, source) in [
+            ("pkg/__pycache__/module.cpython-314.pyc", "pkg/module.py"),
+            (
+                "pkg/__pycache__/module.cpython-313.opt-2.pyc",
+                "pkg/module.py",
+            ),
+            ("pkg/__pycache__/module.pypy310.pyc", "pkg/module.py"),
+        ] {
+            assert_eq!(
+                derived_source_path(Path::new(cache)),
+                Some(PathBuf::from(source))
+            );
+        }
+        for path in [
+            "module.pyc",
+            "__pycache__/module.pyc",
+            "__pycache__/config.json",
+            "__pycache__/module.tag.json",
+            "__pycache__/module.cpython-314.opt-.pyc",
+            "__pycache__/module.cpython-314.opt-!.pyc",
+            "build/module.pyc",
+            "dist/module.js",
+        ] {
+            assert!(derived_source_path(Path::new(path)).is_none(), "{path}");
+        }
+    }
 
     #[derive(Default)]
     struct EndlessReader {

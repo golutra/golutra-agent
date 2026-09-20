@@ -48,8 +48,9 @@ pub struct GovernorAdvisory {
     pub reason: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GovernorLimits {
+    // 所有计数及总预算的零值表示未设限；权限边界和单次请求容量独立生效。
     pub max_iterations: u32,
     pub max_tool_calls: u32,
     /// Maximum consecutive failed tool calls before the runtime stops. Total
@@ -64,23 +65,6 @@ pub struct GovernorLimits {
     /// Maximum wall-clock time in one verification correction without
     /// material progress. Zero disables the elapsed-time limit.
     pub max_correction_no_progress_ms: u64,
-}
-
-impl Default for GovernorLimits {
-    fn default() -> Self {
-        Self {
-            // Zero disables the legacy fixed iteration cap. Long-running work
-            // is bounded by the independent time, cost, tool, and progress limits.
-            max_iterations: 0,
-            max_tool_calls: 256,
-            max_failed_tool_calls: 8,
-            max_planned_input_tokens: 96_000,
-            max_elapsed_ms: 4 * 60 * 60 * 1_000,
-            max_estimated_cost_microusd: 25_000_000,
-            max_correction_no_progress_steps: 16,
-            max_correction_no_progress_ms: 5 * 60 * 1_000,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,10 +186,10 @@ impl RuntimeGovernor {
                 "runtime action has high security risk and requires explicit review",
                 "low",
             )
-        } else if observation
-            .estimated_cost_microusd
-            .is_some_and(|cost| cost > self.limits.max_estimated_cost_microusd)
-        {
+        } else if observation.estimated_cost_microusd.is_some_and(|cost| {
+            self.limits.max_estimated_cost_microusd > 0
+                && cost > self.limits.max_estimated_cost_microusd
+        }) {
             (
                 GovernorAction::AskUser,
                 "runtime estimated cost exceeds the configured budget",
@@ -219,13 +203,15 @@ impl RuntimeGovernor {
                 "runtime iteration budget exceeded",
                 "exceeded",
             )
-        } else if observation.tool_calls > self.limits.max_tool_calls {
+        } else if self.limits.max_tool_calls > 0
+            && observation.tool_calls > self.limits.max_tool_calls
+        {
             (
                 GovernorAction::Block,
                 "runtime tool-call budget exceeded",
                 "exceeded",
             )
-        } else if observation.consecutive_failed_tool_calls > 0
+        } else if self.limits.max_failed_tool_calls > 0
             && observation.consecutive_failed_tool_calls >= self.limits.max_failed_tool_calls
             && observation.phase == GovernorPhase::ToolResult
         {
@@ -234,13 +220,17 @@ impl RuntimeGovernor {
                 "runtime consecutive failed-tool budget reached",
                 "exceeded",
             )
-        } else if observation.planned_input_tokens > self.limits.max_planned_input_tokens {
+        } else if self.limits.max_planned_input_tokens > 0
+            && observation.planned_input_tokens > self.limits.max_planned_input_tokens
+        {
             (
                 GovernorAction::AskUser,
                 "planned provider input exceeds the runtime token budget",
                 "exceeded",
             )
-        } else if observation.elapsed_ms >= self.limits.max_elapsed_ms {
+        } else if self.limits.max_elapsed_ms > 0
+            && observation.elapsed_ms >= self.limits.max_elapsed_ms
+        {
             (
                 GovernorAction::AskUser,
                 "runtime wall-clock budget exceeded",
@@ -373,6 +363,40 @@ mod tests {
 
         assert!(check.aligned);
         assert!(check.alignment_score >= 20);
+    }
+
+    #[test]
+    fn default_budget_does_not_stop_long_tasks() {
+        let observation = GovernorObservation {
+            phase: GovernorPhase::ToolResult,
+            iteration: u32::MAX,
+            tool_calls: u32::MAX,
+            failed_tool_calls: u32::MAX,
+            consecutive_failed_tool_calls: u32::MAX,
+            planned_input_tokens: u64::MAX,
+            elapsed_ms: u64::MAX,
+            latest_action: "implement runtime cancellation".into(),
+            estimated_cost_microusd: Some(u64::MAX),
+            policy_decision: None,
+            policy_block_disposition: None,
+            security_risk: "low".into(),
+        };
+        let decision = RuntimeGovernor::default().evaluate(&ledger(), &observation);
+        assert_eq!(decision.action, GovernorAction::Allow);
+        assert!(
+            decision
+                .advisories
+                .iter()
+                .all(|a| a.code != "approaching_budget")
+        );
+        let explicit = RuntimeGovernor::new(GovernorLimits {
+            max_estimated_cost_microusd: 1,
+            ..GovernorLimits::default()
+        });
+        assert_eq!(
+            explicit.evaluate(&ledger(), &observation).action,
+            GovernorAction::AskUser
+        );
     }
 
     #[test]
@@ -563,7 +587,11 @@ mod tests {
 
     #[test]
     fn only_consecutive_failures_exhaust_the_failed_tool_budget() {
-        let recovered = RuntimeGovernor::default().evaluate(
+        let governor = RuntimeGovernor::new(GovernorLimits {
+            max_failed_tool_calls: 8,
+            ..GovernorLimits::default()
+        });
+        let recovered = governor.evaluate(
             &ledger(),
             &GovernorObservation {
                 phase: GovernorPhase::ToolResult,
@@ -580,7 +608,7 @@ mod tests {
                 security_risk: "low".to_owned(),
             },
         );
-        let exhausted = RuntimeGovernor::default().evaluate(
+        let exhausted = governor.evaluate(
             &ledger(),
             &GovernorObservation {
                 phase: GovernorPhase::ToolResult,

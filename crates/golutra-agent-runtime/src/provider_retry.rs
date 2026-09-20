@@ -16,7 +16,8 @@ pub(crate) fn is_retryable(error: &ProviderError) -> bool {
         return false;
     }
     match error {
-        ProviderError::Unavailable { .. }
+        ProviderError::ConnectionFailed { .. }
+        | ProviderError::Unavailable { .. }
         | ProviderError::RateLimited { .. }
         | ProviderError::Timeout { .. } => true,
         ProviderError::Failed { message } => {
@@ -60,7 +61,8 @@ pub(crate) fn fallback_eligible(error: &ProviderError) -> bool {
         return false;
     }
     match error {
-        ProviderError::Failed { .. }
+        ProviderError::ConnectionFailed { .. }
+        | ProviderError::Failed { .. }
         | ProviderError::Unavailable { .. }
         | ProviderError::RateLimited { .. }
         | ProviderError::Timeout { .. } => true,
@@ -80,10 +82,10 @@ pub(crate) fn backoff(attempt: u32) -> Duration {
     )
 }
 
-/// 计算有界退避，并按请求种子分散相邻请求的重试时间。
+/// 本地退避有界并带抖动；服务端明确的等待时间不截短，取消与总截止时间由调用者执行。
 pub(crate) fn retry_delay(error: &ProviderError, attempt: u32, request_seed: u64) -> Duration {
     if let Some(server_delay) = error.retry_after() {
-        return server_delay.min(Duration::from_millis(MAX_BACKOFF_MS));
+        return server_delay;
     }
 
     let base = backoff(attempt).as_millis() as u64;
@@ -118,7 +120,7 @@ mod tests {
     }
 
     #[test]
-    fn server_retry_after_is_bounded_and_preferred() {
+    fn server_retry_after_is_respected_without_retrying_early() {
         let error = ProviderError::Unavailable {
             message: "busy".to_owned(),
         }
@@ -127,7 +129,7 @@ mod tests {
             ..ProviderErrorMetadata::default()
         });
 
-        assert_eq!(retry_delay(&error, 1, 7), Duration::from_secs(30));
+        assert_eq!(retry_delay(&error, 1, 7), Duration::from_secs(45));
     }
 
     #[test]

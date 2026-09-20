@@ -1,0 +1,775 @@
+{
+  "started_at": "2026-09-20T06:47:57.764554Z",
+  "finished_at": "2026-09-20T07:12:47.621925Z",
+  "model": "gpt-5.6-sol",
+  "effort": "medium",
+  "base_url": "https://api.golutra.cn",
+  "binary_sha256": {
+    "baseline": "b3f34437262a0e627c6ab34ad9ee53867d3f6eed5fff1ca63fbde8645bf159ba",
+    "stage_review": "583d8cd3e12b4d1303d15490cbae4a99860f7bcfb020fe0fcb2a4ddeab2a129a"
+  },
+  "tasks": {
+    "deployment_feedback": {
+      "prompt": {
+        "sha256": "3629f560838dac3fa1f80e2006e77c3a83b66ac8c3e6c19943b012b7e49ce4b1",
+        "bytes": 247,
+        "characters": 247,
+        "tokens_estimated": 62
+      },
+      "files": []
+    },
+    "csv_feedback": {
+      "prompt": {
+        "sha256": "9f796dec04ff67cd8e105fc544ea9cef075ae632adde3d9e8857e82177123515",
+        "bytes": 254,
+        "characters": 254,
+        "tokens_estimated": 64
+      },
+      "files": []
+    },
+    "parser_fix": {
+      "prompt": {
+        "sha256": "ed4e12fe24cb05940ce332b999bf3421e8ea7564da1a7cc52f458a0490b7c808",
+        "bytes": 339,
+        "characters": 339,
+        "tokens_estimated": 85
+      },
+      "files": [
+        "parser.py",
+        "test_existing.py"
+      ]
+    },
+    "multi_file": {
+      "prompt": {
+        "sha256": "71ad3113e3c2287184d66ba3d45d89ba95e8b5eee822233a925fe989fc0b4920",
+        "bytes": 397,
+        "characters": 397,
+        "tokens_estimated": 100
+      },
+      "files": [
+        "prices.py",
+        "receipt.py",
+        "test_existing.py"
+      ]
+    },
+    "stage_review": {
+      "prompt": {
+        "sha256": "724901f636cf4ef33d3faf9ee875590d2d475f8bf5f80c3ec875e540486a75c1",
+        "bytes": 848,
+        "characters": 848,
+        "tokens_estimated": 212
+      },
+      "files": [
+        "inventory.py",
+        "observer.py",
+        "test_existing.py"
+      ]
+    }
+  },
+  "attempts": [
+    {
+      "variant": "baseline",
+      "task": "deployment_feedback",
+      "repeat": 0,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "independent acceptance passed",
+      "metrics": {
+        "elapsed_ms": 41719.9,
+        "request_count": 10,
+        "tool_call_count": 9,
+        "avoidable_repeat_tool_call_count": 0,
+        "state_changed_revalidation_count": 1,
+        "background_wait_count": 0,
+        "prompt_tokens": 34137,
+        "uncached_input_tokens": 4934,
+        "output_tokens": 1232,
+        "cache_read_tokens": 29203,
+        "runtime_terminal_success": true,
+        "return_code": 0
+      }
+    },
+    {
+      "variant": "stage_review",
+      "task": "deployment_feedback",
+      "repeat": 0,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "independent acceptance passed",
+      "metrics": {
+        "elapsed_ms": 42681.7,
+        "request_count": 9,
+        "tool_call_count": 8,
+        "avoidable_repeat_tool_call_count": 0,
+        "state_changed_revalidation_count": 1,
+        "background_wait_count": 0,
+        "prompt_tokens": 30659,
+        "uncached_input_tokens": 4795,
+        "output_tokens": 1208,
+        "cache_read_tokens": 25864,
+        "runtime_terminal_success": true,
+        "return_code": 0
+      }
+    },
+    {
+      "variant": "stage_review",
+      "task": "csv_feedback",
+      "repeat": 0,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "independent acceptance passed",
+      "metrics": {
+        "elapsed_ms": 33678.8,
+        "request_count": 8,
+        "tool_call_count": 7,
+        "avoidable_repeat_tool_call_count": 0,
+        "state_changed_revalidation_count": 1,
+        "background_wait_count": 0,
+        "prompt_tokens": 25274,
+        "uncached_input_tokens": 4274,
+        "output_tokens": 901,
+        "cache_read_tokens": 21000,
+        "runtime_terminal_success": true,
+        "return_code": 0
+      }
+    },
+    {
+      "variant": "baseline",
+      "task": "csv_feedback",
+      "repeat": 0,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "independent acceptance passed",
+      "metrics": {
+        "elapsed_ms": 28732.2,
+        "request_count": 7,
+        "tool_call_count": 5,
+        "avoidable_repeat_tool_call_count": 0,
+        "state_changed_revalidation_count": 0,
+        "background_wait_count": 0,
+        "prompt_tokens": 19289,
+        "uncached_input_tokens": 3877,
+        "output_tokens": 953,
+        "cache_read_tokens": 15412,
+        "runtime_terminal_success": true,
+        "return_code": 0
+      }
+    },
+    {
+      "variant": "baseline",
+      "task": "parser_fix",
+      "repeat": 0,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "independent acceptance passed",
+      "metrics": {
+        "elapsed_ms": 46149.5,
+        "request_count": 8,
+        "tool_call_count": 9,
+        "avoidable_repeat_tool_call_count": 1,
+        "state_changed_revalidation_count": 0,
+        "background_wait_count": 0,
+        "prompt_tokens": 40905,
+        "uncached_input_tokens": 8811,
+        "output_tokens": 2405,
+        "cache_read_tokens": 32094,
+        "runtime_terminal_success": true,
+        "return_code": 0
+      }
+    },
+    {
+      "variant": "stage_review",
+      "task": "parser_fix",
+      "repeat": 0,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "independent acceptance passed",
+      "metrics": {
+        "elapsed_ms": 31626.8,
+        "request_count": 5,
+        "tool_call_count": 7,
+        "avoidable_repeat_tool_call_count": 0,
+        "state_changed_revalidation_count": 0,
+        "background_wait_count": 0,
+        "prompt_tokens": 15935,
+        "uncached_input_tokens": 4791,
+        "output_tokens": 1687,
+        "cache_read_tokens": 11144,
+        "runtime_terminal_success": true,
+        "return_code": 0
+      }
+    },
+    {
+      "variant": "stage_review",
+      "task": "multi_file",
+      "repeat": 0,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "independent acceptance passed",
+      "metrics": {
+        "elapsed_ms": 52202.2,
+        "request_count": 10,
+        "tool_call_count": 11,
+        "avoidable_repeat_tool_call_count": 1,
+        "state_changed_revalidation_count": 0,
+        "background_wait_count": 0,
+        "prompt_tokens": 48020,
+        "uncached_input_tokens": 7373,
+        "output_tokens": 2218,
+        "cache_read_tokens": 40647,
+        "runtime_terminal_success": true,
+        "return_code": 0
+      }
+    },
+    {
+      "variant": "baseline",
+      "task": "multi_file",
+      "repeat": 0,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "independent acceptance passed",
+      "metrics": {
+        "elapsed_ms": 161615.4,
+        "request_count": 25,
+        "tool_call_count": 28,
+        "avoidable_repeat_tool_call_count": 1,
+        "state_changed_revalidation_count": 1,
+        "background_wait_count": 0,
+        "prompt_tokens": 269619,
+        "uncached_input_tokens": 19108,
+        "output_tokens": 7006,
+        "cache_read_tokens": 250511,
+        "runtime_terminal_success": true,
+        "return_code": 0
+      }
+    },
+    {
+      "variant": "baseline",
+      "task": "stage_review",
+      "repeat": 0,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "independent acceptance passed",
+      "metrics": {
+        "elapsed_ms": 155183.2,
+        "request_count": 21,
+        "tool_call_count": 22,
+        "avoidable_repeat_tool_call_count": 3,
+        "state_changed_revalidation_count": 1,
+        "background_wait_count": 1,
+        "prompt_tokens": 211183,
+        "uncached_input_tokens": 16889,
+        "output_tokens": 7806,
+        "cache_read_tokens": 194294,
+        "runtime_terminal_success": true,
+        "return_code": 0
+      }
+    },
+    {
+      "variant": "stage_review",
+      "task": "stage_review",
+      "repeat": 0,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "independent acceptance passed",
+      "metrics": {
+        "elapsed_ms": 70904.4,
+        "request_count": 10,
+        "tool_call_count": 15,
+        "avoidable_repeat_tool_call_count": 1,
+        "state_changed_revalidation_count": 0,
+        "background_wait_count": 1,
+        "prompt_tokens": 55003,
+        "uncached_input_tokens": 9599,
+        "output_tokens": 3082,
+        "cache_read_tokens": 45404,
+        "runtime_terminal_success": true,
+        "return_code": 0
+      }
+    },
+    {
+      "variant": "stage_review",
+      "task": "deployment_feedback",
+      "repeat": 1,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "independent acceptance passed",
+      "metrics": {
+        "elapsed_ms": 41850.8,
+        "request_count": 10,
+        "tool_call_count": 10,
+        "avoidable_repeat_tool_call_count": 0,
+        "state_changed_revalidation_count": 1,
+        "background_wait_count": 0,
+        "prompt_tokens": 35998,
+        "uncached_input_tokens": 5351,
+        "output_tokens": 1347,
+        "cache_read_tokens": 30647,
+        "runtime_terminal_success": true,
+        "return_code": 0
+      }
+    },
+    {
+      "variant": "baseline",
+      "task": "deployment_feedback",
+      "repeat": 1,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "independent acceptance passed",
+      "metrics": {
+        "elapsed_ms": 37145.3,
+        "request_count": 9,
+        "tool_call_count": 9,
+        "avoidable_repeat_tool_call_count": 0,
+        "state_changed_revalidation_count": 1,
+        "background_wait_count": 0,
+        "prompt_tokens": 34334,
+        "uncached_input_tokens": 5563,
+        "output_tokens": 1728,
+        "cache_read_tokens": 28771,
+        "runtime_terminal_success": true,
+        "return_code": 0
+      }
+    },
+    {
+      "variant": "baseline",
+      "task": "csv_feedback",
+      "repeat": 1,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "independent acceptance passed",
+      "metrics": {
+        "elapsed_ms": 31086.3,
+        "request_count": 8,
+        "tool_call_count": 5,
+        "avoidable_repeat_tool_call_count": 0,
+        "state_changed_revalidation_count": 0,
+        "background_wait_count": 0,
+        "prompt_tokens": 22997,
+        "uncached_input_tokens": 4158,
+        "output_tokens": 855,
+        "cache_read_tokens": 18839,
+        "runtime_terminal_success": true,
+        "return_code": 0
+      }
+    },
+    {
+      "variant": "stage_review",
+      "task": "csv_feedback",
+      "repeat": 1,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "independent acceptance passed",
+      "metrics": {
+        "elapsed_ms": 29751.5,
+        "request_count": 8,
+        "tool_call_count": 6,
+        "avoidable_repeat_tool_call_count": 0,
+        "state_changed_revalidation_count": 1,
+        "background_wait_count": 0,
+        "prompt_tokens": 22885,
+        "uncached_input_tokens": 3946,
+        "output_tokens": 771,
+        "cache_read_tokens": 18939,
+        "runtime_terminal_success": true,
+        "return_code": 0
+      }
+    },
+    {
+      "variant": "stage_review",
+      "task": "parser_fix",
+      "repeat": 1,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "independent acceptance passed",
+      "metrics": {
+        "elapsed_ms": 19726.8,
+        "request_count": 4,
+        "tool_call_count": 5,
+        "avoidable_repeat_tool_call_count": 0,
+        "state_changed_revalidation_count": 0,
+        "background_wait_count": 0,
+        "prompt_tokens": 12155,
+        "uncached_input_tokens": 4182,
+        "output_tokens": 1157,
+        "cache_read_tokens": 7973,
+        "runtime_terminal_success": true,
+        "return_code": 0
+      }
+    },
+    {
+      "variant": "baseline",
+      "task": "parser_fix",
+      "repeat": 1,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "independent acceptance passed",
+      "metrics": {
+        "elapsed_ms": 23253.7,
+        "request_count": 4,
+        "tool_call_count": 5,
+        "avoidable_repeat_tool_call_count": 0,
+        "state_changed_revalidation_count": 0,
+        "background_wait_count": 0,
+        "prompt_tokens": 11886,
+        "uncached_input_tokens": 4087,
+        "output_tokens": 1196,
+        "cache_read_tokens": 7799,
+        "runtime_terminal_success": true,
+        "return_code": 0
+      }
+    },
+    {
+      "variant": "baseline",
+      "task": "multi_file",
+      "repeat": 1,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "independent acceptance passed",
+      "metrics": {
+        "elapsed_ms": 26623.1,
+        "request_count": 5,
+        "tool_call_count": 7,
+        "avoidable_repeat_tool_call_count": 0,
+        "state_changed_revalidation_count": 0,
+        "background_wait_count": 0,
+        "prompt_tokens": 14601,
+        "uncached_input_tokens": 4389,
+        "output_tokens": 1242,
+        "cache_read_tokens": 10212,
+        "runtime_terminal_success": true,
+        "return_code": 0
+      }
+    },
+    {
+      "variant": "stage_review",
+      "task": "multi_file",
+      "repeat": 1,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "independent acceptance passed",
+      "metrics": {
+        "elapsed_ms": 25945.9,
+        "request_count": 5,
+        "tool_call_count": 9,
+        "avoidable_repeat_tool_call_count": 0,
+        "state_changed_revalidation_count": 0,
+        "background_wait_count": 0,
+        "prompt_tokens": 16558,
+        "uncached_input_tokens": 5168,
+        "output_tokens": 1380,
+        "cache_read_tokens": 11390,
+        "runtime_terminal_success": true,
+        "return_code": 0
+      }
+    },
+    {
+      "variant": "stage_review",
+      "task": "stage_review",
+      "repeat": 1,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "independent acceptance passed",
+      "metrics": {
+        "elapsed_ms": 66429.2,
+        "request_count": 11,
+        "tool_call_count": 16,
+        "avoidable_repeat_tool_call_count": 1,
+        "state_changed_revalidation_count": 0,
+        "background_wait_count": 1,
+        "prompt_tokens": 63682,
+        "uncached_input_tokens": 9715,
+        "output_tokens": 3259,
+        "cache_read_tokens": 53967,
+        "runtime_terminal_success": true,
+        "return_code": 0
+      }
+    },
+    {
+      "variant": "baseline",
+      "task": "stage_review",
+      "repeat": 1,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "independent acceptance passed",
+      "metrics": {
+        "elapsed_ms": 118956.9,
+        "request_count": 9,
+        "tool_call_count": 13,
+        "avoidable_repeat_tool_call_count": 1,
+        "state_changed_revalidation_count": 0,
+        "background_wait_count": 1,
+        "prompt_tokens": 45556,
+        "uncached_input_tokens": 7216,
+        "output_tokens": 3418,
+        "cache_read_tokens": 38340,
+        "runtime_terminal_success": true,
+        "return_code": 0
+      }
+    },
+    {
+      "variant": "baseline",
+      "task": "deployment_feedback",
+      "repeat": 2,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "independent acceptance passed",
+      "metrics": {
+        "elapsed_ms": 42301.7,
+        "request_count": 10,
+        "tool_call_count": 10,
+        "avoidable_repeat_tool_call_count": 0,
+        "state_changed_revalidation_count": 1,
+        "background_wait_count": 0,
+        "prompt_tokens": 35410,
+        "uncached_input_tokens": 5235,
+        "output_tokens": 1370,
+        "cache_read_tokens": 30175,
+        "runtime_terminal_success": true,
+        "return_code": 0
+      }
+    },
+    {
+      "variant": "stage_review",
+      "task": "deployment_feedback",
+      "repeat": 2,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "independent acceptance passed",
+      "metrics": {
+        "elapsed_ms": 35662.2,
+        "request_count": 9,
+        "tool_call_count": 9,
+        "avoidable_repeat_tool_call_count": 0,
+        "state_changed_revalidation_count": 1,
+        "background_wait_count": 0,
+        "prompt_tokens": 32031,
+        "uncached_input_tokens": 5087,
+        "output_tokens": 1191,
+        "cache_read_tokens": 26944,
+        "runtime_terminal_success": true,
+        "return_code": 0
+      }
+    },
+    {
+      "variant": "stage_review",
+      "task": "csv_feedback",
+      "repeat": 2,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "independent acceptance passed",
+      "metrics": {
+        "elapsed_ms": 31711.3,
+        "request_count": 8,
+        "tool_call_count": 7,
+        "avoidable_repeat_tool_call_count": 0,
+        "state_changed_revalidation_count": 1,
+        "background_wait_count": 0,
+        "prompt_tokens": 25434,
+        "uncached_input_tokens": 4319,
+        "output_tokens": 894,
+        "cache_read_tokens": 21115,
+        "runtime_terminal_success": true,
+        "return_code": 0
+      }
+    },
+    {
+      "variant": "baseline",
+      "task": "csv_feedback",
+      "repeat": 2,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "independent acceptance passed",
+      "metrics": {
+        "elapsed_ms": 36702.3,
+        "request_count": 9,
+        "tool_call_count": 11,
+        "avoidable_repeat_tool_call_count": 0,
+        "state_changed_revalidation_count": 2,
+        "background_wait_count": 0,
+        "prompt_tokens": 32899,
+        "uncached_input_tokens": 5637,
+        "output_tokens": 1473,
+        "cache_read_tokens": 27262,
+        "runtime_terminal_success": true,
+        "return_code": 0
+      }
+    },
+    {
+      "variant": "baseline",
+      "task": "parser_fix",
+      "repeat": 2,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "independent acceptance passed",
+      "metrics": {
+        "elapsed_ms": 28291,
+        "request_count": 5,
+        "tool_call_count": 8,
+        "avoidable_repeat_tool_call_count": 0,
+        "state_changed_revalidation_count": 0,
+        "background_wait_count": 0,
+        "prompt_tokens": 16252,
+        "uncached_input_tokens": 5257,
+        "output_tokens": 1470,
+        "cache_read_tokens": 10995,
+        "runtime_terminal_success": true,
+        "return_code": 0
+      }
+    },
+    {
+      "variant": "stage_review",
+      "task": "parser_fix",
+      "repeat": 2,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "independent acceptance passed",
+      "metrics": {
+        "elapsed_ms": 34290,
+        "request_count": 6,
+        "tool_call_count": 11,
+        "avoidable_repeat_tool_call_count": 0,
+        "state_changed_revalidation_count": 0,
+        "background_wait_count": 0,
+        "prompt_tokens": 24826,
+        "uncached_input_tokens": 6381,
+        "output_tokens": 1950,
+        "cache_read_tokens": 18445,
+        "runtime_terminal_success": true,
+        "return_code": 0
+      }
+    },
+    {
+      "variant": "stage_review",
+      "task": "multi_file",
+      "repeat": 2,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "independent acceptance passed",
+      "metrics": {
+        "elapsed_ms": 28011.7,
+        "request_count": 5,
+        "tool_call_count": 9,
+        "avoidable_repeat_tool_call_count": 0,
+        "state_changed_revalidation_count": 0,
+        "background_wait_count": 0,
+        "prompt_tokens": 16611,
+        "uncached_input_tokens": 5222,
+        "output_tokens": 1497,
+        "cache_read_tokens": 11389,
+        "runtime_terminal_success": true,
+        "return_code": 0
+      }
+    },
+    {
+      "variant": "baseline",
+      "task": "multi_file",
+      "repeat": 2,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "independent acceptance passed",
+      "metrics": {
+        "elapsed_ms": 32692,
+        "request_count": 7,
+        "tool_call_count": 8,
+        "avoidable_repeat_tool_call_count": 1,
+        "state_changed_revalidation_count": 0,
+        "background_wait_count": 0,
+        "prompt_tokens": 25361,
+        "uncached_input_tokens": 5507,
+        "output_tokens": 1571,
+        "cache_read_tokens": 19854,
+        "runtime_terminal_success": true,
+        "return_code": 0
+      }
+    },
+    {
+      "variant": "baseline",
+      "task": "stage_review",
+      "repeat": 2,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "independent acceptance passed",
+      "metrics": {
+        "elapsed_ms": 60350,
+        "request_count": 9,
+        "tool_call_count": 14,
+        "avoidable_repeat_tool_call_count": 1,
+        "state_changed_revalidation_count": 0,
+        "background_wait_count": 1,
+        "prompt_tokens": 43899,
+        "uncached_input_tokens": 7690,
+        "output_tokens": 3443,
+        "cache_read_tokens": 36209,
+        "runtime_terminal_success": true,
+        "return_code": 0
+      }
+    },
+    {
+      "variant": "stage_review",
+      "task": "stage_review",
+      "repeat": 2,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "independent acceptance passed",
+      "metrics": {
+        "elapsed_ms": 72824.6,
+        "request_count": 10,
+        "tool_call_count": 15,
+        "avoidable_repeat_tool_call_count": 1,
+        "state_changed_revalidation_count": 0,
+        "background_wait_count": 1,
+        "prompt_tokens": 52329,
+        "uncached_input_tokens": 8926,
+        "output_tokens": 3286,
+        "cache_read_tokens": 43403,
+        "runtime_terminal_success": true,
+        "return_code": 0
+      }
+    }
+  ],
+  "schema_version": 1,
+  "scope": "Frozen prompt-only candidate vs prior Golutra binary; five task types, three alternating pairs each; no injected repair turns.",
+  "timing_exclusions": [
+    {
+      "task": "stage_review",
+      "repeat": 0,
+      "reason": "User-requested cache cleanup overlapped baseline execution; preserve quality and request metrics, exclude paired timing."
+    }
+  ],
+  "limitations": [
+    "macOS arm64; one Responses upstream/model.",
+    "No Codex rerun and not a multi-hour coding test.",
+    "Derived-change runtime correction is not included in either binary."
+  ]
+}

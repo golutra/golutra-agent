@@ -1,8 +1,5 @@
-//! A bounded, cancellable provider session for one logical model request.
-//!
-//! The session owns retry and transport policy, while `AgentLoop` only maps
-//! the resulting facts into its runtime trace.  This keeps provider recovery
-//! independent from context, tool, and verification logic.
+//! 单次逻辑请求的可取消恢复：断网等待与有限重试分离，并共同服从任务截止时间。
+//! 流式增量仅作预览；只有完整响应才能交给 AgentLoop 执行工具。
 
 use std::time::Duration;
 
@@ -13,10 +10,13 @@ use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep, timeout_at};
 use tokio_util::sync::CancellationToken;
 
+use super::provider_recovery::{ProviderRecovery, RecoveryPhase, RetryState, duration_ms};
 use super::provider_retry;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProviderTransport {
+    #[default]
     Streaming,
     Buffered,
 }
@@ -33,9 +33,9 @@ impl ProviderTransport {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderSessionPolicy {
-    /// Number of reconnects after a dropped streaming attempt.
+    /// 普通流错误的重试额度；已确认的连接故障另行等待，仍受任务截止时间约束。
     pub max_stream_retries: u32,
-    /// Number of retries for a buffered request after a transient failure.
+    /// 非流式请求的普通瞬态错误额度，不包含连接等待。
     pub max_request_retries: u32,
     /// Maximum time without a stream event before the attempt is considered lost.
     pub stream_idle_timeout: Duration,
@@ -75,12 +75,7 @@ pub enum ProviderSessionEvent {
         model_id: String,
         event: ProviderStreamEvent,
     },
-    RetryScheduled {
-        attempt: u32,
-        max_retries: u32,
-        transport: ProviderTransport,
-        reason: String,
-    },
+    Recovery(ProviderRecovery),
     TransportFallback {
         provider_id: String,
         from: ProviderTransport,
@@ -102,12 +97,7 @@ pub(crate) enum ProviderSessionError {
 
 struct StreamAttemptFailure {
     error: ProviderError,
-    replay_barrier_seen: bool,
-}
-
-struct ProviderAttemptFailure {
-    error: ProviderError,
-    replay_safe: bool,
+    preview_seen: bool,
 }
 
 pub(crate) struct ProviderSession<'a, P> {
@@ -115,6 +105,8 @@ pub(crate) struct ProviderSession<'a, P> {
     fallback: Option<&'a P>,
     policy: ProviderSessionPolicy,
     deadline: Option<Instant>,
+    allow_connection_wait: bool,
+    input_budget: u64,
 }
 
 impl<'a, P> ProviderSession<'a, P>
@@ -131,12 +123,24 @@ where
             fallback,
             policy: policy.bounded(),
             deadline: None,
+            allow_connection_wait: true,
+            input_budget: u64::MAX,
         }
     }
 
     #[must_use]
     pub(crate) fn with_deadline(mut self, deadline: Option<Instant>) -> Self {
         self.deadline = deadline;
+        self
+    }
+
+    pub(crate) fn with_connection_wait(mut self, enabled: bool) -> Self {
+        self.allow_connection_wait = enabled;
+        self
+    }
+
+    pub(crate) fn with_input_budget(mut self, budget: u64) -> Self {
+        self.input_budget = budget;
         self
     }
 
@@ -170,7 +174,7 @@ where
 
     async fn complete_without_deadline<E>(
         &self,
-        request: ProviderRequest,
+        mut request: ProviderRequest,
         cancellation: &CancellationToken,
         on_event: &mut E,
     ) -> Result<(ProviderResponse, ProviderRequest), ProviderError>
@@ -178,33 +182,41 @@ where
         E: FnMut(ProviderSessionEvent) + Send,
     {
         match self
-            .complete_provider(self.primary, request.clone(), cancellation, on_event)
+            .complete_provider(self.primary, &mut request, cancellation, on_event)
             .await
         {
             Ok(response) => Ok((response, request)),
             Err(primary_failure) => {
                 let Some(fallback) = self.fallback else {
-                    return Err(primary_failure.error);
+                    return Err(primary_failure);
                 };
-                if !primary_failure.replay_safe
-                    || !provider_retry::fallback_eligible(&primary_failure.error)
-                {
-                    return Err(primary_failure.error);
+                if !provider_retry::fallback_eligible(&primary_failure) {
+                    return Err(primary_failure);
                 };
                 let from_provider = self.primary.contract().provider_id;
                 let to_provider = fallback.contract().provider_id;
+                on_event(ProviderSessionEvent::Recovery(ProviderRecovery {
+                    phase: RecoveryPhase::Retrying,
+                    attempt: 0,
+                    delay_ms: 0,
+                    waited_ms: 0,
+                    network: false,
+                    reset_stream: true,
+                    reason: "switching provider".to_owned(),
+                    transport: ProviderTransport::Streaming,
+                    error_metadata: primary_failure.metadata().cloned(),
+                }));
                 on_event(ProviderSessionEvent::ProviderFallback {
                     from_provider,
                     to_provider: to_provider.clone(),
-                    reason: retry_reason(&primary_failure.error),
+                    reason: retry_reason(&primary_failure),
                 });
                 let mut fallback_request = request;
                 fallback_request.provider_id = to_provider;
                 fallback_request.model_id = fallback.contract().model_id;
-                self.complete_provider(fallback, fallback_request.clone(), cancellation, on_event)
+                self.complete_provider(fallback, &mut fallback_request, cancellation, on_event)
                     .await
                     .map(|response| (response, fallback_request))
-                    .map_err(|failure| failure.error)
             }
         }
     }
@@ -212,63 +224,60 @@ where
     async fn complete_provider<E>(
         &self,
         provider: &P,
-        request: ProviderRequest,
+        request: &mut ProviderRequest,
         cancellation: &CancellationToken,
         on_event: &mut E,
-    ) -> Result<ProviderResponse, ProviderAttemptFailure>
+    ) -> Result<ProviderResponse, ProviderError>
     where
         E: FnMut(ProviderSessionEvent) + Send,
     {
-        let mut last_error = None;
-        let mut replay_safe = true;
-        for retry_index in 0..=self.policy.max_stream_retries {
+        let mut retries = RetryState::default();
+        let error = loop {
+            if self.allow_connection_wait {
+                add_recovery_reminder(request, retries.waited, self.input_budget);
+            }
             match self
                 .complete_stream_attempt(provider, request.clone(), cancellation, on_event)
                 .await
             {
                 Ok(response) => return Ok(response),
-                Err(failure)
-                    if !failure.replay_barrier_seen
-                        && provider_retry::is_retryable(&failure.error)
-                        && retry_index < self.policy.max_stream_retries =>
-                {
-                    let attempt = retry_index.saturating_add(1);
-                    let delay = provider_retry::retry_delay(
-                        &failure.error,
-                        attempt,
-                        request.request_id.0.as_u128() as u64,
-                    );
-                    on_event(ProviderSessionEvent::RetryScheduled {
-                        attempt,
-                        max_retries: self.policy.max_stream_retries,
-                        transport: ProviderTransport::Streaming,
-                        reason: format!(
-                            "{} (retry_delay_ms={})",
-                            retry_reason(&failure.error),
-                            delay.as_millis()
-                        ),
-                    });
-                    if !wait_backoff(delay, cancellation).await {
-                        return Err(ProviderAttemptFailure {
-                            error: ProviderError::Cancelled,
-                            replay_safe: true,
-                        });
-                    }
-                    last_error = Some(failure.error);
-                }
                 Err(failure) => {
-                    replay_safe = !failure.replay_barrier_seen;
-                    last_error = Some(failure.error);
-                    break;
+                    let Some((delay, recovery)) = retries.schedule(
+                        &failure.error,
+                        self.policy.max_stream_retries,
+                        self.allow_connection_wait,
+                        request.request_id.0.as_u128() as u64,
+                        failure.preview_seen,
+                    ) else {
+                        // 换传输之前也必须结束旧预览，不能将 buffered 结果接到半句话后。
+                        if failure.preview_seen
+                            && self.policy.enable_transport_fallback
+                            && provider.supports_buffered_transport()
+                            && provider_retry::is_retryable(&failure.error)
+                        {
+                            on_event(ProviderSessionEvent::Recovery(ProviderRecovery {
+                                phase: RecoveryPhase::Retrying,
+                                attempt: 0,
+                                delay_ms: 0,
+                                waited_ms: duration_ms(retries.waited),
+                                network: false,
+                                reset_stream: true,
+                                reason: "switching to buffered transport".to_owned(),
+                                transport: ProviderTransport::Buffered,
+                                error_metadata: failure.error.metadata().cloned(),
+                            }));
+                        }
+                        break failure.error;
+                    };
+                    if !wait_for_recovery(delay, recovery, &mut retries, cancellation, on_event)
+                        .await
+                    {
+                        return Err(ProviderError::Cancelled);
+                    }
                 }
             }
-        }
-
-        let error = last_error.unwrap_or_else(|| ProviderError::Failed {
-            message: "provider stream ended without a result".to_owned(),
-        });
-        if replay_safe
-            && self.policy.enable_transport_fallback
+        };
+        if self.policy.enable_transport_fallback
             && provider.supports_buffered_transport()
             && provider_retry::is_retryable(&error)
         {
@@ -280,10 +289,10 @@ where
                 reason: retry_reason(&error),
             });
             return self
-                .complete_buffered(provider, request, cancellation, on_event)
+                .complete_buffered(provider, request, cancellation, on_event, &mut retries)
                 .await;
         }
-        Err(ProviderAttemptFailure { error, replay_safe })
+        Err(error)
     }
 
     async fn complete_stream_attempt<E>(
@@ -306,18 +315,18 @@ where
         let future = provider.complete_stream(request, &mut callback);
         tokio::pin!(future);
         let mut idle_deadline = Box::pin(sleep(self.policy.stream_idle_timeout));
-        let mut replay_barrier_seen = false;
+        let mut preview_seen = false;
 
         loop {
             tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => return Err(StreamAttemptFailure {
                     error: ProviderError::Cancelled,
-                    replay_barrier_seen,
+                    preview_seen,
                 }),
                 result = &mut future => {
                     while let Ok(event) = event_receiver.try_recv() {
-                        replay_barrier_seen |= is_replay_barrier_event(&event);
+                        preview_seen |= is_preview_event(&event);
                         on_event(ProviderSessionEvent::Streamed {
                             provider_id: provider_id.clone(),
                             model_id: model_id.clone(),
@@ -326,7 +335,7 @@ where
                     }
                     return result.map_err(|error| StreamAttemptFailure {
                         error,
-                        replay_barrier_seen,
+                        preview_seen,
                     });
                 }
                 event = event_receiver.recv() => {
@@ -335,10 +344,10 @@ where
                             error: ProviderError::Failed {
                                 message: "provider stream event channel closed".to_owned(),
                             },
-                            replay_barrier_seen,
+                            preview_seen,
                         });
                     };
-                    replay_barrier_seen |= is_replay_barrier_event(&event);
+                    preview_seen |= is_preview_event(&event);
                     on_event(ProviderSessionEvent::Streamed {
                         provider_id: provider_id.clone(),
                         model_id: model_id.clone(),
@@ -356,7 +365,7 @@ where
                                 self.policy.stream_idle_timeout.as_millis()
                             ),
                         },
-                        replay_barrier_seen,
+                        preview_seen,
                     });
                 }
             }
@@ -366,14 +375,20 @@ where
     async fn complete_buffered<E>(
         &self,
         provider: &P,
-        request: ProviderRequest,
+        request: &mut ProviderRequest,
         cancellation: &CancellationToken,
         on_event: &mut E,
-    ) -> Result<ProviderResponse, ProviderAttemptFailure>
+        retries: &mut RetryState,
+    ) -> Result<ProviderResponse, ProviderError>
     where
         E: FnMut(ProviderSessionEvent) + Send,
     {
-        for retry_index in 0..=self.policy.max_request_retries {
+        // 传输降级有独立的普通重试额度；累计等待时间仍属于同一逻辑请求。
+        retries.reset_transport_budget();
+        loop {
+            if self.allow_connection_wait {
+                add_recovery_reminder(request, retries.waited, self.input_budget);
+            }
             let result = self
                 .complete_buffered_attempt(provider, request.clone(), cancellation)
                 .await;
@@ -382,42 +397,22 @@ where
                     emit_response_events(provider, &response, on_event);
                     return Ok(response);
                 }
-                Err(error)
-                    if provider_retry::is_retryable(&error)
-                        && retry_index < self.policy.max_request_retries =>
-                {
-                    let attempt = retry_index.saturating_add(1);
-                    let delay = provider_retry::retry_delay(
-                        &error,
-                        attempt,
-                        request.request_id.0.as_u128() as u64,
-                    );
-                    on_event(ProviderSessionEvent::RetryScheduled {
-                        attempt,
-                        max_retries: self.policy.max_request_retries,
-                        transport: ProviderTransport::Buffered,
-                        reason: format!(
-                            "{} (retry_delay_ms={})",
-                            retry_reason(&error),
-                            delay.as_millis()
-                        ),
-                    });
-                    if !wait_backoff(delay, cancellation).await {
-                        return Err(ProviderAttemptFailure {
-                            error: ProviderError::Cancelled,
-                            replay_safe: true,
-                        });
-                    }
-                }
                 Err(error) => {
-                    return Err(ProviderAttemptFailure {
-                        error,
-                        replay_safe: true,
-                    });
+                    let Some((delay, recovery)) = retries.schedule(
+                        &error,
+                        self.policy.max_request_retries,
+                        self.allow_connection_wait,
+                        request.request_id.0.as_u128() as u64,
+                        false,
+                    ) else {
+                        return Err(error);
+                    };
+                    if !wait_for_recovery(delay, recovery, retries, cancellation, on_event).await {
+                        return Err(ProviderError::Cancelled);
+                    }
                 }
             }
         }
-        unreachable!("buffered retry loop always returns")
     }
 
     async fn complete_buffered_attempt(
@@ -445,15 +440,72 @@ where
 }
 
 async fn wait_backoff(delay: Duration, cancellation: &CancellationToken) -> bool {
+    let Some(deadline) = Instant::now().checked_add(delay) else {
+        // 极大的 Retry-After 不能溢出或提前重试；外层任务截止时间仍然生效。
+        cancellation.cancelled().await;
+        return false;
+    };
     tokio::select! {
         _ = cancellation.cancelled() => false,
-        _ = sleep(delay) => true,
+        _ = tokio::time::sleep_until(deadline) => true,
     }
 }
 
-fn is_replay_barrier_event(event: &ProviderStreamEvent) -> bool {
+fn add_recovery_reminder(request: &mut ProviderRequest, waited: Duration, input_budget: u64) {
+    const REMINDER: &str = "Runtime recovery: this request waited at least 60 seconds. Continue the existing task using completed tool results. Before changing files or external state, recheck only the facts that may have changed during the wait. Do not repeat completed side effects.";
+    if waited < Duration::from_secs(60)
+        || request
+            .messages
+            .iter()
+            .any(|message| message.content == REMINDER)
+    {
+        return;
+    }
+    // 仅在长等待后追加一次；保留完整工具配对及原有前缀，返回的 completed_request 包含该提示。
+    let reminder = golutra_agent_llm::ProviderMessage {
+        role: golutra_agent_llm::ProviderRole::System,
+        content: REMINDER.to_owned(),
+        tool_call_id: None,
+        tool_name: None,
+        tool_calls: Vec::new(),
+        metadata: Default::default(),
+    };
+    let input_tokens = golutra_agent_context::estimate_message_tokens(&request.messages)
+        .saturating_add(golutra_agent_llm::estimate_provider_tool_tokens(
+            &request.tools,
+        ))
+        .saturating_add(golutra_agent_context::estimate_message_tokens(
+            std::slice::from_ref(&reminder),
+        ));
+    // 恢复提示不能挤掉原始事实或绕过上下文预算；紧贴预算时保留原请求。
+    if input_tokens <= input_budget {
+        request.messages.push(reminder);
+    }
+}
+
+async fn wait_for_recovery<E: FnMut(ProviderSessionEvent)>(
+    delay: Duration,
+    mut recovery: ProviderRecovery,
+    retries: &mut RetryState,
+    cancellation: &CancellationToken,
+    on_event: &mut E,
+) -> bool {
+    on_event(ProviderSessionEvent::Recovery(recovery.clone()));
+    let started = Instant::now();
+    if !wait_backoff(delay, cancellation).await {
+        return false;
+    }
+    retries.waited += started.elapsed();
+    recovery.phase = RecoveryPhase::Retrying;
+    recovery.waited_ms = duration_ms(retries.waited);
+    recovery.reset_stream = false;
+    on_event(ProviderSessionEvent::Recovery(recovery));
+    true
+}
+
+fn is_preview_event(event: &ProviderStreamEvent) -> bool {
     match event {
-        // reasoning 只用于诊断/UI，不包含可执行副作用；不能阻止安全重放。
+        // 推理不进入正文；正文与工具增量也仅供展示，不表示工具已执行。
         ProviderStreamEvent::ReasoningDelta { .. } => false,
         ProviderStreamEvent::TextDelta { text } => !text.is_empty(),
         ProviderStreamEvent::ToolCallDelta {
@@ -728,7 +780,13 @@ mod tests {
         assert_eq!(
             events
                 .iter()
-                .filter(|event| matches!(event, ProviderSessionEvent::RetryScheduled { .. }))
+                .filter(|event| matches!(
+                    event,
+                    ProviderSessionEvent::Recovery(ProviderRecovery {
+                        phase: RecoveryPhase::Waiting,
+                        ..
+                    })
+                ))
                 .count(),
             2
         );
@@ -742,7 +800,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn does_not_replay_a_stream_after_meaningful_output() {
+    async fn retries_partial_output_with_an_explicit_preview_boundary() {
         let provider = PartialThenFailProvider {
             success: MockProvider::text_response("replayed"),
             stream_calls: Arc::new(AtomicUsize::new(0)),
@@ -757,23 +815,22 @@ mod tests {
         let session = ProviderSession::new(&provider, None, policy);
         let mut events = Vec::new();
 
-        let error = session
+        let (response, _) = session
             .complete(request(), &CancellationToken::new(), &mut |event| {
                 events.push(event)
             })
             .await
-            .expect_err("partial stream must not be replayed");
+            .expect("partial preview can be retried before tool execution");
 
-        assert!(matches!(
-            error,
-            ProviderSessionError::Provider(ProviderError::Unavailable { .. })
-        ));
-        assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 1);
-        assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, ProviderSessionEvent::RetryScheduled { .. }))
-        );
+        assert_eq!(response.message.unwrap().content, "replayed");
+        assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 2);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderSessionEvent::Recovery(ProviderRecovery {
+                reset_stream: true,
+                ..
+            })
+        )));
         assert_eq!(
             events
                 .iter()
@@ -785,7 +842,7 @@ mod tests {
                     }
                 ))
                 .count(),
-            1
+            2
         );
     }
 
@@ -817,7 +874,13 @@ mod tests {
         assert_eq!(
             events
                 .iter()
-                .filter(|event| matches!(event, ProviderSessionEvent::RetryScheduled { .. }))
+                .filter(|event| matches!(
+                    event,
+                    ProviderSessionEvent::Recovery(ProviderRecovery {
+                        phase: RecoveryPhase::Waiting,
+                        ..
+                    })
+                ))
                 .count(),
             1
         );
@@ -1003,7 +1066,7 @@ mod tests {
         )));
     }
 
-    fn request() -> ProviderRequest {
+    pub(super) fn request() -> ProviderRequest {
         ProviderRequest {
             request_id: ProviderRequestId::new(),
             task_id: TaskId::new(),
@@ -1019,3 +1082,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "provider_recovery_tests.rs"]
+mod recovery_tests;

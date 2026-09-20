@@ -97,8 +97,9 @@ impl CommandLine {
     /// 按选定的工作区执行模式解析命令。
     ///
     /// 受保护执行保持仅 argv 的契约，避免调用方把审批变成隐式脚本。
-    /// 不受限任务已经明确退出该策略边界；将合法复合命令作为一个 `bash -lc`
-    /// 脚本接受，可以避免模型使用常见 shell 语法时产生不必要的纠正回合。
+    /// 不受限任务将复合命令及包含展开的命令作为 `bash -c` 脚本接受，继承原环境。
+    /// 隐式 login shell 会重排 PATH，导致同一 python3 在单命令和脚本中变成不同版本；
+    /// 只有调用方显式请求 -lc 时才加载登录配置。
     pub(crate) fn parse_for_execution(
         command: &str,
         allow_implicit_shell: bool,
@@ -115,7 +116,7 @@ impl CommandLine {
                 {
                     return Ok(Self {
                         program: "bash".to_owned(),
-                        args: vec!["-lc".to_owned(), command.trim().to_owned()],
+                        args: vec!["-c".to_owned(), command.trim().to_owned()],
                         stdin: None,
                     });
                 }

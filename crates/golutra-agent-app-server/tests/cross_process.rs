@@ -199,8 +199,13 @@ async fn one_daemon_routes_multiple_cwds_and_preserves_history() {
 
     let session_a = transport_a.info().default_session_id;
     let session_b = transport_b.info().default_session_id;
-    let command_a = prompt_command(session_a, "write result.txt with content alpha");
-    let command_b = prompt_command(session_b, "write result.txt with content beta");
+    let mut command_a = prompt_command(session_a, "write result.txt with content alpha");
+    let mut command_b = prompt_command(session_b, "write result.txt with content beta");
+    // 固定 mock 只负责写入，不会响应独立验收纠偏；本测试验证跨工作区路由，
+    // 因此显式关闭纠偏，避免依赖生产默认的隐式停止次数。
+    for command in [&mut command_a, &mut command_b] {
+        command.payload["task_contract"] = serde_json::json!({"max_correction_rounds": 0});
+    }
     let mut events_a = transport_a
         .subscribe(EventFilter {
             session_id: session_a,

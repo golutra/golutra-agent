@@ -1,4 +1,4 @@
-use std::{fmt, sync::Arc};
+use std::{collections::HashSet, fmt, sync::Arc};
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -7,8 +7,7 @@ use genai::{
     adapter::AdapterKind,
     chat::{
         CacheControl, ChatMessage, ChatOptions, ChatRequest, ChatStreamEvent, ContentPart,
-        MessageContent, ReasoningEffort, StopReason, StreamEnd, Tool, ToolCall, ToolName,
-        ToolResponse,
+        MessageContent, ReasoningEffort, StreamEnd, Tool, ToolCall, ToolName, ToolResponse,
     },
     resolver::{AuthData, Endpoint},
 };
@@ -22,14 +21,14 @@ use serde_json::{Value, json};
 use super::{
     GOLUTRA_AGENT_PROVIDER_AUTH_PROVIDER, GOLUTRA_AGENT_PROVIDER_ROUTE_ID, LlmProvider,
     ProviderCacheCapabilities, ProviderCacheMode, ProviderCacheProfile, ProviderError,
-    ProviderErrorMetadata, ProviderFinishReason, ProviderGenerationConfig, ProviderHttpHeaders,
-    ProviderMessage, ProviderProbeResult, ProviderProtocol, ProviderRequest, ProviderResponse,
-    ProviderRole, ProviderStreamEvent, ProviderToolCall, ProviderUsage, RESERVED_AFFINITY_HEADERS,
-    UsageSource, cache_capabilities_from_reader, configured_or_first_env,
-    custom_headers_from_reader, env_mapping, first_env, generation_config_from_reader,
-    missing_env_error, protocol_capabilities, provider_tool_schema_for_contract,
-    request_id_from_headers, retry_after_from_headers, sanitize_provider_error,
-    selected_protocol_from_reader, validate_provider_base_url_for_model,
+    ProviderErrorMetadata, ProviderGenerationConfig, ProviderHttpHeaders, ProviderMessage,
+    ProviderProbeResult, ProviderProtocol, ProviderRequest, ProviderResponse, ProviderRole,
+    ProviderStreamEvent, ProviderToolCall, ProviderUsage, RESERVED_AFFINITY_HEADERS, UsageSource,
+    cache_capabilities_from_reader, configured_or_first_env, custom_headers_from_reader,
+    env_mapping, first_env, generation_config_from_reader, missing_env_error,
+    protocol_capabilities, provider_tool_schema_for_contract, request_id_from_headers,
+    retry_after_from_headers, sanitize_provider_error, selected_protocol_from_reader,
+    validate_provider_base_url_for_model,
 };
 
 #[derive(Clone, PartialEq, Eq)]
@@ -52,6 +51,8 @@ pub struct GenaiProviderAdapter {
     credential: Arc<dyn CredentialProvider>,
     cache_profile: ProviderCacheProfile,
     client: Client,
+    // 自动选中 Responses 时复用完整实现，避免丢失 end_turn、截断原因和推理回放项。
+    responses: Option<super::OpenAiResponsesProvider>,
 }
 
 impl fmt::Debug for GenaiProviderConfig {
@@ -118,6 +119,23 @@ impl GenaiProviderAdapter {
             .as_ref()
             .unwrap_or(&default_capabilities);
         let cache_profile = ProviderCacheProfile::from_capabilities(config.protocol, capabilities);
+        let responses = (config.protocol == ProviderProtocol::Genai
+            && AdapterKind::from_model(&config.model_id).ok() == Some(AdapterKind::OpenAIResp))
+        .then(|| {
+            super::OpenAiResponsesProvider::from_config_with_credential(
+                super::OpenAiResponsesProviderConfig {
+                    api_key: config.api_key.clone(),
+                    api_key_env: config.api_key_env.clone(),
+                    provider_id: config.provider_id.clone(),
+                    base_url: config.base_url.clone(),
+                    model_id: config.model_id.clone(),
+                    generation_config: config.generation_config.clone(),
+                    custom_headers: config.custom_headers.clone(),
+                    cache_capabilities: config.cache_capabilities.clone(),
+                },
+                credential.clone(),
+            )
+        });
         Self {
             config,
             credential,
@@ -126,6 +144,7 @@ impl GenaiProviderAdapter {
                 .with_web_config(web_config)
                 .build()
                 .expect("static genai client configuration is valid"),
+            responses,
         }
     }
 
@@ -359,6 +378,8 @@ impl GenaiProviderAdapter {
         let mut stream = response.stream;
         let mut stream_end = None;
         let mut tool_delta_index = 0_usize;
+        let mut observed_tool_ids = HashSet::new();
+        let mut observed_id_bytes = 0_usize;
         while let Some(event) = stream.next().await {
             match event.map_err(map_genai_error)? {
                 ChatStreamEvent::Start
@@ -380,6 +401,19 @@ impl GenaiProviderAdapter {
                     }
                 }
                 ChatStreamEvent::ToolCallChunk(chunk) => {
+                    if !chunk.tool_call.call_id.is_empty()
+                        && !observed_tool_ids.contains(&chunk.tool_call.call_id)
+                    {
+                        observed_id_bytes = observed_id_bytes.saturating_add(chunk.tool_call.call_id.len());
+                        if observed_id_bytes > super::MAX_PROVIDER_RESPONSE_BYTES
+                            || chunk.tool_call.call_id.len() > super::MAX_PROVIDER_TOOL_CALL_ID_BYTES
+                        {
+                            return Err(ProviderError::Malformed {
+                                message: "streamed tool call ids exceed provider response limits".into(),
+                            });
+                        }
+                        observed_tool_ids.insert(chunk.tool_call.call_id.clone());
+                    }
                     on_event(ProviderStreamEvent::ToolCallDelta {
                         index: tool_delta_index,
                         tool_call_id: (!chunk.tool_call.call_id.is_empty())
@@ -398,7 +432,12 @@ impl GenaiProviderAdapter {
         let end = stream_end.ok_or_else(|| ProviderError::Unavailable {
             message: "native provider stream ended before a terminal event".to_owned(),
         })?;
-        provider_response_from_genai_stream(end, &model_id)
+        let response = provider_response_from_genai_stream(end, &model_id)?;
+        super::response_contract::ensure_tools_captured(
+            &response,
+            observed_tool_ids.iter().map(String::as_str),
+        )?;
+        Ok(response)
     }
 
     fn affinity_headers(&self, request: &ProviderRequest) -> Headers {
@@ -416,6 +455,9 @@ impl GenaiProviderAdapter {
 #[async_trait]
 impl super::LlmProvider for GenaiProviderAdapter {
     async fn complete(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+        if let Some(provider) = &self.responses {
+            return provider.complete(request).await;
+        }
         self.execute(&request, false).await
     }
 
@@ -424,10 +466,22 @@ impl super::LlmProvider for GenaiProviderAdapter {
         request: ProviderRequest,
         on_event: &mut (dyn FnMut(ProviderStreamEvent) + Send),
     ) -> Result<ProviderResponse, ProviderError> {
+        if let Some(provider) = &self.responses {
+            return provider.complete_stream(request, on_event).await;
+        }
         self.execute_stream(&request, on_event).await
     }
 
+    fn supports_buffered_transport(&self) -> bool {
+        self.responses
+            .as_ref()
+            .is_none_or(LlmProvider::supports_buffered_transport)
+    }
+
     fn contract(&self) -> ProviderContract {
+        if let Some(provider) = &self.responses {
+            return provider.contract();
+        }
         ProviderContract {
             provider_id: self.config.provider_id.clone(),
             model_id: self.config.model_id.clone(),
@@ -446,10 +500,16 @@ impl super::LlmProvider for GenaiProviderAdapter {
     }
 
     fn cache_namespace(&self) -> String {
+        if let Some(provider) = &self.responses {
+            return provider.cache_namespace();
+        }
         super::route_cache_namespace(native_protocol(self.config.protocol), &self.config.base_url)
     }
 
     fn preferred_cache_policy(&self) -> PromptCachePolicy {
+        if let Some(provider) = &self.responses {
+            return provider.preferred_cache_policy();
+        }
         self.cache_profile.preferred_cache_policy()
     }
 }
@@ -742,7 +802,8 @@ pub(crate) fn provider_response_from_genai_stream(
             raw: json!({}),
         },
     };
-    let finish_reason = finish_reason_from_genai(end.captured_stop_reason.as_ref());
+    let finish_reason = super::response_contract::from_genai(end.captured_stop_reason.as_ref())
+        .with_tool_calls(!tool_calls.is_empty());
     Ok(ProviderResponse {
         response_id: ProviderResponseId::new(),
         message: (!content.is_empty()).then_some(ProviderMessage {
@@ -808,7 +869,8 @@ fn provider_response_from_genai(
         .as_ref()
         .and_then(raw_usage_value);
     let usage = provider_usage_from_genai_with_raw(&response.usage, raw_usage.as_ref())?;
-    let finish_reason = finish_reason_from_genai(response.stop_reason.as_ref());
+    let finish_reason = super::response_contract::from_genai(response.stop_reason.as_ref())
+        .with_tool_calls(!tool_calls.is_empty());
     let raw_metadata = response.captured_raw_body.unwrap_or_else(|| {
         json!({
             "provider_model": response.provider_model_iden.to_string(),
@@ -935,16 +997,6 @@ fn raw_usage_value(raw_body: &Value) -> Option<Value> {
         .find_map(|path| raw_body.pointer(path).cloned())
 }
 
-fn finish_reason_from_genai(reason: Option<&StopReason>) -> ProviderFinishReason {
-    match reason {
-        Some(StopReason::Completed(_) | StopReason::StopSequence(_)) => ProviderFinishReason::Stop,
-        Some(StopReason::MaxTokens(_)) => ProviderFinishReason::Length,
-        Some(StopReason::ToolCall(_)) => ProviderFinishReason::ToolCalls,
-        Some(StopReason::ContentFilter(_)) => ProviderFinishReason::ContentFilter,
-        Some(StopReason::Other(_)) | None => ProviderFinishReason::Unknown,
-    }
-}
-
 fn validate_tool_call(call_id: &str, name: &str, arguments: &Value) -> Result<(), ProviderError> {
     if call_id.trim().is_empty() {
         return Err(ProviderError::Malformed {
@@ -1002,19 +1054,15 @@ pub(crate) fn map_genai_error(error: genai::Error) -> ProviderError {
         ProviderError::Unavailable { message }
     } else if status.is_some() {
         ProviderError::Failed { message }
+    } else if super::transport_error::genai_protocol_failure(&error) {
+        ProviderError::Malformed { message }
+    } else if super::transport_error::genai_connection_failed(&error) {
+        ProviderError::ConnectionFailed { message }
     } else {
         match error {
             genai::Error::RequiresApiKey { .. }
             | genai::Error::NoAuthResolver { .. }
             | genai::Error::NoAuthData { .. } => ProviderError::NotConfigured { message },
-            genai::Error::InvalidJsonResponseElement { .. }
-            | genai::Error::ChatResponseGeneration { .. }
-            // rust-genai uses StreamParse for both malformed SSE payloads and
-            // explicit provider `response.failed` events. Neither is safe to
-            // replay: the request would produce the same semantic failure.
-            | genai::Error::StreamParse { .. }
-            | genai::Error::ChatResponse { .. }
-            | genai::Error::SerdeJson(_) => ProviderError::Failed { message },
             _ if message.to_ascii_lowercase().contains("timed out") => {
                 ProviderError::Timeout { message }
             }
@@ -1157,7 +1205,7 @@ mod tests {
         };
         assert!(matches!(
             map_genai_error(parser_error),
-            ProviderError::Failed { .. }
+            ProviderError::Malformed { .. }
         ));
 
         let response_error = genai::Error::ChatResponse {
@@ -1166,7 +1214,7 @@ mod tests {
         };
         assert!(matches!(
             map_genai_error(response_error),
-            ProviderError::Failed { .. }
+            ProviderError::Malformed { .. }
         ));
     }
 

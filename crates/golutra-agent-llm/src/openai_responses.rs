@@ -38,6 +38,9 @@ use super::{
 const CHATGPT_ACCOUNT_ID_HEADER: &str = "ChatGPT-Account-Id";
 const DEFAULT_PROVIDER_ID: &str = "openai-chatgpt";
 
+#[path = "responses_terminal.rs"]
+mod terminal;
+
 /// SSE 首帧通常很小；无压缩可避免代理等待压缩块再刷新。Responses 使用
 /// 独立的无压缩 client，同时保留 TCP_NODELAY、连接池和 HTTP/2 keep-alive。
 fn responses_web_config() -> WebConfig {
@@ -432,7 +435,10 @@ impl OpenAiResponsesProvider {
         loop {
             attempt_count = attempt_count.saturating_add(1);
             let (token, account_id) = self.resolve_credential(force_refresh).await?;
-            let options = self.chat_options(request, account_id.as_deref())?;
+            let terminal = Arc::new(terminal::ResponsesTerminal::default());
+            let options = self
+                .chat_options(request, account_id.as_deref())?
+                .with_raw_frame_sink_arc(terminal.clone());
             let response = match self
                 .client
                 .exec_chat_stream(
@@ -574,10 +580,26 @@ impl OpenAiResponsesProvider {
                 first_stream_event_ms,
                 first_business_event_ms,
                 terminal_event_ms,
+                tool_ready_to_terminal_ms: terminal.tool_ready_to_terminal_ms(),
                 credential_refresh_attempted,
             };
-            let response =
+            let mut response =
                 responses_provider_response(end, &model_id, &self.config.provider_id, diagnostics)?;
+            response.finish_reason = terminal.finish_reason()?;
+            if response.finish_reason == ProviderFinishReason::Length && !tool_calls.is_empty() {
+                // 通用库在 incomplete 分支可能丢弃捕获的调用；预览存在也不能误作纯文本续写。
+                return Err(ProviderError::Malformed {
+                    message: "responses stream truncated tool arguments; tools were not executed"
+                        .into(),
+                });
+            }
+            response.finish_reason = response
+                .finish_reason
+                .with_tool_calls(!response.tool_calls.is_empty());
+            super::response_contract::ensure_tools_captured(
+                &response,
+                tool_calls.keys().map(String::as_str),
+            )?;
             return Ok(response);
         }
     }
@@ -743,9 +765,6 @@ fn responses_provider_response(
         });
         message.metadata.openai_responses_replay_items = replay_items;
     }
-    if !response.tool_calls.is_empty() {
-        response.finish_reason = ProviderFinishReason::ToolCalls;
-    }
     response.raw_metadata = json!({
         "provider": provider_id,
         "provider_model": model_id,
@@ -806,7 +825,7 @@ fn map_responses_genai_error(error: genai::Error) -> ProviderError {
         // parser/business failures as hard errors; transport truncation is
         // represented separately as WebStream and remains retryable.
         None if matches!(error, genai::Error::StreamParse { .. }) => {
-            ProviderError::Failed { message }
+            ProviderError::Malformed { message }
         }
         None => map_genai_error(error),
     };
@@ -855,7 +874,7 @@ mod tests {
 
         assert!(matches!(
             map_responses_genai_error(error),
-            ProviderError::Failed { .. }
+            ProviderError::Malformed { .. }
         ));
     }
 
@@ -906,6 +925,7 @@ mod tests {
             first_stream_event_ms: Some(1_200),
             first_business_event_ms: Some(1_250),
             terminal_event_ms: Some(2_000),
+            tool_ready_to_terminal_ms: Some(250),
             credential_refresh_attempted: true,
         };
         let raw = json!({

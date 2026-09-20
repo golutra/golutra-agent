@@ -19,15 +19,15 @@ path = "src/main.rs"
 [dependencies]
 chrono.workspace = true
 clap.workspace = true
-golutra-agent-app-server = { path = "../golutra-agent-app-server", version = "0.3.1" }
-golutra-agent-auth = { path = "../golutra-agent-auth", version = "0.3.1" }
-golutra-agent-client = { path = "../golutra-agent-client", version = "0.3.1" }
-golutra-agent-code-intelligence = { path = "../golutra-agent-code-intelligence", version = "0.3.1" }
-golutra-agent-config = { path = "../golutra-agent-config", version = "0.3.1" }
+golutra-agent-app-server = { path = "../golutra-agent-app-server", version = "0.3.2" }
+golutra-agent-auth = { path = "../golutra-agent-auth", version = "0.3.2" }
+golutra-agent-client = { path = "../golutra-agent-client", version = "0.3.2" }
+golutra-agent-code-intelligence = { path = "../golutra-agent-code-intelligence", version = "0.3.2" }
+golutra-agent-config = { path = "../golutra-agent-config", version = "0.3.2" }
 golutra-agent-core.workspace = true
-golutra-agent-eval = { path = "../golutra-agent-eval", version = "0.3.1" }
-golutra-agent-llm = { path = "../golutra-agent-llm", version = "0.3.1" }
-golutra-agent-plugin = { path = "../golutra-agent-plugin", version = "0.3.1" }
+golutra-agent-eval = { path = "../golutra-agent-eval", version = "0.3.2" }
+golutra-agent-llm = { path = "../golutra-agent-llm", version = "0.3.2" }
+golutra-agent-plugin = { path = "../golutra-agent-plugin", version = "0.3.2" }
 golutra-agent-project-service.workspace = true
 golutra-agent-protocol.workspace = true
 miette.workspace = true

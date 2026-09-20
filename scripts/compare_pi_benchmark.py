@@ -1660,8 +1660,12 @@ def run_process(
         returncode = process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         returncode = 124
-        stop_timed_out_process(process)
         stderr_lines.append("\nprocess timed out\n")
+        try:
+            stop_timed_out_process(process)
+        except OSError as error:
+            # 宿主拒绝终止信号时仍保存失败样本；不提权或把超时伪装成完成。
+            stderr_lines.append(f"process cleanup failed: {type(error).__name__}: {error}\n")
     pipe_deadline = time.monotonic() + PIPE_DRAIN_TIMEOUT_SECONDS
     join_pipe_reader(stdout_worker, process.stdout, pipe_deadline)
     join_pipe_reader(stderr_worker, process.stderr, pipe_deadline)

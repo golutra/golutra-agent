@@ -421,6 +421,129 @@ fn install_mock_provider(home: &Path) {
 }
 
 #[test]
+fn offline_recovery_and_partial_stream_boundaries_survive_pty_and_resume() {
+    use golutra_agent_auth::{CredentialRef, SecretKind};
+    use golutra_agent_config::{ProviderConfigPaths, ProviderProfile, ProviderSettings};
+    use golutra_agent_llm::ProviderProtocol;
+
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let mut settings = ProviderSettings::default();
+    settings.upsert_profile(
+        ProviderProfile::live_profile(
+            "recovery-fixture",
+            ProviderProtocol::OpenAiCompatible,
+            format!("http://{address}/v1"),
+            "fixture",
+            CredentialRef::environment("GOLUTRA_AGENT_PTY_TEST_KEY", SecretKind::ApiKey).unwrap(),
+        )
+        .unwrap(),
+        true,
+    );
+    let paths = ProviderConfigPaths::from_home(home.path()).unwrap();
+    settings.save(&paths.user_config).unwrap();
+    let resume_key = "pty-network-recovery";
+    let mut pty = PtyHarness::spawn_with_resume(
+        home.path(),
+        workspace.path(),
+        120,
+        32,
+        true,
+        Some(resume_key),
+    );
+    let mut screen = Emulator::new(120, 32);
+    screen.feed(&pty.collect_until(b"Ask Golutra", Duration::from_secs(10)));
+    pty.write("你好\r".as_bytes());
+    screen.feed(&pty.collect_until(b"Waiting for network", Duration::from_secs(10)));
+    assert!(
+        screen.text().contains("Waiting for network"),
+        "{}",
+        screen.text()
+    );
+    assert!(!screen.text().contains("Task failed"));
+
+    let listener = std::net::TcpListener::bind(address).unwrap();
+    let server = thread::spawn(move || {
+        for complete in [false, true] {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(15)))
+                .unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                header.push(byte[0]);
+                assert!(header.len() < 65536);
+            }
+            let header = String::from_utf8(header).unwrap();
+            let length = header
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap();
+            assert!(length < 1024 * 1024);
+            stream.read_exact(&mut vec![0; length]).unwrap();
+            let body = if complete {
+                "data: {\"choices\":[{\"delta\":{\"content\":\"恢复后的完整回答。\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+            } else {
+                "data: {\"choices\":[{\"delta\":{\"content\":\"中断的中文片段\"},\"finish_reason\":null}]}\n\n"
+            };
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).unwrap();
+        }
+    });
+    screen.feed(&pty.collect_until("恢复后的完整回答。".as_bytes(), Duration::from_secs(20)));
+    screen.feed(&pty.collect_for(Duration::from_millis(500)));
+    let text = screen.text();
+    assert!(text.contains("恢复后的完整回答。"), "{text}");
+    assert!(text.contains("Response interrupted; retrying"), "{text}");
+    assert!(!text.contains("Waiting for network"), "{text}");
+    assert!(!text.contains("Task failed"), "{text}");
+    server.join().unwrap();
+
+    pty.write(b"/status\r");
+    screen.feed(&pty.collect_until(b"provider retries", Duration::from_secs(5)));
+    let status = screen.text();
+    let retries = status
+        .split("provider retries ")
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    // 首屏绘制期间可能已发生多次连接拒绝；断流本身还必须贡献一次恢复。
+    assert!(retries >= 2, "{status}");
+    pty.write(b"/quit\r");
+    assert!(pty.wait().1.success());
+
+    let mut resumed = PtyHarness::spawn_with_resume(
+        home.path(),
+        workspace.path(),
+        120,
+        40,
+        true,
+        Some(resume_key),
+    );
+    let mut screen = Emulator::new(120, 40);
+    screen.feed(&resumed.collect_until("恢复后的完整回答。".as_bytes(), Duration::from_secs(10)));
+    screen.feed(&resumed.collect_for(Duration::from_millis(500)));
+    let text = screen.text();
+    assert!(text.contains("恢复后的完整回答。"), "{text}");
+    assert!(text.contains("Response interrupted; retrying"), "{text}");
+    assert!(!text.contains("Waiting for network"), "{text}");
+    resumed.write(b"/quit\r");
+    assert!(resumed.wait().1.success());
+}
+
+#[test]
 fn interactive_binary_accepts_real_pty_unicode_redraw_resize_and_restores_terminal() {
     let home = tempdir().expect("home tempdir");
     let workspace = tempdir().expect("workspace tempdir");

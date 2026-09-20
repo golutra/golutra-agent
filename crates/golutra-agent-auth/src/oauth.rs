@@ -2135,7 +2135,7 @@ mod tests {
 
         assert!(callbacks.0.starts_with("HTTP/1.1 400"));
         assert!(callbacks.1.starts_with("HTTP/1.1 200"));
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "browser login failed: {result:?}");
         assert_eq!(server.requests().len(), 1);
     }
 

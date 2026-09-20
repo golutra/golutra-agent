@@ -5,6 +5,59 @@ use unicode_width::UnicodeWidthStr;
 use super::ActivitySnapshot;
 
 pub(crate) fn activity_status_text(snapshot: ActivitySnapshot, width: usize) -> String {
+    if let Some(recovery) = snapshot.recovery {
+        let state = if !snapshot.can_interrupt {
+            "Stopping"
+        } else if recovery.connecting {
+            "Reconnecting"
+        } else if recovery.network {
+            "Waiting for network"
+        } else {
+            "Waiting to retry"
+        };
+        let detail = if recovery.connecting {
+            format!("attempt {}", recovery.attempt)
+        } else {
+            format!("retry in {}s", recovery.remaining_seconds)
+        };
+        let action = if snapshot.can_interrupt {
+            "esc to interrupt"
+        } else {
+            "stopping"
+        };
+        let full = format!(
+            "• {state} ({} waited • {detail} • {action})",
+            format_elapsed(recovery.waited_seconds)
+        );
+        if UnicodeWidthStr::width(full.as_str()) <= width {
+            return full;
+        }
+        let short_action = if snapshot.can_interrupt {
+            "esc"
+        } else {
+            "stop"
+        };
+        // 重连发起后不再倒计时，不能把上一轮退避秒数当作仍需等待的时间。
+        let compact = if recovery.connecting {
+            format!("• {state} · {short_action}")
+        } else {
+            format!(
+                "• {state} · {}s · {short_action}",
+                recovery.remaining_seconds
+            )
+        };
+        if UnicodeWidthStr::width(compact.as_str()) <= width {
+            return compact;
+        }
+        return truncate_end(
+            if snapshot.can_interrupt {
+                "• Retrying · esc"
+            } else {
+                "• Stopping"
+            },
+            width,
+        );
+    }
     let elapsed = format_elapsed(snapshot.elapsed.as_secs());
     let rate = snapshot.output_rate.map_or_else(
         || "--".to_owned(),
@@ -98,8 +151,31 @@ mod tests {
     }
 
     #[test]
+    fn narrow_reconnection_does_not_display_the_previous_backoff() {
+        let mut snapshot = ActivitySnapshot {
+            recovery: Some(crate::recovery_status::RecoverySnapshot {
+                network: true,
+                connecting: false,
+                attempt: 2,
+                remaining_seconds: 60,
+                waited_seconds: 120,
+            }),
+            elapsed: Duration::from_secs(120),
+            output_rate: None,
+            can_interrupt: true,
+        };
+        assert_eq!(
+            activity_status_text(snapshot, 40),
+            "• Waiting for network · 60s · esc"
+        );
+        snapshot.recovery.as_mut().unwrap().connecting = true;
+        assert_eq!(activity_status_text(snapshot, 40), "• Reconnecting · esc");
+    }
+
+    #[test]
     fn estimated_rates_are_explicit_and_narrow_lines_keep_escape() {
         let snapshot = ActivitySnapshot {
+            recovery: None,
             elapsed: Duration::from_secs(2),
             output_rate: Some(OutputRate {
                 tokens_per_second: 20.0,

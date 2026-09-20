@@ -7580,9 +7580,12 @@ fn provider_failure_uses_full_error_instead_of_truncated_summary() {
     );
     let task = TaskId::new();
     let cause = "Invalid prompt: your prompt was flagged as potentially violating our usage policy. Please try again with a different prompt. 完整错误末尾。";
-    let error = format!(
-        "provider failed: Failed to parse stream data for model 'fixture (adapter: OpenAIResp)'. Cause: {cause}"
-    );
+    let error = golutra_agent_llm::ProviderError::Malformed {
+        message: format!(
+            "Failed to parse stream data for model 'fixture (adapter: OpenAIResp)'. Cause: {cause}"
+        ),
+    }
+    .to_string();
     let full_error = format!("runtime task execution failed: provider call failed: {error}");
     app.events = vec![
         transcript_event(

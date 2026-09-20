@@ -15,6 +15,23 @@ mod subagent_parallel_tests;
 #[path = "pending_batch_tests.rs"]
 mod pending_batch_tests;
 
+#[path = "long_task_recovery_tests.rs"]
+mod long_task_recovery_tests;
+
+#[path = "response_control_tests.rs"]
+mod response_control_tests;
+
+#[path = "correction_feedback_tests.rs"]
+mod correction_feedback_tests;
+#[path = "long_task_compaction_tests.rs"]
+mod long_task_compaction_tests;
+#[path = "long_task_correction_tests.rs"]
+mod long_task_correction_tests;
+#[path = "unlimited_task_tests.rs"]
+mod unlimited_task_tests;
+#[path = "validation_shell_tests.rs"]
+mod validation_shell_tests;
+
 use golutra_agent_context::{
     ContextBudgetPolicy, ContextBuilder, ContextContributor, ContextMessageSource,
     ContextWindowManager, estimate_message_tokens, estimate_tokens,
@@ -584,7 +601,24 @@ fn agent_run_preserves_legacy_touched_code_contract() {
         WorkspaceChangeRequirement::Required
     );
     assert!(run.task_contract.require_objective_validation);
-    assert_eq!(run.task_contract.max_correction_rounds, 1);
+    assert_eq!(run.task_contract.max_correction_rounds, None);
+}
+
+#[test]
+fn unlimited_task_has_no_deadline_advisory_or_shell_clamp() {
+    assert_eq!(deadline_from_budget(0), None);
+    assert_eq!(runtime_deadline_advisory(0, u64::MAX), None);
+    assert_eq!(shell_execution_budget(0, u64::MAX, false), 0);
+    let mut request = ToolRequest {
+        tool_call_id: golutra_agent_core::ToolCallId::new(),
+        provider_tool_call_id: None,
+        session_id: SessionId::new(),
+        turn_id: None,
+        tool_name: "shell".into(),
+        arguments: json!({"command":"cargo test", "timeout_ms":120000}),
+    };
+    clamp_shell_timeout_to_budget(&mut request, 0);
+    assert_eq!(request.arguments["timeout_ms"], 120000);
 }
 
 #[test]
@@ -661,22 +695,6 @@ fn successful_tool_result_resets_only_the_consecutive_failure_count() {
     update_tool_failure_counts(ToolResultStatus::Error, &mut total, &mut consecutive);
     assert_eq!(total, 8);
     assert_eq!(consecutive, 1);
-}
-
-#[test]
-fn duplicate_failures_in_one_provider_round_count_as_one_retry() {
-    let failed = HashSet::from(["shell:{\"command\":\"git\"}".to_owned()]);
-    let mut signature = None;
-    let mut count = 0;
-
-    update_repeated_failure_streak(&failed, &mut signature, &mut count);
-    assert_eq!(count, 1);
-    update_repeated_failure_streak(&failed, &mut signature, &mut count);
-    assert_eq!(count, 2);
-
-    update_repeated_failure_streak(&HashSet::new(), &mut signature, &mut count);
-    assert_eq!(signature, None);
-    assert_eq!(count, 0);
 }
 
 #[test]
@@ -1073,12 +1091,15 @@ fn semantic_failure_families_survive_unrelated_successes() {
     assert_ne!(apt, diagnostic);
 
     let mut ledger = FailureFamilyLedger::default();
-    ledger.observe(&apt, ToolResultStatus::Timeout);
-    ledger.observe(&diagnostic, ToolResultStatus::Ok);
-    ledger.observe(&apt_variant, ToolResultStatus::Error);
+    ledger.observe(&apt, "original-arguments", ToolResultStatus::Timeout);
+    ledger.observe(&diagnostic, "diagnostic", ToolResultStatus::Ok);
+    ledger.observe(&apt_variant, "original-arguments", ToolResultStatus::Error);
 
-    assert_eq!(ledger.failures(&apt), 2);
-    assert_eq!(ledger.failures(&diagnostic), 0);
+    assert_eq!(ledger.failures(&apt, "original-arguments"), 2);
+    assert_eq!(ledger.failures(&apt, "corrected-arguments"), 0);
+    assert_eq!(ledger.failures(&diagnostic, "diagnostic"), 0);
+    ledger.workspace_changed();
+    assert_eq!(ledger.failures(&apt, "original-arguments"), 0);
 }
 
 #[derive(Debug, Clone)]
@@ -3712,7 +3733,28 @@ async fn resume_compaction_summarizes_original_history_before_the_primary_reques
         tool_calls: Vec::new(),
         metadata: Default::default(),
     };
-    let mut messages = vec![message(ProviderRole::System, system.content.clone())];
+    let mut messages = vec![
+        message(ProviderRole::System, system.content.clone()),
+        message(
+            ProviderRole::User,
+            "ORIGINAL: preserve canonical checksum ordering".to_owned(),
+        ),
+    ];
+    let mut original_plan = ContextBuilder::default()
+        .build_from_messages(TaskId::new(), TurnId::new(), messages.clone())
+        .unwrap();
+    original_plan.message_sources[1].contributor = "objective".to_owned();
+    let original_request = golutra_agent_context::provider_request_from_plan(
+        &original_plan,
+        TaskId::new(),
+        TurnId::new(),
+        "mock",
+        "mock-model",
+        Vec::new(),
+    );
+    let manifest =
+        context_snapshot_from_request(SessionId::new(), &original_plan, &original_request)
+            .message_manifest;
     messages.extend((0..30).map(|index| {
         message(
             ProviderRole::User,
@@ -3766,8 +3808,9 @@ async fn resume_compaction_summarizes_original_history_before_the_primary_reques
             contributors: vec![system.clone()],
             tools: Vec::new(),
         };
-        let run = AgentRun::new(request)
-            .with_replay_context(AgentReplayContext::for_resume(messages.clone(), Vec::new()));
+        let mut replay = AgentReplayContext::for_resume(messages.clone(), Vec::new());
+        replay.message_manifest = manifest.clone();
+        let run = AgentRun::new(request).with_replay_context(replay);
         let (_handle, control) = agent_execution_channel(1);
         let mut trace = Vec::new();
         agent_loop
@@ -3796,6 +3839,12 @@ async fn resume_compaction_summarizes_original_history_before_the_primary_reques
             .next_back()
             .expect("primary request");
         assert!(estimate_message_tokens(&primary.messages) <= budget);
+        assert!(
+            primary
+                .messages
+                .iter()
+                .any(|message| message == &messages[1])
+        );
         assert_eq!(
             &primary.messages[primary.messages.len() - 3..],
             &messages[messages.len() - 3..]
@@ -3811,8 +3860,9 @@ async fn resume_compaction_summarizes_original_history_before_the_primary_reques
                     _ => None,
                 })
                 .expect("compaction record");
+            assert_eq!(record.summary_source_messages[0], messages[1]);
             assert!(
-                record.summary_source_messages[0]
+                record.summary_source_messages[1]
                     .content
                     .contains("original-history-0")
             );
@@ -4706,7 +4756,7 @@ async fn verifier_mutation_cannot_satisfy_a_required_delivery() {
                 required_paths: vec!["result.txt".to_owned()],
                 require_objective_validation: true,
                 verification: golutra_agent_core::VerificationRequirement::Required,
-                max_correction_rounds: 0,
+                max_correction_rounds: Some(0),
                 ..TaskContract::default()
             },
             control,
@@ -5647,7 +5697,7 @@ async fn assistant_only_corrections_do_not_reset_the_material_progress_budget() 
                 required_paths: vec!["result.py".to_owned()],
                 require_objective_validation: true,
                 verification: golutra_agent_core::VerificationRequirement::Required,
-                max_correction_rounds: 6,
+                max_correction_rounds: Some(6),
                 ..TaskContract::default()
             },
             control,
@@ -5745,7 +5795,7 @@ async fn readonly_analysis_allows_reads_and_rejects_shell_mutations() {
                 },
                 TaskContract {
                     workspace_change: WorkspaceChangeRequirement::Forbidden,
-                    max_correction_rounds: 0,
+                    max_correction_rounds: Some(0),
                     ..TaskContract::default()
                 },
                 control,
@@ -5795,7 +5845,7 @@ async fn readonly_contract_blocks_parallel_write_batches_before_execution() {
             },
             TaskContract {
                 workspace_change: WorkspaceChangeRequirement::Forbidden,
-                max_correction_rounds: 0,
+                max_correction_rounds: Some(0),
                 ..TaskContract::default()
             },
             control,
@@ -5871,7 +5921,7 @@ async fn explicit_task_contract_blocks_deferred_candidate_without_required_deliv
                 workspace_change: golutra_agent_core::WorkspaceChangeRequirement::Required,
                 required_paths: vec!["src/result.rs".to_owned()],
                 verification: golutra_agent_core::VerificationRequirement::Required,
-                max_correction_rounds: 0,
+                max_correction_rounds: Some(0),
                 ..TaskContract::default()
             },
             control,
@@ -5928,7 +5978,7 @@ async fn required_content_contract_records_evidence_for_an_unchanged_existing_fi
                     content: "already correct\n".to_owned(),
                 }],
                 verification: golutra_agent_core::VerificationRequirement::Required,
-                max_correction_rounds: 0,
+                max_correction_rounds: Some(0),
                 ..TaskContract::default()
             },
             control,
@@ -5985,7 +6035,7 @@ async fn required_path_contract_records_evidence_for_an_unchanged_existing_file(
             TaskContract {
                 required_paths: vec!["result.txt".to_owned()],
                 verification: golutra_agent_core::VerificationRequirement::Required,
-                max_correction_rounds: 0,
+                max_correction_rounds: Some(0),
                 ..TaskContract::default()
             },
             control,
@@ -6500,7 +6550,7 @@ fn parallel_read_candidate_enforces_the_active_tool_profile() {
             .iter()
             .any(|tool| tool.tool_name == "external_hidden_read")
     );
-    assert_eq!(coding_tools.len(), 7);
+    assert_eq!(coding_tools.len(), 8);
 
     let none_tools = provider_tools_for_turn(
         &executor
@@ -6536,6 +6586,7 @@ fn coding_tool_surface_is_stable_across_objectives() {
         "apply_patch",
         "shell_session",
         "subagent",
+        "runtime_status",
     ];
     let selected = provider_tools_for_turn(
         &all_tools,
@@ -6552,6 +6603,13 @@ fn coding_tool_surface_is_stable_across_objectives() {
         expected
     );
     let selected_digest = provider_tool_snapshot(&selected).2;
+    let shell = selected
+        .iter()
+        .find(|tool| tool.tool_name == "shell")
+        .unwrap();
+    let wire = golutra_agent_llm::provider_tool_schema_projection(&shell.input_schema);
+    assert!(wire["properties"].get("argv").is_none());
+    assert_eq!(wire["required"], json!(["command"]));
     let mut reversed = selected.clone();
     reversed.reverse();
     assert_ne!(
@@ -6609,7 +6667,7 @@ fn coding_tool_surface_retains_declared_capabilities_without_keyword_matching() 
         executor.registry(),
         "implement the task and keep the code maintainable",
     );
-    assert_eq!(generic.len(), 7);
+    assert_eq!(generic.len(), 8);
 
     let long_task = provider_tools_for_turn(
         &all_tools,
@@ -6618,7 +6676,7 @@ fn coding_tool_surface_retains_declared_capabilities_without_keyword_matching() 
         executor.registry(),
         "complete this long-running task and keep the code maintainable",
     );
-    assert_eq!(long_task.len(), 7);
+    assert_eq!(long_task.len(), 8);
 
     let explicit = provider_tools_for_turn(
         &all_tools,
@@ -6627,7 +6685,7 @@ fn coding_tool_surface_retains_declared_capabilities_without_keyword_matching() 
         executor.registry(),
         "run the test suite as a background process and wait for the process state",
     );
-    assert_eq!(explicit.len(), 7);
+    assert_eq!(explicit.len(), 8);
 
     let server = provider_tools_for_turn(
         &all_tools,
@@ -6636,7 +6694,7 @@ fn coding_tool_surface_retains_declared_capabilities_without_keyword_matching() 
         executor.registry(),
         "start a long-running server and wait for the process state",
     );
-    assert_eq!(server.len(), 7);
+    assert_eq!(server.len(), 8);
 
     let read_only = provider_tools_for_turn(
         &all_tools,
@@ -6648,7 +6706,7 @@ fn coding_tool_surface_retains_declared_capabilities_without_keyword_matching() 
         executor.registry(),
         "inspect the workspace without changing it",
     );
-    assert_eq!(read_only.len(), 2);
+    assert_eq!(read_only.len(), 3);
     assert_eq!(read_only[0].tool_name, "read_file");
 }
 
@@ -6671,7 +6729,7 @@ fn stable_tool_surface_expands_once_and_does_not_shrink_with_objective_text() {
         executor.registry(),
         "update the ledger files",
     );
-    assert_eq!(initial.len(), 7);
+    assert_eq!(initial.len(), 8);
 
     let expanded_candidate = provider_tools_for_turn(
         &all_tools,
@@ -6688,7 +6746,7 @@ fn stable_tool_surface_expands_once_and_does_not_shrink_with_objective_text() {
         executor.registry(),
         true,
     );
-    assert_eq!(expanded.len(), 7);
+    assert_eq!(expanded.len(), 8);
     let expanded_digest = provider_tool_snapshot(&expanded).2;
 
     let narrowed_candidate = provider_tools_for_turn(
@@ -6706,7 +6764,7 @@ fn stable_tool_surface_expands_once_and_does_not_shrink_with_objective_text() {
         executor.registry(),
         true,
     );
-    assert_eq!(retained.len(), 7);
+    assert_eq!(retained.len(), 8);
     assert_eq!(provider_tool_snapshot(&retained).2, expanded_digest);
 
     let forbidden = TaskContract {
@@ -7388,7 +7446,7 @@ async fn steering_turn_is_injected_after_the_complete_tool_batch() {
             TaskContract {
                 required_paths: vec!["README.md".to_owned()],
                 verification: golutra_agent_core::VerificationRequirement::Required,
-                max_correction_rounds: 0,
+                max_correction_rounds: Some(0),
                 ..TaskContract::default()
             },
             control,
@@ -8110,7 +8168,7 @@ async fn queued_turn_resets_deferred_external_verification() {
     let queued_contract = TaskContract {
         workspace_change: WorkspaceChangeRequirement::Required,
         require_objective_validation: true,
-        max_correction_rounds: 1,
+        max_correction_rounds: Some(1),
         ..TaskContract::default()
     };
     handle
@@ -8185,7 +8243,7 @@ async fn explicit_read_contract_requires_objective_evidence() {
             TaskContract {
                 require_objective_validation: true,
                 verification: golutra_agent_core::VerificationRequirement::Required,
-                max_correction_rounds: 0,
+                max_correction_rounds: Some(0),
                 ..TaskContract::default()
             },
             control,

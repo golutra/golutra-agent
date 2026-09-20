@@ -1,0 +1,2602 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-19",
+  "local_validation": {
+    "workspace_all_targets": {"passed": 1939, "failed": 0, "ignored": 4},
+    "python_comparison_tests": {"passed": 66, "failed": 0},
+    "provider_golden_tests_in_workspace_total": 35,
+    "pty_tests_in_workspace_total": 27,
+    "clippy_workspace_all_targets_deny_warnings": "passed",
+    "format_and_diff_checks": "passed",
+    "other_platform_runtime_acceptance": "not_run"
+  },
+  "platform": "macOS arm64",
+  "scope": "Four sequential coding stages with process resume; not multi-hour autonomous or cross-platform acceptance",
+  "comparison_limits": [
+    "One four-stage sample per build; no stable P95 or general superiority claim",
+    "Intermediate failures and manual interruptions retained",
+    "Experiments and local builds sometimes overlapped; gateway/cache/load were not controlled",
+    "Codex executable 0.154.0 and inspected source fc269b66 are different provenance",
+    "Codex conventional Responses override used where noted; unavailable request counts remain null",
+    "Prompt shortening was tested then reverted; no default prompt change shipped"
+  ],
+  "experiments": [
+    {
+      "variant": "release-baseline",
+      "note": "Release baseline; original prompt, before this plan",
+      "source_report": "golutra-capability-release-baseline-20260919.json",
+      "source_report_sha256": "06025e8e9c402c04cf0216532d762207bc714391c02d9c647ab5fb85454d1edc",
+      "started_at": "2026-09-19T13:45:01.881754Z",
+      "finished_at": "2026-09-19T13:56:00.418013Z",
+      "model": "gpt-5.6-sol",
+      "reasoning_effort": "medium",
+      "protocol": "openai-responses",
+      "base_url": "https://api.golutra.cn",
+      "fixture_sha256": "99be54e3f414a59ba885ffbfeda525e351cd4f7405cbdc2fedec9e992f1657c3",
+      "golutra_binary_sha256": "b579d0443f2ae684d9c7f3a5059361e19eae2f38927f4a8eec1e3b380a1a977b",
+      "versions": {
+        "golutra": "golutra-agent 0.3.1",
+        "codex": "codex-cli 0.155.1"
+      },
+      "codex_conventional_responses_override": true,
+      "summary": {
+        "golutra": {
+          "elapsed_total_ms": 330244.1,
+          "prompt_tokens": 749794,
+          "uncached_input_tokens": 46521,
+          "cache_read_tokens": 703273,
+          "output_tokens": 20855,
+          "provider_total_tokens": 770649,
+          "request_count": 31,
+          "tool_call_count": 53,
+          "model_tool_call_count": 53,
+          "cache_hit_ratio": 0.938,
+          "workspace_verifier_passed": 4,
+          "runtime_terminal_successes": 4,
+          "strict_passed": 4,
+          "stages_total": 4,
+          "process_return_codes": {
+            "0": 4
+          },
+          "repair_attempts": 0,
+          "first_observable_p50_ms": 5451.7,
+          "provider_ttft_p50_ms": 5196.9,
+          "usage_complete_stages": 4,
+          "cache_prefix_relations": {
+            "cold_start": 1,
+            "append_only": 30
+          }
+        },
+        "codex": {
+          "elapsed_total_ms": 324339.6,
+          "prompt_tokens": 1007044,
+          "uncached_input_tokens": 53340,
+          "cache_read_tokens": 953704,
+          "output_tokens": 21899,
+          "provider_total_tokens": 1028943,
+          "request_count": null,
+          "tool_call_count": 22,
+          "model_tool_call_count": 22,
+          "cache_hit_ratio": 0.947,
+          "workspace_verifier_passed": 4,
+          "runtime_terminal_successes": 4,
+          "strict_passed": 4,
+          "stages_total": 4,
+          "process_return_codes": {
+            "0": 4
+          },
+          "repair_attempts": 0,
+          "first_observable_p50_ms": 5693.7,
+          "provider_ttft_p50_ms": null,
+          "usage_complete_stages": 4,
+          "cache_prefix_relations": null
+        }
+      },
+      "stages": [
+        {
+          "stage": 1,
+          "order": [
+            "golutra",
+            "codex"
+          ],
+          "golutra": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "d78dd99ade171c19944874a958f661c224061f97d61c0b7dc4464ebe48305749",
+              "bytes": 1262,
+              "characters": 1262,
+              "tokens_estimated": 316
+            },
+            "metrics": {
+              "elapsed_ms": 96273.6,
+              "prompt_tokens": 63713,
+              "uncached_input_tokens": 11484,
+              "cache_read_tokens": 52229,
+              "output_tokens": 7535,
+              "provider_total_tokens": 71248,
+              "request_count": 9,
+              "tool_call_count": 19,
+              "model_tool_call_count": 19,
+              "task_terminal_arrival_ms": 95804.97633400955,
+              "process_elapsed_ms": 96273.56070899987,
+              "post_terminal_ms": 468.58437499031425
+            },
+            "independent_checks": [
+              "stage_1"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          },
+          "codex": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "d78dd99ade171c19944874a958f661c224061f97d61c0b7dc4464ebe48305749",
+              "bytes": 1262,
+              "characters": 1262,
+              "tokens_estimated": 316
+            },
+            "metrics": {
+              "elapsed_ms": 133767.8,
+              "prompt_tokens": 165600,
+              "uncached_input_tokens": 22520,
+              "cache_read_tokens": 143080,
+              "output_tokens": 10686,
+              "provider_total_tokens": 176286,
+              "request_count": null,
+              "tool_call_count": 7,
+              "model_tool_call_count": 7,
+              "task_terminal_arrival_ms": 133400.2774170076,
+              "process_elapsed_ms": 133767.83158400212,
+              "post_terminal_ms": 367.55416699452326
+            },
+            "independent_checks": [
+              "stage_1"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          }
+        },
+        {
+          "stage": 2,
+          "order": [
+            "codex",
+            "golutra"
+          ],
+          "golutra": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "4506514f846ca03a1191722cf9794ca1abe0958a5e522a4e19c147a8c23d38ed",
+              "bytes": 943,
+              "characters": 943,
+              "tokens_estimated": 236
+            },
+            "metrics": {
+              "elapsed_ms": 89591.3,
+              "prompt_tokens": 131110,
+              "uncached_input_tokens": 10035,
+              "cache_read_tokens": 121075,
+              "output_tokens": 6633,
+              "provider_total_tokens": 137743,
+              "request_count": 8,
+              "tool_call_count": 12,
+              "model_tool_call_count": 12,
+              "task_terminal_arrival_ms": 88929.77358300413,
+              "process_elapsed_ms": 89591.32737500477,
+              "post_terminal_ms": 661.5537920006318
+            },
+            "independent_checks": [
+              "stage_2"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          },
+          "codex": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "4506514f846ca03a1191722cf9794ca1abe0958a5e522a4e19c147a8c23d38ed",
+              "bytes": 943,
+              "characters": 943,
+              "tokens_estimated": 236
+            },
+            "metrics": {
+              "elapsed_ms": 58906.5,
+              "prompt_tokens": 104562,
+              "uncached_input_tokens": 6857,
+              "cache_read_tokens": 97705,
+              "output_tokens": 4548,
+              "provider_total_tokens": 109110,
+              "request_count": null,
+              "tool_call_count": 3,
+              "model_tool_call_count": 3,
+              "task_terminal_arrival_ms": 57913.18304100423,
+              "process_elapsed_ms": 58906.5136660065,
+              "post_terminal_ms": 993.3306250022724
+            },
+            "independent_checks": [
+              "stage_2"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          }
+        },
+        {
+          "stage": 3,
+          "order": [
+            "golutra",
+            "codex"
+          ],
+          "golutra": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "873eb70f2daa2a14ad4a49644cee3ea426e88c8108faff8b789fd5176ce07eb6",
+              "bytes": 56706,
+              "characters": 56706,
+              "tokens_estimated": 14177
+            },
+            "metrics": {
+              "elapsed_ms": 72564.1,
+              "prompt_tokens": 219217,
+              "uncached_input_tokens": 19809,
+              "cache_read_tokens": 199408,
+              "output_tokens": 4323,
+              "provider_total_tokens": 223540,
+              "request_count": 6,
+              "tool_call_count": 11,
+              "model_tool_call_count": 11,
+              "task_terminal_arrival_ms": 71663.47650000534,
+              "process_elapsed_ms": 72564.08974999795,
+              "post_terminal_ms": 900.6132499926025
+            },
+            "independent_checks": [
+              "stage_3"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          },
+          "codex": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "873eb70f2daa2a14ad4a49644cee3ea426e88c8108faff8b789fd5176ce07eb6",
+              "bytes": 56706,
+              "characters": 56706,
+              "tokens_estimated": 14177
+            },
+            "metrics": {
+              "elapsed_ms": 74177.3,
+              "prompt_tokens": 322795,
+              "uncached_input_tokens": 19853,
+              "cache_read_tokens": 302942,
+              "output_tokens": 4582,
+              "provider_total_tokens": 327377,
+              "request_count": null,
+              "tool_call_count": 6,
+              "model_tool_call_count": 6,
+              "task_terminal_arrival_ms": 73814.21779099037,
+              "process_elapsed_ms": 74177.34104099509,
+              "post_terminal_ms": 363.123250004719
+            },
+            "independent_checks": [
+              "stage_3"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          }
+        },
+        {
+          "stage": 4,
+          "order": [
+            "codex",
+            "golutra"
+          ],
+          "golutra": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "7a3a2ee52d7491d0c7a14a277fe9e1414675723fa22a9d260fe3cc86ebf52731",
+              "bytes": 911,
+              "characters": 911,
+              "tokens_estimated": 228
+            },
+            "metrics": {
+              "elapsed_ms": 71815.1,
+              "prompt_tokens": 335754,
+              "uncached_input_tokens": 5193,
+              "cache_read_tokens": 330561,
+              "output_tokens": 2364,
+              "provider_total_tokens": 338118,
+              "request_count": 8,
+              "tool_call_count": 11,
+              "model_tool_call_count": 11,
+              "task_terminal_arrival_ms": 69300.73766699934,
+              "process_elapsed_ms": 71815.14229199092,
+              "post_terminal_ms": 2514.4046249915846
+            },
+            "independent_checks": [
+              "stage_4"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          },
+          "codex": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "7a3a2ee52d7491d0c7a14a277fe9e1414675723fa22a9d260fe3cc86ebf52731",
+              "bytes": 911,
+              "characters": 911,
+              "tokens_estimated": 228
+            },
+            "metrics": {
+              "elapsed_ms": 57488,
+              "prompt_tokens": 414087,
+              "uncached_input_tokens": 4110,
+              "cache_read_tokens": 409977,
+              "output_tokens": 2083,
+              "provider_total_tokens": 416170,
+              "request_count": null,
+              "tool_call_count": 6,
+              "model_tool_call_count": 6,
+              "task_terminal_arrival_ms": 56582.71716600575,
+              "process_elapsed_ms": 57487.97116600326,
+              "post_terminal_ms": 905.2539999975124
+            },
+            "independent_checks": [
+              "stage_4"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          }
+        }
+      ],
+      "golutra_durable_tool_observations": {
+        "scope": "all recorded events, including interrupted or unfinished stages",
+        "internal_completed_reports": 53,
+        "admission_rejections": 4,
+        "errors": [
+          {
+            "tool": "shell",
+            "status": "error",
+            "rejected_before_execution": true,
+            "summary": "tool request is invalid",
+            "error": "tool arguments are invalid: tool `shell` arguments do not match its contract: command: <redacted-value> is shorter than 1 character"
+          },
+          {
+            "tool": "read_file",
+            "status": "error",
+            "rejected_before_execution": false,
+            "summary": "tool execution failed",
+            "error": "tool execution failed: path policy rejected tool execution: path resolution failed: path canonicalization failed: /private/var/folders/fv/2smpjc6d2fl4d73rdtdy12q00000gn/T/golutra-continuous-work-_h7n0nvp/golutra/workspace/tests/test_jobledger.py"
+          },
+          {
+            "tool": "shell",
+            "status": "error",
+            "rejected_before_execution": true,
+            "summary": "tool request is invalid",
+            "error": "tool arguments are invalid: tool `shell` arguments do not match its contract: yield_time_ms: <redacted-value> is greater than the maximum of 30000"
+          },
+          {
+            "tool": "shell",
+            "status": "error",
+            "rejected_before_execution": true,
+            "summary": "tool request is invalid",
+            "error": "tool arguments are invalid: tool `shell` arguments do not match its contract: yield_time_ms: <redacted-value> is greater than the maximum of 30000"
+          },
+          {
+            "tool": "shell",
+            "status": "error",
+            "rejected_before_execution": true,
+            "summary": "tool request is invalid",
+            "error": "tool arguments are invalid: shell command and argv describe different commands"
+          }
+        ]
+      }
+    },
+    {
+      "variant": "tools",
+      "note": "Initial tool contract trial; neutral wait placeholders still rejected",
+      "source_report": "golutra-capability-tools-20260919.json",
+      "source_report_sha256": "a1b13e481f8f3d4dac434e6b6233903a2c067797ed7f49519805d37ff759de0c",
+      "started_at": "2026-09-19T13:54:29.752332Z",
+      "finished_at": "2026-09-19T13:59:37.125560Z",
+      "model": "gpt-5.6-sol",
+      "reasoning_effort": "medium",
+      "protocol": "openai-responses",
+      "base_url": "https://api.golutra.cn",
+      "fixture_sha256": "99be54e3f414a59ba885ffbfeda525e351cd4f7405cbdc2fedec9e992f1657c3",
+      "golutra_binary_sha256": "c9052a2362e5b64832841d09b004c3c0067691271731c384fc8ccd2cdcb098db",
+      "versions": {
+        "golutra": "golutra-agent 0.3.1",
+        "codex": "codex-cli 0.155.1"
+      },
+      "codex_conventional_responses_override": false,
+      "summary": {
+        "golutra": {
+          "elapsed_total_ms": 305909,
+          "prompt_tokens": 599437,
+          "uncached_input_tokens": 47291,
+          "cache_read_tokens": 552146,
+          "output_tokens": 19179,
+          "provider_total_tokens": 618616,
+          "request_count": 25,
+          "tool_call_count": 49,
+          "model_tool_call_count": 49,
+          "cache_hit_ratio": 0.9211,
+          "workspace_verifier_passed": 4,
+          "runtime_terminal_successes": 3,
+          "strict_passed": 3,
+          "stages_total": 4,
+          "process_return_codes": {
+            "0": 3,
+            "1": 1
+          },
+          "repair_attempts": 0,
+          "first_observable_p50_ms": 4219.9,
+          "provider_ttft_p50_ms": 4118.2,
+          "usage_complete_stages": 4,
+          "cache_prefix_relations": {
+            "cold_start": 1,
+            "append_only": 24
+          }
+        }
+      },
+      "stages": [
+        {
+          "stage": 1,
+          "order": [
+            "golutra"
+          ],
+          "golutra": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "d78dd99ade171c19944874a958f661c224061f97d61c0b7dc4464ebe48305749",
+              "bytes": 1262,
+              "characters": 1262,
+              "tokens_estimated": 316
+            },
+            "metrics": {
+              "elapsed_ms": 107647.6,
+              "prompt_tokens": 57609,
+              "uncached_input_tokens": 12371,
+              "cache_read_tokens": 45238,
+              "output_tokens": 7674,
+              "provider_total_tokens": 65283,
+              "request_count": 8,
+              "tool_call_count": 19,
+              "model_tool_call_count": 19,
+              "task_terminal_arrival_ms": 107127.76087499515,
+              "process_elapsed_ms": 107647.58866700868,
+              "post_terminal_ms": 519.8277920135297
+            },
+            "independent_checks": [
+              "stage_1"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          }
+        },
+        {
+          "stage": 2,
+          "order": [
+            "golutra"
+          ],
+          "golutra": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "4506514f846ca03a1191722cf9794ca1abe0958a5e522a4e19c147a8c23d38ed",
+              "bytes": 943,
+              "characters": 943,
+              "tokens_estimated": 236
+            },
+            "metrics": {
+              "elapsed_ms": 66368.5,
+              "prompt_tokens": 80181,
+              "uncached_input_tokens": 8713,
+              "cache_read_tokens": 71468,
+              "output_tokens": 4532,
+              "provider_total_tokens": 84713,
+              "request_count": 5,
+              "tool_call_count": 12,
+              "model_tool_call_count": 12,
+              "task_terminal_arrival_ms": 65520.490334005444,
+              "process_elapsed_ms": 66368.52729199745,
+              "post_terminal_ms": 848.036957992008
+            },
+            "independent_checks": [
+              "stage_2"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          }
+        },
+        {
+          "stage": 3,
+          "order": [
+            "golutra"
+          ],
+          "golutra": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "873eb70f2daa2a14ad4a49644cee3ea426e88c8108faff8b789fd5176ce07eb6",
+              "bytes": 56706,
+              "characters": 56706,
+              "tokens_estimated": 14177
+            },
+            "metrics": {
+              "elapsed_ms": 84207.9,
+              "prompt_tokens": 253736,
+              "uncached_input_tokens": 22986,
+              "cache_read_tokens": 230750,
+              "output_tokens": 5771,
+              "provider_total_tokens": 259507,
+              "request_count": 7,
+              "tool_call_count": 13,
+              "model_tool_call_count": 13,
+              "task_terminal_arrival_ms": 83402.0155830076,
+              "process_elapsed_ms": 84207.89625000907,
+              "post_terminal_ms": 805.8806670014746
+            },
+            "independent_checks": [
+              "stage_3"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          }
+        },
+        {
+          "stage": 4,
+          "order": [
+            "golutra"
+          ],
+          "golutra": {
+            "strict_passed": false,
+            "runtime_terminal_success": false,
+            "workspace_verifier_pass": true,
+            "process_return_code": 1,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "7a3a2ee52d7491d0c7a14a277fe9e1414675723fa22a9d260fe3cc86ebf52731",
+              "bytes": 911,
+              "characters": 911,
+              "tokens_estimated": 228
+            },
+            "metrics": {
+              "elapsed_ms": 47685,
+              "prompt_tokens": 207911,
+              "uncached_input_tokens": 3221,
+              "cache_read_tokens": 204690,
+              "output_tokens": 1202,
+              "provider_total_tokens": 209113,
+              "request_count": 5,
+              "tool_call_count": 5,
+              "model_tool_call_count": 5,
+              "task_terminal_arrival_ms": 46761.096084010205,
+              "process_elapsed_ms": 47685.02879200969,
+              "post_terminal_ms": 923.9327079994837
+            },
+            "independent_checks": [
+              "stage_4"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          }
+        }
+      ],
+      "golutra_durable_tool_observations": {
+        "scope": "all recorded events, including interrupted or unfinished stages",
+        "internal_completed_reports": 49,
+        "admission_rejections": 3,
+        "errors": [
+          {
+            "tool": "shell",
+            "status": "error",
+            "rejected_before_execution": false,
+            "summary": "process exited with an error",
+            "error": null
+          },
+          {
+            "tool": "apply_patch",
+            "status": "error",
+            "rejected_before_execution": true,
+            "summary": "tool request is invalid",
+            "error": "tool arguments are invalid: patch names the file more than once: jobledger/checkpoint.py"
+          },
+          {
+            "tool": "shell_session",
+            "status": "error",
+            "rejected_before_execution": true,
+            "summary": "tool request is invalid",
+            "error": "tool arguments are invalid: input does not apply to shell_session wait; omit it"
+          },
+          {
+            "tool": "shell_session",
+            "status": "error",
+            "rejected_before_execution": true,
+            "summary": "tool request is invalid",
+            "error": "tool arguments are invalid: input does not apply to shell_session wait; omit it"
+          }
+        ]
+      }
+    },
+    {
+      "variant": "prompt",
+      "note": "Initial short-prompt trial on same initial tool contract",
+      "source_report": "golutra-capability-prompt-20260919.json",
+      "source_report_sha256": "fbf3fb58665b74950fdab37dc33569b9a141bc648b1fe9a2cbfacd6c342fc887",
+      "started_at": "2026-09-19T13:57:17.861831Z",
+      "finished_at": "2026-09-19T14:02:37.353099Z",
+      "model": "gpt-5.6-sol",
+      "reasoning_effort": "medium",
+      "protocol": "openai-responses",
+      "base_url": "https://api.golutra.cn",
+      "fixture_sha256": "99be54e3f414a59ba885ffbfeda525e351cd4f7405cbdc2fedec9e992f1657c3",
+      "golutra_binary_sha256": "4f93b9e4edade3f78051ea76551b8ce2cddb72033636e84d46ad155aaad5fbc9",
+      "versions": {
+        "golutra": "golutra-agent 0.3.1",
+        "codex": "codex-cli 0.155.1"
+      },
+      "codex_conventional_responses_override": false,
+      "summary": {
+        "golutra": {
+          "elapsed_total_ms": 317774.2,
+          "prompt_tokens": 716312,
+          "uncached_input_tokens": 49557,
+          "cache_read_tokens": 666755,
+          "output_tokens": 18911,
+          "provider_total_tokens": 735223,
+          "request_count": 26,
+          "tool_call_count": 51,
+          "model_tool_call_count": 51,
+          "cache_hit_ratio": 0.9308,
+          "workspace_verifier_passed": 4,
+          "runtime_terminal_successes": 3,
+          "strict_passed": 3,
+          "stages_total": 4,
+          "process_return_codes": {
+            "0": 3,
+            "1": 1
+          },
+          "repair_attempts": 0,
+          "first_observable_p50_ms": 5109.4,
+          "provider_ttft_p50_ms": 4962.8,
+          "usage_complete_stages": 4,
+          "cache_prefix_relations": {
+            "cold_start": 1,
+            "append_only": 25
+          }
+        }
+      },
+      "stages": [
+        {
+          "stage": 1,
+          "order": [
+            "golutra"
+          ],
+          "golutra": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "d78dd99ade171c19944874a958f661c224061f97d61c0b7dc4464ebe48305749",
+              "bytes": 1262,
+              "characters": 1262,
+              "tokens_estimated": 316
+            },
+            "metrics": {
+              "elapsed_ms": 125131.7,
+              "prompt_tokens": 56787,
+              "uncached_input_tokens": 13274,
+              "cache_read_tokens": 43513,
+              "output_tokens": 8205,
+              "provider_total_tokens": 64992,
+              "request_count": 7,
+              "tool_call_count": 18,
+              "model_tool_call_count": 18,
+              "task_terminal_arrival_ms": 124701.5926669992,
+              "process_elapsed_ms": 125131.71816700196,
+              "post_terminal_ms": 430.1255000027595
+            },
+            "independent_checks": [
+              "stage_1"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          }
+        },
+        {
+          "stage": 2,
+          "order": [
+            "golutra"
+          ],
+          "golutra": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "4506514f846ca03a1191722cf9794ca1abe0958a5e522a4e19c147a8c23d38ed",
+              "bytes": 943,
+              "characters": 943,
+              "tokens_estimated": 236
+            },
+            "metrics": {
+              "elapsed_ms": 70007.6,
+              "prompt_tokens": 87725,
+              "uncached_input_tokens": 9623,
+              "cache_read_tokens": 78102,
+              "output_tokens": 4609,
+              "provider_total_tokens": 92334,
+              "request_count": 5,
+              "tool_call_count": 11,
+              "model_tool_call_count": 11,
+              "task_terminal_arrival_ms": 69416.5808329999,
+              "process_elapsed_ms": 70007.55720799498,
+              "post_terminal_ms": 590.9763749950798
+            },
+            "independent_checks": [
+              "stage_2"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          }
+        },
+        {
+          "stage": 3,
+          "order": [
+            "golutra"
+          ],
+          "golutra": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "873eb70f2daa2a14ad4a49644cee3ea426e88c8108faff8b789fd5176ce07eb6",
+              "bytes": 56706,
+              "characters": 56706,
+              "tokens_estimated": 14177
+            },
+            "metrics": {
+              "elapsed_ms": 79781.3,
+              "prompt_tokens": 308891,
+              "uncached_input_tokens": 22869,
+              "cache_read_tokens": 286022,
+              "output_tokens": 4763,
+              "provider_total_tokens": 313654,
+              "request_count": 8,
+              "tool_call_count": 14,
+              "model_tool_call_count": 14,
+              "task_terminal_arrival_ms": 78904.78583300137,
+              "process_elapsed_ms": 79781.33716699085,
+              "post_terminal_ms": 876.5513339894824
+            },
+            "independent_checks": [
+              "stage_3"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          }
+        },
+        {
+          "stage": 4,
+          "order": [
+            "golutra"
+          ],
+          "golutra": {
+            "strict_passed": false,
+            "runtime_terminal_success": false,
+            "workspace_verifier_pass": true,
+            "process_return_code": 1,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "7a3a2ee52d7491d0c7a14a277fe9e1414675723fa22a9d260fe3cc86ebf52731",
+              "bytes": 911,
+              "characters": 911,
+              "tokens_estimated": 228
+            },
+            "metrics": {
+              "elapsed_ms": 42853.6,
+              "prompt_tokens": 262909,
+              "uncached_input_tokens": 3791,
+              "cache_read_tokens": 259118,
+              "output_tokens": 1334,
+              "provider_total_tokens": 264243,
+              "request_count": 6,
+              "tool_call_count": 8,
+              "model_tool_call_count": 8,
+              "task_terminal_arrival_ms": 41849.0946660022,
+              "process_elapsed_ms": 42853.56895800214,
+              "post_terminal_ms": 1004.4742919999408
+            },
+            "independent_checks": [
+              "stage_4"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          }
+        }
+      ],
+      "golutra_durable_tool_observations": {
+        "scope": "all recorded events, including interrupted or unfinished stages",
+        "internal_completed_reports": 51,
+        "admission_rejections": 3,
+        "errors": [
+          {
+            "tool": "shell",
+            "status": "error",
+            "rejected_before_execution": false,
+            "summary": "process exited with an error",
+            "error": null
+          },
+          {
+            "tool": "shell",
+            "status": "error",
+            "rejected_before_execution": false,
+            "summary": "process exited with an error",
+            "error": null
+          },
+          {
+            "tool": "shell_session",
+            "status": "error",
+            "rejected_before_execution": true,
+            "summary": "tool request is invalid",
+            "error": "tool arguments are invalid: input does not apply to shell_session read; omit it"
+          },
+          {
+            "tool": "shell_session",
+            "status": "error",
+            "rejected_before_execution": true,
+            "summary": "tool request is invalid",
+            "error": "tool arguments are invalid: input does not apply to shell_session wait; omit it"
+          },
+          {
+            "tool": "shell_session",
+            "status": "error",
+            "rejected_before_execution": true,
+            "summary": "tool request is invalid",
+            "error": "tool arguments are invalid: input does not apply to shell_session wait; omit it"
+          }
+        ]
+      }
+    },
+    {
+      "variant": "final",
+      "note": "Obsolete freshness implementation; stage 1 failed, stage 2 manually interrupted, stage 3 runner stopped",
+      "source_report": "golutra-capability-final-20260919.json",
+      "source_report_sha256": "65b84260cd2a58c07c332a9f9ec3c46a902a71d8ecd080b5645b720f2176a615",
+      "started_at": "2026-09-19T14:15:53.027054Z",
+      "finished_at": "2026-09-19T14:34:24.295928Z",
+      "model": "gpt-5.6-sol",
+      "reasoning_effort": "medium",
+      "protocol": "openai-responses",
+      "base_url": "https://api.golutra.cn",
+      "fixture_sha256": "99be54e3f414a59ba885ffbfeda525e351cd4f7405cbdc2fedec9e992f1657c3",
+      "golutra_binary_sha256": "57e2c9dfbbe3c6f6d9da26e7a0422c85d4fa3dca544d4bb3f73ce67ff7c9597a",
+      "versions": {
+        "golutra": "golutra-agent 0.3.1",
+        "codex": "codex-cli 0.155.1"
+      },
+      "engines": [
+        "golutra",
+        "codex"
+      ],
+      "codex_conventional_responses_override": true,
+      "summary": {
+        "golutra": {
+          "elapsed_total_ms": 907448.6,
+          "prompt_tokens": null,
+          "uncached_input_tokens": null,
+          "cache_read_tokens": null,
+          "output_tokens": null,
+          "provider_total_tokens": null,
+          "request_count": 71,
+          "tool_call_count": 80,
+          "model_tool_call_count": 80,
+          "cache_hit_ratio": null,
+          "workspace_verifier_passed": 2,
+          "runtime_terminal_successes": 0,
+          "strict_passed": 0,
+          "stages_total": 2,
+          "process_return_codes": {
+            "1": 2
+          },
+          "repair_attempts": 0,
+          "task_terminal_arrival_ms": 905322.3657499911,
+          "process_elapsed_ms": 907448.5626670066,
+          "post_terminal_ms": 2126.196917015477,
+          "terminal_export_ms": 1310,
+          "first_observable_p50_ms": 4150.5,
+          "provider_ttft_p50_ms": 4030.5,
+          "usage_complete_stages": 0,
+          "cache_prefix_relations": {
+            "cold_start": 1,
+            "append_only": 70
+          }
+        },
+        "codex": {
+          "elapsed_total_ms": 188231.7,
+          "prompt_tokens": 291813,
+          "uncached_input_tokens": 27556,
+          "cache_read_tokens": 264257,
+          "output_tokens": 14194,
+          "provider_total_tokens": 306007,
+          "request_count": null,
+          "tool_call_count": 12,
+          "model_tool_call_count": 12,
+          "cache_hit_ratio": 0.9056,
+          "workspace_verifier_passed": 2,
+          "runtime_terminal_successes": 2,
+          "strict_passed": 2,
+          "stages_total": 2,
+          "process_return_codes": {
+            "0": 2
+          },
+          "repair_attempts": 0,
+          "task_terminal_arrival_ms": 187657.15199999977,
+          "process_elapsed_ms": 188231.73987500195,
+          "post_terminal_ms": 574.5878750021802,
+          "terminal_export_ms": null,
+          "first_observable_p50_ms": 4296.8,
+          "provider_ttft_p50_ms": null,
+          "usage_complete_stages": 2,
+          "cache_prefix_relations": null
+        }
+      },
+      "stages": [
+        {
+          "stage": 1,
+          "order": [
+            "golutra",
+            "codex"
+          ],
+          "golutra": {
+            "strict_passed": false,
+            "runtime_terminal_success": false,
+            "workspace_verifier_pass": true,
+            "process_return_code": 1,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "d78dd99ade171c19944874a958f661c224061f97d61c0b7dc4464ebe48305749",
+              "bytes": 1262,
+              "characters": 1262,
+              "tokens_estimated": 316
+            },
+            "metrics": {
+              "elapsed_ms": 595992.7,
+              "prompt_tokens": null,
+              "uncached_input_tokens": null,
+              "cache_read_tokens": null,
+              "output_tokens": null,
+              "provider_total_tokens": null,
+              "request_count": 46,
+              "tool_call_count": 56,
+              "model_tool_call_count": 56,
+              "task_terminal_arrival_ms": 595128.8845829986,
+              "process_elapsed_ms": 595992.7044170036,
+              "post_terminal_ms": 863.8198340049712,
+              "terminal_export_ms": 481,
+              "terminal_export_mode": "delivery"
+            },
+            "independent_checks": [
+              "stage_1"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          },
+          "codex": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "d78dd99ade171c19944874a958f661c224061f97d61c0b7dc4464ebe48305749",
+              "bytes": 1262,
+              "characters": 1262,
+              "tokens_estimated": 316
+            },
+            "metrics": {
+              "elapsed_ms": 121161.5,
+              "prompt_tokens": 146526,
+              "uncached_input_tokens": 20510,
+              "cache_read_tokens": 126016,
+              "output_tokens": 9730,
+              "provider_total_tokens": 156256,
+              "request_count": null,
+              "tool_call_count": 7,
+              "model_tool_call_count": 7,
+              "task_terminal_arrival_ms": 120871.45070900442,
+              "process_elapsed_ms": 121161.52912500547,
+              "post_terminal_ms": 290.07841600105166,
+              "terminal_export_ms": null,
+              "terminal_export_mode": null
+            },
+            "independent_checks": [
+              "stage_1"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          }
+        },
+        {
+          "stage": 2,
+          "order": [
+            "codex",
+            "golutra"
+          ],
+          "golutra": {
+            "strict_passed": false,
+            "runtime_terminal_success": false,
+            "workspace_verifier_pass": true,
+            "process_return_code": 1,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "4506514f846ca03a1191722cf9794ca1abe0958a5e522a4e19c147a8c23d38ed",
+              "bytes": 943,
+              "characters": 943,
+              "tokens_estimated": 236
+            },
+            "metrics": {
+              "elapsed_ms": 311455.9,
+              "prompt_tokens": null,
+              "uncached_input_tokens": null,
+              "cache_read_tokens": null,
+              "output_tokens": null,
+              "provider_total_tokens": null,
+              "request_count": 25,
+              "tool_call_count": 24,
+              "model_tool_call_count": 24,
+              "task_terminal_arrival_ms": 310193.48116699257,
+              "process_elapsed_ms": 311455.8582500031,
+              "post_terminal_ms": 1262.3770830105059,
+              "terminal_export_ms": 829,
+              "terminal_export_mode": "delivery"
+            },
+            "independent_checks": [
+              "stage_2"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60",
+            "manually_interrupted": true
+          },
+          "codex": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "4506514f846ca03a1191722cf9794ca1abe0958a5e522a4e19c147a8c23d38ed",
+              "bytes": 943,
+              "characters": 943,
+              "tokens_estimated": 236
+            },
+            "metrics": {
+              "elapsed_ms": 67070.2,
+              "prompt_tokens": 145287,
+              "uncached_input_tokens": 7046,
+              "cache_read_tokens": 138241,
+              "output_tokens": 4464,
+              "provider_total_tokens": 149751,
+              "request_count": null,
+              "tool_call_count": 5,
+              "model_tool_call_count": 5,
+              "task_terminal_arrival_ms": 66785.70129099535,
+              "process_elapsed_ms": 67070.21074999648,
+              "post_terminal_ms": 284.50945900112856,
+              "terminal_export_ms": null,
+              "terminal_export_mode": null
+            },
+            "independent_checks": [
+              "stage_2"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60",
+            "manually_interrupted": false
+          }
+        }
+      ],
+      "golutra_durable_tool_observations": {
+        "scope": "all recorded events, including interrupted or unfinished stages",
+        "internal_completed_reports": 80,
+        "admission_rejections": 0,
+        "errors": [
+          {
+            "tool": "shell",
+            "status": "error",
+            "rejected_before_execution": false,
+            "summary": "process exited with an error",
+            "error": null
+          },
+          {
+            "tool": "shell",
+            "status": "error",
+            "rejected_before_execution": false,
+            "summary": "tool execution failed",
+            "error": "tool execution failed: No such file or directory (os error 2)"
+          },
+          {
+            "tool": "shell",
+            "status": "error",
+            "rejected_before_execution": false,
+            "summary": "tool execution failed",
+            "error": "tool execution failed: No such file or directory (os error 2)"
+          },
+          {
+            "tool": "shell",
+            "status": "error",
+            "rejected_before_execution": false,
+            "summary": "tool execution failed",
+            "error": "tool execution failed: No such file or directory (os error 2)"
+          },
+          {
+            "tool": "shell_session",
+            "status": "timeout",
+            "rejected_before_execution": false,
+            "summary": "process timed out",
+            "error": null
+          }
+        ]
+      }
+    },
+    {
+      "variant": "original-prompt",
+      "note": "Obsolete freshness control; stage 1 exceeded 600 s and cleanup signal was rejected; incomplete report",
+      "source_report": "golutra-capability-original-prompt-20260919.json",
+      "source_report_sha256": "53f37013b3c3e5f1fb6564313402f0dbf62020371e89a21f7c35d91c58477abc",
+      "started_at": "2026-09-19T14:19:57.792491Z",
+      "finished_at": "2026-09-19T14:29:58.536765Z",
+      "model": "gpt-5.6-sol",
+      "reasoning_effort": "medium",
+      "protocol": "openai-responses",
+      "base_url": "https://api.golutra.cn",
+      "fixture_sha256": "99be54e3f414a59ba885ffbfeda525e351cd4f7405cbdc2fedec9e992f1657c3",
+      "golutra_binary_sha256": "0c57a79eaab4988e5afd1182cc340bef8bafad1959a9db2bcfe0989ce7035d9f",
+      "versions": {
+        "golutra": "golutra-agent 0.3.1",
+        "codex": "codex-cli 0.155.1"
+      },
+      "engines": [
+        "golutra"
+      ],
+      "codex_conventional_responses_override": false,
+      "summary": {},
+      "stages": [],
+      "golutra_durable_tool_observations": {
+        "scope": "all recorded events, including interrupted or unfinished stages",
+        "internal_completed_reports": 56,
+        "admission_rejections": 1,
+        "errors": [
+          {
+            "tool": "shell",
+            "status": "error",
+            "rejected_before_execution": false,
+            "summary": "process exited with an error",
+            "error": null
+          },
+          {
+            "tool": "shell",
+            "status": "error",
+            "rejected_before_execution": false,
+            "summary": "tool execution failed",
+            "error": "tool execution failed: No such file or directory (os error 2)"
+          },
+          {
+            "tool": "shell",
+            "status": "error",
+            "rejected_before_execution": false,
+            "summary": "tool execution failed",
+            "error": "tool execution failed: No such file or directory (os error 2)"
+          },
+          {
+            "tool": "shell",
+            "status": "error",
+            "rejected_before_execution": false,
+            "summary": "tool execution failed",
+            "error": "tool execution failed: No such file or directory (os error 2)"
+          },
+          {
+            "tool": "shell_session",
+            "status": "error",
+            "rejected_before_execution": true,
+            "summary": "tool request is invalid",
+            "error": "tool arguments are invalid: wait_for_terminal does not apply to shell_session write; omit it"
+          }
+        ]
+      }
+    },
+    {
+      "variant": "verified",
+      "note": "Read-freshness correction with short prompt; stage 4 list cursor rejected",
+      "source_report": "golutra-capability-verified-20260919.json",
+      "source_report_sha256": "e71e12e334798766b0289a32a87d78ac37659ac107c3bdad4d2cddf3170f7b31",
+      "started_at": "2026-09-19T14:28:58.088331Z",
+      "finished_at": "2026-09-19T14:38:50.766807Z",
+      "model": "gpt-5.6-sol",
+      "reasoning_effort": "medium",
+      "protocol": "openai-responses",
+      "base_url": "https://api.golutra.cn",
+      "fixture_sha256": "99be54e3f414a59ba885ffbfeda525e351cd4f7405cbdc2fedec9e992f1657c3",
+      "golutra_binary_sha256": "d45837f676bf150d2521305c20a859d5c4cd24d4351fd8561bec2edd7af9decf",
+      "versions": {
+        "golutra": "golutra-agent 0.3.1",
+        "codex": "codex-cli 0.155.1"
+      },
+      "engines": [
+        "golutra",
+        "codex"
+      ],
+      "codex_conventional_responses_override": true,
+      "summary": {
+        "golutra": {
+          "elapsed_total_ms": 280324.1,
+          "prompt_tokens": 654452,
+          "uncached_input_tokens": 45302,
+          "cache_read_tokens": 609150,
+          "output_tokens": 15494,
+          "provider_total_tokens": 669946,
+          "request_count": 29,
+          "tool_call_count": 51,
+          "model_tool_call_count": 51,
+          "cache_hit_ratio": 0.9308,
+          "workspace_verifier_passed": 4,
+          "runtime_terminal_successes": 3,
+          "strict_passed": 3,
+          "stages_total": 4,
+          "process_return_codes": {
+            "0": 3,
+            "1": 1
+          },
+          "repair_attempts": 0,
+          "task_terminal_arrival_ms": 278876.32562499493,
+          "process_elapsed_ms": 280324.0900009987,
+          "post_terminal_ms": 1447.7643760037608,
+          "terminal_export_ms": 1098,
+          "first_observable_p50_ms": 7200.2,
+          "provider_ttft_p50_ms": 6937,
+          "usage_complete_stages": 4,
+          "cache_prefix_relations": {
+            "cold_start": 1,
+            "append_only": 28
+          }
+        },
+        "codex": {
+          "elapsed_total_ms": 308797.8,
+          "prompt_tokens": 1023184,
+          "uncached_input_tokens": 59948,
+          "cache_read_tokens": 963236,
+          "output_tokens": 20763,
+          "provider_total_tokens": 1043947,
+          "request_count": null,
+          "tool_call_count": 23,
+          "model_tool_call_count": 23,
+          "cache_hit_ratio": 0.9414,
+          "workspace_verifier_passed": 4,
+          "runtime_terminal_successes": 4,
+          "strict_passed": 4,
+          "stages_total": 4,
+          "process_return_codes": {
+            "0": 4
+          },
+          "repair_attempts": 0,
+          "task_terminal_arrival_ms": 307472.7147910162,
+          "process_elapsed_ms": 308797.76895800023,
+          "post_terminal_ms": 1325.0541669840459,
+          "terminal_export_ms": null,
+          "first_observable_p50_ms": 5079,
+          "provider_ttft_p50_ms": null,
+          "usage_complete_stages": 4,
+          "cache_prefix_relations": null
+        }
+      },
+      "stages": [
+        {
+          "stage": 1,
+          "order": [
+            "golutra",
+            "codex"
+          ],
+          "golutra": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "d78dd99ade171c19944874a958f661c224061f97d61c0b7dc4464ebe48305749",
+              "bytes": 1262,
+              "characters": 1262,
+              "tokens_estimated": 316
+            },
+            "metrics": {
+              "elapsed_ms": 97294.5,
+              "prompt_tokens": 53654,
+              "uncached_input_tokens": 10587,
+              "cache_read_tokens": 43067,
+              "output_tokens": 6791,
+              "provider_total_tokens": 60445,
+              "request_count": 8,
+              "tool_call_count": 19,
+              "model_tool_call_count": 19,
+              "task_terminal_arrival_ms": 96799.18987498968,
+              "process_elapsed_ms": 97294.48745799891,
+              "post_terminal_ms": 495.29758300923277,
+              "terminal_export_ms": 353,
+              "terminal_export_mode": "delivery"
+            },
+            "independent_checks": [
+              "stage_1"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          },
+          "codex": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "d78dd99ade171c19944874a958f661c224061f97d61c0b7dc4464ebe48305749",
+              "bytes": 1262,
+              "characters": 1262,
+              "tokens_estimated": 316
+            },
+            "metrics": {
+              "elapsed_ms": 95915.2,
+              "prompt_tokens": 142694,
+              "uncached_input_tokens": 24103,
+              "cache_read_tokens": 118591,
+              "output_tokens": 7298,
+              "provider_total_tokens": 149992,
+              "request_count": null,
+              "tool_call_count": 7,
+              "model_tool_call_count": 7,
+              "task_terminal_arrival_ms": 95456.72975000343,
+              "process_elapsed_ms": 95915.18216699478,
+              "post_terminal_ms": 458.4524169913493,
+              "terminal_export_ms": null,
+              "terminal_export_mode": null
+            },
+            "independent_checks": [
+              "stage_1"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          }
+        },
+        {
+          "stage": 2,
+          "order": [
+            "codex",
+            "golutra"
+          ],
+          "golutra": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "4506514f846ca03a1191722cf9794ca1abe0958a5e522a4e19c147a8c23d38ed",
+              "bytes": 943,
+              "characters": 943,
+              "tokens_estimated": 236
+            },
+            "metrics": {
+              "elapsed_ms": 77293.2,
+              "prompt_tokens": 117333,
+              "uncached_input_tokens": 9111,
+              "cache_read_tokens": 108222,
+              "output_tokens": 4494,
+              "provider_total_tokens": 121827,
+              "request_count": 8,
+              "tool_call_count": 14,
+              "model_tool_call_count": 14,
+              "task_terminal_arrival_ms": 77056.84995799675,
+              "process_elapsed_ms": 77293.16016699886,
+              "post_terminal_ms": 236.31020900211297,
+              "terminal_export_ms": 196,
+              "terminal_export_mode": "delivery"
+            },
+            "independent_checks": [
+              "stage_2"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          },
+          "codex": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "4506514f846ca03a1191722cf9794ca1abe0958a5e522a4e19c147a8c23d38ed",
+              "bytes": 943,
+              "characters": 943,
+              "tokens_estimated": 236
+            },
+            "metrics": {
+              "elapsed_ms": 74015.2,
+              "prompt_tokens": 173121,
+              "uncached_input_tokens": 9999,
+              "cache_read_tokens": 163122,
+              "output_tokens": 5220,
+              "provider_total_tokens": 178341,
+              "request_count": null,
+              "tool_call_count": 6,
+              "model_tool_call_count": 6,
+              "task_terminal_arrival_ms": 73752.49262500438,
+              "process_elapsed_ms": 74015.1648750034,
+              "post_terminal_ms": 262.67224999901373,
+              "terminal_export_ms": null,
+              "terminal_export_mode": null
+            },
+            "independent_checks": [
+              "stage_2"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          }
+        },
+        {
+          "stage": 3,
+          "order": [
+            "golutra",
+            "codex"
+          ],
+          "golutra": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "873eb70f2daa2a14ad4a49644cee3ea426e88c8108faff8b789fd5176ce07eb6",
+              "bytes": 56706,
+              "characters": 56706,
+              "tokens_estimated": 14177
+            },
+            "metrics": {
+              "elapsed_ms": 44155.4,
+              "prompt_tokens": 135642,
+              "uncached_input_tokens": 18364,
+              "cache_read_tokens": 117278,
+              "output_tokens": 2800,
+              "provider_total_tokens": 138442,
+              "request_count": 4,
+              "tool_call_count": 6,
+              "model_tool_call_count": 6,
+              "task_terminal_arrival_ms": 43860.79900000186,
+              "process_elapsed_ms": 44155.443416995695,
+              "post_terminal_ms": 294.64441699383315,
+              "terminal_export_ms": 235,
+              "terminal_export_mode": "delivery"
+            },
+            "independent_checks": [
+              "stage_3"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          },
+          "codex": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "873eb70f2daa2a14ad4a49644cee3ea426e88c8108faff8b789fd5176ce07eb6",
+              "bytes": 56706,
+              "characters": 56706,
+              "tokens_estimated": 14177
+            },
+            "metrics": {
+              "elapsed_ms": 71181,
+              "prompt_tokens": 307484,
+              "uncached_input_tokens": 20365,
+              "cache_read_tokens": 287119,
+              "output_tokens": 5045,
+              "provider_total_tokens": 312529,
+              "request_count": null,
+              "tool_call_count": 5,
+              "model_tool_call_count": 5,
+              "task_terminal_arrival_ms": 70903.5164579982,
+              "process_elapsed_ms": 71180.9732910042,
+              "post_terminal_ms": 277.4568330059992,
+              "terminal_export_ms": null,
+              "terminal_export_mode": null
+            },
+            "independent_checks": [
+              "stage_3"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          }
+        },
+        {
+          "stage": 4,
+          "order": [
+            "codex",
+            "golutra"
+          ],
+          "golutra": {
+            "strict_passed": false,
+            "runtime_terminal_success": false,
+            "workspace_verifier_pass": true,
+            "process_return_code": 1,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "7a3a2ee52d7491d0c7a14a277fe9e1414675723fa22a9d260fe3cc86ebf52731",
+              "bytes": 911,
+              "characters": 911,
+              "tokens_estimated": 228
+            },
+            "metrics": {
+              "elapsed_ms": 61581,
+              "prompt_tokens": 347823,
+              "uncached_input_tokens": 7240,
+              "cache_read_tokens": 340583,
+              "output_tokens": 1409,
+              "provider_total_tokens": 349232,
+              "request_count": 9,
+              "tool_call_count": 12,
+              "model_tool_call_count": 12,
+              "task_terminal_arrival_ms": 61159.486792006646,
+              "process_elapsed_ms": 61580.99895900523,
+              "post_terminal_ms": 421.51216699858196,
+              "terminal_export_ms": 314,
+              "terminal_export_mode": "delivery"
+            },
+            "independent_checks": [
+              "stage_4"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          },
+          "codex": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "7a3a2ee52d7491d0c7a14a277fe9e1414675723fa22a9d260fe3cc86ebf52731",
+              "bytes": 911,
+              "characters": 911,
+              "tokens_estimated": 228
+            },
+            "metrics": {
+              "elapsed_ms": 67686.4,
+              "prompt_tokens": 399885,
+              "uncached_input_tokens": 5481,
+              "cache_read_tokens": 394404,
+              "output_tokens": 3200,
+              "provider_total_tokens": 403085,
+              "request_count": null,
+              "tool_call_count": 5,
+              "model_tool_call_count": 5,
+              "task_terminal_arrival_ms": 67359.97595801018,
+              "process_elapsed_ms": 67686.44862499787,
+              "post_terminal_ms": 326.4726669876836,
+              "terminal_export_ms": null,
+              "terminal_export_mode": null
+            },
+            "independent_checks": [
+              "stage_4"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          }
+        }
+      ],
+      "golutra_durable_tool_observations": {
+        "scope": "all recorded events, including interrupted or unfinished stages",
+        "internal_completed_reports": 51,
+        "admission_rejections": 2,
+        "errors": [
+          {
+            "tool": "shell_session",
+            "status": "error",
+            "rejected_before_execution": true,
+            "summary": "tool request is invalid",
+            "error": "tool arguments are invalid: cursor does not apply to shell_session list; omit it"
+          },
+          {
+            "tool": "shell_session",
+            "status": "error",
+            "rejected_before_execution": true,
+            "summary": "tool request is invalid",
+            "error": "tool arguments are invalid: cursor does not apply to shell_session list; omit it"
+          }
+        ]
+      }
+    },
+    {
+      "variant": "control-verified",
+      "note": "Same core with original prompt; stage 4 stale diagnostic loop manually interrupted",
+      "source_report": "golutra-capability-control-verified-20260919.json",
+      "source_report_sha256": "5280db65e75596fa0c3bd441c394dd88644f4ad2d7bd6b25850f5556c9669123",
+      "started_at": "2026-09-19T14:32:35.967023Z",
+      "finished_at": "2026-09-19T14:43:35.209639Z",
+      "model": "gpt-5.6-sol",
+      "reasoning_effort": "medium",
+      "protocol": "openai-responses",
+      "base_url": "https://api.golutra.cn",
+      "fixture_sha256": "99be54e3f414a59ba885ffbfeda525e351cd4f7405cbdc2fedec9e992f1657c3",
+      "golutra_binary_sha256": "ab82ecd647b298703ab2e069cdd14afbf460b4c7ebb4d5ab68b7fa9d03b64c8e",
+      "versions": {
+        "golutra": "golutra-agent 0.3.1",
+        "codex": "codex-cli 0.155.1"
+      },
+      "engines": [
+        "golutra"
+      ],
+      "codex_conventional_responses_override": false,
+      "summary": {
+        "golutra": {
+          "elapsed_total_ms": 657374.5,
+          "prompt_tokens": null,
+          "uncached_input_tokens": null,
+          "cache_read_tokens": null,
+          "output_tokens": null,
+          "provider_total_tokens": null,
+          "request_count": 54,
+          "tool_call_count": 94,
+          "model_tool_call_count": 94,
+          "cache_hit_ratio": null,
+          "workspace_verifier_passed": 3,
+          "runtime_terminal_successes": 3,
+          "strict_passed": 3,
+          "stages_total": 4,
+          "process_return_codes": {
+            "0": 3,
+            "1": 1
+          },
+          "repair_attempts": 0,
+          "task_terminal_arrival_ms": 654705.8800420054,
+          "process_elapsed_ms": 657374.566960003,
+          "post_terminal_ms": 2668.6869179975474,
+          "terminal_export_ms": 1642,
+          "first_observable_p50_ms": 4566.4,
+          "provider_ttft_p50_ms": 4427.9,
+          "usage_complete_stages": 3,
+          "cache_prefix_relations": {
+            "cold_start": 1,
+            "append_only": 53
+          }
+        }
+      },
+      "stages": [
+        {
+          "stage": 1,
+          "order": [
+            "golutra"
+          ],
+          "golutra": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "d78dd99ade171c19944874a958f661c224061f97d61c0b7dc4464ebe48305749",
+              "bytes": 1262,
+              "characters": 1262,
+              "tokens_estimated": 316
+            },
+            "metrics": {
+              "elapsed_ms": 90881.6,
+              "prompt_tokens": 46370,
+              "uncached_input_tokens": 10323,
+              "cache_read_tokens": 36047,
+              "output_tokens": 6909,
+              "provider_total_tokens": 53279,
+              "request_count": 7,
+              "tool_call_count": 17,
+              "model_tool_call_count": 17,
+              "task_terminal_arrival_ms": 90722.99158299575,
+              "process_elapsed_ms": 90881.64524998865,
+              "post_terminal_ms": 158.65366699290462,
+              "terminal_export_ms": 111,
+              "terminal_export_mode": "delivery"
+            },
+            "independent_checks": [
+              "stage_1"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          }
+        },
+        {
+          "stage": 2,
+          "order": [
+            "golutra"
+          ],
+          "golutra": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "4506514f846ca03a1191722cf9794ca1abe0958a5e522a4e19c147a8c23d38ed",
+              "bytes": 943,
+              "characters": 943,
+              "tokens_estimated": 236
+            },
+            "metrics": {
+              "elapsed_ms": 59669.4,
+              "prompt_tokens": 69986,
+              "uncached_input_tokens": 8022,
+              "cache_read_tokens": 61964,
+              "output_tokens": 4063,
+              "provider_total_tokens": 74049,
+              "request_count": 5,
+              "tool_call_count": 10,
+              "model_tool_call_count": 10,
+              "task_terminal_arrival_ms": 59470.174999994924,
+              "process_elapsed_ms": 59669.40095899918,
+              "post_terminal_ms": 199.22595900425222,
+              "terminal_export_ms": 159,
+              "terminal_export_mode": "delivery"
+            },
+            "independent_checks": [
+              "stage_2"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          }
+        },
+        {
+          "stage": 3,
+          "order": [
+            "golutra"
+          ],
+          "golutra": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "873eb70f2daa2a14ad4a49644cee3ea426e88c8108faff8b789fd5176ce07eb6",
+              "bytes": 56706,
+              "characters": 56706,
+              "tokens_estimated": 14177
+            },
+            "metrics": {
+              "elapsed_ms": 78011.1,
+              "prompt_tokens": 205078,
+              "uncached_input_tokens": 23021,
+              "cache_read_tokens": 182057,
+              "output_tokens": 6318,
+              "provider_total_tokens": 211396,
+              "request_count": 6,
+              "tool_call_count": 13,
+              "model_tool_call_count": 13,
+              "task_terminal_arrival_ms": 77738.70512501162,
+              "process_elapsed_ms": 78011.14366701222,
+              "post_terminal_ms": 272.43854200060014,
+              "terminal_export_ms": 222,
+              "terminal_export_mode": "delivery"
+            },
+            "independent_checks": [
+              "stage_3"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          }
+        },
+        {
+          "stage": 4,
+          "order": [
+            "golutra"
+          ],
+          "golutra": {
+            "strict_passed": false,
+            "runtime_terminal_success": false,
+            "workspace_verifier_pass": false,
+            "process_return_code": 1,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "7a3a2ee52d7491d0c7a14a277fe9e1414675723fa22a9d260fe3cc86ebf52731",
+              "bytes": 911,
+              "characters": 911,
+              "tokens_estimated": 228
+            },
+            "metrics": {
+              "elapsed_ms": 428812.4,
+              "prompt_tokens": null,
+              "uncached_input_tokens": null,
+              "cache_read_tokens": null,
+              "output_tokens": null,
+              "provider_total_tokens": null,
+              "request_count": 36,
+              "tool_call_count": 54,
+              "model_tool_call_count": 54,
+              "task_terminal_arrival_ms": 426774.00833400316,
+              "process_elapsed_ms": 428812.37708400295,
+              "post_terminal_ms": 2038.3687499997905,
+              "terminal_export_ms": 1150,
+              "terminal_export_mode": "delivery"
+            },
+            "independent_checks": [],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60",
+            "manually_interrupted": true
+          }
+        }
+      ],
+      "golutra_durable_tool_observations": {
+        "scope": "all recorded events, including interrupted or unfinished stages",
+        "internal_completed_reports": 94,
+        "admission_rejections": 1,
+        "errors": [
+          {
+            "tool": "shell",
+            "status": "error",
+            "rejected_before_execution": false,
+            "summary": "process exited with an error",
+            "error": null
+          },
+          {
+            "tool": "apply_patch",
+            "status": "error",
+            "rejected_before_execution": true,
+            "summary": "tool request is invalid",
+            "error": "tool arguments are invalid: patch names the file more than once: jobledger/checkpoint.py"
+          },
+          {
+            "tool": "shell",
+            "status": "error",
+            "rejected_before_execution": false,
+            "summary": "process exited with an error",
+            "error": null
+          },
+          {
+            "tool": "apply_patch",
+            "status": "error",
+            "rejected_before_execution": false,
+            "summary": "tool execution failed",
+            "error": "tool arguments are invalid: patch does not change file: .long-bench/checkpoint.json"
+          }
+        ]
+      }
+    },
+    {
+      "variant": "complete",
+      "note": "Short prompt with expanded soft hints and diagnostic correction; implicit login shell changed Python version; stage 1 manually interrupted at 546683.6 ms, paired Codex run stopped",
+      "source_report": "golutra-capability-complete-20260919.json",
+      "source_report_sha256": "ecda6c0a6690b7ccb2ae72d2b0f7d004f58b28cf95d42feb1d0a3567285f2bb4",
+      "started_at": "2026-09-19T14:44:35.120717Z",
+      "finished_at": "2026-09-19T14:54:17.364717Z",
+      "model": "gpt-5.6-sol",
+      "reasoning_effort": "medium",
+      "protocol": "openai-responses",
+      "base_url": "https://api.golutra.cn",
+      "fixture_sha256": "99be54e3f414a59ba885ffbfeda525e351cd4f7405cbdc2fedec9e992f1657c3",
+      "golutra_binary_sha256": "4ab6738597d913becbc277f34e1839469cd45d067035ec9b75945a0767dba08a",
+      "versions": {
+        "golutra": "golutra-agent 0.3.1",
+        "codex": "codex-cli 0.155.1"
+      },
+      "engines": [
+        "golutra",
+        "codex"
+      ],
+      "codex_conventional_responses_override": true,
+      "summary": {},
+      "stages": [],
+      "golutra_durable_tool_observations": {
+        "scope": "all recorded events, including interrupted or unfinished stages",
+        "internal_completed_reports": 38,
+        "admission_rejections": 0,
+        "errors": [
+          {
+            "tool": "shell",
+            "status": "error",
+            "rejected_before_execution": false,
+            "summary": "process exited with an error",
+            "error": null
+          },
+          {
+            "tool": "shell",
+            "status": "error",
+            "rejected_before_execution": false,
+            "summary": "process exited with an error",
+            "error": null
+          }
+        ]
+      }
+    },
+    {
+      "variant": "control-complete",
+      "note": "Same core and original prompt; before final preview-space and implicit-shell environment corrections",
+      "source_report": "golutra-capability-control-complete-20260919.json",
+      "source_report_sha256": "182a5b2a0e5e3dd4f6a21381a58a37653e9064425f76b0c655f7c6d27cfa9a9a",
+      "started_at": "2026-09-19T14:47:42.814342Z",
+      "finished_at": "2026-09-19T14:52:42.927501Z",
+      "model": "gpt-5.6-sol",
+      "reasoning_effort": "medium",
+      "protocol": "openai-responses",
+      "base_url": "https://api.golutra.cn",
+      "fixture_sha256": "99be54e3f414a59ba885ffbfeda525e351cd4f7405cbdc2fedec9e992f1657c3",
+      "golutra_binary_sha256": "8ca352f527904f12522237a0a089b3cc0f61df33cdad217592522d405ac29198",
+      "versions": {
+        "golutra": "golutra-agent 0.3.1",
+        "codex": "codex-cli 0.155.1"
+      },
+      "engines": [
+        "golutra"
+      ],
+      "codex_conventional_responses_override": false,
+      "summary": {
+        "golutra": {
+          "elapsed_total_ms": 298122.9,
+          "prompt_tokens": 696566,
+          "uncached_input_tokens": 50446,
+          "cache_read_tokens": 646120,
+          "output_tokens": 21016,
+          "provider_total_tokens": 717582,
+          "request_count": 27,
+          "tool_call_count": 53,
+          "model_tool_call_count": 53,
+          "cache_hit_ratio": 0.9276,
+          "workspace_verifier_passed": 4,
+          "runtime_terminal_successes": 4,
+          "strict_passed": 4,
+          "stages_total": 4,
+          "process_return_codes": {
+            "0": 4
+          },
+          "repair_attempts": 0,
+          "task_terminal_arrival_ms": 296596.93058297853,
+          "process_elapsed_ms": 298122.9232909682,
+          "post_terminal_ms": 1525.9927079896443,
+          "terminal_export_ms": 1202,
+          "first_observable_p50_ms": 4957.2,
+          "provider_ttft_p50_ms": 4836.5,
+          "usage_complete_stages": 4,
+          "cache_prefix_relations": {
+            "cold_start": 1,
+            "append_only": 26
+          }
+        }
+      },
+      "stages": [
+        {
+          "stage": 1,
+          "order": [
+            "golutra"
+          ],
+          "golutra": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "d78dd99ade171c19944874a958f661c224061f97d61c0b7dc4464ebe48305749",
+              "bytes": 1262,
+              "characters": 1262,
+              "tokens_estimated": 316
+            },
+            "metrics": {
+              "elapsed_ms": 84947.5,
+              "prompt_tokens": 37522,
+              "uncached_input_tokens": 9822,
+              "cache_read_tokens": 27700,
+              "output_tokens": 7155,
+              "provider_total_tokens": 44677,
+              "request_count": 6,
+              "tool_call_count": 15,
+              "model_tool_call_count": 15,
+              "task_terminal_arrival_ms": 84723.69729197817,
+              "process_elapsed_ms": 84947.53333297558,
+              "post_terminal_ms": 223.83604099741206,
+              "terminal_export_ms": 152,
+              "terminal_export_mode": "delivery"
+            },
+            "independent_checks": [
+              "stage_1"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          }
+        },
+        {
+          "stage": 2,
+          "order": [
+            "golutra"
+          ],
+          "golutra": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "4506514f846ca03a1191722cf9794ca1abe0958a5e522a4e19c147a8c23d38ed",
+              "bytes": 943,
+              "characters": 943,
+              "tokens_estimated": 236
+            },
+            "metrics": {
+              "elapsed_ms": 74139.4,
+              "prompt_tokens": 102966,
+              "uncached_input_tokens": 9616,
+              "cache_read_tokens": 93350,
+              "output_tokens": 5103,
+              "provider_total_tokens": 108069,
+              "request_count": 7,
+              "tool_call_count": 14,
+              "model_tool_call_count": 14,
+              "task_terminal_arrival_ms": 73947.37312500365,
+              "process_elapsed_ms": 74139.40074999118,
+              "post_terminal_ms": 192.02762498753145,
+              "terminal_export_ms": 165,
+              "terminal_export_mode": "delivery"
+            },
+            "independent_checks": [
+              "stage_2"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          }
+        },
+        {
+          "stage": 3,
+          "order": [
+            "golutra"
+          ],
+          "golutra": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "873eb70f2daa2a14ad4a49644cee3ea426e88c8108faff8b789fd5176ce07eb6",
+              "bytes": 56706,
+              "characters": 56706,
+              "tokens_estimated": 14177
+            },
+            "metrics": {
+              "elapsed_ms": 86345.6,
+              "prompt_tokens": 252960,
+              "uncached_input_tokens": 24344,
+              "cache_read_tokens": 228616,
+              "output_tokens": 6593,
+              "provider_total_tokens": 259553,
+              "request_count": 7,
+              "tool_call_count": 14,
+              "model_tool_call_count": 14,
+              "task_terminal_arrival_ms": 86002.79895798303,
+              "process_elapsed_ms": 86345.5732500006,
+              "post_terminal_ms": 342.77429201756604,
+              "terminal_export_ms": 247,
+              "terminal_export_mode": "delivery"
+            },
+            "independent_checks": [
+              "stage_3"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          }
+        },
+        {
+          "stage": 4,
+          "order": [
+            "golutra"
+          ],
+          "golutra": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "7a3a2ee52d7491d0c7a14a277fe9e1414675723fa22a9d260fe3cc86ebf52731",
+              "bytes": 911,
+              "characters": 911,
+              "tokens_estimated": 228
+            },
+            "metrics": {
+              "elapsed_ms": 52690.4,
+              "prompt_tokens": 303118,
+              "uncached_input_tokens": 6664,
+              "cache_read_tokens": 296454,
+              "output_tokens": 2165,
+              "provider_total_tokens": 305283,
+              "request_count": 7,
+              "tool_call_count": 10,
+              "model_tool_call_count": 10,
+              "task_terminal_arrival_ms": 51923.06120801368,
+              "process_elapsed_ms": 52690.41595800081,
+              "post_terminal_ms": 767.3547499871347,
+              "terminal_export_ms": 638,
+              "terminal_export_mode": "delivery"
+            },
+            "independent_checks": [
+              "stage_4"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          }
+        }
+      ],
+      "golutra_durable_tool_observations": {
+        "scope": "all recorded events, including interrupted or unfinished stages",
+        "internal_completed_reports": 53,
+        "admission_rejections": 1,
+        "errors": [
+          {
+            "tool": "read_file",
+            "status": "error",
+            "rejected_before_execution": false,
+            "summary": "tool execution failed",
+            "error": "tool execution failed: path policy rejected tool execution: path resolution failed: path canonicalization failed: /private/var/folders/fv/2smpjc6d2fl4d73rdtdy12q00000gn/T/golutra-continuous-work-8rps8c1m/golutra/workspace/tests/test_jobledger.py"
+          },
+          {
+            "tool": "shell",
+            "status": "error",
+            "rejected_before_execution": false,
+            "summary": "process exited with an error",
+            "error": null
+          },
+          {
+            "tool": "apply_patch",
+            "status": "error",
+            "rejected_before_execution": true,
+            "summary": "tool request is invalid",
+            "error": "tool arguments are invalid: patch names the file more than once: jobledger/checkpoint.py"
+          }
+        ]
+      }
+    },
+    {
+      "variant": "accepted",
+      "note": "Delivery source: original prompt, all contract/freshness/preview/environment corrections",
+      "source_report": "golutra-capability-accepted-20260919.json",
+      "source_report_sha256": "7105d778d4a0063d32c48038d35049a5846ca0ff1e5a949556f02a114901fa9d",
+      "started_at": "2026-09-19T14:56:15.385538Z",
+      "finished_at": "2026-09-19T15:05:34.586018Z",
+      "model": "gpt-5.6-sol",
+      "reasoning_effort": "medium",
+      "protocol": "openai-responses",
+      "base_url": "https://api.golutra.cn",
+      "fixture_sha256": "99be54e3f414a59ba885ffbfeda525e351cd4f7405cbdc2fedec9e992f1657c3",
+      "golutra_binary_sha256": "d804d929424e1162e149c39d58bd1c321682776c0b4309786d65ee82319e52df",
+      "versions": {
+        "golutra": "golutra-agent 0.3.1",
+        "codex": "codex-cli 0.155.1"
+      },
+      "engines": [
+        "golutra",
+        "codex"
+      ],
+      "codex_conventional_responses_override": true,
+      "summary": {
+        "golutra": {
+          "elapsed_total_ms": 243526.5,
+          "prompt_tokens": 492322,
+          "uncached_input_tokens": 44447,
+          "cache_read_tokens": 447875,
+          "output_tokens": 15469,
+          "provider_total_tokens": 507791,
+          "request_count": 23,
+          "tool_call_count": 43,
+          "model_tool_call_count": 43,
+          "cache_hit_ratio": 0.9097,
+          "workspace_verifier_passed": 4,
+          "runtime_terminal_successes": 4,
+          "strict_passed": 4,
+          "stages_total": 4,
+          "process_return_codes": {
+            "0": 4
+          },
+          "repair_attempts": 0,
+          "task_terminal_arrival_ms": 242422.5898339646,
+          "process_elapsed_ms": 243526.51995801716,
+          "post_terminal_ms": 1103.9301240525674,
+          "terminal_export_ms": 825,
+          "first_observable_p50_ms": 5452.8,
+          "provider_ttft_p50_ms": 5231.1,
+          "usage_complete_stages": 4,
+          "cache_prefix_relations": {
+            "cold_start": 1,
+            "append_only": 22
+          }
+        },
+        "codex": {
+          "elapsed_total_ms": 312905.1,
+          "prompt_tokens": 978787,
+          "uncached_input_tokens": 53410,
+          "cache_read_tokens": 925377,
+          "output_tokens": 20787,
+          "provider_total_tokens": 999574,
+          "request_count": null,
+          "tool_call_count": 22,
+          "model_tool_call_count": 22,
+          "cache_hit_ratio": 0.9454,
+          "workspace_verifier_passed": 4,
+          "runtime_terminal_successes": 4,
+          "strict_passed": 4,
+          "stages_total": 4,
+          "process_return_codes": {
+            "0": 4
+          },
+          "repair_attempts": 0,
+          "task_terminal_arrival_ms": 310923.1275829661,
+          "process_elapsed_ms": 312905.13795797597,
+          "post_terminal_ms": 1982.0103750098497,
+          "terminal_export_ms": null,
+          "first_observable_p50_ms": 4777.1,
+          "provider_ttft_p50_ms": null,
+          "usage_complete_stages": 4,
+          "cache_prefix_relations": null
+        }
+      },
+      "stages": [
+        {
+          "stage": 1,
+          "order": [
+            "golutra",
+            "codex"
+          ],
+          "golutra": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "d78dd99ade171c19944874a958f661c224061f97d61c0b7dc4464ebe48305749",
+              "bytes": 1262,
+              "characters": 1262,
+              "tokens_estimated": 316
+            },
+            "metrics": {
+              "elapsed_ms": 73171.2,
+              "prompt_tokens": 33670,
+              "uncached_input_tokens": 9005,
+              "cache_read_tokens": 24665,
+              "output_tokens": 5646,
+              "provider_total_tokens": 39316,
+              "request_count": 6,
+              "tool_call_count": 14,
+              "model_tool_call_count": 14,
+              "task_terminal_arrival_ms": 72986.48058300023,
+              "process_elapsed_ms": 73171.16166601772,
+              "post_terminal_ms": 184.68108301749453,
+              "terminal_export_ms": 126,
+              "terminal_export_mode": "delivery"
+            },
+            "independent_checks": [
+              "stage_1"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          },
+          "codex": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "d78dd99ade171c19944874a958f661c224061f97d61c0b7dc4464ebe48305749",
+              "bytes": 1262,
+              "characters": 1262,
+              "tokens_estimated": 316
+            },
+            "metrics": {
+              "elapsed_ms": 118337.8,
+              "prompt_tokens": 129769,
+              "uncached_input_tokens": 20614,
+              "cache_read_tokens": 109155,
+              "output_tokens": 10022,
+              "provider_total_tokens": 139791,
+              "request_count": null,
+              "tool_call_count": 6,
+              "model_tool_call_count": 6,
+              "task_terminal_arrival_ms": 118076.25520799775,
+              "process_elapsed_ms": 118337.77495799586,
+              "post_terminal_ms": 261.519749998115,
+              "terminal_export_ms": null,
+              "terminal_export_mode": null
+            },
+            "independent_checks": [
+              "stage_1"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          }
+        },
+        {
+          "stage": 2,
+          "order": [
+            "codex",
+            "golutra"
+          ],
+          "golutra": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "4506514f846ca03a1191722cf9794ca1abe0958a5e522a4e19c147a8c23d38ed",
+              "bytes": 943,
+              "characters": 943,
+              "tokens_estimated": 236
+            },
+            "metrics": {
+              "elapsed_ms": 64093.1,
+              "prompt_tokens": 78339,
+              "uncached_input_tokens": 9103,
+              "cache_read_tokens": 69236,
+              "output_tokens": 4008,
+              "provider_total_tokens": 82347,
+              "request_count": 6,
+              "tool_call_count": 12,
+              "model_tool_call_count": 12,
+              "task_terminal_arrival_ms": 63778.61058397684,
+              "process_elapsed_ms": 64093.077541998355,
+              "post_terminal_ms": 314.46695802151226,
+              "terminal_export_ms": 231,
+              "terminal_export_mode": "delivery"
+            },
+            "independent_checks": [
+              "stage_2"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          },
+          "codex": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "4506514f846ca03a1191722cf9794ca1abe0958a5e522a4e19c147a8c23d38ed",
+              "bytes": 943,
+              "characters": 943,
+              "tokens_estimated": 236
+            },
+            "metrics": {
+              "elapsed_ms": 60939.5,
+              "prompt_tokens": 123188,
+              "uncached_input_tokens": 7435,
+              "cache_read_tokens": 115753,
+              "output_tokens": 4119,
+              "provider_total_tokens": 127307,
+              "request_count": null,
+              "tool_call_count": 4,
+              "model_tool_call_count": 4,
+              "task_terminal_arrival_ms": 59966.52445799555,
+              "process_elapsed_ms": 60939.51666599605,
+              "post_terminal_ms": 972.9922080005053,
+              "terminal_export_ms": null,
+              "terminal_export_mode": null
+            },
+            "independent_checks": [
+              "stage_2"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          }
+        },
+        {
+          "stage": 3,
+          "order": [
+            "golutra",
+            "codex"
+          ],
+          "golutra": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "873eb70f2daa2a14ad4a49644cee3ea426e88c8108faff8b789fd5176ce07eb6",
+              "bytes": 56706,
+              "characters": 56706,
+              "tokens_estimated": 14177
+            },
+            "metrics": {
+              "elapsed_ms": 60247.1,
+              "prompt_tokens": 160283,
+              "uncached_input_tokens": 20394,
+              "cache_read_tokens": 139889,
+              "output_tokens": 3880,
+              "provider_total_tokens": 164163,
+              "request_count": 5,
+              "tool_call_count": 10,
+              "model_tool_call_count": 10,
+              "task_terminal_arrival_ms": 59945.6665419857,
+              "process_elapsed_ms": 60247.142666979926,
+              "post_terminal_ms": 301.47612499422394,
+              "terminal_export_ms": 216,
+              "terminal_export_mode": "delivery"
+            },
+            "independent_checks": [
+              "stage_3"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          },
+          "codex": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "873eb70f2daa2a14ad4a49644cee3ea426e88c8108faff8b789fd5176ce07eb6",
+              "bytes": 56706,
+              "characters": 56706,
+              "tokens_estimated": 14177
+            },
+            "metrics": {
+              "elapsed_ms": 67915.5,
+              "prompt_tokens": 315672,
+              "uncached_input_tokens": 20065,
+              "cache_read_tokens": 295607,
+              "output_tokens": 4388,
+              "provider_total_tokens": 320060,
+              "request_count": null,
+              "tool_call_count": 6,
+              "model_tool_call_count": 6,
+              "task_terminal_arrival_ms": 67558.04424997768,
+              "process_elapsed_ms": 67915.51804199116,
+              "post_terminal_ms": 357.4737920134794,
+              "terminal_export_ms": null,
+              "terminal_export_mode": null
+            },
+            "independent_checks": [
+              "stage_3"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          }
+        },
+        {
+          "stage": 4,
+          "order": [
+            "codex",
+            "golutra"
+          ],
+          "golutra": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "7a3a2ee52d7491d0c7a14a277fe9e1414675723fa22a9d260fe3cc86ebf52731",
+              "bytes": 911,
+              "characters": 911,
+              "tokens_estimated": 228
+            },
+            "metrics": {
+              "elapsed_ms": 46015.1,
+              "prompt_tokens": 220030,
+              "uncached_input_tokens": 5945,
+              "cache_read_tokens": 214085,
+              "output_tokens": 1935,
+              "provider_total_tokens": 221965,
+              "request_count": 6,
+              "tool_call_count": 7,
+              "model_tool_call_count": 7,
+              "task_terminal_arrival_ms": 45711.83212500182,
+              "process_elapsed_ms": 46015.13808302116,
+              "post_terminal_ms": 303.3059580193367,
+              "terminal_export_ms": 252,
+              "terminal_export_mode": "delivery"
+            },
+            "independent_checks": [
+              "stage_4"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          },
+          "codex": {
+            "strict_passed": true,
+            "runtime_terminal_success": true,
+            "workspace_verifier_pass": true,
+            "process_return_code": 0,
+            "immutable_inputs_preserved": true,
+            "repair_attempts": 0,
+            "prompt": {
+              "sha256": "7a3a2ee52d7491d0c7a14a277fe9e1414675723fa22a9d260fe3cc86ebf52731",
+              "bytes": 911,
+              "characters": 911,
+              "tokens_estimated": 228
+            },
+            "metrics": {
+              "elapsed_ms": 65712.3,
+              "prompt_tokens": 410158,
+              "uncached_input_tokens": 5296,
+              "cache_read_tokens": 404862,
+              "output_tokens": 2258,
+              "provider_total_tokens": 412416,
+              "request_count": null,
+              "tool_call_count": 6,
+              "model_tool_call_count": 6,
+              "task_terminal_arrival_ms": 65322.30366699514,
+              "process_elapsed_ms": 65712.32829199289,
+              "post_terminal_ms": 390.0246249977499,
+              "terminal_export_ms": null,
+              "terminal_export_mode": null
+            },
+            "independent_checks": [
+              "stage_4"
+            ],
+            "verifier_sha256": "5060e3266b753481083f31baba535aa932061833b194e22cfad45058bcbe0f60"
+          }
+        }
+      ],
+      "golutra_durable_tool_observations": {
+        "scope": "all recorded events, including interrupted or unfinished stages",
+        "internal_completed_reports": 43,
+        "admission_rejections": 0,
+        "errors": []
+      }
+    }
+  ],
+  "delivery_source": {
+    "sha256": "4715633fed880d1199b574b4668d175c6e3d9e558247fce6167a124b7259fe57",
+    "file_count": 313,
+    "definition": "Sorted crate .rs/Cargo.toml plus root Cargo.toml/Cargo.lock; hash path + NUL + bytes + NUL. Includes pre-existing uncommitted work."
+  }
+}

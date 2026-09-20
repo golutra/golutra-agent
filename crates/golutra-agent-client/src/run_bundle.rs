@@ -155,6 +155,7 @@ pub struct RunBundleFile {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum DebugExportOutcome {
+    Deferred,
     Exported {
         path: String,
         receipt: DebugExportManifestReceipt,
@@ -214,6 +215,23 @@ impl<'a> RunBundleExporter<'a> {
         let prior_manifest = load_existing_manifest(&request.destination)?;
         self.export_with_mode(request, prior_manifest, false, false, BundleWriteMode::Fast)
             .await
+    }
+
+    /// 普通交付仍耐久写入恢复身份与原始观测，但不等待派生评估或复制完整调试包。
+    /// 显式 export/refresh 继续生成完整审计产物。
+    pub async fn export_delivery(
+        &self,
+        request: RunBundleExportRequest,
+    ) -> Result<RunBundleReceipt, ClientError> {
+        let prior_manifest = load_existing_manifest(&request.destination)?;
+        self.export_with_mode(
+            request,
+            prior_manifest,
+            false,
+            false,
+            BundleWriteMode::Durable,
+        )
+        .await
     }
 
     /// Persist a recoverable snapshot while an exec turn is still running.
@@ -346,10 +364,7 @@ impl<'a> RunBundleExporter<'a> {
                 }
             }
         } else {
-            DebugExportOutcome::Failed {
-                path: "debug-export".to_owned(),
-                error: "deferred until terminal run export".to_owned(),
-            }
+            DebugExportOutcome::Deferred
         };
 
         let manifest = RunBundleManifest {
@@ -382,6 +397,7 @@ impl<'a> RunBundleExporter<'a> {
         let (debug_export_path, debug_export_error) = match &manifest.debug_export {
             DebugExportOutcome::Exported { path, .. } => (Some(path.clone()), None),
             DebugExportOutcome::Failed { error, .. } => (None, Some(error.clone())),
+            DebugExportOutcome::Deferred => (None, None),
         };
         Ok(RunBundleReceipt {
             destination: request.destination,
