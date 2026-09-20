@@ -10,9 +10,11 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 
 import compare_long_benchmark as bench
 import compare_pi_benchmark as process
+import compare_continuous_tasks as continuous
 
 
 TASKS = {
@@ -39,12 +41,71 @@ TASKS = {
             "test_existing.py": "import unittest\nfrom receipt import render\nclass Existing(unittest.TestCase):\n    def test_whole(self):\n        self.assertEqual(render(['2.00']), '2.00')\n",
         },
     },
+    "stage_review": {
+        "prompt": "First start python3 observer.py using the native background process mechanism and observe .observer/started.json. While that process is running, implement inventory.adjust_counts(counts, changes): return a fresh dict applying integer deltas, preserve zero-count entries including newly introduced keys, reject any negative resulting count with ValueError, and never mutate either input, including on failure. Add useful regression tests and run the existing tests. Review the implementation and complete all changes to inventory.py before creating .observer/release; then wait for the same background process to finish and run tests again. Do not edit inventory.py after release. Do not change observer.py or test_existing.py, write observer state except the release marker, or leave a process running. Work only in this workspace; do not delegate.",
+        "files": {},
+    },
+    "continuous": {
+        "prompt": continuous.single_task_prompt(),
+        "files": {},
+    },
 }
+
+
+def task_files(task):
+    """阶段夹具保持独立文件，便于摘要保护与复用真实后台进程。"""
+    if task == "continuous":
+        root = Path(__file__).parent / "fixtures" / "long_benchmark"
+        return {path.relative_to(root).as_posix(): path.read_text()
+                for path in sorted(root.rglob("*"))
+                if path.is_file() and "__pycache__" not in path.parts}
+    if task == "stage_review":
+        root = Path(__file__).parent / "fixtures" / "stage_review"
+        return {name: (root / name).read_text() for name in
+                ("inventory.py", "observer.py", "test_existing.py")}
+    return TASKS[task]["files"]
+
+
+def verify_stage_order(workspace):
+    """校验快照、进程退出及写入时序，不能用最终测试通过掩盖阶段违约。"""
+    state = workspace / ".observer"
+    started = json.loads((state / "started.json").read_text())
+    snapshot = json.loads((state / "snapshot.json").read_text())
+    if not (state / "release").is_file():
+        raise ValueError("observer was not released")
+    try:
+        os.kill(started["pid"], 0)
+    except ProcessLookupError:
+        pass
+    else:
+        raise ValueError("observer is still running")
+    source = workspace / "inventory.py"
+    if snapshot["sha256"] != bench.file_digest(source):
+        raise ValueError("inventory.py changed after the observer snapshot")
+    if not started["started_ns"] <= source.stat().st_mtime_ns <= (state / "release").stat().st_mtime_ns:
+        raise ValueError("inventory.py must be changed while the observer runs, before release")
+    if not (state / "release").stat().st_mtime_ns <= snapshot["completed_ns"]:
+        raise ValueError("release must precede observer completion")
+
+
+def cleanup_observer(workspace):
+    """失败样本也回收已启动的夹具；不把宿主清理后的状态计作代理成功。"""
+    state = workspace / ".observer"
+    if not (state / "started.json").exists() or (state / "snapshot.json").exists():
+        return
+    (state / "release").touch()
+    deadline = time.monotonic() + 3
+    while not (state / "snapshot.json").exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
 
 
 def verify(task: str, workspace: Path) -> tuple[bool, str]:
     """判题在独立进程加载交付代码；输入测试文件另由宿主摘要保护。"""
     try:
+        if task == "continuous":
+            with tempfile.TemporaryDirectory(prefix="golutra-stage-judge-") as output:
+                result = continuous.verify_single_task(workspace, Path(output))
+            return result["passed"], result.get("error") or "all four phases passed"
         if task == "deployment_feedback":
             data = json.loads((workspace / "settings.json").read_text())
             if data.get("enabled") is not True:
@@ -60,6 +121,8 @@ def verify(task: str, workspace: Path) -> tuple[bool, str]:
             if raw[3:] != b"customer,total\r\nAda,12.50\r\n":
                 return False, "report.csv: preserve customer,total and Ada,12.50, with CRLF after every line"
         else:
+            if task == "stage_review":
+                verify_stage_order(workspace)
             code = {
                 "parser_fix": """from parser import parse_pairs
 assert parse_pairs('') == {}
@@ -81,6 +144,18 @@ assert render([]) == '0.00'
 values = ['0.10', '0.20']; render(values)
 assert values == ['0.10', '0.20']
 """,
+                "stage_review": """from inventory import adjust_counts
+counts = {'apple': 2, 'zero': 0}; changes = {'apple': -2, 'new': 0}
+assert adjust_counts(counts, changes) == {'apple': 0, 'zero': 0, 'new': 0}
+assert counts == {'apple': 2, 'zero': 0} and changes == {'apple': -2, 'new': 0}
+result = adjust_counts(counts, {}); result['apple'] = 100
+assert counts['apple'] == 2
+try: adjust_counts(counts, {'apple': 1, 'missing': -1})
+except ValueError: pass
+else: raise AssertionError('negative count accepted')
+assert counts == {'apple': 2, 'zero': 0}
+assert adjust_counts({}, {}) == {}
+""",
             }[task]
             for command in ([sys.executable, "-c", code],
                             [sys.executable, "-m", "unittest", "discover", "-v"]):
@@ -88,7 +163,7 @@ assert values == ['0.10', '0.20']
                 if result.returncode:
                     return False, (result.stdout + result.stderr)[-4000:]
         return True, "independent acceptance passed"
-    except (OSError, ValueError, AttributeError, subprocess.TimeoutExpired) as error:
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, subprocess.TimeoutExpired) as error:
         return False, str(error)
 
 
@@ -100,7 +175,9 @@ def run(args):
     report = {"started_at": bench.utc_now(), "model": args.model, "effort": args.reasoning_effort,
               "base_url": args.base_url, "work_root": str(root), "attempts": [],
               "binary_sha256": {name: bench.file_digest(path) for name, path in variants},
-              "scope": "Two synthetic verifier-feedback stress cases plus two ordinary coding tasks; not a broad performance or multi-hour claim."}
+              "scope": "Verifier feedback, ordinary coding and phase-order tasks; not a broad performance or multi-hour claim.",
+              "tasks": {task: {"prompt": bench.prompt_metadata(TASKS[task]["prompt"]),
+                               "files": sorted(task_files(task))} for task in (args.task or TASKS)}}
     bench.write_private_text(args.output, json.dumps(report, indent=2))
     for repeat in range(args.repeats):
         for task_index, task in enumerate(args.task or TASKS):
@@ -110,17 +187,19 @@ def run(args):
                 attempt = root / f"{repeat}-{task}-{name}"
                 workspace = attempt / "workspace"
                 workspace.mkdir(parents=True)
-                for path, content in TASKS[task]["files"].items():
+                files = task_files(task)
+                for path, content in files.items():
+                    (workspace / path).parent.mkdir(parents=True, exist_ok=True)
                     (workspace / path).write_text(content)
-                protected = {p: bench.file_digest(workspace / p) for p in TASKS[task]["files"] if p.startswith("test_")}
+                protected = {p: bench.file_digest(workspace / p) for p in files
+                             if p.startswith("test_") or p == "observer.py" or p in bench.IMMUTABLE_PATHS}
                 with tempfile.TemporaryDirectory(prefix="golutra-optimization-auth-") as sensitive:
                     home = Path(sensitive)
                     bench.prepare_golutra_home(args, home)
                     env = os.environ.copy()
                     env["GOLUTRA_AGENT_HOME"] = str(home)
                     command = [str(binary), "--cwd", str(workspace), "exec", "--json", "--ephemeral",
-                               "--run-dir", str(attempt / "run"), "--yolo", "--no-project-verifier-discovery",
-                               "--max-elapsed-ms", str(int(args.timeout * 1000) - 5000)]
+                               "--run-dir", str(attempt / "run"), "--yolo", "--no-project-verifier-discovery"]
                     if task.endswith("feedback"):
                         command += ["--verify-program", sys.executable]
                         for value in [str(Path(__file__).resolve()), "--verify", task, "--workspace", str(workspace)]:
@@ -130,6 +209,8 @@ def run(args):
                                                    attempt / "stdout.jsonl", attempt / "stderr.log")
                 metrics = process.parse_golutra(captured.stdout, captured.elapsed_ms, captured.return_code,
                                                attempt / "run", captured.stdout_line_times_ms)
+                bench.apply_tool_call_accounting(metrics, "golutra", captured.stdout,
+                                                captured.stdout_line_times_ms)
                 passed, detail = verify(task, workspace)
                 unchanged = all((workspace / p).exists() and bench.file_digest(workspace / p) == digest for p, digest in protected.items())
                 result = {"variant": name, "task": task, "repeat": repeat,
@@ -138,6 +219,10 @@ def run(args):
                           "detail": detail, "metrics": metrics}
                 report["attempts"].append(result)
                 bench.write_private_text(args.output, json.dumps(report, indent=2))
+                if task == "stage_review":
+                    cleanup_observer(workspace)
+                elif task == "continuous":
+                    bench.cleanup_probe(workspace)
                 print(json.dumps({k: result[k] for k in ("variant", "task", "strict_pass")}) +
                       f" elapsed_ms={captured.elapsed_ms:.0f}", flush=True)
     report["finished_at"] = bench.utc_now()

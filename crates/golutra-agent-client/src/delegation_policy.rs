@@ -16,9 +16,7 @@ use tokio_util::sync::CancellationToken;
 pub(crate) const MAX_DELEGATION_DEPTH: u8 = 1;
 pub(crate) const DELEGATION_COST_BUDGET_KEY: &str = "_delegation_cost_budget_microusd";
 pub(crate) const DEFAULT_DELEGATED_ACTIVE_CHILDREN: usize = 10;
-pub(crate) const DEFAULT_DELEGATED_ELAPSED_MS: u64 = 30 * 60 * 1_000;
 pub(crate) const DEFAULT_DELEGATED_CHILD_TOKEN_RESERVATION: u64 = 4_096;
-pub(crate) const MIN_DELEGATED_TOKEN_BUDGET: u64 = 8_192;
 pub(crate) const MAX_DELEGATED_TOKEN_BUDGET: u64 = 128_000;
 pub(crate) const DELEGATION_TOKEN_BUDGET_SEMANTICS: &str = "aggregate_output_reservation";
 // A child can consume at most 75% of its parent's remaining local deadline.
@@ -78,10 +76,10 @@ pub(crate) struct DelegationRecoveryState {
     pub(crate) parent_task_id: Option<TaskId>,
     pub(crate) parent_thread_id: Option<ThreadId>,
     pub(crate) depth: u8,
-    pub(crate) remaining_elapsed_ms: u64,
+    pub(crate) remaining_elapsed_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) local_remaining_elapsed_ms: Option<u64>,
-    pub(crate) max_tokens: u64,
+    pub(crate) max_tokens: Option<u64>,
     pub(crate) max_cost_microusd: Option<u64>,
     pub(crate) started_children: usize,
     pub(crate) spent_tokens: u64,
@@ -101,8 +99,9 @@ impl TimedDelegationRecoveryState {
     pub(crate) fn refreshed(mut self, now: DateTime<Utc>) -> Self {
         if self.captured_at > now {
             // 未来 checkpoint 无法证明真实剩余时长；直接耗尽预算，避免时钟偏差或脏数据延长期限。
-            self.state.remaining_elapsed_ms = 0;
-            self.state.local_remaining_elapsed_ms = Some(0);
+            self.state.remaining_elapsed_ms = self.state.remaining_elapsed_ms.map(|_| 0);
+            self.state.local_remaining_elapsed_ms =
+                self.state.local_remaining_elapsed_ms.map(|_| 0);
             self.captured_at = now;
             return self;
         }
@@ -111,8 +110,10 @@ impl TimedDelegationRecoveryState {
             .num_milliseconds()
             .max(0);
         let elapsed_ms = u64::try_from(elapsed_ms).unwrap_or(u64::MAX);
-        self.state.remaining_elapsed_ms =
-            self.state.remaining_elapsed_ms.saturating_sub(elapsed_ms);
+        self.state.remaining_elapsed_ms = self
+            .state
+            .remaining_elapsed_ms
+            .map(|remaining| remaining.saturating_sub(elapsed_ms));
         if let Some(local_remaining_elapsed_ms) = &mut self.state.local_remaining_elapsed_ms {
             *local_remaining_elapsed_ms = local_remaining_elapsed_ms.saturating_sub(elapsed_ms);
         }
@@ -123,15 +124,13 @@ impl TimedDelegationRecoveryState {
 
 /// A shared live admission budget for one root task and all of its descendants.
 ///
-/// `max_tokens` is derived from each child's requested provider output allowance and is used
-/// to reserve future children before they start. `spent_tokens` records observed provider usage
-/// (including input and repeated rounds). Output admission is settled separately;
-/// input-cache volume must not exhaust the child's output allowance.
+/// 默认仅限制活动子任务数，不从单请求输出容量推导累计限额。
+/// 显式恢复的累计预算独立结算；缓存输入及多轮用量仍完整计入观测。
 #[derive(Debug)]
 pub(crate) struct DelegationBudget {
     max_active_children: usize,
-    deadline: Instant,
-    max_tokens: u64,
+    deadline: Option<Instant>,
+    max_tokens: Option<u64>,
     max_cost_microusd: Option<u64>,
     state: Mutex<BudgetState>,
     checkpoint_lock: Arc<AsyncMutex<()>>,
@@ -141,24 +140,15 @@ pub(crate) struct DelegationBudget {
 impl DelegationBudget {
     fn configured(
         max_elapsed_ms: Option<u64>,
-        provider_max_tokens: Option<u64>,
         max_cost_microusd: Option<u64>,
         cancellation: CancellationToken,
         max_active_children: usize,
     ) -> Arc<Self> {
-        let elapsed_ms = max_elapsed_ms
-            .unwrap_or(DEFAULT_DELEGATED_ELAPSED_MS)
-            .clamp(1, DEFAULT_DELEGATED_ELAPSED_MS);
-        let per_child = provider_max_tokens
-            .unwrap_or(DEFAULT_DELEGATED_CHILD_TOKEN_RESERVATION)
-            .clamp(1, MAX_DELEGATED_TOKEN_BUDGET);
-        let max_tokens = per_child
-            .saturating_mul(max_active_children as u64)
-            .clamp(MIN_DELEGATED_TOKEN_BUDGET, MAX_DELEGATED_TOKEN_BUDGET);
+        // 每次生成的输出容量不是整个任务的累计配额；只有显式任务时限才创建截止时间。
         Arc::new(Self {
             max_active_children: max_active_children.max(1),
-            deadline: Instant::now() + Duration::from_millis(elapsed_ms),
-            max_tokens,
+            deadline: max_elapsed_ms.map(|ms| Instant::now() + Duration::from_millis(ms)),
+            max_tokens: None,
             max_cost_microusd,
             state: Mutex::new(BudgetState::default()),
             checkpoint_lock: Arc::new(AsyncMutex::new(())),
@@ -166,17 +156,19 @@ impl DelegationBudget {
         })
     }
 
-    pub(crate) fn remaining_elapsed_ms(&self) -> u64 {
-        u64::try_from(
-            self.deadline
-                .saturating_duration_since(Instant::now())
-                .as_millis(),
-        )
-        .unwrap_or(u64::MAX)
+    pub(crate) fn remaining_elapsed_ms(&self) -> Option<u64> {
+        self.deadline.map(|deadline| {
+            u64::try_from(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX)
+        })
     }
 
     pub(crate) fn is_expired(&self) -> bool {
-        self.remaining_elapsed_ms() == 0
+        self.remaining_elapsed_ms() == Some(0)
     }
 
     pub(crate) fn cancellation(&self) -> CancellationToken {
@@ -203,12 +195,13 @@ impl DelegationBudget {
         if state.active_children >= self.max_active_children {
             return Err(DelegationLimit::ActiveChildren);
         }
-        if state
-            .spent_output_tokens
-            .saturating_add(state.reserved_tokens)
-            .saturating_add(requested_tokens)
-            > self.max_tokens
-        {
+        if self.max_tokens.is_some_and(|max| {
+            state
+                .spent_output_tokens
+                .saturating_add(state.reserved_tokens)
+                .saturating_add(requested_tokens)
+                > max
+        }) {
             return Err(DelegationLimit::TokenBudget);
         }
         let committed_cost = state
@@ -268,7 +261,7 @@ impl DelegationBudget {
             "spent_output_tokens": state.spent_output_tokens,
             // 准入余额必须和使用统计分开；provider usage 可能包含输入 token 和多轮请求。
             "token_admission_committed": committed_tokens,
-            "token_admission_remaining": self.max_tokens.saturating_sub(committed_tokens),
+            "token_admission_remaining": self.max_tokens.map(|max| max.saturating_sub(committed_tokens)),
             "token_budget_semantics": DELEGATION_TOKEN_BUDGET_SEMANTICS,
             "spent_tokens_are_usage_accounting": true,
             "max_cost_microusd": self.max_cost_microusd,
@@ -351,7 +344,7 @@ pub(crate) struct DelegationContext {
     pub(crate) parent_thread_id: Option<ThreadId>,
     pub(crate) depth: u8,
     pub(crate) budget: Arc<DelegationBudget>,
-    local_deadline: Instant,
+    local_deadline: Option<Instant>,
     lease: Option<Arc<DelegationLease>>,
 }
 
@@ -364,14 +357,12 @@ impl DelegationContext {
     pub(crate) fn root(
         session_id: SessionId,
         max_elapsed_ms: Option<u64>,
-        provider_max_tokens: Option<u64>,
         max_cost_microusd: Option<u64>,
         cancellation: CancellationToken,
     ) -> Self {
         Self::configured(
             session_id,
             max_elapsed_ms,
-            provider_max_tokens,
             max_cost_microusd,
             cancellation,
             DEFAULT_DELEGATED_ACTIVE_CHILDREN,
@@ -381,14 +372,12 @@ impl DelegationContext {
     pub(crate) fn configured(
         session_id: SessionId,
         max_elapsed_ms: Option<u64>,
-        provider_max_tokens: Option<u64>,
         max_cost_microusd: Option<u64>,
         cancellation: CancellationToken,
         max_active_children: usize,
     ) -> Self {
         let budget = DelegationBudget::configured(
             max_elapsed_ms,
-            provider_max_tokens,
             max_cost_microusd,
             cancellation,
             max_active_children,
@@ -415,23 +404,21 @@ impl DelegationContext {
         if recovered.depth > MAX_DELEGATION_DEPTH {
             return Err("recovered delegation depth exceeds the supported maximum");
         }
-        if recovered.max_tokens == 0 || recovered.max_tokens > MAX_DELEGATED_TOKEN_BUDGET {
+        if recovered.max_tokens == Some(0) {
             return Err("recovered delegation token budget is invalid");
         }
         if recovered.max_active_children == 0 {
             return Err("recovered delegated concurrency must be positive");
         }
         let now = Instant::now();
-        let root_remaining_elapsed_ms = recovered
-            .remaining_elapsed_ms
-            .min(DEFAULT_DELEGATED_ELAPSED_MS);
-        let local_remaining_elapsed_ms = recovered
-            .local_remaining_elapsed_ms
-            .unwrap_or(root_remaining_elapsed_ms)
-            .min(root_remaining_elapsed_ms);
+        let root_remaining_elapsed_ms = recovered.remaining_elapsed_ms;
+        let local_remaining_elapsed_ms = earliest_remaining(
+            recovered.local_remaining_elapsed_ms,
+            root_remaining_elapsed_ms,
+        );
         let budget = Arc::new(DelegationBudget {
             max_active_children: recovered.max_active_children,
-            deadline: now + Duration::from_millis(root_remaining_elapsed_ms),
+            deadline: root_remaining_elapsed_ms.map(|ms| now + Duration::from_millis(ms)),
             max_tokens: recovered.max_tokens,
             max_cost_microusd: recovered.max_cost_microusd,
             state: Mutex::new(BudgetState {
@@ -455,7 +442,7 @@ impl DelegationContext {
             parent_thread_id: recovered.parent_thread_id,
             depth: recovered.depth,
             budget,
-            local_deadline: now + Duration::from_millis(local_remaining_elapsed_ms),
+            local_deadline: local_remaining_elapsed_ms.map(|ms| now + Duration::from_millis(ms)),
             lease: None,
         })
     }
@@ -473,16 +460,15 @@ impl DelegationContext {
             return Err(DelegationLimit::Depth);
         }
         let parent_remaining_elapsed_ms = self.remaining_elapsed_ms();
-        if parent_remaining_elapsed_ms == 0 {
+        if parent_remaining_elapsed_ms == Some(0) {
             return Err(DelegationLimit::Elapsed);
         }
         let lease = self
             .budget
             .reserve(requested_tokens, requested_cost_microusd, cancellation)?;
-        let child_elapsed_ms = delegated_child_elapsed_ms(parent_remaining_elapsed_ms);
-        let local_deadline = (Instant::now() + Duration::from_millis(child_elapsed_ms))
-            .min(self.local_deadline)
-            .min(self.budget.deadline);
+        let local_deadline = parent_remaining_elapsed_ms
+            .map(delegated_child_elapsed_ms)
+            .map(|ms| Instant::now() + Duration::from_millis(ms));
         Ok(Self {
             root_session_id: self.root_session_id,
             parent_session_id: Some(parent_session_id),
@@ -495,15 +481,20 @@ impl DelegationContext {
         })
     }
 
-    pub(crate) fn remaining_elapsed_ms(&self) -> u64 {
-        let now = Instant::now();
-        let local_remaining = self.local_deadline.saturating_duration_since(now);
-        let root_remaining = self.budget.deadline.saturating_duration_since(now);
-        u64::try_from(local_remaining.min(root_remaining).as_millis()).unwrap_or(u64::MAX)
+    pub(crate) fn remaining_elapsed_ms(&self) -> Option<u64> {
+        let local = self.local_deadline.map(|deadline| {
+            u64::try_from(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis(),
+            )
+            .unwrap_or(u64::MAX)
+        });
+        earliest_remaining(local, self.budget.remaining_elapsed_ms())
     }
 
     pub(crate) fn is_expired(&self) -> bool {
-        self.remaining_elapsed_ms() == 0
+        self.remaining_elapsed_ms() == Some(0)
     }
 
     pub(crate) fn cancellation(&self) -> CancellationToken {
@@ -631,8 +622,10 @@ impl DelegationContext {
             // A child's aggregate multi-turn usage can exceed its requested
             // output reservation. Until an actual settlement is durable, the
             // only safe admission checkpoint is to consume the remaining cap.
-            spent_tokens = spent_tokens.max(self.budget.max_tokens);
-            spent_output_tokens = spent_output_tokens.max(self.budget.max_tokens);
+            if let Some(max_tokens) = self.budget.max_tokens {
+                spent_tokens = spent_tokens.max(max_tokens);
+                spent_output_tokens = spent_output_tokens.max(max_tokens);
+            }
             if let Some(max_cost_microusd) = self.budget.max_cost_microusd {
                 spent_cost_microusd = spent_cost_microusd.max(max_cost_microusd);
             }
@@ -648,7 +641,7 @@ impl DelegationContext {
                 parent_thread_id: None,
                 depth: 0,
                 remaining_elapsed_ms,
-                local_remaining_elapsed_ms: Some(remaining_elapsed_ms),
+                local_remaining_elapsed_ms: remaining_elapsed_ms,
                 max_tokens: self.budget.max_tokens,
                 max_cost_microusd: self.budget.max_cost_microusd,
                 started_children: state.started_children,
@@ -657,6 +650,13 @@ impl DelegationContext {
                 spent_cost_microusd,
             },
         }
+    }
+}
+
+fn earliest_remaining(local: Option<u64>, root: Option<u64>) -> Option<u64> {
+    match (local, root) {
+        (Some(local), Some(root)) => Some(local.min(root)),
+        (local, root) => local.or(root),
     }
 }
 
@@ -710,7 +710,6 @@ mod tests {
         let root = DelegationContext::root(
             SessionId::new(),
             Some(1_000_000),
-            Some(1_024),
             None,
             cancellation.clone(),
         );
@@ -724,8 +723,8 @@ mod tests {
                 &cancellation,
             )
             .expect("child");
-        let root_remaining = root.remaining_elapsed_ms();
-        let child_remaining = child.remaining_elapsed_ms();
+        let root_remaining = root.remaining_elapsed_ms().unwrap();
+        let child_remaining = child.remaining_elapsed_ms().unwrap();
         assert!(child_remaining < root_remaining);
         assert!(child_remaining <= delegated_child_elapsed_ms(root_remaining.saturating_add(2)));
         assert!(matches!(
@@ -745,15 +744,10 @@ mod tests {
     fn exhausted_local_budget_blocks_nested_delegation() {
         let cancellation = CancellationToken::new();
         let now = Instant::now();
-        let root = DelegationContext::root(
-            SessionId::new(),
-            Some(10_000),
-            Some(1_024),
-            None,
-            cancellation.clone(),
-        );
+        let root =
+            DelegationContext::root(SessionId::new(), Some(10_000), None, cancellation.clone());
         let expired = DelegationContext {
-            local_deadline: now,
+            local_deadline: Some(now),
             ..root
         };
 
@@ -783,9 +777,9 @@ mod tests {
                     parent_task_id: Some(TaskId::new()),
                     parent_thread_id: Some(ThreadId::new()),
                     depth: 1,
-                    remaining_elapsed_ms: 100_000,
+                    remaining_elapsed_ms: Some(100_000),
                     local_remaining_elapsed_ms: Some(25_000),
-                    max_tokens: MIN_DELEGATED_TOKEN_BUDGET,
+                    max_tokens: Some(8_192),
                     max_cost_microusd: None,
                     started_children: 0,
                     spent_tokens: 0,
@@ -798,17 +792,17 @@ mod tests {
         )
         .expect("recovered child context");
 
-        assert!(recovered.remaining_elapsed_ms() <= 25_000);
-        assert!(recovered.remaining_elapsed_ms() > 24_900);
-        assert!(recovered.budget.remaining_elapsed_ms() > 99_900);
+        assert!(recovered.remaining_elapsed_ms().unwrap() <= 25_000);
+        assert!(recovered.remaining_elapsed_ms().unwrap() > 24_900);
+        assert!(recovered.budget.remaining_elapsed_ms().unwrap() > 99_900);
 
         let canonical = recovered.recovery_state(captured_at);
         assert_eq!(canonical.state.depth, 0);
         assert_eq!(
             canonical.state.local_remaining_elapsed_ms,
-            Some(canonical.state.remaining_elapsed_ms)
+            canonical.state.remaining_elapsed_ms
         );
-        assert!(canonical.state.remaining_elapsed_ms > 99_900);
+        assert!(canonical.state.remaining_elapsed_ms.unwrap() > 99_900);
     }
 
     #[test]
@@ -823,9 +817,9 @@ mod tests {
                 parent_task_id: None,
                 parent_thread_id: None,
                 depth: 0,
-                remaining_elapsed_ms: 10_000,
+                remaining_elapsed_ms: Some(10_000),
                 local_remaining_elapsed_ms: Some(4_000),
-                max_tokens: MIN_DELEGATED_TOKEN_BUDGET,
+                max_tokens: Some(8_192),
                 max_cost_microusd: None,
                 started_children: 0,
                 spent_tokens: 0,
@@ -835,7 +829,7 @@ mod tests {
         }
         .refreshed(captured_at + chrono::Duration::milliseconds(1_500));
 
-        assert_eq!(refreshed.state.remaining_elapsed_ms, 8_500);
+        assert_eq!(refreshed.state.remaining_elapsed_ms, Some(8_500));
         assert_eq!(refreshed.state.local_remaining_elapsed_ms, Some(2_500));
     }
 
@@ -852,9 +846,9 @@ mod tests {
                     parent_task_id: None,
                     parent_thread_id: None,
                     depth: 0,
-                    remaining_elapsed_ms: 10_000,
+                    remaining_elapsed_ms: Some(10_000),
                     local_remaining_elapsed_ms: None,
-                    max_tokens: MIN_DELEGATED_TOKEN_BUDGET,
+                    max_tokens: Some(8_192),
                     max_cost_microusd: None,
                     started_children: 0,
                     spent_tokens: 0,
@@ -868,8 +862,8 @@ mod tests {
         .expect("future checkpoint is recovered with an exhausted deadline");
 
         assert!(recovered.is_expired());
-        assert_eq!(recovered.remaining_elapsed_ms(), 0);
-        assert_eq!(recovered.budget.remaining_elapsed_ms(), 0);
+        assert_eq!(recovered.remaining_elapsed_ms(), Some(0));
+        assert_eq!(recovered.budget.remaining_elapsed_ms(), Some(0));
     }
 
     #[test]
@@ -878,7 +872,6 @@ mod tests {
         let root = DelegationContext::configured(
             SessionId::new(),
             Some(10_000),
-            Some(1_024),
             None,
             cancellation.clone(),
             2,
@@ -948,7 +941,6 @@ mod tests {
         let root = DelegationContext::root(
             SessionId::new(),
             Some(10_000),
-            Some(1_024),
             Some(10),
             cancellation.clone(),
         );
@@ -985,13 +977,8 @@ mod tests {
     #[test]
     fn long_input_usage_does_not_exhaust_output_admission_and_recovery_preserves_both() {
         let cancellation = CancellationToken::new();
-        let root = DelegationContext::root(
-            SessionId::new(),
-            Some(10_000),
-            Some(4_096),
-            None,
-            cancellation.clone(),
-        );
+        let root =
+            DelegationContext::root(SessionId::new(), Some(10_000), None, cancellation.clone());
         let launch = |context: &DelegationContext| {
             context.child(
                 SessionId::new(),
@@ -1021,16 +1008,11 @@ mod tests {
     }
 
     #[test]
-    fn actual_output_exhaustion_and_missing_output_remain_conservative() {
+    fn output_usage_does_not_create_an_implicit_lifetime_budget() {
         for output in [Some(50_000), None] {
             let cancellation = CancellationToken::new();
-            let root = DelegationContext::root(
-                SessionId::new(),
-                Some(10_000),
-                Some(4_096),
-                None,
-                cancellation.clone(),
-            );
+            let root =
+                DelegationContext::root(SessionId::new(), Some(10_000), None, cancellation.clone());
             let child = root
                 .child(
                     SessionId::new(),
@@ -1042,17 +1024,15 @@ mod tests {
                 )
                 .unwrap();
             child.finish(100_000, None, output);
-            assert!(matches!(
-                root.child(
-                    SessionId::new(),
-                    TaskId::new(),
-                    ThreadId::new(),
-                    4_096,
-                    None,
-                    &cancellation
-                ),
-                Err(DelegationLimit::TokenBudget)
-            ));
+            root.child(
+                SessionId::new(),
+                TaskId::new(),
+                ThreadId::new(),
+                4_096,
+                None,
+                &cancellation,
+            )
+            .expect("usage accounting must not impose a lifetime cap");
         }
     }
 
@@ -1062,7 +1042,6 @@ mod tests {
         let root = DelegationContext::configured(
             SessionId::new(),
             Some(10_000),
-            Some(1_024),
             None,
             cancellation.clone(),
             2,
@@ -1087,7 +1066,7 @@ mod tests {
         assert_eq!(snapshot["spent_tokens"], 10_000);
         assert_eq!(snapshot["spent_tokens_are_usage_accounting"], true);
         assert_eq!(snapshot["token_admission_committed"], 10_000);
-        assert_eq!(snapshot["token_admission_remaining"], 0);
+        assert_eq!(snapshot["token_admission_remaining"], Value::Null);
     }
 
     #[test]
@@ -1103,12 +1082,12 @@ mod tests {
                     parent_task_id: None,
                     parent_thread_id: None,
                     depth: 0,
-                    remaining_elapsed_ms: 10_000,
+                    remaining_elapsed_ms: Some(10_000),
                     local_remaining_elapsed_ms: None,
-                    max_tokens: MIN_DELEGATED_TOKEN_BUDGET,
+                    max_tokens: Some(8_192),
                     max_cost_microusd: Some(10),
                     started_children: 1,
-                    spent_tokens: MIN_DELEGATED_TOKEN_BUDGET + 500,
+                    spent_tokens: 8_192 + 500,
                     spent_output_tokens: None,
                     spent_cost_microusd: 12,
                 },
@@ -1119,7 +1098,7 @@ mod tests {
         .expect("recovered usage is valid accounting evidence");
 
         let snapshot = recovered.budget.snapshot();
-        assert_eq!(snapshot["spent_tokens"], MIN_DELEGATED_TOKEN_BUDGET + 500);
+        assert_eq!(snapshot["spent_tokens"], 8_192 + 500);
         assert_eq!(snapshot["token_admission_remaining"], 0);
         assert_eq!(snapshot["cost_admission_remaining"], 0);
         assert!(matches!(
@@ -1148,9 +1127,9 @@ mod tests {
                     parent_task_id: None,
                     parent_thread_id: None,
                     depth: 0,
-                    remaining_elapsed_ms: 10_000,
+                    remaining_elapsed_ms: Some(10_000),
                     local_remaining_elapsed_ms: None,
-                    max_tokens: MIN_DELEGATED_TOKEN_BUDGET,
+                    max_tokens: Some(8_192),
                     max_cost_microusd: Some(10),
                     started_children: 1,
                     spent_tokens: 0,
@@ -1182,7 +1161,6 @@ mod tests {
         let root = DelegationContext::root(
             SessionId::new(),
             Some(10_000),
-            Some(1_024),
             Some(10),
             cancellation.clone(),
         );
@@ -1219,7 +1197,6 @@ mod tests {
         let root = DelegationContext::root(
             SessionId::new(),
             Some(10_000),
-            Some(1_024),
             Some(10),
             cancellation.clone(),
         );
@@ -1246,7 +1223,6 @@ mod tests {
         let root = DelegationContext::root(
             SessionId::new(),
             Some(10_000),
-            Some(1_024),
             Some(10),
             cancellation.clone(),
         );
@@ -1291,7 +1267,6 @@ mod tests {
         let root = DelegationContext::root(
             root_session_id,
             Some(10_000),
-            Some(1_024),
             Some(10),
             cancellation.clone(),
         );
@@ -1349,7 +1324,6 @@ mod tests {
         let root = DelegationContext::root(
             SessionId::new(),
             Some(10_000),
-            Some(1_024),
             Some(10_000),
             cancellation.clone(),
         );
@@ -1365,7 +1339,8 @@ mod tests {
             .expect("child admission");
 
         let reservation = root.recovery_state(Utc::now());
-        assert_eq!(reservation.state.spent_tokens, reservation.state.max_tokens);
+        assert_eq!(reservation.state.max_tokens, None);
+        assert!(reservation.state.spent_tokens > 0);
         assert_eq!(reservation.state.spent_cost_microusd, 10_000);
 
         let settlement = child.settlement_recovery_state(Utc::now(), 5_000, Some(2_000), None);
@@ -1381,8 +1356,7 @@ mod tests {
 
     #[test]
     fn default_ten_slots_are_atomic_and_reusable_without_a_cumulative_limit() {
-        let root =
-            DelegationContext::root(SessionId::new(), None, None, None, CancellationToken::new());
+        let root = DelegationContext::root(SessionId::new(), None, None, CancellationToken::new());
         let barrier = Arc::new(std::sync::Barrier::new(20));
         let handles: Vec<_> = (0..20)
             .map(|_| {
@@ -1427,13 +1401,21 @@ mod tests {
                     &CancellationToken::new(),
                 )
                 .unwrap();
-            child.finish(0, Some(0), None);
+            child.finish(100_000, Some(0), Some(50_000));
         }
         let state = root.recovery_state(Utc::now());
         assert_eq!(state.state.started_children, 70);
-        let recovered =
-            DelegationContext::recovered(state, Utc::now(), CancellationToken::new()).unwrap();
+        assert_eq!(state.state.max_tokens, None);
+        assert_eq!(state.state.remaining_elapsed_ms, None);
+        assert_eq!(state.state.spent_output_tokens, Some(3_000_000));
+        let recovered = DelegationContext::recovered(
+            state,
+            Utc::now() + chrono::Duration::hours(24),
+            CancellationToken::new(),
+        )
+        .unwrap();
         assert_eq!(recovered.max_active_children(), 10);
+        assert_eq!(recovered.remaining_elapsed_ms(), None);
         assert!(
             recovered
                 .child(
@@ -1457,7 +1439,6 @@ mod tests {
     fn configured_concurrency_survives_recovery_and_legacy_defaults_to_ten() {
         let root = DelegationContext::configured(
             SessionId::new(),
-            None,
             None,
             None,
             CancellationToken::new(),

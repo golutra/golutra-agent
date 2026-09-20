@@ -209,7 +209,7 @@ fn default_task_contract(request: &AgentTaskRequest) -> TaskContract {
     if request.touched_code {
         contract.workspace_change = WorkspaceChangeRequirement::Required;
         contract.require_objective_validation = true;
-        contract.max_correction_rounds = 1;
+        contract.max_correction_rounds = None;
     }
     contract
 }
@@ -227,7 +227,7 @@ fn strict_task_contract(request: &AgentTaskRequest) -> TaskContract {
     let mut contract = default_task_contract(request);
     contract.require_objective_validation = true;
     contract.verification = VerificationRequirement::Required;
-    contract.max_correction_rounds = contract.max_correction_rounds.max(1);
+    contract.max_correction_rounds = None;
     contract
 }
 
@@ -496,11 +496,11 @@ mod tests {
             run.task_contract.verification,
             VerificationRequirement::Required
         );
-        assert_eq!(run.task_contract.max_correction_rounds, 1);
+        assert_eq!(run.task_contract.max_correction_rounds, None);
     }
 
     #[test]
-    fn open_mode_checks_completion_with_bounded_correction() {
+    fn open_mode_checks_completion_without_a_default_correction_limit() {
         let mut request = request();
         request.touched_code = true;
         let run =
@@ -511,10 +511,7 @@ mod tests {
             WorkspaceChangeRequirement::Required
         );
         assert!(run.task_contract.require_objective_validation);
-        assert_eq!(
-            run.task_contract.max_correction_rounds,
-            golutra_agent_core::MAX_TASK_CORRECTION_ROUNDS
-        );
+        assert_eq!(run.task_contract.max_correction_rounds, None);
     }
 
     #[test]

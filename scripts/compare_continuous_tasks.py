@@ -73,6 +73,10 @@ def run_stage(args, state, prompt, stage, immutable):
     output = state.artifact_root / f"stage-{stage}"
     output.mkdir(parents=True)
     command = (bench.golutra_agent_command if state.name == "golutra" else codex_command)(args, state, prompt, stage)
+    if state.name == "golutra" and getattr(args, "single_task", False):
+        # 仅测试宿主设定终止超时；产品任务本身不注入预算。
+        index = command.index("--max-elapsed-ms")
+        del command[index:index + 2]
     if state.name == "golutra" and getattr(args, "full_run_export", False):
         command.insert(command.index("exec") + 1, "--full-run-export")
     captured = process.run_process(command, state.workspace, state.env, args.timeout,
@@ -87,7 +91,9 @@ def run_stage(args, state, prompt, stage, immutable):
     metrics["final_message"] = bench.sanitize_local_paths(metrics.get("final_message"), state)
     if state.name == "golutra" and state.thread_id is None:
         state.thread_id = process.run_bundle_thread_id(state.artifact_root / "run")
-    verification = bench.run_verifier(state.workspace, stage, output)
+    verification = (verify_single_task(state.workspace, output)
+                    if getattr(args, "single_task", False)
+                    else bench.run_verifier(state.workspace, stage, output))
     unchanged = immutable == bench.immutable_digests(state.workspace)
     result = {"stage": stage, "prompt": bench.prompt_metadata(prompt),
               **bench.classify_turn(metrics, verification, unchanged),
@@ -97,8 +103,35 @@ def run_stage(args, state, prompt, stage, immutable):
     return result
 
 
+def verify_single_task(workspace, output):
+    """独立判题器按阶段隔离；单任务必须验收全部交付，不能仅检查最后阶段。"""
+    stages = []
+    for stage in range(1, 5):
+        directory = output / f"verification-stage-{stage}"
+        directory.mkdir(parents=True, exist_ok=True)
+        stages.append(bench.run_verifier(workspace, stage, directory))
+    return {"passed": all(result.get("passed") is True for result in stages),
+            "checks": [check for result in stages for check in result.get("checks", [])],
+            "stages": stages,
+            "error": next((result.get("error") or result.get("diagnostic")
+                           for result in stages if result.get("passed") is not True), None)}
+
+
+def single_task_prompt():
+    """将四个交付阶段明确为一次授权，保留原验收要求及后台工作的先后关系。"""
+    prompts = list(bench.turn_prompts())
+    prompts[2] = prompts[2].split("End compatibility ledger.\n\n", 1)[1]
+    return ("Complete all four phases below in one autonomous task. Do not stop after an intermediate phase. "
+            "Preserve the public API, original tests and probe tool; verify the final combined deliverable.\n\n"
+            + "\n\n".join(prompts)).replace(
+                "use one shell_session wait with wait_for_terminal=true and a bounded wait_ms",
+                "use the product's native bounded wait mechanism"
+            ) + "\nWork in this workspace only. Do not delegate to subagents."
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--single-task", action="store_true", help="Complete all four phases in one autonomous task; no injected repair turns")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--golutra", type=Path, default=Path("target/release/golutra-agent"))
     parser.add_argument("--engines", nargs="+", choices=["golutra", "codex"], default=["golutra", "codex"])
@@ -135,7 +168,7 @@ def main():
               "codex_conventional_responses_override": args.codex_model_catalog is not None,
               "versions": {"golutra": bench.version([str(args.golutra), "--version"], work),
                            "codex": bench.version([args.codex, "--version"], work)},
-              "scope": "Four sequential user stages with process resume, not a multi-hour autonomous coding claim.",
+              "scope": ("One autonomous four-phase coding task; measured duration, not a multi-hour claim." if args.single_task else "Four sequential user stages with process resume, not a multi-hour autonomous coding claim."),
               "stages": []}
     states = {}
     try:
@@ -162,12 +195,14 @@ def main():
                 artifacts = work / engine / "artifacts"
                 artifacts.mkdir()
                 states[engine] = bench.EngineState(engine, workspace, artifacts, env)
-            for stage, prompt in enumerate(bench.turn_prompts(), 1):
+            stages = [(4, single_task_prompt())] if args.single_task else list(enumerate(bench.turn_prompts(), 1))
+            for stage, prompt in stages:
                 # 同一提示不指定某产品专属工具名，禁止基准意外变成子代理测评。
                 prompt = prompt.replace("use one shell_session wait with wait_for_terminal=true and a bounded wait_ms",
                                         "use the product's native bounded wait mechanism")
                 prompt += "\nWork in this workspace only. Do not delegate to subagents."
-                order = ["golutra", "codex"] if stage % 2 else ["codex", "golutra"]
+                # 单任务按显式 engines 顺序运行，复测时反转顺序以减少时段偏差。
+                order = list(dict.fromkeys(args.engines)) if args.single_task else (["golutra", "codex"] if stage % 2 else ["codex", "golutra"])
                 order = [engine for engine in order if engine in states]
                 results = {"stage": stage, "order": order}
                 for engine in order:

@@ -35,13 +35,8 @@ impl LlmProvider for CompactionProvider {
                 .to_owned();
             for message in source["history"].as_array().unwrap() {
                 let text = message["content"].as_str().unwrap_or_default();
-                if message["role"] == "user"
-                    && (text == ORIGINAL || text == STEER)
-                    && !retained.contains(text)
-                {
-                    retained.push('\n');
-                    retained.push_str(text);
-                }
+                // 故意不复述用户要求，验证宿主保留的原文不会依赖摘要质量。
+
                 // 只从真实工具观察提取里程碑；已压缩事实必须通过 previous_summary 继续传递。
                 if message["role"] == "tool" {
                     for fact in [FIRST_FACT, FRESH_FACT] {

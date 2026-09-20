@@ -13,6 +13,28 @@ import compare_continuous_tasks as comparison
 
 
 class ContinuousComparisonTests(unittest.TestCase):
+    def test_single_task_verifies_all_four_stages_even_after_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            workspace = output / "workspace"
+            with patch.object(comparison.bench, "run_verifier", side_effect=lambda _workspace, stage, _output: {
+                "passed": stage != 2, "checks": [f"stage_{stage}"], "error": "failure" if stage == 2 else None,
+            }) as verify:
+                result = comparison.verify_single_task(workspace, output)
+            self.assertEqual([call.args[1] for call in verify.call_args_list], [1, 2, 3, 4])
+            self.assertEqual(len({call.args[2] for call in verify.call_args_list}), 4)
+            self.assertFalse(result["passed"])
+            self.assertEqual(result["error"], "failure")
+            self.assertEqual(len(result["stages"]), 4)
+
+    def test_single_task_keeps_all_requirements_and_neutral_background_contract(self):
+        prompt = comparison.single_task_prompt()
+        for requirement in ["load_recovering", "transactional", "restore_counts", "atomic replace",
+                            "LEDGER-LONG-73X", "background_probe.py", "Do not stop after an intermediate"]:
+            self.assertIn(requirement, prompt)
+        self.assertNotIn("shell_session", prompt)
+        self.assertNotIn("End compatibility ledger.", prompt)
+
     def test_codex_resume_retains_same_model_provider_and_explicit_permissions(self):
         args = types.SimpleNamespace(codex="codex", model="same-model",
                                      reasoning_effort="medium", base_url="https://example.test")

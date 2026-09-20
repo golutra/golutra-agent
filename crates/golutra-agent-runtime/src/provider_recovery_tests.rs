@@ -70,9 +70,11 @@ impl LlmProvider for FaultProvider {
 
 #[tokio::test(start_paused = true)]
 async fn offline_for_hours_recovers_the_same_request_while_background_work_progresses() {
-    let provider = FaultProvider::offline(240);
+    let provider = FaultProvider::offline(360);
     let session = ProviderSession::new(&provider, None, ProviderSessionPolicy::default())
-        .with_deadline(Some(Instant::now() + Duration::from_secs(4 * 3600)));
+        .with_deadline(crate::deadline_from_budget(
+            golutra_agent_governor::GovernorLimits::default().max_elapsed_ms,
+        ));
     let original = super::tests::request();
     let ticks = Arc::new(AtomicUsize::new(0));
     let background_ticks = ticks.clone();
@@ -95,7 +97,7 @@ async fn offline_for_hours_recovers_the_same_request_while_background_work_progr
         .await
         .expect("network restores without another user turn");
     background.abort();
-    assert!(started.elapsed() > Duration::from_secs(3 * 3600));
+    assert!(started.elapsed() > Duration::from_secs(5 * 3600));
     assert!(ticks.load(Ordering::SeqCst) > 300);
     assert_eq!(completed.request_id, original.request_id);
     assert_eq!(completed.turn_id, original.turn_id);
@@ -108,7 +110,7 @@ async fn offline_for_hours_recovers_the_same_request_while_background_work_progr
         1
     );
     assert!(response.message.unwrap().content.contains("完成"));
-    assert_eq!(waits.len(), 240);
+    assert_eq!(waits.len(), 360);
     assert!(
         waits
             .iter()

@@ -154,11 +154,15 @@ async fn unsuccessful_terminal_responses_never_execute_tools_or_claim_completion
 }
 
 #[tokio::test]
-async fn differing_nonterminal_text_is_bounded_without_resetting_task_budget() {
+async fn differing_nonterminal_text_continues_beyond_old_limit() {
     let workspace = tempdir().unwrap();
     let agent = AgentLoop::new(
         TerminalProvider {
-            reasons: vec![ProviderFinishReason::Continue],
+            reasons: [
+                vec![ProviderFinishReason::Continue; 20],
+                vec![ProviderFinishReason::Stop],
+            ]
+            .concat(),
             requests: Mutex::new(Vec::new()),
             tool: false,
         },
@@ -166,14 +170,14 @@ async fn differing_nonterminal_text_is_bounded_without_resetting_task_budget() {
         BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).unwrap()),
     );
     let mut events = Vec::new();
-    let error = agent
+    let outcome = agent
         .run_with_trace(task(), |e| events.push(e))
         .await
-        .unwrap_err();
-    assert!(error.to_string().contains("8 consecutive"));
-    assert_eq!(agent.provider.requests.lock().unwrap().len(), 9);
+        .unwrap();
+    assert_eq!(outcome.loop_decision.action, LoopAction::StopSuccess);
+    assert_eq!(agent.provider.requests.lock().unwrap().len(), 21);
     assert!(
-        !events
+        events
             .iter()
             .any(|e| matches!(e, AgentLoopTraceEvent::CandidateReady { .. }))
     );

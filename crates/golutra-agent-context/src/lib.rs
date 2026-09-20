@@ -205,6 +205,32 @@ pub fn context_message_prefix_digest(
 }
 
 impl ContextBuildPlan {
+    /// 恢复可信快照中的用户需求来源；逐条校验完整 wire，避免把摘要、纠偏
+    /// 或被改写的 user 消息提升为原始需求。缺失或不匹配的来源保持回放分类。
+    pub fn restore_user_instruction_sources(&mut self, manifest: &[ContextMessageSnapshot]) {
+        for entry in manifest {
+            let index = entry.index as usize;
+            if entry.role != "user"
+                || !matches!(entry.contributor.as_str(), "objective" | "user_message")
+                || self
+                    .messages
+                    .get(index)
+                    .is_none_or(|message| message.role != ProviderRole::User)
+                || self.message_digests.get(index) != Some(&entry.wire_digest)
+            {
+                continue;
+            }
+            if let Some(source) = self.message_sources.get_mut(index) {
+                *source = ContextMessageSource {
+                    contributor: entry.contributor.clone(),
+                    source_refs: entry.source_refs.clone(),
+                    origin: entry.origin.clone(),
+                    visibility: ModelInputVisibility::ModelVisible,
+                };
+            }
+        }
+    }
+
     /// Append one model-visible message and capture its estimate in the same
     /// operation.  Runtime code keeps the plan as the single mutable source
     /// of truth, so budgeting, snapshotting and attribution cannot drift.
@@ -586,7 +612,26 @@ impl ContextWindowManager {
             .saturating_sub(recent_reserve)
             .min(MAX_AUTOMATIC_COMPACTION_SUMMARY_TOKENS)
             .max(minimum_summary_reserve.min(target_available.saturating_sub(1)));
-        let tail_budget = target_available.saturating_sub(summary_reserve);
+        let normalized_sources = normalized_message_sources(messages, message_sources);
+        // 原始用户要求独立于模型摘要保留，避免摘要反复改写后漂移。
+        // 保留完整消息和来源，容量不足时仍由摘要及持久化历史承接，不能截断成另一条指令。
+        let instruction_budget = target_available
+            .saturating_sub(summary_reserve)
+            .saturating_div(4)
+            .min(2_048);
+        let instruction_indices = retained_user_instructions(
+            messages,
+            &normalized_sources,
+            protected_prefix_len,
+            instruction_budget,
+        );
+        let instruction_tokens = instruction_indices
+            .iter()
+            .map(|index| message_estimates[*index])
+            .sum::<u64>();
+        let tail_budget = target_available
+            .saturating_sub(summary_reserve)
+            .saturating_sub(instruction_tokens);
         let tail = &messages[protected_prefix_len..];
         let groups = message_groups(tail);
         let mut retained_groups = Vec::<Range<usize>>::new();
@@ -620,7 +665,12 @@ impl ContextWindowManager {
         }
         let dropped_end = tail.len().saturating_sub(retained.len());
         let dropped = &tail[..dropped_end];
-        let dropped_message_count = dropped.len();
+        let dropped_message_count = dropped.len().saturating_sub(
+            instruction_indices
+                .iter()
+                .filter(|index| **index < protected_prefix_len + dropped_end)
+                .count(),
+        );
         let mut summary_message = ProviderMessage {
             role: ProviderRole::User,
             content: COMPACTION_SUMMARY_PREFIX.to_owned(),
@@ -630,7 +680,6 @@ impl ContextWindowManager {
             metadata: Default::default(),
         };
         let summary_overhead = estimate_message_tokens(std::slice::from_ref(&summary_message));
-        let normalized_sources = normalized_message_sources(messages, message_sources);
         let summary_source_sources =
             normalized_sources[protected_prefix_len..protected_prefix_len + dropped_end].to_vec();
         let summary_token_budget = summary_reserve.saturating_sub(summary_overhead);
@@ -678,11 +727,23 @@ impl ContextWindowManager {
             });
         }
         let retained_count = retained.len();
-        replacement_messages.extend(retained);
         let retained_source_start = messages.len().saturating_sub(retained_count);
+        let mut instruction_message_tokens = 0_u64;
+        let instruction_indices = instruction_indices
+            .into_iter()
+            .filter(|index| *index < retained_source_start)
+            .collect::<Vec<_>>();
+        for &index in &instruction_indices {
+            replacement_messages.push(messages[index].clone());
+            replacement_sources.push(normalized_sources[index].clone());
+            instruction_message_tokens =
+                instruction_message_tokens.saturating_add(message_estimates[index]);
+        }
+        replacement_messages.extend(retained);
         replacement_sources.extend_from_slice(&normalized_sources[retained_source_start..]);
 
         let replacement_source_by_original = (0..protected_prefix_len)
+            .chain(instruction_indices)
             .chain(retained_source_start..messages.len())
             .collect::<HashSet<_>>();
         let message_decisions = messages
@@ -712,6 +773,7 @@ impl ContextWindowManager {
 
         let replacement_estimated_tokens = protected_message_tokens
             .saturating_add(summary_message_tokens)
+            .saturating_add(instruction_message_tokens)
             .saturating_add(retained_message_tokens)
             .saturating_add(planned_tool_tokens);
         if replacement_estimated_tokens > compaction_limit {
@@ -2270,6 +2332,41 @@ fn message_groups(messages: &[ProviderMessage]) -> Vec<Range<usize>> {
     groups
 }
 
+/// 最早的目标与最新的补充优先保留；不把工具输出或运行时纠偏冒充用户要求。
+fn retained_user_instructions(
+    messages: &[ProviderMessage],
+    sources: &[ContextMessageSource],
+    start: usize,
+    budget: u64,
+) -> Vec<usize> {
+    let candidates = (start..messages.len())
+        .filter(|&index| {
+            messages[index].role == ProviderRole::User
+                && matches!(
+                    sources[index].contributor.as_str(),
+                    "user_message" | "objective"
+                )
+                && sources[index].visibility.is_model_visible()
+        })
+        .collect::<Vec<_>>();
+    let mut remaining = budget;
+    let mut retained = Vec::new();
+    for index in candidates
+        .first()
+        .copied()
+        .into_iter()
+        .chain(candidates.iter().rev().copied())
+    {
+        let tokens = estimate_message_token(&messages[index]);
+        if !retained.contains(&index) && tokens <= remaining {
+            remaining -= tokens;
+            retained.push(index);
+        }
+    }
+    retained.sort_unstable();
+    retained
+}
+
 fn compact_message_group(messages: &[ProviderMessage], budget: u64) -> Vec<ProviderMessage> {
     if messages.is_empty() || budget == 0 {
         return Vec::new();
@@ -2795,6 +2892,49 @@ mod tests {
             stable_prefix_token_estimate(&snapshot),
             snapshot.message_manifest[0].estimated_tokens
         );
+    }
+
+    #[test]
+    fn replay_restores_only_matching_original_user_sources() {
+        let task_id = TaskId::new();
+        let turn_id = TurnId::new();
+        let builder = ContextBuilder::default();
+        let contributors = ["objective", "user_message", "working_summary"]
+            .into_iter()
+            .map(|name| ContextContributor {
+                name: name.to_owned(),
+                role: ProviderRole::User,
+                content: format!("content from {name}"),
+                token_budget_hint: 0,
+                source_refs: vec![format!("source:{name}")],
+            })
+            .collect();
+        let original = builder.build(task_id, turn_id, contributors).unwrap();
+        let request =
+            provider_request_from_plan(&original, task_id, turn_id, "mock", "model", Vec::new());
+        let snapshot = context_snapshot_from_request(SessionId::new(), &original, &request);
+        let mut messages = original.messages.clone();
+        let edited_index = original
+            .message_sources
+            .iter()
+            .position(|source| source.contributor == "user_message")
+            .unwrap();
+        messages[edited_index].content.push_str(" altered");
+        let mut replay = builder
+            .build_from_messages(task_id, turn_id, messages)
+            .unwrap();
+        replay.restore_user_instruction_sources(&snapshot.message_manifest);
+        for (index, source) in original.message_sources.iter().enumerate() {
+            if source.contributor == "objective" {
+                assert_eq!(replay.message_sources[index], *source);
+            } else {
+                assert!(
+                    replay.message_sources[index]
+                        .contributor
+                        .starts_with("replay_message_")
+                );
+            }
+        }
     }
 
     #[test]

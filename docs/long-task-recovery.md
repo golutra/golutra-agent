@@ -4,7 +4,7 @@
 
 A temporary connection failure keeps the current task and logical provider request alive. The user does not have to submit another prompt. This is waiting for the remote model, not offline inference. No daemon, new slash command, database migration, or separate user data directory is required.
 
-Connection retries use a 5, 10, 20, 40, 60 second schedule with 90–100% request-specific jitter and a 60 second ceiling. Only typed connection failures enter this path. The task deadline and cancellation still apply. The default governor retains its four-hour wall-clock budget, tool/cost limits and verification rules. Waiting counts toward the total deadline, but not toward the correction no-progress time limit. Reaching the deadline is not reported as successful completion.
+Connection retries use a 5, 10, 20, 40, 60 second schedule with 90–100% request-specific jitter and a 60 second ceiling. Only typed connection failures enter this path. The task deadline and cancellation still apply. The default governor has no total wall-clock, tool-count or cost cutoff. Explicit budgets, cancellation and verification rules still apply. Waiting counts toward an explicitly configured deadline, but not toward an explicitly configured correction no-progress time limit. Reaching the deadline is not reported as successful completion.
 
 HTTP 429 and transient stream/server failures use the existing bounded retry budgets (two streaming retries and two buffered retries by default). Valid `Retry-After` advice is no longer shortened to 30 seconds. Cancellation and the task deadline can interrupt a long server-advised wait. Explicit client errors other than 429, invalid credentials, malformed responses and semantic parser failures do not enter endless retries. TLS certificate/configuration failures are excluded from the connection-wait classification. A proxy that converts an outage into an HTTP error uses the HTTP policy, not the connection policy.
 
@@ -14,7 +14,7 @@ Auxiliary semantic compaction has finite connection retries. If the model summar
 
 Provider deltas are previews. AgentLoop dispatches tools only after a complete provider response. A failed response's incomplete tool arguments never become executable calls.
 
-Response completion also respects the normalized finish reason. Text cut off by an output limit or explicitly marked for continuation stays in the same task; unsuccessful terminal states do not enter completion verification. See [continuous task execution](long-task-execution.md) for protocol mappings, continuation bounds and the tool-dispatch timing evaluation.
+Response completion also respects the normalized finish reason. Text cut off by an output limit or explicitly marked for continuation stays in the same task; unsuccessful terminal states do not enter completion verification. See [continuous task execution](long-task-execution.md) for protocol mappings, continuation behavior and the tool-dispatch timing evaluation.
 
 Before retrying a response that emitted text or tool previews, the runtime emits a required, durable recovery boundary. The terminal seals the old text with `[Response interrupted; retrying]` and starts a separate response. It does not join newly generated text onto an old partial sentence. This also applies to transport/provider fallback and to history rebuilt by resume. Already printed terminal scrollback is retained rather than falsely presented as retractable.
 
@@ -53,7 +53,7 @@ Clients consuming deltas must honor `reset_stream`; concatenating all deltas acr
 
 ## Validation
 
-Deterministic tests cover multiple hours of virtual offline time, the four-hour deadline, cancellation, a 120-second `Retry-After`, hard errors, incomplete Chinese text/tool deltas, background progress and bounded auxiliary compaction. Runtime integration executes a real file write and verifies it occurs only once across recovery. HTTP fixtures cover connection refusal and a truncated SSE stream split across UTF-8 byte boundaries. TUI reducer and PTY tests cover waiting, recovery, status counters and resume in a new process.
+Deterministic tests cover more than five hours of virtual offline time without a default deadline, explicit deadlines, cancellation, a 120-second `Retry-After`, hard errors, incomplete Chinese text/tool deltas, background progress and bounded auxiliary compaction. Runtime integration executes a real file write and verifies it occurs only once across recovery. HTTP fixtures cover connection refusal and a truncated SSE stream split across UTF-8 byte boundaries. TUI reducer and PTY tests cover waiting, recovery, status counters and resume in a new process.
 
 ```sh
 REQUEST_METHOD=GET cargo test -p golutra-agent-llm -p golutra-agent-runtime -p golutra-agent-client -p golutra-agent-tui --all-targets --locked

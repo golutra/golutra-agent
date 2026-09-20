@@ -1617,7 +1617,7 @@ TaskClass: TypeAlias = Literal['plain_conversation', 'read_only_analysis', 'work
 
 class TaskContract(TypedDict, total=False):
     completion_criteria: NotRequired[list[str]]
-    max_correction_rounds: NotRequired[int]
+    max_correction_rounds: NotRequired[int | None]
     require_objective_validation: NotRequired[bool]
     required_file_contents: NotRequired[list[RequiredFileContent]]
     required_paths: NotRequired[list[str]]

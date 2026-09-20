@@ -4938,6 +4938,7 @@ fn supervised_process_report(
             "output_lost": snapshot.output_lost,
             "terminal_event_id": snapshot.terminal_event_id,
             "workspace_changes_known": workspace_changes_known,
+            "workspace_only_derived_changes": snapshot.workspace_only_derived_changes,
             "process_lifetime_scope": "runtime",
             "survives_runtime_exit": false,
             "terminal": terminal,

@@ -51,7 +51,7 @@ fn correction_feedback_omits_recovered_and_unlinked_checks_and_deduplicates_repo
     let mut duplicate = record.checks[2].clone();
     duplicate.kind = VerificationCheckKind::ToolExecution;
     record.checks.push(duplicate);
-    let correction = correction_envelope(&record, 1, 2);
+    let correction = correction_envelope(&record, 1, Some(2));
     let content = model_instruction(&correction, &record, &reports);
     assert!(!content.contains("case_0"));
     assert!(!content.contains("case_1"));
@@ -72,7 +72,7 @@ fn correction_feedback_bounds_escaped_unicode_and_redacts_before_truncating() {
         ));
     }
     record.checks[0].command = Some("PASSWORD=command-secret python3 -m unittest".into());
-    let content = model_instruction(&correction_envelope(&record, 1, 2), &record, &reports);
+    let content = model_instruction(&correction_envelope(&record, 1, Some(2)), &record, &reports);
     assert!(!content.contains("secret-value"));
     assert!(!content.contains("secret-output"));
     assert!(!content.contains("command-secret"));
@@ -87,7 +87,7 @@ fn correction_feedback_bounds_escaped_unicode_and_redacts_before_truncating() {
 fn correction_feedback_without_linked_failures_preserves_existing_instruction() {
     let (mut record, reports) = fixture(1);
     record.checks[0].passed = true;
-    let correction = correction_envelope(&record, 1, 2);
+    let correction = correction_envelope(&record, 1, Some(2));
     assert_eq!(
         model_instruction(&correction, &record, &reports),
         correction.as_model_instruction()
@@ -110,7 +110,7 @@ fn correction_feedback_keeps_failure_at_end_of_a_long_verifier_log() {
             artifact_id,
             bytes: output.into_bytes(),
         });
-    let content = model_instruction(&correction_envelope(&record, 1, 2), &record, &reports);
+    let content = model_instruction(&correction_envelope(&record, 1, Some(2)), &record, &reports);
     assert!(content.contains("actual=17 expected=23"), "{content}");
     assert!(content.contains("Build started"));
     assert!(content.contains("omitted"));

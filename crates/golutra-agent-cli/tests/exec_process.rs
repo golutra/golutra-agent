@@ -340,6 +340,7 @@ async fn failed_exec_run_dir_still_retains_verification_observations() {
     let export_parent = tempdir().expect("export parent");
     let state_dir = export_parent.path().join("failed-runtime");
     install_mock_provider(home.path());
+    let task_contract = write_bounded_mock_contract(home.path());
 
     let output = tokio::time::timeout(
         Duration::from_secs(60),
@@ -349,6 +350,8 @@ async fn failed_exec_run_dir_still_retains_verification_observations() {
             .arg("exec")
             .arg("--run-dir")
             .arg(&state_dir)
+            .arg("--task-contract")
+            .arg(&task_contract)
             .arg("--verify-program")
             .arg("false")
             .arg("reply after a failing verifier")
@@ -609,6 +612,7 @@ async fn exec_runs_caller_declared_verifier_across_the_app_server_boundary() {
     let home = tempdir().expect("home");
     let workspace = tempdir().expect("workspace");
     install_mock_provider(home.path());
+    let task_contract = write_bounded_mock_contract(home.path());
     let address = reserve_address();
     let mut app_server = Command::new(env!("CARGO_BIN_EXE_golutra-agent"))
         .arg("app-server")
@@ -654,6 +658,8 @@ async fn exec_runs_caller_declared_verifier_across_the_app_server_boundary() {
             "tests pass",
             "--verify-program",
             "false",
+            "--task-contract",
+            task_contract.to_str().expect("contract path"),
             "reply after verification",
         ],
     )
@@ -767,4 +773,11 @@ fn install_mock_provider(home: &Path) {
         .expect("provider JSON"),
     )
     .expect("provider config");
+}
+
+fn write_bounded_mock_contract(home: &Path) -> std::path::PathBuf {
+    // 固定 false 验收器不可能被 mock 修复；失败终态测试必须显式设置纠偏预算。
+    let path = home.join("bounded-task-contract.json");
+    fs::write(&path, r#"{"max_correction_rounds":1}"#).expect("bounded contract");
+    path
 }

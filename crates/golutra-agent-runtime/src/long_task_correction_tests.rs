@@ -98,6 +98,7 @@ fn passing_python_tests_do_not_expire_previous_checks_by_writing_bytecode_cache(
         "Ran 1 test in 0.01s\nOK\n",
     );
     next.envelope.structured_facts["workspace_changes_known"] = json!(true);
+    next.envelope.structured_facts["workspace_only_derived_changes"] = json!(true);
     next.changed_files = vec!["__pycache__/test_added.cpython-314.pyc".into()];
     let current = |next: &ToolExecutionReport| {
         validation_is_current(&previous, &[previous.clone(), next.clone()])
@@ -105,6 +106,7 @@ fn passing_python_tests_do_not_expire_previous_checks_by_writing_bytecode_cache(
     assert!(current(&next));
     let mut source_edit = next.clone();
     source_edit.changed_files.push("test_added.py".into());
+    source_edit.envelope.structured_facts["workspace_only_derived_changes"] = json!(false);
     assert!(!current(&source_edit));
     let mut explicit_edit = next.clone();
     explicit_edit.envelope.tool_name = "write_file".into();
@@ -117,6 +119,7 @@ fn passing_python_tests_do_not_expire_previous_checks_by_writing_bytecode_cache(
     assert!(!current(&failed));
     let mut standalone = next.clone();
     standalone.changed_files = vec!["module.pyc".into()];
+    standalone.envelope.structured_facts["workspace_only_derived_changes"] = json!(false);
     assert!(!current(&standalone));
 }
 
@@ -124,6 +127,97 @@ struct CorrectionSequence {
     actions: Vec<Option<Value>>,
     requests: Mutex<Vec<ProviderRequest>>,
     workspace: PathBuf,
+}
+
+#[test]
+fn source_backed_derived_changes_do_not_expire_tests_but_real_edits_do() {
+    let previous = objective_test_report_with_output(
+        "python3 -m unittest discover -v",
+        "Ran 1 test in 0.01s\nOK\n",
+    );
+    let mut compile =
+        objective_test_report_with_output("python3 -m py_compile prices.py receipt.py", "");
+    compile.envelope.structured_facts["workspace_changes_known"] = json!(true);
+    compile.envelope.structured_facts["workspace_only_derived_changes"] = json!(true);
+    compile.changed_files = vec!["__pycache__/prices.cpython-314.pyc".into()];
+    let current = |later: &ToolExecutionReport| {
+        validation_is_current(&previous, &[previous.clone(), later.clone()])
+    };
+    assert!(
+        current(&compile),
+        "successful syntax checking only rewrote derived bytecode"
+    );
+    let mut source_edit = compile.clone();
+    source_edit.changed_files.push("prices.py".into());
+    source_edit.envelope.structured_facts["workspace_only_derived_changes"] = json!(false);
+    assert!(!current(&source_edit));
+    let mut unknown = compile.clone();
+    unknown.envelope.structured_facts["workspace_changes_known"] = json!(false);
+    assert!(!current(&unknown));
+    let mut failed = compile.clone();
+    failed.envelope.status = ToolResultStatus::Error;
+    assert!(!current(&failed));
+    let mut direct_write = compile.clone();
+    direct_write.envelope.tool_name = "write_file".into();
+    assert!(!current(&direct_write));
+    let mut unproven = compile.clone();
+    unproven.envelope.structured_facts["workspace_only_derived_changes"] = Value::Null;
+    assert!(!current(&unproven));
+}
+
+#[tokio::test]
+async fn real_process_snapshots_preserve_validation_across_different_cache_producers() {
+    // 用真实进程和前后快照证明派生关系，不能靠模型命令名或伪造“测试通过”输出放行。
+    let workspace = tempdir().unwrap();
+    fs::write(workspace.path().join("module.py"), "value = 42\n").unwrap();
+    fs::write(workspace.path().join("test_module.py"),
+        "import unittest\nfrom module import value\nclass Module(unittest.TestCase):\n def test_value(self): self.assertEqual(value, 42)\n").unwrap();
+    let executor = BasicToolExecutor::new(
+        WorkspacePolicy::new(workspace.path())
+            .unwrap()
+            .with_unrestricted_access(true),
+    );
+    let shell = |command: &str| golutra_agent_tools::ToolRequest {
+        tool_call_id: ToolCallId::new(),
+        provider_tool_call_id: None,
+        session_id: SessionId::new(),
+        turn_id: None,
+        tool_name: "shell".into(),
+        arguments: json!({"command":command}),
+    };
+    let test = executor
+        .execute(
+            shell("python3 -m unittest discover -v"),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(objective_validation_report(&test).unwrap().passed);
+    for command in [
+        "python3 -m py_compile module.py",
+        "python3 -c \"import py_compile; py_compile.compile('module.py', dfile='review/module.py', doraise=True)\"",
+    ] {
+        let compile = executor
+            .execute(shell(command), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(compile.envelope.status, ToolResultStatus::Ok);
+        assert!(!compile.changed_files.is_empty());
+        assert_eq!(
+            compile.envelope.structured_facts["workspace_only_derived_changes"],
+            true
+        );
+        assert!(
+            validation_is_current(&test, &[test.clone(), compile]),
+            "{command}"
+        );
+    }
+    let edit = executor.execute(shell("python3 -c \"from pathlib import Path; Path('module.py').write_text('value = 43\\n')\""), CancellationToken::new()).await.unwrap();
+    assert_eq!(
+        edit.envelope.structured_facts["workspace_only_derived_changes"],
+        false
+    );
+    assert!(!validation_is_current(&test, &[test.clone(), edit]));
 }
 
 struct ReadImplementVerifyProvider(AtomicUsize, bool);
@@ -196,7 +290,7 @@ async fn reading_then_implementing_and_testing_does_not_require_reading_again() 
         let run = ConfiguredAgentRun::new(req)
             .with_execution_mode(Some(AgentExecutionMode::Open))
             .with_task_contract(TaskContract {
-                max_correction_rounds: 0,
+                max_correction_rounds: Some(0),
                 ..TaskContract::open(Vec::new())
             });
         let (_handle, control) = agent_execution_channel(1);
@@ -314,7 +408,7 @@ async fn run_sequence(
         ConfiguredAgentRun::new(request()).with_execution_mode(Some(AgentExecutionMode::Open));
     if let Some(limit) = correction_limit {
         run = run.with_task_contract(TaskContract {
-            max_correction_rounds: limit,
+            max_correction_rounds: Some(limit),
             ..TaskContract::open(Vec::new())
         });
     }
@@ -363,6 +457,25 @@ async fn invalid_arguments_are_corrected_before_any_write_and_do_not_poison_veri
                 .any(|c| c.passed && c.message.contains("original error evidence retained"))
         );
     }
+}
+
+#[tokio::test]
+async fn default_open_corrects_beyond_eight_failed_candidates() {
+    let mut actions = Vec::new();
+    for index in 0..12 {
+        actions.extend([write(&format!("wrong-{index}")), None]);
+    }
+    actions.extend([write("correct"), None]);
+    let (outcome, trace, calls) = run_sequence(actions, None).await;
+    assert_eq!(outcome.loop_decision.action, LoopAction::StopSuccess);
+    assert_eq!(calls, 26);
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|event| matches!(event, AgentLoopTraceEvent::CorrectionIssued(_)))
+            .count(),
+        12
+    );
 }
 
 #[tokio::test]
@@ -461,6 +574,127 @@ async fn correction_delivers_external_verifier_command_and_error_to_the_model() 
 
 struct RevisedFormatProvider(AtomicUsize);
 
+#[cfg(unix)]
+struct PublishedSnapshotProvider(AtomicUsize);
+
+#[cfg(unix)]
+#[async_trait]
+impl LlmProvider for PublishedSnapshotProvider {
+    async fn complete(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+        let index = self.0.fetch_add(1, Ordering::SeqCst);
+        if index == 3 {
+            let feedback = &request.messages.last().unwrap().content;
+            assert!(
+                feedback.contains("cmp published.snapshot result.py"),
+                "{feedback}"
+            );
+            assert!(feedback.contains("differ"), "{feedback}");
+        }
+        let action = match index {
+            0 => Some((
+                "write_file",
+                json!({"path":"result.py", "content":"value = 2\n"}),
+            )),
+            1 | 4 => Some((
+                "shell",
+                json!({"command":"python3 -m unittest discover -v"}),
+            )),
+            3 => Some((
+                "shell",
+                json!({"command":"cp result.py published.snapshot"}),
+            )),
+            _ => None,
+        };
+        let mut response = MockProvider::text_response("Tests passed; delivery complete.")
+            .complete(request)
+            .await?;
+        if let Some((name, arguments)) = action {
+            response.message = None;
+            response.finish_reason = ProviderFinishReason::ToolCalls;
+            response.tool_calls = vec![ProviderToolCall {
+                tool_call_id: format!("snapshot-{index}"),
+                tool_name: name.into(),
+                arguments,
+            }];
+        }
+        Ok(response)
+    }
+
+    fn contract(&self) -> ProviderContract {
+        MockProvider::text_response("").contract()
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn passing_tests_cannot_hide_stale_published_snapshot_and_feedback_repairs_same_task() {
+    // 单元测试不能证明发布顺序正确；显式验收拒绝旧快照，默认纠偏在原任务重新发布。
+    for correction_limit in [Some(0), None] {
+        let workspace = tempdir().unwrap();
+        fs::write(workspace.path().join("published.snapshot"), "value = 1\n").unwrap();
+        fs::write(workspace.path().join("test_result.py"),
+            "import unittest\nfrom result import value\nclass Result(unittest.TestCase):\n def test_value(self): self.assertEqual(value, 2)\n").unwrap();
+        let harness = AgentHarness::new(
+            PublishedSnapshotProvider(AtomicUsize::new(0)),
+            ContextBuilder::default(),
+            BasicToolExecutor::new(
+                WorkspacePolicy::new(workspace.path())
+                    .unwrap()
+                    .with_unrestricted_access(true),
+            ),
+        )
+        .with_external_verifiers(vec![ExternalVerificationSpec {
+            program: "cmp".into(),
+            args: vec!["published.snapshot".into(), "result.py".into()],
+            cwd: ".".into(),
+            timeout_ms: 5_000,
+            expected_exit_code: 0,
+            max_output_bytes: 1024,
+        }]);
+        let mut req = request();
+        req.objective = "Implement value = 2, test it and publish an identical snapshot. Republish if validation finds an outdated snapshot.".into();
+        req.tools = vec!["write_file".into(), "shell".into()];
+        let run = ConfiguredAgentRun::new(req)
+            .with_execution_mode(Some(AgentExecutionMode::Open))
+            .with_task_contract(TaskContract {
+                max_correction_rounds: correction_limit,
+                ..TaskContract::open(Vec::new())
+            });
+        let (_handle, control) = agent_execution_channel(1);
+        let mut trace = Vec::new();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            harness.execute_configured(run, control, |event| trace.push(event)),
+        )
+        .await
+        .expect("snapshot correction test timed out")
+        .unwrap();
+        assert!(outcome.tool_reports.iter().any(|report| {
+            objective_validation_report(report).is_some_and(|validation| validation.passed)
+                && report.envelope.tool_name == "shell"
+        }));
+        assert_eq!(
+            outcome.loop_decision.action == LoopAction::StopSuccess,
+            correction_limit.is_none()
+        );
+        assert_eq!(
+            trace
+                .iter()
+                .filter(|event| matches!(event, AgentLoopTraceEvent::CorrectionIssued(_)))
+                .count(),
+            usize::from(correction_limit.is_none())
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("published.snapshot")).unwrap(),
+            if correction_limit.is_none() {
+                "value = 2\n"
+            } else {
+                "value = 1\n"
+            }
+        );
+    }
+}
+
 #[async_trait]
 impl LlmProvider for RevisedFormatProvider {
     async fn complete(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
@@ -528,7 +762,7 @@ async fn independent_current_verification_supersedes_stale_successful_exploratio
             .with_execution_mode(Some(mode))
             .with_task_contract(TaskContract {
                 verification: VerificationRequirement::Independent,
-                max_correction_rounds: 0,
+                max_correction_rounds: Some(0),
                 ..TaskContract::open(Vec::new())
             });
         let (_handle, control) = agent_execution_channel(1);
@@ -554,6 +788,58 @@ async fn independent_current_verification_supersedes_stale_successful_exploratio
             "original diagnostic remains observable"
         );
     }
+}
+
+#[test]
+fn current_formal_tests_supersede_old_exploration_under_required_validation() {
+    let diagnostic = objective_test_report(
+        "shell",
+        Some("python3 -c 'from pathlib import Path; assert Path(\"result.txt\").exists()'"),
+    );
+    let mut changed = objective_test_report("write_file", None);
+    changed.changed_files.push("result.txt".into());
+    let formal =
+        objective_test_report_with_output("python3 -m unittest", "Ran 1 test in 0.01s\nOK\n");
+    let attempts = [&diagnostic, &formal]
+        .iter()
+        .enumerate()
+        .map(|(step, report)| ToolAttemptMetadata {
+            tool_call_id: report.envelope.tool_call_id,
+            signature: format!("check-{step}"),
+            step_no: step as u32,
+            status: report.envelope.status,
+            recoverable_failure: false,
+        })
+        .collect::<Vec<_>>();
+    let reports = vec![diagnostic.clone(), changed.clone(), formal.clone()];
+    let contract = TaskContract {
+        require_objective_validation: true,
+        verification: VerificationRequirement::Required,
+        ..TaskContract::open(Vec::new())
+    };
+    assert!(optional_open_attempt(
+        &diagnostic,
+        Some(AgentExecutionMode::Open),
+        &contract,
+        &attempts,
+        &reports
+    ));
+    assert!(!optional_open_attempt(
+        &diagnostic,
+        Some(AgentExecutionMode::Strict),
+        &contract,
+        &attempts,
+        &reports
+    ));
+    let mut stale = reports;
+    stale.push(changed);
+    assert!(!optional_open_attempt(
+        &diagnostic,
+        Some(AgentExecutionMode::Open),
+        &contract,
+        &attempts,
+        &stale
+    ));
 }
 
 #[test]
@@ -637,19 +923,20 @@ async fn corrected_schema_cannot_hide_incorrect_delivery() {
 }
 
 #[tokio::test]
-async fn repeated_invalid_arguments_stop_without_writing() {
-    let (outcome, _, calls) = run_sequence(vec![Some(json!("invalid"))], None).await;
-    assert_ne!(outcome.loop_decision.action, LoopAction::StopSuccess);
-    assert!(
-        calls <= 8,
-        "invalid calls must hit the existing failure/progress guard"
-    );
-    assert!(
+async fn repeated_invalid_arguments_can_be_corrected_beyond_old_limits() {
+    let mut sequence = vec![Some(json!("invalid")); 20];
+    sequence.extend([write("correct"), None]);
+    let (outcome, _, calls) = run_sequence(sequence, None).await;
+    assert_eq!(outcome.loop_decision.action, LoopAction::StopSuccess);
+    assert_eq!(calls, 22);
+    assert_eq!(
         outcome
             .tool_reports
             .iter()
-            .filter(|r| r.envelope.tool_name == "write_file")
-            .all(|r| r.envelope.status != ToolResultStatus::Ok)
+            .filter(|r| r.envelope.tool_name == "write_file"
+                && r.envelope.status == ToolResultStatus::Ok)
+            .count(),
+        1
     );
 }
 
@@ -814,7 +1101,7 @@ async fn open_checks_delivery_without_requiring_every_exploration_to_succeed_but
         let run = ConfiguredAgentRun::new(req)
             .with_execution_mode(Some(mode))
             .with_task_contract(TaskContract {
-                max_correction_rounds: 0,
+                max_correction_rounds: Some(0),
                 ..TaskContract::open(Vec::new())
             });
         let (_handle, control) = agent_execution_channel(1);

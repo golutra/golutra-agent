@@ -132,7 +132,7 @@ pub(crate) fn apply_execution_mode_contract(
         if matches!(contract.verification, VerificationRequirement::BestEffort) {
             contract.verification = VerificationRequirement::Required;
         }
-        contract.max_correction_rounds = contract.max_correction_rounds.max(1);
+        contract.max_correction_rounds = None;
     }
 }
 
@@ -267,7 +267,7 @@ mod tests {
 
         assert!(contract.require_objective_validation);
         assert_eq!(contract.verification, VerificationRequirement::Required);
-        assert_eq!(contract.max_correction_rounds, 1);
+        assert_eq!(contract.max_correction_rounds, None);
     }
 
     #[test]
@@ -277,6 +277,6 @@ mod tests {
 
         assert!(!contract.require_objective_validation);
         assert_eq!(contract.verification, VerificationRequirement::BestEffort);
-        assert_eq!(contract.max_correction_rounds, 0);
+        assert_eq!(contract.max_correction_rounds, Some(0));
     }
 }

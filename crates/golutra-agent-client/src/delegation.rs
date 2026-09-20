@@ -740,9 +740,7 @@ async fn run_delegated_child(
         DELEGATED_TASK_MARKER: true,
         "allow_network": parent_control.allow_network,
         "yolo": parent_control.yolo,
-        "max_elapsed_ms": delegated_child_runtime_elapsed_ms(
-            child_context.remaining_elapsed_ms(),
-        ),
+        "max_elapsed_ms": child_context.remaining_elapsed_ms().map(delegated_child_runtime_elapsed_ms),
         "_delegation_parent_session_id": request.session_id,
         "_delegation_parent_tool_call_id": request.tool_call_id,
         DELEGATED_ADMISSION_TOKEN_KEY: admission_token,
@@ -856,12 +854,13 @@ async fn run_delegated_child(
         operation.ready_sender.send_replace(true);
     }
 
-    let child_state = match timeout(
-        Duration::from_millis(child_context.remaining_elapsed_ms().max(1)),
-        wait_for_child(host, child_session_id, cancellation, &child_context),
-    )
-    .await
-    {
+    let wait = wait_for_child(host, child_session_id, cancellation, &child_context);
+    let outcome = if let Some(remaining_ms) = child_context.remaining_elapsed_ms() {
+        timeout(Duration::from_millis(remaining_ms), wait).await
+    } else {
+        Ok(wait.await)
+    };
+    let child_state = match outcome {
         Ok(Ok(state)) => state,
         Ok(Err(error)) => {
             return fail_delegation(
@@ -1442,8 +1441,9 @@ async fn wait_for_child(
     let mut cancelled_child = false;
     let context_cancellation = context.cancellation();
     let mut event_bus = host.execution.event_bus.subscribe();
-    let deadline =
-        tokio::time::Instant::now() + Duration::from_millis(context.remaining_elapsed_ms().max(1));
+    let deadline = context
+        .remaining_elapsed_ms()
+        .map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms));
     let mut cancellation_deadline = None;
     let mut event_bus_open = true;
     loop {
@@ -1525,7 +1525,10 @@ async fn wait_for_child(
                     tokio::time::Instant::now() + Duration::from_millis(DELEGATED_CANCEL_GRACE_MS),
                 );
             }
-            _ = tokio::time::sleep_until(deadline), if !cancelled_child => {
+            _ = async {
+                if let Some(deadline) = deadline { tokio::time::sleep_until(deadline).await; }
+                else { std::future::pending::<()>().await; }
+            }, if !cancelled_child => {
                 cancel_child(host, session_id).await;
                 cancelled_child = true;
                 cancellation_deadline = Some(
@@ -1984,7 +1987,6 @@ mod tests {
         let parent_context = delegation_policy::DelegationContext::root(
             parent_session_id,
             Some(30_000),
-            Some(4_096),
             None,
             parent_cancellation,
         );
@@ -2448,7 +2450,6 @@ mod tests {
         let root = delegation_policy::DelegationContext::root(
             root_session_id,
             Some(10_000),
-            Some(1_024),
             None,
             cancellation.clone(),
         );
@@ -2534,7 +2535,6 @@ mod tests {
         let context = delegation_policy::DelegationContext::root(
             SessionId::new(),
             Some(10_000),
-            Some(1_024),
             None,
             cancellation.clone(),
         );

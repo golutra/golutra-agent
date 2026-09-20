@@ -8,7 +8,7 @@ use golutra_agent_core::TurnId;
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_NO_PROGRESS_ADVISORY_LIMIT: u32 = 3;
-pub const DEFAULT_NO_PROGRESS_LIMIT: u32 = 6;
+pub const DEFAULT_NO_PROGRESS_LIMIT: u32 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CorrectionProgressLimits {
@@ -107,12 +107,15 @@ impl StepMachine {
         stop_limit: u32,
         correction_limits: CorrectionProgressLimits,
     ) -> Self {
-        let stop_limit = stop_limit.max(1);
         Self {
             next_step_no: 0,
             last_fingerprint: None,
             repeated_no_progress: 0,
-            no_progress_advisory_limit: advisory_limit.clamp(1, stop_limit),
+            no_progress_advisory_limit: if stop_limit == 0 {
+                advisory_limit.max(1)
+            } else {
+                advisory_limit.clamp(1, stop_limit)
+            },
             no_progress_limit: stop_limit,
             correction_limits,
             correction_active: false,
@@ -199,11 +202,11 @@ impl StepMachine {
         let semantic_advisory =
             (self.repeated_no_progress == self.no_progress_advisory_limit).then(|| {
                 format!(
-                    "runtime has made no observable progress for {} semantically equivalent steps; execution remains active until the hard limit of {}",
-                    self.repeated_no_progress, self.no_progress_limit
+                    "runtime has made no observable progress for {} semantically equivalent steps; inspect the results and reconsider the approach",
+                    self.repeated_no_progress
                 )
             });
-        let semantic_stop = self.repeated_no_progress >= self.no_progress_limit;
+        let semantic_stop = limit_reached(self.repeated_no_progress, self.no_progress_limit);
         let mut correction_advisory = None;
         let mut correction_stop = false;
         if self.correction_active {
@@ -380,19 +383,19 @@ mod tests {
     }
 
     #[test]
-    fn default_policy_advises_before_it_stops() {
+    fn default_policy_advises_without_stopping() {
         let turn_id = TurnId::new();
         let mut machine = StepMachine::default();
         let mut completions = Vec::new();
 
-        for _ in 0..DEFAULT_NO_PROGRESS_LIMIT {
+        for _ in 0..100 {
             let step = machine.begin(turn_id);
             completions.push(machine.complete(step, "same-action", false));
         }
 
         assert!(completions[2].advisory.is_some());
         assert!(!completions[2].should_stop);
-        assert!(completions[5].should_stop);
+        assert!(completions.iter().all(|completion| !completion.should_stop));
     }
 
     #[test]

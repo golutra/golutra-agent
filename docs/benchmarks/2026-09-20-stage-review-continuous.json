@@ -1,0 +1,1345 @@
+{
+  "started_at": "2026-09-20T07:42:34.211838Z",
+  "finished_at": "2026-09-20T08:02:43.437738Z",
+  "model": "gpt-5.6-sol",
+  "effort": "medium",
+  "base_url": "https://api.golutra.cn",
+  "binary_sha256": {
+    "baseline": "b3f34437262a0e627c6ab34ad9ee53867d3f6eed5fff1ca63fbde8645bf159ba",
+    "final": "c961c0651e7d6e7404382d8d8b0512e397a8a1ba383b966af820caf3cfcf7967"
+  },
+  "tasks": {
+    "continuous": {
+      "prompt": {
+        "sha256": "9eaa9d2c20157fa255422411742e121f40ed7776c8aba7729d5fe5af9b5de226",
+        "bytes": 4036,
+        "characters": 4036,
+        "tokens_estimated": 1009
+      },
+      "files": [
+        "README.md",
+        "jobledger/__init__.py",
+        "jobledger/checkpoint.py",
+        "jobledger/cli.py",
+        "jobledger/codec.py",
+        "jobledger/ledger.py",
+        "jobledger/model.py",
+        "tests/test_stage1.py",
+        "tools/background_probe.py"
+      ]
+    }
+  },
+  "attempts": [
+    {
+      "variant": "baseline",
+      "task": "continuous",
+      "repeat": 0,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "all four phases passed",
+      "metrics": {
+        "elapsed_ms": 188925.1,
+        "request_count": 10,
+        "tool_call_count": 22,
+        "model_tool_call_count": 22,
+        "uncached_input_tokens": 15655,
+        "output_tokens": 13515,
+        "prompt_tokens": 98537,
+        "cache_read_tokens": 82882,
+        "usage_complete": true,
+        "usage_source": "provider",
+        "first_token_ms": 4547.8,
+        "provider_first_token_ms": 4461.8,
+        "process_first_event_ms": 55.4,
+        "avoidable_repeat_tool_call_count": 0,
+        "completed": true,
+        "runtime_terminal_success": true,
+        "return_code": 0,
+        "provider_requests": [
+          {
+            "request_index": 0,
+            "ttft_ms": 4461.8,
+            "terminal_latency_ms": 6642.6,
+            "tool_call_count": 2,
+            "error_count": 0,
+            "output_tokens": 331,
+            "uncached_input_tokens": 2546,
+            "cache_read_tokens": 0,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 1,
+            "ttft_ms": 2576.3,
+            "terminal_latency_ms": 4885.3,
+            "tool_call_count": 9,
+            "error_count": 0,
+            "output_tokens": 300,
+            "uncached_input_tokens": 779,
+            "cache_read_tokens": 2543,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 2,
+            "ttft_ms": 28680.7,
+            "terminal_latency_ms": 29844.7,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 1692,
+            "uncached_input_tokens": 2417,
+            "cache_read_tokens": 3319,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 3,
+            "ttft_ms": 32548.4,
+            "terminal_latency_ms": 65085.6,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 6128,
+            "uncached_input_tokens": 372,
+            "cache_read_tokens": 5733,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 4,
+            "ttft_ms": 11339.4,
+            "terminal_latency_ms": 21353.3,
+            "tool_call_count": 3,
+            "error_count": 0,
+            "output_tokens": 1824,
+            "uncached_input_tokens": 4724,
+            "cache_read_tokens": 6102,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 5,
+            "ttft_ms": 9133.1,
+            "terminal_latency_ms": 11204.6,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 619,
+            "uncached_input_tokens": 2029,
+            "cache_read_tokens": 10823,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 6,
+            "ttft_ms": 11770.2,
+            "terminal_latency_ms": 15113.1,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 940,
+            "uncached_input_tokens": 418,
+            "cache_read_tokens": 12849,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 7,
+            "ttft_ms": 4926.5,
+            "terminal_latency_ms": 6119.8,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 202,
+            "uncached_input_tokens": 699,
+            "cache_read_tokens": 13264,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 8,
+            "ttft_ms": 11544.4,
+            "terminal_latency_ms": 17410,
+            "tool_call_count": 3,
+            "error_count": 0,
+            "output_tokens": 1132,
+            "uncached_input_tokens": 332,
+            "cache_read_tokens": 13960,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 9,
+            "ttft_ms": 5454.4,
+            "terminal_latency_ms": 8002,
+            "tool_call_count": 0,
+            "error_count": 0,
+            "output_tokens": 347,
+            "uncached_input_tokens": 1339,
+            "cache_read_tokens": 14289,
+            "attempt_count": 1
+          }
+        ]
+      }
+    },
+    {
+      "variant": "final",
+      "task": "continuous",
+      "repeat": 0,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "all four phases passed",
+      "metrics": {
+        "elapsed_ms": 169539.6,
+        "request_count": 10,
+        "tool_call_count": 24,
+        "model_tool_call_count": 24,
+        "uncached_input_tokens": 17370,
+        "output_tokens": 11272,
+        "prompt_tokens": 105056,
+        "cache_read_tokens": 87686,
+        "usage_complete": true,
+        "usage_source": "provider",
+        "first_token_ms": 5058.9,
+        "provider_first_token_ms": 4017.9,
+        "process_first_event_ms": 994.4,
+        "avoidable_repeat_tool_call_count": 0,
+        "completed": true,
+        "runtime_terminal_success": true,
+        "return_code": 0,
+        "provider_requests": [
+          {
+            "request_index": 0,
+            "ttft_ms": 4017.9,
+            "terminal_latency_ms": 5630.9,
+            "tool_call_count": 2,
+            "error_count": 0,
+            "output_tokens": 199,
+            "uncached_input_tokens": 2589,
+            "cache_read_tokens": 0,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 1,
+            "ttft_ms": 2304.6,
+            "terminal_latency_ms": 4319.3,
+            "tool_call_count": 9,
+            "error_count": 0,
+            "output_tokens": 295,
+            "uncached_input_tokens": 658,
+            "cache_read_tokens": 2586,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 2,
+            "ttft_ms": 4827.4,
+            "terminal_latency_ms": 5596.8,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 208,
+            "uncached_input_tokens": 2409,
+            "cache_read_tokens": 3241,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 3,
+            "ttft_ms": 37495.8,
+            "terminal_latency_ms": 69952.9,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 5883,
+            "uncached_input_tokens": 323,
+            "cache_read_tokens": 5647,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 4,
+            "ttft_ms": 10977,
+            "terminal_latency_ms": 15582.7,
+            "tool_call_count": 4,
+            "error_count": 0,
+            "output_tokens": 1132,
+            "uncached_input_tokens": 4356,
+            "cache_read_tokens": 5967,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 5,
+            "ttft_ms": 13284,
+            "terminal_latency_ms": 16610.3,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 892,
+            "uncached_input_tokens": 3664,
+            "cache_read_tokens": 10320,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 6,
+            "ttft_ms": 3151.1,
+            "terminal_latency_ms": 4109.2,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 120,
+            "uncached_input_tokens": 576,
+            "cache_read_tokens": 13981,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 7,
+            "ttft_ms": 11165.6,
+            "terminal_latency_ms": 18385.8,
+            "tool_call_count": 3,
+            "error_count": 0,
+            "output_tokens": 1347,
+            "uncached_input_tokens": 336,
+            "cache_read_tokens": 14554,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 8,
+            "ttft_ms": 13463.6,
+            "terminal_latency_ms": 15187.6,
+            "tool_call_count": 2,
+            "error_count": 0,
+            "output_tokens": 697,
+            "uncached_input_tokens": 1619,
+            "cache_read_tokens": 14887,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 9,
+            "ttft_ms": 8360.3,
+            "terminal_latency_ms": 10388.6,
+            "tool_call_count": 0,
+            "error_count": 0,
+            "output_tokens": 499,
+            "uncached_input_tokens": 840,
+            "cache_read_tokens": 16503,
+            "attempt_count": 1
+          }
+        ]
+      }
+    },
+    {
+      "variant": "final",
+      "task": "continuous",
+      "repeat": 1,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "all four phases passed",
+      "metrics": {
+        "elapsed_ms": 240721.3,
+        "request_count": 20,
+        "tool_call_count": 37,
+        "model_tool_call_count": 37,
+        "uncached_input_tokens": 28951,
+        "output_tokens": 15520,
+        "prompt_tokens": 380366,
+        "cache_read_tokens": 351415,
+        "usage_complete": true,
+        "usage_source": "provider",
+        "first_token_ms": 3058.5,
+        "provider_first_token_ms": 2977.4,
+        "process_first_event_ms": 47.1,
+        "avoidable_repeat_tool_call_count": 1,
+        "completed": true,
+        "runtime_terminal_success": true,
+        "return_code": 0,
+        "provider_requests": [
+          {
+            "request_index": 0,
+            "ttft_ms": 2977.4,
+            "terminal_latency_ms": 4678.2,
+            "tool_call_count": 2,
+            "error_count": 0,
+            "output_tokens": 191,
+            "uncached_input_tokens": 2589,
+            "cache_read_tokens": 0,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 1,
+            "ttft_ms": 2628.3,
+            "terminal_latency_ms": 5059.5,
+            "tool_call_count": 9,
+            "error_count": 0,
+            "output_tokens": 304,
+            "uncached_input_tokens": 679,
+            "cache_read_tokens": 2586,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 2,
+            "ttft_ms": 32949.1,
+            "terminal_latency_ms": 60642.1,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 5564,
+            "uncached_input_tokens": 2414,
+            "cache_read_tokens": 3262,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 3,
+            "ttft_ms": 11725.9,
+            "terminal_latency_ms": 18596.8,
+            "tool_call_count": 5,
+            "error_count": 0,
+            "output_tokens": 1304,
+            "uncached_input_tokens": 4217,
+            "cache_read_tokens": 5673,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 4,
+            "ttft_ms": 9238.4,
+            "terminal_latency_ms": 10933.1,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 638,
+            "uncached_input_tokens": 4334,
+            "cache_read_tokens": 9887,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 5,
+            "ttft_ms": 6580.4,
+            "terminal_latency_ms": 13404,
+            "tool_call_count": 2,
+            "error_count": 0,
+            "output_tokens": 1050,
+            "uncached_input_tokens": 479,
+            "cache_read_tokens": 14218,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 6,
+            "ttft_ms": 5971.6,
+            "terminal_latency_ms": 8816.7,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 555,
+            "uncached_input_tokens": 1408,
+            "cache_read_tokens": 14694,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 7,
+            "ttft_ms": 2682.8,
+            "terminal_latency_ms": 3696.3,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 123,
+            "uncached_input_tokens": 563,
+            "cache_read_tokens": 16099,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 8,
+            "ttft_ms": 3422.6,
+            "terminal_latency_ms": 7310.7,
+            "tool_call_count": 4,
+            "error_count": 0,
+            "output_tokens": 537,
+            "uncached_input_tokens": 336,
+            "cache_read_tokens": 16659,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 9,
+            "ttft_ms": 11691.3,
+            "terminal_latency_ms": 13026.6,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 673,
+            "uncached_input_tokens": 3199,
+            "cache_read_tokens": 16992,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 10,
+            "ttft_ms": 10081.6,
+            "terminal_latency_ms": 13341.7,
+            "tool_call_count": 4,
+            "error_count": 0,
+            "output_tokens": 882,
+            "uncached_input_tokens": 297,
+            "cache_read_tokens": 20188,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 11,
+            "ttft_ms": 6443.8,
+            "terminal_latency_ms": 8343.1,
+            "tool_call_count": 0,
+            "error_count": 0,
+            "output_tokens": 410,
+            "uncached_input_tokens": 1705,
+            "cache_read_tokens": 20482,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 12,
+            "ttft_ms": 5434.9,
+            "terminal_latency_ms": 19397.5,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 1781,
+            "uncached_input_tokens": 1522,
+            "cache_read_tokens": 22184,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 13,
+            "ttft_ms": 4667,
+            "terminal_latency_ms": 6034,
+            "tool_call_count": 0,
+            "error_count": 0,
+            "output_tokens": 260,
+            "uncached_input_tokens": 1946,
+            "cache_read_tokens": 23703,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 14,
+            "ttft_ms": 9607.3,
+            "terminal_latency_ms": 10534.5,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 181,
+            "uncached_input_tokens": 1486,
+            "cache_read_tokens": 25646,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 15,
+            "ttft_ms": 6612.6,
+            "terminal_latency_ms": 7762.5,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 320,
+            "uncached_input_tokens": 395,
+            "cache_read_tokens": 27129,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 16,
+            "ttft_ms": 3341.4,
+            "terminal_latency_ms": 4234.8,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 98,
+            "uncached_input_tokens": 310,
+            "cache_read_tokens": 27521,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 17,
+            "ttft_ms": 4427,
+            "terminal_latency_ms": 5248.3,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 81,
+            "uncached_input_tokens": 182,
+            "cache_read_tokens": 27828,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 18,
+            "ttft_ms": 4817,
+            "terminal_latency_ms": 5886.9,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 251,
+            "uncached_input_tokens": 653,
+            "cache_read_tokens": 28007,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 19,
+            "ttft_ms": 7030.1,
+            "terminal_latency_ms": 8316.5,
+            "tool_call_count": 0,
+            "error_count": 0,
+            "output_tokens": 317,
+            "uncached_input_tokens": 237,
+            "cache_read_tokens": 28657,
+            "attempt_count": 1
+          }
+        ]
+      }
+    },
+    {
+      "variant": "baseline",
+      "task": "continuous",
+      "repeat": 1,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "all four phases passed",
+      "metrics": {
+        "elapsed_ms": 203713.3,
+        "request_count": 15,
+        "tool_call_count": 24,
+        "model_tool_call_count": 24,
+        "uncached_input_tokens": 19484,
+        "output_tokens": 13350,
+        "prompt_tokens": 169336,
+        "cache_read_tokens": 149852,
+        "usage_complete": true,
+        "usage_source": "provider",
+        "first_token_ms": 5023.4,
+        "provider_first_token_ms": 4942.1,
+        "process_first_event_ms": 47.4,
+        "avoidable_repeat_tool_call_count": 1,
+        "completed": true,
+        "runtime_terminal_success": true,
+        "return_code": 0,
+        "provider_requests": [
+          {
+            "request_index": 0,
+            "ttft_ms": 4942.1,
+            "terminal_latency_ms": 6138.2,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 212,
+            "uncached_input_tokens": 2546,
+            "cache_read_tokens": 0,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 1,
+            "ttft_ms": 2883.7,
+            "terminal_latency_ms": 5267.9,
+            "tool_call_count": 8,
+            "error_count": 0,
+            "output_tokens": 259,
+            "uncached_input_tokens": 376,
+            "cache_read_tokens": 2543,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 2,
+            "ttft_ms": 3109.6,
+            "terminal_latency_ms": 4742.2,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 229,
+            "uncached_input_tokens": 1917,
+            "cache_read_tokens": 2916,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 3,
+            "ttft_ms": 2542.5,
+            "terminal_latency_ms": 3602.4,
+            "tool_call_count": 3,
+            "error_count": 0,
+            "output_tokens": 123,
+            "uncached_input_tokens": 441,
+            "cache_read_tokens": 4830,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 4,
+            "ttft_ms": 20644.8,
+            "terminal_latency_ms": 48352.8,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 4978,
+            "uncached_input_tokens": 1057,
+            "cache_read_tokens": 5268,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 5,
+            "ttft_ms": 9664.8,
+            "terminal_latency_ms": 11492.7,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 617,
+            "uncached_input_tokens": 4251,
+            "cache_read_tokens": 6322,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 6,
+            "ttft_ms": 11337.3,
+            "terminal_latency_ms": 14549.3,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 920,
+            "uncached_input_tokens": 325,
+            "cache_read_tokens": 10570,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 7,
+            "ttft_ms": 3152.9,
+            "terminal_latency_ms": 4282.9,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 119,
+            "uncached_input_tokens": 607,
+            "cache_read_tokens": 10892,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 8,
+            "ttft_ms": 10215.3,
+            "terminal_latency_ms": 18196,
+            "tool_call_count": 2,
+            "error_count": 0,
+            "output_tokens": 1540,
+            "uncached_input_tokens": 332,
+            "cache_read_tokens": 11496,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 9,
+            "ttft_ms": 10457.3,
+            "terminal_latency_ms": 14573.8,
+            "tool_call_count": 3,
+            "error_count": 0,
+            "output_tokens": 749,
+            "uncached_input_tokens": 1586,
+            "cache_read_tokens": 11825,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 10,
+            "ttft_ms": 9146.5,
+            "terminal_latency_ms": 11187.1,
+            "tool_call_count": 0,
+            "error_count": 0,
+            "output_tokens": 619,
+            "uncached_input_tokens": 2421,
+            "cache_read_tokens": 13408,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 11,
+            "ttft_ms": 7348,
+            "terminal_latency_ms": 14352.4,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 951,
+            "uncached_input_tokens": 1150,
+            "cache_read_tokens": 15826,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 12,
+            "ttft_ms": 12011.9,
+            "terminal_latency_ms": 13146.1,
+            "tool_call_count": 0,
+            "error_count": 0,
+            "output_tokens": 567,
+            "uncached_input_tokens": 1012,
+            "cache_read_tokens": 16973,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 13,
+            "ttft_ms": 25198.8,
+            "terminal_latency_ms": 26620.1,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 1430,
+            "uncached_input_tokens": 1022,
+            "cache_read_tokens": 17982,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 14,
+            "ttft_ms": 2994.2,
+            "terminal_latency_ms": 3531,
+            "tool_call_count": 0,
+            "error_count": 0,
+            "output_tokens": 37,
+            "uncached_input_tokens": 441,
+            "cache_read_tokens": 19001,
+            "attempt_count": 1
+          }
+        ]
+      }
+    },
+    {
+      "variant": "baseline",
+      "task": "continuous",
+      "repeat": 2,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "all four phases passed",
+      "metrics": {
+        "elapsed_ms": 263544.2,
+        "request_count": 25,
+        "tool_call_count": 30,
+        "model_tool_call_count": 30,
+        "uncached_input_tokens": 21905,
+        "output_tokens": 14475,
+        "prompt_tokens": 361481,
+        "cache_read_tokens": 339576,
+        "usage_complete": true,
+        "usage_source": "provider",
+        "first_token_ms": 2918.5,
+        "provider_first_token_ms": 2839.1,
+        "process_first_event_ms": 46.8,
+        "avoidable_repeat_tool_call_count": 3,
+        "completed": true,
+        "runtime_terminal_success": true,
+        "return_code": 0,
+        "provider_requests": [
+          {
+            "request_index": 0,
+            "ttft_ms": 2839.1,
+            "terminal_latency_ms": 5375.7,
+            "tool_call_count": 8,
+            "error_count": 0,
+            "output_tokens": 284,
+            "uncached_input_tokens": 2546,
+            "cache_read_tokens": 0,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 1,
+            "ttft_ms": 3496.9,
+            "terminal_latency_ms": 4365.1,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 131,
+            "uncached_input_tokens": 1912,
+            "cache_read_tokens": 2543,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 2,
+            "ttft_ms": 2909.8,
+            "terminal_latency_ms": 4168.7,
+            "tool_call_count": 3,
+            "error_count": 0,
+            "output_tokens": 146,
+            "uncached_input_tokens": 345,
+            "cache_read_tokens": 4452,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 3,
+            "ttft_ms": 25296.7,
+            "terminal_latency_ms": 51256,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 5275,
+            "uncached_input_tokens": 1080,
+            "cache_read_tokens": 4794,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 4,
+            "ttft_ms": 10623.7,
+            "terminal_latency_ms": 15011.1,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 1122,
+            "uncached_input_tokens": 4372,
+            "cache_read_tokens": 5871,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 5,
+            "ttft_ms": 3368.9,
+            "terminal_latency_ms": 4417,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 132,
+            "uncached_input_tokens": 807,
+            "cache_read_tokens": 10240,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 6,
+            "ttft_ms": 11185.2,
+            "terminal_latency_ms": 14292.5,
+            "tool_call_count": 3,
+            "error_count": 0,
+            "output_tokens": 791,
+            "uncached_input_tokens": 331,
+            "cache_read_tokens": 11044,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 7,
+            "ttft_ms": 18190.7,
+            "terminal_latency_ms": 20898.7,
+            "tool_call_count": 0,
+            "error_count": 0,
+            "output_tokens": 1069,
+            "uncached_input_tokens": 1098,
+            "cache_read_tokens": 11372,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 8,
+            "ttft_ms": 6751.6,
+            "terminal_latency_ms": 8634,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 193,
+            "uncached_input_tokens": 689,
+            "cache_read_tokens": 12467,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 9,
+            "ttft_ms": 12348.3,
+            "terminal_latency_ms": 20927.4,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 1358,
+            "uncached_input_tokens": 356,
+            "cache_read_tokens": 13153,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 10,
+            "ttft_ms": 8170.8,
+            "terminal_latency_ms": 9184,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 300,
+            "uncached_input_tokens": 1157,
+            "cache_read_tokens": 13506,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 11,
+            "ttft_ms": 2771.9,
+            "terminal_latency_ms": 3717.5,
+            "tool_call_count": 0,
+            "error_count": 0,
+            "output_tokens": 84,
+            "uncached_input_tokens": 397,
+            "cache_read_tokens": 14660,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 12,
+            "ttft_ms": 8537,
+            "terminal_latency_ms": 9390.7,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 404,
+            "uncached_input_tokens": 662,
+            "cache_read_tokens": 15054,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 13,
+            "ttft_ms": 5455,
+            "terminal_latency_ms": 6218.7,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 271,
+            "uncached_input_tokens": 392,
+            "cache_read_tokens": 15713,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 14,
+            "ttft_ms": 2871.1,
+            "terminal_latency_ms": 3704.5,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 96,
+            "uncached_input_tokens": 306,
+            "cache_read_tokens": 16102,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 15,
+            "ttft_ms": 3221.3,
+            "terminal_latency_ms": 4256.5,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 127,
+            "uncached_input_tokens": 180,
+            "cache_read_tokens": 16405,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 16,
+            "ttft_ms": 2878.3,
+            "terminal_latency_ms": 3962.3,
+            "tool_call_count": 0,
+            "error_count": 0,
+            "output_tokens": 51,
+            "uncached_input_tokens": 403,
+            "cache_read_tokens": 16582,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 17,
+            "ttft_ms": 12072,
+            "terminal_latency_ms": 14173.3,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 750,
+            "uncached_input_tokens": 976,
+            "cache_read_tokens": 16982,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 18,
+            "ttft_ms": 2972.8,
+            "terminal_latency_ms": 3618.3,
+            "tool_call_count": 0,
+            "error_count": 0,
+            "output_tokens": 50,
+            "uncached_input_tokens": 567,
+            "cache_read_tokens": 17955,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 19,
+            "ttft_ms": 14045.1,
+            "terminal_latency_ms": 15756.7,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 821,
+            "uncached_input_tokens": 975,
+            "cache_read_tokens": 18519,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 20,
+            "ttft_ms": 2924.6,
+            "terminal_latency_ms": 3827.3,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 88,
+            "uncached_input_tokens": 434,
+            "cache_read_tokens": 19491,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 21,
+            "ttft_ms": 3109.9,
+            "terminal_latency_ms": 3531.5,
+            "tool_call_count": 0,
+            "error_count": 0,
+            "output_tokens": 43,
+            "uncached_input_tokens": 390,
+            "cache_read_tokens": 19922,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 22,
+            "ttft_ms": 12525.3,
+            "terminal_latency_ms": 14654.2,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 739,
+            "uncached_input_tokens": 700,
+            "cache_read_tokens": 20309,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 23,
+            "ttft_ms": 6932.7,
+            "terminal_latency_ms": 8585,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 96,
+            "uncached_input_tokens": 431,
+            "cache_read_tokens": 21006,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 24,
+            "ttft_ms": 3309.5,
+            "terminal_latency_ms": 3928.6,
+            "tool_call_count": 0,
+            "error_count": 0,
+            "output_tokens": 54,
+            "uncached_input_tokens": 399,
+            "cache_read_tokens": 21434,
+            "attempt_count": 1
+          }
+        ]
+      }
+    },
+    {
+      "variant": "final",
+      "task": "continuous",
+      "repeat": 2,
+      "strict_pass": true,
+      "independent_pass": true,
+      "immutable_inputs_preserved": true,
+      "detail": "all four phases passed",
+      "metrics": {
+        "elapsed_ms": 139958.6,
+        "request_count": 11,
+        "tool_call_count": 28,
+        "model_tool_call_count": 28,
+        "uncached_input_tokens": 17348,
+        "output_tokens": 9752,
+        "prompt_tokens": 106633,
+        "cache_read_tokens": 89285,
+        "usage_complete": true,
+        "usage_source": "provider",
+        "first_token_ms": 3618.4,
+        "provider_first_token_ms": 3539,
+        "process_first_event_ms": 46.6,
+        "avoidable_repeat_tool_call_count": 0,
+        "completed": true,
+        "runtime_terminal_success": true,
+        "return_code": 0,
+        "provider_requests": [
+          {
+            "request_index": 0,
+            "ttft_ms": 3539,
+            "terminal_latency_ms": 4920.2,
+            "tool_call_count": 2,
+            "error_count": 0,
+            "output_tokens": 179,
+            "uncached_input_tokens": 2589,
+            "cache_read_tokens": 0,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 1,
+            "ttft_ms": 2254.8,
+            "terminal_latency_ms": 4550.4,
+            "tool_call_count": 9,
+            "error_count": 0,
+            "output_tokens": 295,
+            "uncached_input_tokens": 673,
+            "cache_read_tokens": 2586,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 2,
+            "ttft_ms": 5187.5,
+            "terminal_latency_ms": 6055.1,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 278,
+            "uncached_input_tokens": 2412,
+            "cache_read_tokens": 3256,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 3,
+            "ttft_ms": 16260.9,
+            "terminal_latency_ms": 42486.2,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 4468,
+            "uncached_input_tokens": 331,
+            "cache_read_tokens": 5665,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 4,
+            "ttft_ms": 12936.7,
+            "terminal_latency_ms": 14930.2,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 793,
+            "uncached_input_tokens": 4016,
+            "cache_read_tokens": 5993,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 5,
+            "ttft_ms": 9931.6,
+            "terminal_latency_ms": 10794.9,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 521,
+            "uncached_input_tokens": 481,
+            "cache_read_tokens": 10006,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 6,
+            "ttft_ms": 2655.6,
+            "terminal_latency_ms": 3465.3,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 119,
+            "uncached_input_tokens": 164,
+            "cache_read_tokens": 10484,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 7,
+            "ttft_ms": 9194.7,
+            "terminal_latency_ms": 16646.4,
+            "tool_call_count": 3,
+            "error_count": 0,
+            "output_tokens": 1355,
+            "uncached_input_tokens": 335,
+            "cache_read_tokens": 10645,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 8,
+            "ttft_ms": 8483.5,
+            "terminal_latency_ms": 11065.3,
+            "tool_call_count": 8,
+            "error_count": 0,
+            "output_tokens": 619,
+            "uncached_input_tokens": 1691,
+            "cache_read_tokens": 10977,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 9,
+            "ttft_ms": 15570.5,
+            "terminal_latency_ms": 16612.7,
+            "tool_call_count": 1,
+            "error_count": 0,
+            "output_tokens": 892,
+            "uncached_input_tokens": 4346,
+            "cache_read_tokens": 12665,
+            "attempt_count": 1
+          },
+          {
+            "request_index": 10,
+            "ttft_ms": 2805.1,
+            "terminal_latency_ms": 5301.5,
+            "tool_call_count": 0,
+            "error_count": 0,
+            "output_tokens": 233,
+            "uncached_input_tokens": 310,
+            "cache_read_tokens": 17008,
+            "attempt_count": 1
+          }
+        ]
+      }
+    }
+  ],
+  "fixture_sha256": "99be54e3f414a59ba885ffbfeda525e351cd4f7405cbdc2fedec9e992f1657c3",
+  "source_sha256": {
+    "scripts/compare_optimization_variants.py": "59e9fb5d39c137bd5ba2b8e0c2d7e8c815ceb89a6f096b62ce0ffb6112635dce",
+    "scripts/compare_continuous_tasks.py": "e320a2b61bcb0d49f41830da17d68dc17d3b8f910fd6dd912a496167a1e4281d",
+    "crates/golutra-agent-client/src/context.rs": "a87497dc61530c8fbd6267c43410f8736716bfebc3333d435694c3ebb2eae904"
+  },
+  "trace_summary": [
+    {
+      "attempt": "0-continuous-baseline",
+      "correction_rounds": 0,
+      "corrections": [],
+      "derived_batches": 0
+    },
+    {
+      "attempt": "0-continuous-final",
+      "correction_rounds": 0,
+      "corrections": [],
+      "derived_batches": 1
+    },
+    {
+      "attempt": "1-continuous-baseline",
+      "correction_rounds": 2,
+      "corrections": [
+        [
+          "objective: objective validation failed: validation predates later workspace changes; rerun the relevant check",
+          "semantic verification has failed blocking assertions",
+          "some objective checks failed"
+        ],
+        [
+          "objective: objective validation failed: validation predates later workspace changes; rerun the relevant check",
+          "semantic verification has failed blocking assertions",
+          "some objective checks failed"
+        ]
+      ],
+      "derived_batches": 0
+    },
+    {
+      "attempt": "1-continuous-final",
+      "correction_rounds": 2,
+      "corrections": [
+        [
+          "objective: objective validation failed: validation predates later workspace changes; rerun the relevant check",
+          "semantic verification has failed blocking assertions",
+          "some objective checks failed"
+        ],
+        [
+          "objective: objective validation failed: validation predates later workspace changes; rerun the relevant check",
+          "semantic verification has failed blocking assertions",
+          "some objective checks failed"
+        ]
+      ],
+      "derived_batches": 4
+    },
+    {
+      "attempt": "2-continuous-baseline",
+      "correction_rounds": 5,
+      "corrections": [
+        [
+          "objective: objective validation failed: validation predates later workspace changes; rerun the relevant check",
+          "semantic verification has failed blocking assertions",
+          "some objective checks failed"
+        ],
+        [
+          "objective: objective validation failed: validation predates later workspace changes; rerun the relevant check",
+          "semantic verification has failed blocking assertions",
+          "some objective checks failed"
+        ],
+        [
+          "objective: objective validation failed: validation predates later workspace changes; rerun the relevant check",
+          "semantic verification has failed blocking assertions",
+          "some objective checks failed"
+        ],
+        [
+          "objective: objective validation failed: validation predates later workspace changes; rerun the relevant check",
+          "semantic verification has failed blocking assertions",
+          "some objective checks failed"
+        ],
+        [
+          "objective: objective validation failed: validation predates later workspace changes; rerun the relevant check",
+          "semantic verification has failed blocking assertions",
+          "some objective checks failed"
+        ]
+      ],
+      "derived_batches": 0
+    },
+    {
+      "attempt": "2-continuous-final",
+      "correction_rounds": 0,
+      "corrections": [],
+      "derived_batches": 3
+    }
+  ],
+  "totals": {
+    "baseline": {
+      "elapsed_ms": 656182.6000000001,
+      "request_count": 50,
+      "tool_call_count": 76,
+      "uncached_input_tokens": 57044,
+      "output_tokens": 41340
+    },
+    "final": {
+      "elapsed_ms": 550219.5,
+      "request_count": 41,
+      "tool_call_count": 89,
+      "uncached_input_tokens": 63669,
+      "output_tokens": 36544
+    }
+  },
+  "method": {
+    "protocol": "openai-responses",
+    "repeats": 3,
+    "order": [
+      "baseline,final",
+      "final,baseline",
+      "baseline,final"
+    ],
+    "verification": "All four independent stage verifiers; protected original tests/probe digests; process lifetime/order; runtime successful terminal. No injected repair turns.",
+    "host_timeout_seconds": 600,
+    "implicit_task_budget": false,
+    "platform": "macOS arm64",
+    "exclusions": [],
+    "raw_report": "/tmp/golutra-stage-review.3Ay29a/continuous-final.json"
+  },
+  "limitations": [
+    "Three paired autonomous tasks are not a multi-hour coding or cross-platform claim.",
+    "No new Codex run; this compares frozen Golutra versions.",
+    "Final was slower in repeat 1; tool calls and uncached input increased in aggregate.",
+    "Compound-command validation identity still caused two correction rounds in final repeat 1.",
+    "Prompt and runtime changes are combined here; their individual effects are not isolated."
+  ]
+}

@@ -218,7 +218,7 @@ pub(super) async fn apply_agent_type(
     if explore {
         payload["task_contract"] = serde_json::to_value(TaskContract {
             workspace_change: WorkspaceChangeRequirement::Forbidden,
-            max_correction_rounds: 0,
+            max_correction_rounds: Some(0),
             ..TaskContract::default()
         })?;
         payload["verify_on_change"] = json!("off");

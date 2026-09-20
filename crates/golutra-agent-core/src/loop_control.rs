@@ -172,7 +172,7 @@ impl TurnState {
 pub struct CorrectionEnvelope {
     pub verification_id: VerificationId,
     pub attempt: u32,
-    pub remaining_attempts: u32,
+    pub remaining_attempts: Option<u32>,
     pub failed_requirements: Vec<String>,
     pub evidence_refs: Vec<EvidenceId>,
     pub requested_action: String,
@@ -186,9 +186,13 @@ impl CorrectionEnvelope {
         } else {
             self.failed_requirements.join("; ")
         };
+        let budget = self
+            .remaining_attempts
+            .map(|remaining| format!(" Remaining correction attempts: {remaining}."))
+            .unwrap_or_default();
         format!(
-            "Runtime verification did not pass. Correct the following before claiming completion: {requirements}. Requested action: {}. Remaining correction attempts: {}.",
-            self.requested_action, self.remaining_attempts
+            "Runtime verification did not pass. Correct the following before claiming completion: {requirements}. Requested action: {}.{budget}",
+            self.requested_action
         )
     }
 }
@@ -234,7 +238,7 @@ mod tests {
         let envelope = CorrectionEnvelope {
             verification_id: VerificationId::new(),
             attempt: 1,
-            remaining_attempts: 0,
+            remaining_attempts: Some(0),
             failed_requirements: vec!["tests must pass".to_owned()],
             evidence_refs: vec![EvidenceId::new()],
             requested_action: "run the failing test and fix the result".to_owned(),
