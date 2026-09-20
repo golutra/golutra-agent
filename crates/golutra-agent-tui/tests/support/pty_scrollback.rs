@@ -1636,7 +1636,7 @@ fn model_editor_uses_native_mouse_and_enter_applies_to_next_provider_request() {
     assert!(!parser.screen().alternate_screen());
     assert!(parser.screen().contents().contains("gpt-5.6-sol"));
     submit(&mut pty, &mut parser, "hi");
-    wait_for_visible(&mut pty, &mut parser, "MODEL_SAVE_CONFIRMED");
+    wait_for_idle_reply(&mut pty, &mut parser, "MODEL_SAVE_CONFIRMED");
     assert_eq!(server.requests.lock().unwrap()[0]["model"], "gpt-5.6-sol");
     submit(&mut pty, &mut parser, "/model");
     wait_for_visible(&mut pty, &mut parser, "Ctrl+U clear");
@@ -1653,7 +1653,7 @@ fn model_editor_uses_native_mouse_and_enter_applies_to_next_provider_request() {
     assert!(!parser.screen().alternate_screen());
     assert!(parser.screen().contents().contains("gpt-6-astra"));
     submit(&mut pty, &mut parser, "hi again");
-    wait_for_visible(&mut pty, &mut parser, "MODEL_ESC_SAVE_CONFIRMED");
+    wait_for_idle_reply(&mut pty, &mut parser, "MODEL_ESC_SAVE_CONFIRMED");
     assert_eq!(server.requests.lock().unwrap()[1]["model"], "gpt-6-astra");
     submit(&mut pty, &mut parser, "/quit");
     assert!(pty.wait().1.success());
@@ -1669,7 +1669,7 @@ fn model_editor_uses_native_mouse_and_enter_applies_to_next_provider_request() {
     pty.write(b"\r");
     wait_for_visible(&mut pty, &mut parser, "Ask Golutra");
     submit(&mut pty, &mut parser, "hi after restart");
-    wait_for_visible(&mut pty, &mut parser, "MODEL_RESTART_CONFIRMED");
+    wait_for_idle_reply(&mut pty, &mut parser, "MODEL_RESTART_CONFIRMED");
     assert_eq!(server.requests.lock().unwrap()[2]["model"], "gpt-6-astra");
     submit(&mut pty, &mut parser, "/quit");
     assert!(pty.wait().1.success());
