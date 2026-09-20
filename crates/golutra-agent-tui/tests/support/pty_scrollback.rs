@@ -64,6 +64,20 @@ struct FixtureServer {
 }
 
 impl FixtureServer {
+    fn with_held_first_stream(responses: Vec<String>) -> (Self, Arc<AtomicBool>) {
+        let release = Arc::new(AtomicBool::new(false));
+        let server = Self::with_stream_gate(
+            responses
+                .into_iter()
+                .map(|text| (text, Vec::new()))
+                .collect(),
+            None,
+            ProviderProtocol::OpenAiCompatible,
+            Some(release.clone()),
+        );
+        (server, release)
+    }
+
     fn new(responses: Vec<String>) -> Self {
         Self::with_rounds(
             responses
@@ -88,6 +102,15 @@ impl FixtureServer {
         responses: Vec<(String, Vec<serde_json::Value>)>,
         error: Option<serde_json::Value>,
         protocol: ProviderProtocol,
+    ) -> Self {
+        Self::with_stream_gate(responses, error, protocol, None)
+    }
+
+    fn with_stream_gate(
+        responses: Vec<(String, Vec<serde_json::Value>)>,
+        error: Option<serde_json::Value>,
+        protocol: ProviderProtocol,
+        first_stream_release: Option<Arc<AtomicBool>>,
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/v1", listener.local_addr().unwrap());
@@ -153,6 +176,7 @@ impl FixtureServer {
                     )
                 });
                 captured.lock().unwrap().push(body);
+                let first_stream = captured.lock().unwrap().len() == 1;
                 let (content, calls) = responses
                     .next()
                     .unwrap_or_else(|| ("FIXTURE_DONE".to_owned(), Vec::new()));
@@ -200,7 +224,19 @@ impl FixtureServer {
                 if write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n").is_err() { continue; }
                 let mut sent_all = true;
                 let stream_started = Instant::now();
+                let terminal_frame = frames.len() - 1;
                 for (index, frame) in frames.into_iter().enumerate() {
+                    // 补充输入测试由真实可见状态放行终帧，避免依赖固定流时长；
+                    // 析构停止仍能中断等待，测试断言失败时不会卡住清理。
+                    if first_stream && index == terminal_frame {
+                        while first_stream_release
+                            .as_ref()
+                            .is_some_and(|release| !release.load(Ordering::Acquire))
+                            && !flag.load(Ordering::Relaxed)
+                        {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                    }
                     if flag.load(Ordering::Relaxed) || socket.write_all(frame.as_bytes()).is_err() {
                         sent_all = false;
                         break;
@@ -761,11 +797,8 @@ fn visible_screen_rows(parser: &ScreenModel) -> Vec<String> {
 fn queued_tasks_and_current_turn_supplements_use_distinct_provider_batches() {
     let home = tempdir().unwrap();
     let workspace = tempdir().unwrap();
-    let server = FixtureServer::new(vec![
-        format!(
-            "BATCH_START\n{}\nBATCH_END",
-            "Original response still streaming.\n".repeat(350)
-        ),
+    let (server, release_first_stream) = FixtureServer::with_held_first_stream(vec![
+        "BATCH_START".into(),
         "STEERS_HANDLED".into(),
         "FOLLOW_ONE_HANDLED".into(),
         "FOLLOW_TWO_HANDLED".into(),
@@ -787,6 +820,9 @@ fn queued_tasks_and_current_turn_supplements_use_distinct_provider_batches() {
         pty.write(&[key]);
         wait_for_visible(&mut pty, &mut parser, &format!("↳ {text}"));
     }
+    assert_eq!(server.completed_streams.load(Ordering::Acquire), 0);
+    assert_eq!(server.requests.lock().unwrap().len(), 1);
+    release_first_stream.store(true, Ordering::Release);
     wait_for_visible(&mut pty, &mut parser, "FOLLOW_TWO_HANDLED");
     let requests = server.requests.lock().unwrap();
     assert_eq!(requests.len(), 4);
