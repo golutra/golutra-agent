@@ -133,7 +133,6 @@ impl RenderedHistoryEntry {
 pub(crate) struct InlineHistoryState {
     last_flush: Option<(u64, u16, usize)>,
     native_scrollback: bool,
-    reflow_after_stream: bool,
     session_id: SessionId,
     generation: u64,
     mode: InlineHistoryMode,
@@ -163,7 +162,6 @@ impl InlineHistoryState {
         Self {
             last_flush: None,
             native_scrollback: false,
-            reflow_after_stream: false,
             session_id,
             generation: 0,
             mode: InlineHistoryMode::Transcript,
@@ -207,20 +205,10 @@ impl InlineHistoryState {
         app: &mut TuiApp,
     ) -> io::Result<bool> {
         self.native_scrollback = true;
-        if self.reflow_after_stream && !has_active_task(app) {
-            self.reflow_after_stream = false;
-            self.request_resize_reflow(app);
-        }
-        let reflow = app.transcript.history.reflow_pending;
         self.flush_with_callbacks(
             terminal,
             app,
-            |terminal| {
-                if reflow {
-                    rebuild_inline_history_terminal(terminal)?;
-                }
-                Ok(())
-            },
+            rebuild_inline_history_terminal,
             sync_inline_viewport_height,
         )
     }
@@ -327,7 +315,9 @@ impl InlineHistoryState {
 
         let mut history_cleared = false;
         if clear_previous_history {
-            rebuild_terminal(terminal)?;
+            if !self.native_scrollback || app.transcript.history.reflow_pending {
+                rebuild_terminal(terminal)?;
+            }
             history_cleared = true;
         }
         if !self.initialized || identity_changed {
@@ -359,8 +349,6 @@ impl InlineHistoryState {
             return Ok(history_cleared);
         }
         if app.transcript.history.reflow_pending {
-            // A resize during streaming needs one final repair from the finalized source.
-            self.reflow_after_stream = has_active_task(app);
             app.transcript.history.reflow_pending = false;
         }
         if self.rebuild_after_replay && !self.native_scrollback {
@@ -392,11 +380,15 @@ impl InlineHistoryState {
                 .iter()
                 .any(|id| self.stream_prefix_revised(entry, id))
         });
-        if !self.native_scrollback
-            && ((!matches!(mode, InlineHistoryMode::Transcript)
-                && !self.committed_event_ids.is_subset(&committable_ids))
-                || grouping_changed
-                || stream_prefix_changed)
+        if stream_prefix_changed && app.history_has_more_before {
+            app.transcript.history.reflow_pending = true;
+            return Ok(false);
+        }
+        if stream_prefix_changed
+            || (!self.native_scrollback
+                && ((!matches!(mode, InlineHistoryMode::Transcript)
+                    && !self.committed_event_ids.is_subset(&committable_ids))
+                    || grouping_changed))
         {
             if !history_cleared {
                 rebuild_terminal(terminal)?;
@@ -417,19 +409,6 @@ impl InlineHistoryState {
             app.set_inline_history_committed_stream_lines(HashMap::new());
             // 取消旧提交边界后重新投影，不能沿用受旧分组边界影响的条目。
             history_entries = rendered_history_entries(app, width, mode);
-        }
-        let native_stream_revised = self.native_scrollback && stream_prefix_changed;
-        if native_stream_revised {
-            // 已进入终端历史的流式正文不可擦除；真正的最终修订以明确标记追加，不能按旧行数截掉新答案。
-            for entry in &history_entries {
-                for id in &entry.event_ids {
-                    if self.stream_prefix_revised(entry, id) {
-                        self.committed_stream_prefixes.remove(id);
-                        self.committed_stream_sources.remove(id);
-                        self.committed_stream_lines.remove(id);
-                    }
-                }
-            }
         }
         self.committed_stream_prefixes
             .retain(|id, _| committable_ids.contains(id));
@@ -462,15 +441,6 @@ impl InlineHistoryState {
             }
         }
 
-        if native_stream_revised {
-            self.tail.append(
-                &mut lines,
-                &[Line::from(
-                    "• Updated response (replaces earlier streamed text)",
-                )],
-                None,
-            );
-        }
         self.append_event_lines(app, history_entries, layout_width, &mut lines);
         self.append_local_messages(app, width, &mut lines);
 
@@ -493,6 +463,12 @@ impl InlineHistoryState {
     }
 
     fn stream_prefix_revised(&self, entry: &RenderedHistoryEntry, id: &EventId) -> bool {
+        if entry.commit_event {
+            return self
+                .committed_stream_prefixes
+                .get(id)
+                .is_some_and(|prefix| !entry.lines.starts_with(prefix));
+        }
         self.committed_stream_sources.get(id).map_or_else(
             || {
                 self.committed_stream_prefixes
@@ -1762,7 +1738,7 @@ mod boundary_tests {
     }
 
     #[test]
-    fn native_history_preserves_commits_and_labels_a_revised_final_without_clearing() {
+    fn native_history_replaces_a_revised_final_from_source() {
         for finish_in_debug in [false, true] {
             let session_id = SessionId::new();
             let turn_id = TurnId::new();
@@ -1818,11 +1794,7 @@ mod boundary_tests {
             event.event_type = golutra_agent_protocol::RuntimeEventType::AssistantMessage;
             event.payload = json!({"content":"Corrected final answer."});
             app.events.push(event);
-            history
-                .flush_with_rebuild(&mut terminal, &mut app, |_| {
-                    panic!("native history must not clear terminal")
-                })
-                .unwrap();
+            history.flush(&mut terminal, &mut app).unwrap();
             let text = terminal
                 .backend()
                 .buffer()
@@ -1830,17 +1802,9 @@ mod boundary_tests {
                 .iter()
                 .map(|cell| cell.symbol())
                 .collect::<String>();
-            assert!(
-                text.contains("Earlier paragraph."),
-                "already emitted facts stay in native history"
-            );
-            let notice = text.find("Updated response").expect("revision marker");
-            assert!(
-                notice
-                    < text
-                        .find("Corrected final answer.")
-                        .expect("complete final answer")
-            );
+            assert!(!text.contains("Earlier paragraph."), "{text}");
+            assert!(!text.contains("Updated response"), "{text}");
+            assert!(text.contains("Corrected final answer."), "{text}");
             assert!(
                 !history
                     .flush_with_rebuild(&mut terminal, &mut app, |_| panic!("unexpected reset"))

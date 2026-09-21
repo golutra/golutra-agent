@@ -1,27 +1,55 @@
 //! 按 Markdown 源码边界冻结流式前缀，禁止用屏幕行数推断语义是否稳定。
 
-use pulldown_cmark::{Event, Parser};
+use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag};
 use ratatui::text::Line;
 
-/// 最后一个顶层块仍可能被后续 token 改写（表格列宽、列表或代码围栏），保留为活动尾部。
 pub(crate) fn stable_source_end(source: &str) -> usize {
     let mut depth = 0usize;
     let mut last_block_start = 0;
+    let mut fenced = false;
     for (event, range) in
         Parser::new_ext(source, super::rich_text::markdown_options()).into_offset_iter()
     {
         match event {
-            Event::Start(_) => {
+            Event::Start(tag) => {
                 if depth == 0 {
                     last_block_start = range.start;
+                    fenced = matches!(tag, Tag::CodeBlock(CodeBlockKind::Fenced(_)));
                 }
                 depth += 1;
             }
             Event::End(_) => depth = depth.saturating_sub(1),
+            Event::Rule if depth == 0 => {
+                last_block_start = range.start;
+                fenced = false;
+            }
             _ => {}
         }
     }
-    last_block_start
+    if fenced {
+        complete_code_source_end(source, last_block_start)
+    } else {
+        last_block_start
+    }
+}
+
+pub(crate) fn complete_code_source_end(source: &str, start: usize) -> usize {
+    let tail = &source[start..];
+    let opener = tail.trim_start_matches(' ');
+    if tail.len() - opener.len() > 3 || (!opener.starts_with("```") && !opener.starts_with("~~~")) {
+        return start;
+    }
+    let Some(header_end) = tail.find('\n') else {
+        return start;
+    };
+    let Some(end) = tail.rfind('\n') else {
+        return start;
+    };
+    if end > header_end {
+        start + end + 1
+    } else {
+        start
+    }
 }
 
 pub(crate) fn stable_rendered_prefix(
@@ -38,6 +66,15 @@ pub(crate) fn stable_rendered_prefix(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn complete_fenced_lines_are_archived_before_the_closing_fence() {
+        for fence in ["```rust", "~~~python"] {
+            let source = format!("intro\n\n{fence}\nfirst\nsecond\npartial");
+            assert_eq!(&source[stable_source_end(&source)..], "partial");
+        }
+        assert_eq!(complete_code_source_end("    first\n    second\n", 0), 0);
+    }
 
     #[test]
     fn holds_open_tables_lists_and_fences_in_the_mutable_tail() {

@@ -1079,10 +1079,68 @@ fn streaming_with_suggestions_and_status_preserves_every_message_once() {
 }
 
 #[test]
+fn open_code_fence_archives_complete_lines_before_provider_completion() {
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let markers = (0..60)
+        .map(|i| format!("CODE_LINE_{i:03}"))
+        .collect::<Vec<_>>();
+    let (server, release) =
+        FixtureServer::with_held_first_stream(vec![format!("```text\n{}\n", markers.join("\n"))]);
+    server.install(home.path());
+    let mut pty = PtyHarness::spawn_configured(home.path(), workspace.path(), 100, 24, true);
+    let mut parser = ScreenModel::new(24, 100);
+    wait_for_visible(&mut pty, &mut parser, "pty-model");
+    submit(&mut pty, &mut parser, "stream a long code block");
+    wait_for_visible(&mut pty, &mut parser, "CODE_LINE_059");
+    assert_eq!(server.completed_streams.load(Ordering::Acquire), 0);
+    assert!(!parser.screen().contents().contains("CODE_LINE_000"));
+    assert_once_in_order(&all_terminal_rows(&mut parser), &markers);
+    release.store(true, Ordering::Release);
+    wait_for_idle_reply(&mut pty, &mut parser, "CODE_LINE_059");
+    assert_once_in_order(&all_terminal_rows(&mut parser), &markers);
+    submit(&mut pty, &mut parser, "/quit");
+    assert!(pty.wait().1.success());
+}
+
+#[test]
+fn large_paste_is_compact_but_provider_receives_the_full_text() {
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let server = FixtureServer::new(vec!["PASTE_ACCEPTED".into()]);
+    server.install(home.path());
+    let mut pty = PtyHarness::spawn_configured(home.path(), workspace.path(), 100, 24, true);
+    let mut parser = ScreenModel::new(24, 100);
+    wait_for_visible(&mut pty, &mut parser, "pty-model");
+    let pasted = format!("{}END_OF_PASTED_TEXT", "中文 paste payload\n".repeat(100));
+    pty.write(format!("\x1b[200~{pasted}\x1b[201~").as_bytes());
+    wait_for_visible(&mut pty, &mut parser, "[Pasted Content");
+    assert!(!parser.screen().contents().contains("END_OF_PASTED_TEXT"));
+    pty.write(b"\r");
+    wait_for_idle_reply(&mut pty, &mut parser, "PASTE_ACCEPTED");
+    let requests = server.requests.lock().unwrap();
+    let body = requests.last().unwrap().to_string();
+    assert!(body.contains("END_OF_PASTED_TEXT"));
+    assert!(!body.contains("[Pasted Content"));
+    assert!(
+        requests.last().unwrap()["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["role"] == "user"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains(&pasted)))
+    );
+    drop(requests);
+    submit(&mut pty, &mut parser, "/quit");
+    assert!(pty.wait().1.success());
+}
+
+#[test]
 fn completed_fullscreen_height_stream_does_not_leave_a_page_gap() {
     let home = tempdir().unwrap();
     let workspace = tempdir().unwrap();
-    // 单个长代码块在完成前全部属于活动尾部；完成后一次归档，不能继续为旧尾部保留一整屏。
     let markers = (1..=100)
         .map(|n| format!("TAIL_{n:03}"))
         .collect::<Vec<_>>();

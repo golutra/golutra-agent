@@ -12,6 +12,7 @@ const MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024;
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MarkdownCache {
     documents: VecDeque<Document>,
+    cwd: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -33,10 +34,20 @@ struct Block {
 }
 
 impl MarkdownCache {
+    pub(crate) fn set_cwd(&mut self, cwd: &std::path::Path) {
+        if self.cwd.as_deref() != Some(cwd) {
+            self.cwd = Some(cwd.to_owned());
+            self.documents.clear();
+        }
+    }
+
     pub(crate) fn render(&mut self, source: &str, width: u16) -> Vec<Line<'static>> {
         let width = width.max(1);
         if source.len() > MAX_SOURCE_BYTES {
-            return super::markdown_lines(source, width);
+            return layout::render_markdown_document(
+                &markdown::parse_markdown_in(source, self.cwd.as_deref()),
+                usize::from(width),
+            );
         }
         if let Some(index) = self
             .documents
@@ -64,10 +75,10 @@ impl MarkdownCache {
         let previous = previous_index.and_then(|index| self.documents.get(index));
         let retained = previous.filter(|entry| !entry.source_wide);
         let offset = retained.map_or(0, |entry| entry.stable_source_len);
-        let mut parsed = markdown::parse_stream(&source[offset..]);
+        let mut parsed = markdown::parse_stream(&source[offset..], self.cwd.as_deref());
         // 尾部新增引用定义可能改变任何旧块，不能只修订最后一个块。
         let retained = if parsed.source_wide && offset > 0 {
-            parsed = markdown::parse_stream(source);
+            parsed = markdown::parse_stream(source, self.cwd.as_deref());
             None
         } else {
             retained
@@ -78,10 +89,17 @@ impl MarkdownCache {
         let stable_blocks = retained_blocks + parsed.stable_blocks;
         // 归档沿用原来的最后顶层块边界，并比较渲染前缀；解析复用必须更保守，
         // 不能把两者合并成同一个游标，否则未换行正文会推迟已有历史的提交。
-        let archive_source_end = parsed.last_block_start.map_or_else(
+        let mut archive_source_end = parsed.last_block_start.map_or_else(
             || crate::stream_commit::stable_source_end(source),
             |start| retained.map_or(0, |entry| entry.stable_source_len) + start,
         );
+        if matches!(
+            parsed.document.blocks.last(),
+            Some(MarkdownBlock::Code { .. })
+        ) {
+            archive_source_end =
+                crate::stream_commit::complete_code_source_end(source, archive_source_end);
+        }
         let models = retained
             .into_iter()
             .flat_map(|entry| {
@@ -181,25 +199,25 @@ fn append_code(
     if language != old_language || old_source.is_empty() {
         return None;
     }
-    // A parser can synthesize the last newline. Retain the completed lines but
-    // always re-render the last source line, including partial-token updates.
     let body = old_source.strip_suffix('\n').unwrap_or(old_source);
     let stable_end = body.rfind('\n').map_or(0, |index| index + 1);
     if !source.starts_with(&old_source[..stable_end]) {
         return None;
     }
-    let old_tail_rows = layout::render_code_body(
+    let old_tail_rows = layout::render_code_body_from(
         language.as_deref(),
-        &old_source[stable_end..],
+        old_source,
+        stable_end,
         usize::from(width),
     )
     .len();
     let mut lines = previous.lines.as_ref().clone();
     lines.truncate(lines.len().checked_sub(old_tail_rows)?);
     if stable_end == 0 || stable_end < source.len() {
-        lines.extend(layout::render_code_body(
+        lines.extend(layout::render_code_body_from(
             language.as_deref(),
-            &source[stable_end..],
+            source,
+            stable_end,
             usize::from(width),
         ));
     }
