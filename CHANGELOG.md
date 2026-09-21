@@ -6,6 +6,39 @@ follow [Semantic Versioning](https://semver.org/) where applicable.
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-09-21
+
+### Changed
+
+- Improve TUI input responsiveness and streaming stability with bounded event
+  processing, incremental history updates and cached rendering work.
+- Provider setup saves keys to local owner-only storage by default. Ctrl+E
+  switches to an existing environment-variable reference; its name starts blank.
+- Golutra API and Custom Provider model selection starts with a blank manual
+  entry. Upstream models load asynchronously and appear below it, without
+  moving the selection or overwriting typed or pasted input.
+- Discover model catalogs using OpenAI Chat/Responses, Anthropic and Gemini
+  authentication and response formats. Failed, empty or unsupported catalogs
+  never block manual entry; leaving the page cancels pending discovery.
+
+### Fixed
+
+- Make advanced provider settings editable with the keyboard. Continue is the
+  first option; select other fields to cycle values or edit text, then return
+  to Continue for offline review and saving.
+- Preserve native terminal text selection, drafts and streaming content while
+  reducing repeated redraws and long-history rendering work.
+
+### Validation
+
+- Provider discovery and TUI coverage passed 475 tests, including local HTTP
+  fixtures, delayed results, cancellation, keyboard navigation and real PTY
+  regressions. One live-provider smoke test was intentionally skipped.
+- Local catalog fixtures bypass host system proxies for deterministic tests;
+  production retains system proxy support and bounded discovery timeouts.
+- Six native release targets must pass packaging, npm/native payload parity,
+  offline launch and shared-data checks before automatic publication.
+
 ## [0.3.2] - 2026-09-20
 
 ### Changed
@@ -155,7 +188,8 @@ This is the initial public development baseline. See the repository history
 and [architecture documentation](docs/ARCHITECTURE.md) for the implementation
 details and current compatibility boundaries.
 
-[unreleased]: https://github.com/golutra/golutra-agent/compare/v0.3.2...HEAD
+[unreleased]: https://github.com/golutra/golutra-agent/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/golutra/golutra-agent/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/golutra/golutra-agent/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/golutra/golutra-agent/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/golutra/golutra-agent/compare/v0.2.0...v0.3.0

@@ -31,9 +31,9 @@ use golutra_agent_client::{
 use golutra_agent_config::{
     BuiltinOAuthMethod, ProviderConfigPaths, ProviderConfigScope, ProviderInstallPlan,
     ProviderProfile, apply_oauth_provider_install_plan_verified, apply_provider_install_plan,
-    generate_custom_provider_api_key_env, load_non_secret_runtime_settings, load_provider_settings,
-    logout_provider_profile_verified, provider_auth_service, provider_onboarding_state,
-    provider_protocol_has_runtime_adapter, update_provider_settings_verified,
+    load_non_secret_runtime_settings, load_provider_settings, logout_provider_profile_verified,
+    provider_auth_service, provider_onboarding_state, provider_protocol_has_runtime_adapter,
+    update_provider_settings_verified,
 };
 use golutra_agent_core::{
     ActorKind, ApprovalRequest, ApprovalScope, EventId, QueryId, SessionId, TaskId, ThreadId,
@@ -82,6 +82,7 @@ mod activity_view;
 mod activity_widget;
 mod approval_dialog;
 mod auth_flow;
+mod auth_models;
 mod auth_state;
 mod change_projection;
 mod composer_input;
@@ -92,6 +93,7 @@ mod developer_query;
 mod developer_view;
 mod developer_widget;
 mod driver;
+mod fair_select;
 mod frame_scheduler;
 mod help;
 mod history_source;
@@ -119,6 +121,7 @@ mod tool_preview;
 mod transcript_spacing;
 mod transcript_view;
 mod transcript_widget;
+mod ui_timing;
 pub(crate) use activity_view::*;
 pub(crate) use activity_widget::*;
 pub(crate) use approval_dialog::*;
@@ -356,7 +359,9 @@ struct TuiApp {
     developer_projection: Option<golutra_agent_protocol::DebugProjection>,
     developer_error: Option<String>,
     debug_scroll: PaneScrollState,
+    // 生产路径只通过 append/replace/trim 修改历史，同时维护字节预算。
     events: Vec<RuntimeEvent>,
+    event_history_bytes: usize,
     command_messages: Vec<TranscriptItem>,
     tool_detail: Option<tool_detail::ToolDetailState>,
     resume_picker: Option<ResumePickerState>,
@@ -372,11 +377,13 @@ struct TuiApp {
     export_operation: Option<PendingExportOperation>,
     auth_dialog: Option<AuthDialogState>,
     auth_operation: Option<PendingAuthOperation>,
+    auth_model_discovery: Option<PendingModelDiscovery>,
     input: ComposerInput,
     prompt_history: PromptHistory,
     history_search: Option<HistorySearchState>,
     mention_catalog: MentionCatalog,
     mention_catalog_loaded: bool,
+    mention_discovery: Option<composer_support::MentionDiscovery>,
     mention_completion: Option<MentionCompletion>,
     attachments: Vec<ComposerAttachment>,
     selected_attachment: Option<usize>,
@@ -427,27 +434,11 @@ struct TuiApp {
 /// 这样高频流式事件不会把 TUI 的生命周期绑定到整段会话历史。
 impl TuiApp {
     fn retained_event_bytes(&self) -> usize {
-        self.events
-            .iter()
-            .map(ui_event_memory_bytes)
-            .fold(0_usize, usize::saturating_add)
+        self.event_history_bytes
     }
 
     fn trim_event_history(&mut self) -> bool {
-        // 事件可能来自外部回放，单条 payload 不能因为“最后一条必须保留”而
-        // 绕过总预算；完整内容仍由 durable artifact/payload_ref 承载。
-        for event in &mut self.events {
-            bound_event_payload(event);
-        }
-        // 字节预算只在固定批次检查，避免每个流式 delta 都线性扫描整个窗口。
-        if self.events.len() < TUI_EVENT_HISTORY_LIMIT
-            && !self
-                .events
-                .len()
-                .is_multiple_of(TUI_EVENT_HISTORY_TRIM_BATCH)
-        {
-            return false;
-        }
+        // 写入时增量记账，预算检查不再周期性扫描和序列化整段历史。
         let total_bytes = self.retained_event_bytes();
         if self.events.len() <= TUI_EVENT_HISTORY_LIMIT
             && total_bytes <= TUI_EVENT_HISTORY_BYTE_LIMIT
@@ -471,17 +462,20 @@ impl TuiApp {
             return false;
         }
         self.events.drain(..remove_count);
+        self.event_history_bytes = remaining_bytes;
         self.history_start_cursor = self.events.first().map(|event| event.sequence_no);
         true
     }
 
     fn replace_event_history(&mut self, mut events: Vec<RuntimeEvent>, has_more_before: bool) {
+        self.invalidate_transcript_layout();
         events.sort_by_key(|event| event.sequence_no);
         events.dedup_by_key(|event| event.sequence_no);
         for event in &mut events {
             bound_event_payload(event);
         }
         self.events = events;
+        self.event_history_bytes = self.events.iter().map(ui_event_memory_bytes).sum();
         let trimmed = self.trim_event_history();
         self.history_has_more_before = has_more_before || trimmed;
         self.history_start_cursor = self.events.first().map(|event| event.sequence_no);
@@ -490,6 +484,9 @@ impl TuiApp {
     fn append_event_to_history(&mut self, event: RuntimeEvent) {
         let mut event = event;
         bound_event_payload(&mut event);
+        self.event_history_bytes = self
+            .event_history_bytes
+            .saturating_add(ui_event_memory_bytes(&event));
         self.events.push(event);
         if self.trim_event_history() {
             self.history_has_more_before = true;
@@ -497,6 +494,10 @@ impl TuiApp {
     }
 
     pub(crate) async fn shutdown_pending_operations(&mut self) {
+        if let Some(pending) = self.auth_model_discovery.take() {
+            pending.task.abort();
+            let _ = pending.task.await;
+        }
         if let Some(operation) = self.auth_operation.take() {
             operation.cancellation.cancel();
             shutdown_join_handle(operation.task).await;
@@ -509,6 +510,9 @@ impl TuiApp {
 
 impl Drop for TuiApp {
     fn drop(&mut self) {
+        if let Some(pending) = self.auth_model_discovery.as_ref() {
+            pending.task.abort();
+        }
         // 正常退出由 shutdown_pending_operations 等待；Drop 只负责取消仍未交接的任务，
         // 避免 panic 或构造失败路径把 OAuth/export JoinHandle 变成 detached task。
         if let Some(operation) = self.auth_operation.as_ref() {
@@ -677,6 +681,7 @@ impl TuiApp {
                 ..PaneScrollState::default()
             },
             events: Vec::new(),
+            event_history_bytes: 0,
             command_messages: Vec::new(),
             tool_detail: None,
             resume_picker: None,
@@ -692,11 +697,13 @@ impl TuiApp {
             export_operation: None,
             auth_dialog,
             auth_operation: None,
+            auth_model_discovery: None,
             input: ComposerInput::default(),
             prompt_history: PromptHistory::default(),
             history_search: None,
             mention_catalog: MentionCatalog::default(),
             mention_catalog_loaded: false,
+            mention_discovery: None,
             mention_completion: None,
             attachments: Vec::new(),
             selected_attachment: None,
@@ -752,6 +759,7 @@ impl TuiApp {
         self.workspace_path = workspace_path.into();
         self.mention_catalog = MentionCatalog::default();
         self.mention_catalog_loaded = false;
+        self.mention_discovery = None;
         self.mention_completion = None;
         self.provider_model = provider_model.into();
         let (mut controls, choices) =
@@ -1009,6 +1017,7 @@ impl TuiApp {
     }
 
     fn apply_runtime_refresh_snapshot(&mut self, snapshot: RuntimeRefreshSnapshot) -> bool {
+        let _timing = ui_timing::span("refresh_snapshot");
         if snapshot.binding != self.runtime_refresh_binding() {
             return false;
         }
@@ -1239,6 +1248,7 @@ impl TuiApp {
     }
 
     fn apply_runtime_event(&mut self, event: RuntimeEvent) {
+        let _timing = ui_timing::span("apply_event");
         if self
             .cursor
             .is_some_and(|sequence_no| event.sequence_no <= sequence_no)
@@ -1364,7 +1374,10 @@ impl TuiApp {
                 picker.selected = picker.selected.min(picker.items.len().saturating_sub(1));
             }
         }
-        self.invalidate_transcript_layout();
+        if let Some(event) = self.events.last() {
+            self.transcript
+                .invalidate_for_event(event, self.events.len());
+        }
         if transcript_anchor.is_some() {
             self.reflow_transcript_with_anchor(transcript_anchor, previous_row_count);
         }
@@ -1615,10 +1628,40 @@ impl TuiApp {
             return;
         }
         if !self.mention_catalog_loaded {
-            self.mention_catalog = MentionCatalog::discover(&self.workspace_path);
-            self.mention_catalog_loaded = true;
+            if self.mention_discovery.is_none() {
+                match composer_support::MentionDiscovery::start(self.workspace_path.clone()) {
+                    Ok(discovery) => self.mention_discovery = Some(discovery),
+                    Err(error) => self.status_message = format!("file search unavailable: {error}"),
+                }
+            }
+            return;
         }
         self.mention_completion = self.mention_catalog.complete(&self.input);
+    }
+
+    fn poll_mention_completion(&mut self) -> bool {
+        let Some(discovery) = &self.mention_discovery else {
+            return false;
+        };
+        if discovery.workspace != self.workspace_path {
+            self.mention_discovery = None;
+            return false;
+        }
+        match discovery.poll() {
+            Ok(catalog) => {
+                self.mention_catalog = catalog;
+                self.mention_catalog_loaded = true;
+                self.mention_discovery = None;
+                // Resolve against the current draft, never the query at scan start.
+                self.mention_completion = self.mention_catalog.complete(&self.input);
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.mention_discovery = None;
+                false
+            }
+        }
     }
 
     fn move_mention_selection(&mut self, forward: bool) -> bool {
@@ -2733,7 +2776,7 @@ impl TuiApp {
                 self.projection = None;
                 self.developer_projection = None;
                 self.developer_error = None;
-                self.events.clear();
+                self.replace_event_history(Vec::new(), false);
                 self.activity_projection = ActivityProjection::default();
                 self.invalidate_activity_snapshot();
                 self.change_projection = ChangeProjection::default();
@@ -3216,7 +3259,7 @@ impl TuiApp {
         self.projection = None;
         self.developer_projection = None;
         self.developer_error = None;
-        self.events.clear();
+        self.replace_event_history(Vec::new(), false);
         self.activity_projection = ActivityProjection::default();
         self.invalidate_activity_snapshot();
         self.change_projection = ChangeProjection::default();
@@ -3256,7 +3299,7 @@ impl TuiApp {
         self.projection = None;
         self.developer_projection = None;
         self.developer_error = None;
-        self.events.clear();
+        self.replace_event_history(Vec::new(), false);
         self.activity_projection = ActivityProjection::default();
         self.invalidate_activity_snapshot();
         self.change_projection = ChangeProjection::default();
@@ -4353,6 +4396,7 @@ async fn run_app(
     let parent_watch_enabled = parent_watch.enabled();
     let parent_watch_future = parent_watch.wait();
     tokio::pin!(parent_watch_future);
+    let mut event_priority = 0;
 
     let result: miette::Result<()> = async {
         draw_interactive_frame(terminal, &mut overlay_screen, &mut app, &mut inline_history)?;
@@ -4364,12 +4408,18 @@ async fn run_app(
             .deadline()
             .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
         tokio::select! {
-            _ = tokio::time::sleep_until(frame_deadline.into()), if app.render_metrics.deadline().is_some() => {
+            ready = fair_select::next(
+                &mut event_priority,
+                tokio::time::sleep_until(frame_deadline.into()),
+                terminal_events.next(),
+                controller.recv(),
+            ) => { match ready {
+            fair_select::Ready::First(()) => {
                 draw_interactive_frame(terminal, &mut overlay_screen, &mut app, &mut inline_history)?;
                 app.render_metrics.mark_drawn_at(Instant::now());
             }
-            runtime_event = controller.recv() => {
-                controller.apply_received(&mut app, runtime_event).await?;
+            fair_select::Ready::Third(runtime_event) => {
+                controller.apply_wake(&mut app, runtime_event).await?;
                 let now = Instant::now();
                 if app.take_immediate_frame_request() {
                     app.render_metrics.request_immediate_at(now);
@@ -4377,7 +4427,8 @@ async fn run_app(
                     app.render_metrics.request_at(now);
                 }
             }
-            terminal_event = terminal_events.next() => {
+            fair_select::Ready::Second(terminal_event) => {
+                let _timing = ui_timing::span("input");
                 let event = terminal_event
                     .ok_or_else(|| miette::miette!("terminal input stream closed"))?
                     .map_err(|error| miette::miette!("{error}"))?;
@@ -4409,6 +4460,7 @@ async fn run_app(
                 }
                 app.render_metrics.request_at(Instant::now());
             }
+            } }
             _ = &mut parent_watch_future, if parent_watch_enabled => {
                 app.status_message = "parent process exited; shutting down".to_owned();
                 app.should_quit = true;
@@ -4440,6 +4492,7 @@ async fn run_app(
     .await;
     app.shutdown_pending_operations().await;
     let shutdown = controller.shutdown().await;
+    ui_timing::finish().map_err(|error| miette::miette!("write UI timing: {error}"))?;
     result.and(shutdown)
 }
 
@@ -4468,12 +4521,17 @@ fn draw_interactive_frame(
     inline_history: &mut InlineHistoryState,
 ) -> miette::Result<()> {
     // 归档、滚屏与活动区重画是一帧；支持同步更新的终端不应展示它们之间的半成品。
+    let _timing = ui_timing::span("frame");
     execute!(
         terminal.backend_mut(),
         crossterm::terminal::BeginSynchronizedUpdate
     )
     .map_err(|error| miette::miette!("begin terminal update: {error}"))?;
+    app.transcript.frame_cache_enabled = true;
     let result = draw_interactive_frame_inner(terminal, overlay_screen, app, inline_history);
+    app.transcript.frame_cache_enabled = false;
+    app.transcript.frame_layout.get_mut().take();
+    let _output_timing = ui_timing::span("terminal_flush");
     let end = execute!(
         terminal.backend_mut(),
         crossterm::terminal::EndSynchronizedUpdate
@@ -4488,6 +4546,9 @@ fn draw_interactive_frame_inner(
     app: &mut TuiApp,
     inline_history: &mut InlineHistoryState,
 ) -> miette::Result<()> {
+    // Height calculation and drawing share layout inside this frame. Reset at
+    // its boundary as local notices and overlays can change without runtime events.
+    app.transcript.frame_layout.get_mut().take();
     let overlay_visible =
         app.overlay_surface().is_some() || app.tool_detail.is_some() || app.transcript.fullscreen;
     if !overlay_screen.active {
@@ -5558,7 +5619,17 @@ fn handle_paste(pasted: &str, app: &mut TuiApp) {
         | Some(OverlaySurface::Dashboard) => return,
         Some(OverlaySurface::Auth) => {
             let dialog = app.auth_dialog.as_mut().expect("auth surface");
-            if let Some(input) = dialog.current_input_mut() {
+            if let Some(input) = &mut dialog.advanced_input {
+                input.insert_str(&single_line);
+                dialog.error = None;
+                return;
+            }
+            let input = if dialog.step == AuthDialogStep::Model {
+                Some(dialog.prepare_custom_model_input())
+            } else {
+                dialog.current_input_mut()
+            };
+            if let Some(input) = input {
                 input.push_str(&normalized.replace('\n', ""));
                 dialog.error = None;
             }
@@ -6522,7 +6593,8 @@ async fn handle_queue_picker_key(
     Ok(())
 }
 
-type InteractiveTerminal = Terminal<CursorFallbackBackend<ContiguousCrosstermBackend<Stdout>>>;
+type InteractiveTerminal =
+    Terminal<CursorFallbackBackend<ContiguousCrosstermBackend<io::BufWriter<Stdout>>>>;
 
 fn setup_terminal(viewport_height: u16) -> miette::Result<InteractiveTerminal> {
     enable_raw_mode().map_err(|error| miette::miette!("{error}"))?;
@@ -6536,7 +6608,8 @@ fn setup_terminal(viewport_height: u16) -> miette::Result<InteractiveTerminal> {
         return Err(rollback_terminal_setup(error, false));
     }
     match Terminal::with_options(
-        CursorFallbackBackend::new(ContiguousCrosstermBackend::new(stdout)),
+        // 合并字符和样式的小写入；帧结束仍显式 flush，不引入显示计时延迟。
+        CursorFallbackBackend::new(ContiguousCrosstermBackend::new(io::BufWriter::new(stdout))),
         TerminalOptions {
             viewport: Viewport::Inline(viewport_height.max(1)),
         },

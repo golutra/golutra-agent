@@ -20,6 +20,12 @@ mod history_test_backend;
 #[path = "pending_input_tests.rs"]
 mod pending_input_tests;
 
+#[path = "auth_model_tests.rs"]
+mod auth_model_tests;
+
+#[path = "auth_advanced_tests.rs"]
+mod auth_advanced_tests;
+
 #[test]
 fn remote_subcommand_is_an_explicit_app_server_transport() {
     let args = Args::try_parse_from([
@@ -269,6 +275,46 @@ fn tui_history_bounds_a_single_oversized_event_payload() {
 }
 
 #[test]
+fn history_byte_accounting_tracks_trim_replay_and_reset() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "mock".into(),
+        None,
+    );
+    let task = TaskId::new();
+    for sequence in 1..=TUI_EVENT_HISTORY_LIMIT + 1 {
+        app.append_event_to_history(transcript_event(
+            sequence as u64,
+            app.session_id,
+            task,
+            RuntimeEventType::ProviderStreamed,
+            json!({"delta":{"kind":"text_delta","text":"中"}}),
+        ));
+    }
+    assert!(app.history_has_more_before);
+    assert!(app.events.len() < TUI_EVENT_HISTORY_LIMIT);
+    assert_eq!(
+        app.retained_event_bytes(),
+        app.events.iter().map(ui_event_memory_bytes).sum::<usize>()
+    );
+    let mut replay = app.events[..3].to_vec();
+    replay.reverse();
+    replay.push(replay[0].clone());
+    app.replace_event_history(replay, false);
+    assert_eq!(app.events.len(), 3);
+    assert_eq!(
+        app.retained_event_bytes(),
+        app.events.iter().map(ui_event_memory_bytes).sum::<usize>()
+    );
+    app.replace_event_history(Vec::new(), false);
+    assert_eq!(app.retained_event_bytes(), 0);
+    assert!(!app.history_has_more_before);
+}
+
+#[test]
 fn tui_history_preserves_oversized_assistant_content_for_resume() {
     let session_id = SessionId::new();
     let task_id = TaskId::new();
@@ -296,6 +342,51 @@ fn tui_history_preserves_oversized_assistant_content_for_resume() {
         Some(content.as_str())
     );
     assert_eq!(app.events[0].payload["_metadata_truncated"], json!(true));
+}
+
+#[test]
+fn live_and_replayed_events_are_bounded_once_without_rewriting_original_size() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        None,
+        false,
+        "mock".into(),
+        None,
+    );
+    let event = transcript_event(
+        1,
+        session_id,
+        task_id,
+        RuntimeEventType::AssistantMessage,
+        json!({"content": "正文".repeat(20_000), "provider_metadata": "x".repeat(80_000)}),
+    );
+    let original_bytes = serde_json::to_vec(&event.payload).unwrap().len();
+    app.replace_event_history(vec![event.clone()], false);
+    assert_eq!(app.events[0].payload["original_bytes"], original_bytes);
+    let replayed = app.events[0].clone();
+    app.replace_event_history(Vec::new(), false);
+    app.append_event_to_history(event);
+    assert_eq!(app.events[0].payload, replayed.payload);
+    for sequence in 2..=TUI_EVENT_HISTORY_TRIM_BATCH as u64 {
+        app.append_event_to_history(transcript_event(
+            sequence,
+            session_id,
+            task_id,
+            RuntimeEventType::CommandAccepted,
+            json!({"summary":"next"}),
+        ));
+    }
+    assert_eq!(app.events[0].payload, replayed.payload);
+    assert!(
+        !app.events[0]
+            .payload
+            .as_object()
+            .unwrap()
+            .contains_key("provider_metadata")
+    );
 }
 
 #[tokio::test]
@@ -634,7 +725,6 @@ async fn auth_dialog_openai_flow_persists_user_key() {
         dialog.provider = Some(OFFICIAL_PROVIDER_PRESET);
         dialog.step = AuthDialogStep::BaseUrl;
         dialog.base_url = base_url;
-        dialog.model = "qwen-coder".to_owned();
         dialog.api_key = "test-key".to_owned();
     }
 
@@ -644,10 +734,28 @@ async fn auth_dialog_openai_flow_persists_user_key() {
     advance_auth_dialog(&mut app, &transport)
         .await
         .expect("api key");
-    {
-        let dialog = app.auth_dialog.as_mut().expect("dialog");
-        dialog.selected = dialog.custom_model_index();
-    }
+    tokio::time::timeout(Duration::from_secs(12), async {
+        while app.auth_model_discovery.is_some() {
+            app.poll_auth_model_discovery().await;
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("model discovery");
+    handle_auth_dialog_key(
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        app.auth_dialog
+            .as_ref()
+            .unwrap()
+            .selected_recommended_model(),
+        Some("qwen-coder")
+    );
     advance_auth_dialog(&mut app, &transport)
         .await
         .expect("model");
@@ -3601,7 +3709,7 @@ fn reasoning_effort_order_and_saved_payload_include_lowercase_max_and_ultra() {
     let mut auth_effort = None;
     for expected in ["low", "medium", "high", "xhigh", "max", "ultra", "default"] {
         app.runtime_controls.cycle_effort(true);
-        auth_effort = next_reasoning_effort(auth_effort);
+        auth_effort = cycle_reasoning_effort(auth_effort, true);
         assert_eq!(
             effort_label(app.runtime_controls.reasoning_effort),
             expected
@@ -5531,7 +5639,7 @@ async fn auth_review_can_replace_an_unreadable_provider_config() {
 }
 
 #[tokio::test]
-async fn auth_review_custom_provider_uses_derived_env_key() {
+async fn auth_review_custom_provider_uses_entered_env_key() {
     let home = tempfile::tempdir().expect("home");
     let _guard = env_lock_guard().await;
     let previous_home = std::env::var("GOLUTRA_AGENT_HOME").ok();
@@ -5544,7 +5652,7 @@ async fn auth_review_custom_provider_uses_derived_env_key() {
     dialog.base_url = "https://api.example.com/v1/".to_owned();
     dialog.model = "gpt-5.5".to_owned();
     dialog.credential_store = AuthCredentialStore::Environment;
-    dialog.api_key_env = suggested_api_key_env(&dialog);
+    dialog.api_key_env = "MY_API_KEY".to_owned();
 
     let review = build_auth_review(&dialog).expect("review");
 
@@ -5556,11 +5664,8 @@ async fn auth_review_custom_provider_uses_derived_env_key() {
             std::env::remove_var("GOLUTRA_AGENT_HOME");
         },
     }
-    let expected_env = generate_custom_provider_api_key_env(
-        ProviderProtocol::OpenAiCompatible,
-        "https://api.example.com/v1/",
-    );
-    assert!(review.preview_json.contains(&expected_env));
+    assert_eq!(review.credential, "env:MY_API_KEY");
+    assert!(review.preview_json.contains("MY_API_KEY"));
     assert!(!review.preview_json.contains("test-key"));
     assert!(
         !review
@@ -6060,7 +6165,7 @@ fn auth_dialog_custom_provider_exposes_protocol_step() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(lines.contains("Custom Provider · Step 1/7 · Protocol"));
+    assert!(lines.contains("Custom Provider · Step 1/6 · Protocol"));
     assert!(lines.contains("OpenAI Chat Completions"));
     assert!(lines.contains("OpenAI Responses"));
     assert!(lines.contains("/chat/completions"));
@@ -6158,7 +6263,7 @@ async fn auth_custom_responses_selection_persists_and_uses_responses_wire() {
             .expect("dialog")
             .select_provider(CUSTOM_PROVIDER_PRESET);
         handle_auth_dialog_key(
-            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
             &mut app,
             &transport,
         )
@@ -6314,7 +6419,12 @@ async fn auth_dialog_advances_for_native_custom_protocols() {
 #[test]
 fn auth_dialog_exposes_recommended_models_and_custom_input() {
     let mut dialog = AuthDialogState::new();
-    dialog.select_provider(OFFICIAL_PROVIDER_PRESET);
+    dialog.select_provider(
+        *THIRD_PARTY_PROVIDER_PRESETS
+            .iter()
+            .find(|preset| preset.profile == "openai")
+            .unwrap(),
+    );
     dialog.step = AuthDialogStep::Model;
     let lines = auth_model_lines(&dialog)
         .into_iter()
@@ -6322,7 +6432,7 @@ fn auth_dialog_exposes_recommended_models_and_custom_input() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(lines.contains("gpt-test"));
+    assert!(lines.contains("gpt-5.5"));
     assert!(lines.contains("Custom model"));
 }
 
@@ -6340,18 +6450,6 @@ fn auth_advanced_custom_headers_parse_without_persisting_literal_secrets() {
             if key == "GOLUTRA_AGENT_PROVIDER_HEADER_KEY"
     ));
     assert!(parse_dialog_custom_headers("X-Api-Key=inline-secret").is_err());
-}
-
-#[test]
-fn auth_advanced_header_field_accepts_full_text_input() {
-    let mut dialog = AuthDialogState::new();
-    dialog.step = AuthDialogStep::AdvancedConfig;
-    dialog.advanced_selected = 4;
-    for character in "X-Client=golutra".chars() {
-        handle_auth_advanced_character(&mut dialog, character);
-    }
-
-    assert_eq!(dialog.custom_headers, "X-Client=golutra");
 }
 
 #[tokio::test]
@@ -10110,7 +10208,9 @@ async fn active_task_blocks_session_switching_commands() {
 }
 
 #[tokio::test]
-async fn auth_dialog_offers_disk_or_environment_reference() {
+async fn auth_dialog_defaults_to_key_and_toggles_environment_reference() {
+    use secrecy::ExposeSecret;
+
     let transport = RuntimeTransport::in_memory().await.expect("transport");
     let mut app = TuiApp::new(
         ThreadId::new(),
@@ -10132,31 +10232,101 @@ async fn auth_dialog_offers_disk_or_environment_reference() {
         .expect("base URL");
     assert_eq!(
         app.auth_dialog.as_ref().map(|dialog| dialog.step),
-        Some(AuthDialogStep::CredentialStore)
+        Some(AuthDialogStep::ApiKey)
     );
     {
         let dialog = app.auth_dialog.as_mut().expect("dialog");
-        let lines = auth_credential_store_lines(dialog)
+        dialog.api_key = "test-key-never-visible".to_owned();
+        let lines = auth_dialog_lines(dialog)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(lines.contains("Local disk"));
         assert!(lines.contains("$GOLUTRA_AGENT_HOME/credentials.json"));
-        assert!(lines.contains("Environment variable"));
-        dialog.selected = 1;
+        assert!(lines.contains("Ctrl+E"));
+        assert!(!lines.contains("test-key-never-visible"));
+        assert!(!lines.contains("1 Local disk"));
     }
-    advance_auth_dialog(&mut app, &transport)
-        .await
-        .expect("credential store");
+    handle_auth_dialog_key(
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("toggle environment");
     let dialog = app.auth_dialog.as_ref().expect("dialog");
     assert_eq!(dialog.step, AuthDialogStep::EnvKey);
-    assert_eq!(dialog.api_key_env, "GOLUTRA_AGENT_PROVIDER_API_KEY");
+    assert!(dialog.api_key.is_empty());
+    assert!(dialog.api_key_env.is_empty());
+    assert!(credential_for_login(&auth_login(dialog).unwrap()).is_err());
+    advance_auth_dialog(&mut app, &transport).await.unwrap();
+    let dialog = app.auth_dialog.as_mut().unwrap();
+    assert_eq!(dialog.step, AuthDialogStep::EnvKey);
+    assert!(dialog.error.is_some());
+    dialog.api_key_env = "MY_CUSTOM_API_KEY".to_owned();
+    dialog.model = "explicit-model".to_owned();
 
     let review = build_auth_review(dialog).expect("review");
-    assert_eq!(review.credential, "env:GOLUTRA_AGENT_PROVIDER_API_KEY");
+    assert_eq!(review.credential, "env:MY_CUSTOM_API_KEY");
     assert!(review.preview_json.contains("environment"));
     assert!(!review.preview_json.contains("oauth-access-token"));
+    let (reference, pending_secret) = credential_for_login(&auth_login(dialog).unwrap()).unwrap();
+    assert!(matches!(
+        reference.source,
+        CredentialSource::Environment { .. }
+    ));
+    assert!(pending_secret.is_none());
+
+    // 返回地址页后保留手填变量名；再次前进不能恢复旧密钥或强制切回本地模式。
+    handle_auth_dialog_key(
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        app.auth_dialog.as_ref().unwrap().step,
+        AuthDialogStep::BaseUrl
+    );
+    advance_auth_dialog(&mut app, &transport).await.unwrap();
+    assert_eq!(
+        app.auth_dialog.as_ref().unwrap().step,
+        AuthDialogStep::EnvKey
+    );
+    assert_eq!(
+        app.auth_dialog.as_ref().unwrap().api_key_env,
+        "MY_CUSTOM_API_KEY"
+    );
+    advance_auth_dialog(&mut app, &transport).await.unwrap();
+    assert_eq!(
+        app.auth_dialog.as_ref().unwrap().step,
+        AuthDialogStep::Model
+    );
+    app.auth_dialog.as_mut().unwrap().go_back();
+    assert_eq!(
+        app.auth_dialog.as_ref().unwrap().step,
+        AuthDialogStep::EnvKey
+    );
+
+    handle_auth_dialog_key(
+        KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+        &mut app,
+        &transport,
+    )
+    .await
+    .unwrap();
+    let dialog = app.auth_dialog.as_mut().unwrap();
+    assert_eq!(dialog.step, AuthDialogStep::ApiKey);
+    assert_eq!(dialog.credential_store, AuthCredentialStore::Disk);
+    assert!(dialog.api_key.is_empty());
+    dialog.api_key = "replacement-test-key".to_owned();
+    let (reference, pending_secret) = credential_for_login(&auth_login(dialog).unwrap()).unwrap();
+    assert!(matches!(reference.source, CredentialSource::Disk));
+    assert_eq!(
+        pending_secret.unwrap().expose_secret(),
+        "replacement-test-key"
+    );
 }
 
 #[tokio::test]

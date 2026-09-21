@@ -10,8 +10,24 @@ use golutra_agent_llm::{ProviderGenerationConfig, ProviderProtocol, ProviderReas
 use golutra_agent_tui::{AuthCredentialStore, OpenAiCompatibleLogin};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
-use super::ResumeSelectionDirection;
+use super::{ComposerInput, ResumeSelectionDirection, cycle_reasoning_effort};
+
+#[derive(Debug)]
+pub(crate) struct PendingModelDiscovery {
+    pub(crate) id: Uuid,
+    pub(crate) task: JoinHandle<Result<Vec<String>, String>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) enum ModelDiscoveryState {
+    #[default]
+    Idle,
+    Loading(Uuid),
+    Ready,
+    Failed(String),
+}
 
 #[derive(Debug)]
 pub(crate) struct PendingAuthOperation {
@@ -44,6 +60,9 @@ pub(crate) struct AuthDialogState {
     pub(crate) protocol: ProviderProtocol,
     pub(crate) base_url: String,
     pub(crate) model: String,
+    pub(crate) models: Vec<String>,
+    pub(crate) model_discovery: ModelDiscoveryState,
+    pub(crate) manual_model_input: bool,
     pub(crate) api_key: String,
     pub(crate) api_key_env: String,
     pub(crate) credential_store: AuthCredentialStore,
@@ -53,6 +72,7 @@ pub(crate) struct AuthDialogState {
     pub(crate) max_tokens: String,
     pub(crate) custom_headers: String,
     pub(crate) advanced_selected: usize,
+    pub(crate) advanced_input: Option<ComposerInput>,
     pub(crate) review: Option<AuthReview>,
     pub(crate) error: Option<String>,
 }
@@ -64,7 +84,6 @@ pub(crate) enum AuthDialogStep {
     AuthMethod,
     Protocol,
     BaseUrl,
-    CredentialStore,
     ApiKey,
     EnvKey,
     Model,
@@ -150,6 +169,9 @@ impl AuthDialogState {
             protocol: ProviderProtocol::OpenAiCompatible,
             base_url: String::new(),
             model: String::new(),
+            models: Vec::new(),
+            model_discovery: ModelDiscoveryState::Idle,
+            manual_model_input: false,
             api_key: String::new(),
             api_key_env: String::new(),
             credential_store: default_auth_credential_store(),
@@ -159,6 +181,7 @@ impl AuthDialogState {
             max_tokens: String::new(),
             custom_headers: String::new(),
             advanced_selected: 0,
+            advanced_input: None,
             review: None,
             error: None,
         }
@@ -189,6 +212,13 @@ impl AuthDialogState {
             .unwrap_or(ProviderProtocol::OpenAiCompatible);
         self.base_url = provider.base_url.unwrap_or_default().to_owned();
         self.model = provider.model.unwrap_or_default().to_owned();
+        self.models = provider
+            .recommended_models
+            .iter()
+            .map(|model| (*model).to_owned())
+            .collect();
+        self.model_discovery = ModelDiscoveryState::Idle;
+        self.manual_model_input = false;
         self.api_key.clear();
         self.api_key_env.clear();
         self.credential_store = default_auth_credential_store();
@@ -198,6 +228,7 @@ impl AuthDialogState {
         self.max_tokens.clear();
         self.custom_headers.clear();
         self.advanced_selected = 0;
+        self.advanced_input = None;
         self.review = None;
         self.error = None;
         self.step = if !self.oauth_methods().is_empty() {
@@ -216,6 +247,27 @@ impl AuthDialogState {
         self.provider
             .map(|provider| provider.protocol_options)
             .unwrap_or(&[])
+    }
+
+    pub(crate) fn toggle_credential_input(&mut self) {
+        match self.step {
+            AuthDialogStep::ApiKey => {
+                self.credential_store = AuthCredentialStore::Environment;
+                self.step = AuthDialogStep::EnvKey;
+            }
+            AuthDialogStep::EnvKey => {
+                self.credential_store = AuthCredentialStore::Disk;
+                self.step = AuthDialogStep::ApiKey;
+            }
+            _ => return,
+        }
+        // 切换来源后不能复用旧密钥或旧确认计划，避免无意保存已放弃的凭据。
+        self.api_key.clear();
+        self.review = None;
+        self.error = None;
+        self.selected = 0;
+        self.scroll = 0;
+        self.manual_scroll = false;
     }
 
     pub(crate) fn oauth_methods(&self) -> Vec<BuiltinOAuthMethod> {
@@ -262,25 +314,29 @@ impl AuthDialogState {
         }
     }
 
-    pub(crate) fn model_options(&self) -> &'static [&'static str] {
-        self.provider
-            .map(|provider| provider.recommended_models)
-            .unwrap_or(&[])
+    pub(crate) fn model_options(&self) -> &[String] {
+        &self.models
     }
 
     pub(crate) fn custom_model_index(&self) -> usize {
-        self.model_options().len()
+        0
     }
 
-    pub(crate) fn selected_recommended_model(&self) -> Option<&'static str> {
-        self.model_options().get(self.selected).copied()
+    pub(crate) fn selected_recommended_model(&self) -> Option<&str> {
+        self.selected
+            .checked_sub(1)
+            .and_then(|index| self.models.get(index))
+            .map(String::as_str)
     }
 
     pub(crate) fn is_custom_model_selected(&self) -> bool {
-        self.selected >= self.custom_model_index()
+        self.selected == self.custom_model_index()
     }
 
     pub(crate) fn move_selection(&mut self, direction: ResumeSelectionDirection) {
+        if self.advanced_input.is_some() {
+            return;
+        }
         let last_index = self.last_selection_index();
         let current = if self.step == AuthDialogStep::AdvancedConfig {
             self.advanced_selected
@@ -307,13 +363,15 @@ impl AuthDialogState {
                 | AuthDialogStep::ThirdPartyChoice
                 | AuthDialogStep::AuthMethod
                 | AuthDialogStep::Protocol
-                | AuthDialogStep::CredentialStore
                 | AuthDialogStep::Model
                 | AuthDialogStep::AdvancedConfig
         )
     }
 
     pub(crate) fn set_interactive_selection(&mut self, index: usize) {
+        if self.advanced_input.is_some() {
+            return;
+        }
         if self.step == AuthDialogStep::AdvancedConfig {
             self.advanced_selected = index.min(AUTH_ADVANCED_ITEMS.saturating_sub(1));
         } else {
@@ -346,8 +404,7 @@ impl AuthDialogState {
             }
             AuthDialogStep::AuthMethod => self.auth_method_count().saturating_sub(1),
             AuthDialogStep::Protocol => self.protocol_options().len().saturating_sub(1),
-            AuthDialogStep::CredentialStore => 1,
-            AuthDialogStep::Model => self.custom_model_index(),
+            AuthDialogStep::Model => self.model_options().len(),
             AuthDialogStep::AdvancedConfig => AUTH_ADVANCED_ITEMS.saturating_sub(1),
             AuthDialogStep::BaseUrl
             | AuthDialogStep::ApiKey
@@ -361,18 +418,15 @@ impl AuthDialogState {
             AuthDialogStep::BaseUrl => Some(&mut self.base_url),
             AuthDialogStep::ApiKey => Some(&mut self.api_key),
             AuthDialogStep::EnvKey => Some(&mut self.api_key_env),
-            AuthDialogStep::Model if self.is_custom_model_selected() => Some(&mut self.model),
-            AuthDialogStep::AdvancedConfig => match self.advanced_selected {
-                2 => Some(&mut self.context_window_size),
-                3 => Some(&mut self.max_tokens),
-                4 => Some(&mut self.custom_headers),
-                _ => None,
-            },
+            AuthDialogStep::Model if self.is_custom_model_selected() => {
+                self.manual_model_input = true;
+                Some(&mut self.model)
+            }
+            AuthDialogStep::AdvancedConfig => None,
             AuthDialogStep::GroupChoice
             | AuthDialogStep::ThirdPartyChoice
             | AuthDialogStep::AuthMethod
             | AuthDialogStep::Protocol
-            | AuthDialogStep::CredentialStore
             | AuthDialogStep::Model
             | AuthDialogStep::Review => None,
         }
@@ -380,23 +434,25 @@ impl AuthDialogState {
 
     pub(crate) fn prepare_custom_model_input(&mut self) -> &mut String {
         let was_custom_model_selected = self.is_custom_model_selected();
-        let model_matches_preset = self
-            .model_options()
-            .iter()
-            .any(|model| *model == self.model)
+        let model_matches_preset = self.model_options().contains(&self.model)
             || self
                 .provider
                 .and_then(|provider| provider.model)
                 .is_some_and(|model| model == self.model);
         self.selected = self.custom_model_index();
-        if !was_custom_model_selected || model_matches_preset {
+        if !was_custom_model_selected || (!self.manual_model_input && model_matches_preset) {
             self.model.clear();
         }
+        self.manual_model_input = true;
         self.error = None;
         &mut self.model
     }
 
     pub(crate) fn go_back(&mut self) {
+        if self.advanced_input.is_some() {
+            self.finish_advanced_edit();
+            return;
+        }
         self.error = None;
         self.review = None;
         self.scroll = 0;
@@ -416,16 +472,10 @@ impl AuthDialogState {
                 Some(AuthProviderSource::ThirdParty) => AuthDialogStep::ThirdPartyChoice,
                 _ => AuthDialogStep::GroupChoice,
             },
-            AuthDialogStep::CredentialStore => AuthDialogStep::BaseUrl,
-            AuthDialogStep::ApiKey => {
-                if self.credential_store == AuthCredentialStore::Ephemeral {
-                    AuthDialogStep::BaseUrl
-                } else {
-                    AuthDialogStep::CredentialStore
-                }
-            }
-            AuthDialogStep::EnvKey => AuthDialogStep::CredentialStore,
+            AuthDialogStep::ApiKey | AuthDialogStep::EnvKey => AuthDialogStep::BaseUrl,
             AuthDialogStep::Model => {
+                // 退回凭据页即使随后再次进入，也不能接受旧 Key 发起的目录请求。
+                self.model_discovery = ModelDiscoveryState::Idle;
                 if self.credential_store == AuthCredentialStore::Environment {
                     AuthDialogStep::EnvKey
                 } else {
@@ -438,27 +488,63 @@ impl AuthDialogState {
         };
     }
 
-    pub(crate) fn toggle_advanced_item(&mut self) {
+    pub(crate) fn cycle_advanced_item(&mut self, forward: bool) {
         match self.advanced_selected {
-            0 => self.enable_thinking = !self.enable_thinking,
-            1 => self.reasoning_effort = next_reasoning_effort(self.reasoning_effort),
+            1 => self.enable_thinking = !self.enable_thinking,
+            2 => self.reasoning_effort = cycle_reasoning_effort(self.reasoning_effort, forward),
+            _ => {}
+        }
+        self.error = None;
+    }
+
+    pub(crate) fn advanced_text_value(&self, index: usize) -> Option<&str> {
+        if index == self.advanced_selected
+            && let Some(input) = &self.advanced_input
+        {
+            return Some(input.text());
+        }
+        match index {
+            3 => Some(&self.context_window_size),
+            4 => Some(&self.max_tokens),
+            5 => Some(&self.custom_headers),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn start_advanced_edit(&mut self) {
+        if let Some(value) = self.advanced_text_value(self.advanced_selected) {
+            self.advanced_input = Some(ComposerInput::from_text(value));
+            self.error = None;
+            self.manual_scroll = false;
+        }
+    }
+
+    pub(crate) fn finish_advanced_edit(&mut self) {
+        let Some(input) = self.advanced_input.take() else {
+            return;
+        };
+        // Enter/Esc 只保留本页草稿，最终校验和落盘仍分别由 Continue 与确认页负责。
+        let value = input.trimmed();
+        match self.advanced_selected {
+            3 => self.context_window_size = value,
+            4 => self.max_tokens = value,
+            5 => self.custom_headers = value,
             _ => {}
         }
         self.error = None;
     }
 }
 
-pub(crate) const AUTH_ADVANCED_ITEMS: usize = 5;
+pub(crate) const AUTH_ADVANCED_ITEMS: usize = 6;
 pub(crate) const OPENAI_PROTOCOL_ONLY: &[ProviderProtocol] = &[ProviderProtocol::OpenAiCompatible];
 pub(crate) const CUSTOM_PROTOCOL_OPTIONS: &[ProviderProtocol] = &[
-    ProviderProtocol::OpenAiCompatible,
     ProviderProtocol::OpenAiResponses,
     ProviderProtocol::Anthropic,
     ProviderProtocol::Gemini,
+    ProviderProtocol::OpenAiCompatible,
     ProviderProtocol::VertexAi,
     ProviderProtocol::Genai,
 ];
-pub(crate) const OFFICIAL_MODELS: &[&str] = &["gpt-test", "gpt-4.1", "qwen-coder-plus"];
 pub(crate) const OPENAI_MODELS: &[&str] = &["gpt-5.5", "gpt-5.4", "gpt-4.1"];
 pub(crate) const OPENROUTER_MODELS: &[&str] = &[
     "openai/gpt-4.1",
@@ -483,8 +569,8 @@ pub(crate) const OFFICIAL_PROVIDER_PRESET: AuthProviderPreset = AuthProviderPres
     source: AuthProviderSource::Official,
     protocol_options: OPENAI_PROTOCOL_ONLY,
     base_url: Some("https://api.golutra.cn/v1"),
-    model: Some("gpt-test"),
-    recommended_models: OFFICIAL_MODELS,
+    model: None,
+    recommended_models: &[],
     oauth_provider_id: None,
     api_key_supported: true,
 };
@@ -602,20 +688,6 @@ pub(crate) const AUTH_GROUP_ITEMS: &[(&str, &str)] = &[
     ("Continue with mock", "Use local deterministic provider"),
     ("Quit", "Leave without changing provider settings"),
 ];
-
-pub(crate) fn next_reasoning_effort(
-    value: Option<ProviderReasoningEffort>,
-) -> Option<ProviderReasoningEffort> {
-    match value {
-        None => Some(ProviderReasoningEffort::Low),
-        Some(ProviderReasoningEffort::Low) => Some(ProviderReasoningEffort::Medium),
-        Some(ProviderReasoningEffort::Medium) => Some(ProviderReasoningEffort::High),
-        Some(ProviderReasoningEffort::High) => Some(ProviderReasoningEffort::Xhigh),
-        Some(ProviderReasoningEffort::Xhigh) => Some(ProviderReasoningEffort::Max),
-        Some(ProviderReasoningEffort::Max) => Some(ProviderReasoningEffort::Ultra),
-        Some(ProviderReasoningEffort::Ultra) => None,
-    }
-}
 
 pub(crate) fn reasoning_effort_label(value: Option<ProviderReasoningEffort>) -> &'static str {
     match value {

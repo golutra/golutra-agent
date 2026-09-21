@@ -7,16 +7,29 @@ pub(crate) async fn handle_auth_dialog_key(
     app: &mut TuiApp,
     transport: &RuntimeTransport,
 ) -> miette::Result<()> {
+    if let Some(dialog) = app.auth_dialog.as_mut()
+        && dialog.step == AuthDialogStep::AdvancedConfig
+        && dialog.advanced_input.is_some()
+    {
+        handle_auth_advanced_editor_key(dialog, key);
+        return Ok(());
+    }
     let page = usize::from(app.layout.transcript.height.saturating_sub(1)).max(1);
     let max_scroll = app
         .auth_dialog
         .as_ref()
         .map_or(0, |dialog| auth_scroll_max(dialog, app.layout.transcript));
     match key.code {
+        KeyCode::Char('e' | 'E') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(dialog) = &mut app.auth_dialog {
+                dialog.toggle_credential_input();
+            }
+        }
         KeyCode::Esc => {
             if let Some(dialog) = &mut app.auth_dialog {
                 dialog.go_back();
             }
+            app.cancel_auth_model_discovery();
         }
         KeyCode::Up | KeyCode::Char('k') => {
             if let Some(dialog) = &mut app.auth_dialog {
@@ -43,6 +56,13 @@ pub(crate) async fn handle_auth_dialog_key(
                 .and_then(AuthDialogState::current_input_mut)
             {
                 delete_last_grapheme(input);
+            }
+        }
+        KeyCode::Left | KeyCode::Right => {
+            if let Some(dialog) = &mut app.auth_dialog
+                && dialog.step == AuthDialogStep::AdvancedConfig
+            {
+                dialog.cycle_advanced_item(key.code == KeyCode::Right);
             }
         }
         KeyCode::Enter => {
@@ -78,7 +98,6 @@ pub(crate) async fn handle_auth_dialog_key(
                         | AuthDialogStep::ThirdPartyChoice
                         | AuthDialogStep::AuthMethod
                         | AuthDialogStep::Protocol
-                        | AuthDialogStep::CredentialStore
                 )
                 && let Some(index) = character
                     .to_digit(10)
@@ -91,7 +110,6 @@ pub(crate) async fn handle_auth_dialog_key(
                     }
                     AuthDialogStep::AuthMethod => dialog.auth_method_count().saturating_sub(1),
                     AuthDialogStep::Protocol => dialog.protocol_options().len().saturating_sub(1),
-                    AuthDialogStep::CredentialStore => 1,
                     AuthDialogStep::BaseUrl
                     | AuthDialogStep::ApiKey
                     | AuthDialogStep::EnvKey
@@ -134,14 +152,15 @@ pub(crate) fn auth_step_accepts_vim_selection_keys(dialog: &AuthDialogState) -> 
             | AuthDialogStep::ThirdPartyChoice
             | AuthDialogStep::AuthMethod
             | AuthDialogStep::Protocol
-            | AuthDialogStep::CredentialStore
             | AuthDialogStep::AdvancedConfig
     )
 }
 
 pub(crate) fn handle_auth_dialog_character(dialog: &mut AuthDialogState, character: char) {
     if dialog.step == AuthDialogStep::AdvancedConfig {
-        handle_auth_advanced_character(dialog, character);
+        if character == ' ' {
+            dialog.cycle_advanced_item(true);
+        }
     } else if dialog.step == AuthDialogStep::Model {
         dialog.prepare_custom_model_input().push(character);
     } else if let Some(input) = dialog.current_input_mut() {
@@ -149,37 +168,50 @@ pub(crate) fn handle_auth_dialog_character(dialog: &mut AuthDialogState, charact
     }
 }
 
-pub(crate) fn handle_auth_advanced_character(dialog: &mut AuthDialogState, character: char) {
-    if dialog.advanced_selected == 4 {
-        dialog.custom_headers.push(character);
-        dialog.error = None;
+fn handle_auth_advanced_editor_key(dialog: &mut AuthDialogState, key: KeyEvent) {
+    if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+        dialog.finish_advanced_edit();
         return;
     }
-    match character {
-        ' ' => dialog.toggle_advanced_item(),
-        't' | 'T' => {
-            dialog.advanced_selected = 0;
-            dialog.toggle_advanced_item();
+    let input = dialog.advanced_input.as_mut().expect("advanced editor");
+    match key.code {
+        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            input.move_to_start()
         }
-        'r' | 'R' => {
-            dialog.advanced_selected = 1;
-            dialog.toggle_advanced_item();
+        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => input.move_to_end(),
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => input.clear(),
+        KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            input.delete_to_line_end()
         }
-        'c' | 'C' => {
-            dialog.advanced_selected = 2;
-            dialog.error = None;
+        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            input.delete_word_backward()
         }
-        'm' | 'M' => {
-            dialog.advanced_selected = 3;
-            dialog.error = None;
+        KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            input.undo();
         }
-        character if character.is_ascii_digit() => {
-            if let Some(input) = dialog.current_input_mut() {
-                input.push(character);
-            }
+        KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            input.redo();
+        }
+        KeyCode::Left => input.move_left(),
+        KeyCode::Right => input.move_right(),
+        KeyCode::Home => input.move_to_start(),
+        KeyCode::End => input.move_to_end(),
+        KeyCode::Backspace => input.delete_backward(),
+        KeyCode::Delete => input.delete_forward(),
+        KeyCode::Char(character)
+            if !key.modifiers.intersects(
+                KeyModifiers::CONTROL
+                    | KeyModifiers::ALT
+                    | KeyModifiers::SUPER
+                    | KeyModifiers::HYPER
+                    | KeyModifiers::META,
+            ) =>
+        {
+            input.insert_char(character);
         }
         _ => {}
     }
+    dialog.error = None;
 }
 
 pub(crate) async fn advance_auth_dialog(
@@ -251,11 +283,11 @@ pub(crate) async fn advance_auth_dialog(
                 match validate_auth_base_url(dialog.protocol, &dialog.base_url) {
                     Ok(base_url) => {
                         dialog.base_url = base_url;
-                        dialog.api_key_env = suggested_api_key_env(dialog);
-                        dialog.step = if dialog.credential_store == AuthCredentialStore::Ephemeral {
-                            AuthDialogStep::ApiKey
+                        dialog.step = if dialog.credential_store == AuthCredentialStore::Environment
+                        {
+                            AuthDialogStep::EnvKey
                         } else {
-                            AuthDialogStep::CredentialStore
+                            AuthDialogStep::ApiKey
                         };
                         dialog.error = None;
                     }
@@ -263,24 +295,6 @@ pub(crate) async fn advance_auth_dialog(
                         dialog.error = Some(error);
                     }
                 }
-                AuthAdvanceAction::None
-            }
-            AuthDialogStep::CredentialStore => {
-                dialog.credential_store = if dialog.selected == 1 {
-                    AuthCredentialStore::Environment
-                } else {
-                    AuthCredentialStore::Disk
-                };
-                if dialog.credential_store == AuthCredentialStore::Environment {
-                    dialog.api_key.clear();
-                }
-                dialog.step = if dialog.credential_store == AuthCredentialStore::Environment {
-                    AuthDialogStep::EnvKey
-                } else {
-                    AuthDialogStep::ApiKey
-                };
-                dialog.selected = 0;
-                dialog.error = None;
                 AuthAdvanceAction::None
             }
             AuthDialogStep::ApiKey => {
@@ -295,6 +309,10 @@ pub(crate) async fn advance_auth_dialog(
                 AuthAdvanceAction::None
             }
             AuthDialogStep::EnvKey => {
+                if dialog.api_key_env.trim().is_empty() {
+                    dialog.error = Some("Environment variable name cannot be empty".to_owned());
+                    return Ok(());
+                }
                 match CredentialRef::environment(dialog.api_key_env.trim(), SecretKind::ApiKey) {
                     Ok(_) => {
                         dialog.api_key_env = dialog.api_key_env.trim().to_owned();
@@ -322,9 +340,20 @@ pub(crate) async fn advance_auth_dialog(
                     AuthAdvanceAction::None
                 } else {
                     dialog.step = AuthDialogStep::AdvancedConfig;
+                    dialog.advanced_selected = 0;
+                    dialog.advanced_input = None;
                     dialog.error = None;
                     AuthAdvanceAction::None
                 }
+            }
+            AuthDialogStep::AdvancedConfig if dialog.advanced_input.is_some() => {
+                dialog.finish_advanced_edit();
+                AuthAdvanceAction::None
+            }
+            AuthDialogStep::AdvancedConfig if dialog.advanced_selected != 0 => {
+                dialog.cycle_advanced_item(true);
+                dialog.start_advanced_edit();
+                AuthAdvanceAction::None
             }
             AuthDialogStep::AdvancedConfig => {
                 match validate_generation_config(dialog).and_then(|_| build_auth_review(dialog)) {
@@ -353,6 +382,24 @@ pub(crate) async fn advance_auth_dialog(
     {
         dialog.scroll = 0;
         dialog.manual_scroll = false;
+    }
+    if app
+        .auth_dialog
+        .as_ref()
+        .is_none_or(|dialog| dialog.step != AuthDialogStep::Model)
+    {
+        // 手填后继续无需等待维护轮询，更不能让目录请求延迟确认保存或实际推理。
+        app.cancel_auth_model_discovery();
+    }
+    if matches!(
+        previous_step,
+        Some(AuthDialogStep::ApiKey | AuthDialogStep::EnvKey)
+    ) && app
+        .auth_dialog
+        .as_ref()
+        .is_some_and(|dialog| dialog.step == AuthDialogStep::Model)
+    {
+        app.start_auth_model_discovery();
     }
     match action {
         AuthAdvanceAction::None => {}
@@ -595,11 +642,7 @@ pub(crate) fn provider_scope(scope: AuthConfigScope) -> ProviderConfigScope {
 
 pub(crate) fn auth_login(dialog: &AuthDialogState) -> Result<OpenAiCompatibleLogin, String> {
     let provider = dialog.provider.unwrap_or(CUSTOM_PROVIDER_PRESET);
-    let api_key_env = if dialog.api_key_env.trim().is_empty() {
-        suggested_api_key_env(dialog)
-    } else {
-        dialog.api_key_env.trim().to_owned()
-    };
+    let api_key_env = dialog.api_key_env.trim().to_owned();
     Ok(OpenAiCompatibleLogin {
         profile: provider.profile.to_owned(),
         protocol: dialog.protocol,
@@ -617,17 +660,6 @@ pub(crate) fn auth_login(dialog: &AuthDialogState) -> Result<OpenAiCompatibleLog
         custom_headers: parse_dialog_custom_headers(&dialog.custom_headers)?,
         scope: AuthConfigScope::User,
     })
-}
-
-pub(crate) fn suggested_api_key_env(dialog: &AuthDialogState) -> String {
-    match dialog.provider.unwrap_or(CUSTOM_PROVIDER_PRESET).source {
-        AuthProviderSource::Custom => {
-            generate_custom_provider_api_key_env(dialog.protocol, dialog.base_url.trim())
-        }
-        AuthProviderSource::Official | AuthProviderSource::ThirdParty => {
-            "GOLUTRA_AGENT_PROVIDER_API_KEY".to_owned()
-        }
-    }
 }
 
 pub(crate) fn build_auth_review(dialog: &AuthDialogState) -> Result<AuthReview, String> {

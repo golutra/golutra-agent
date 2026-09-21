@@ -5,6 +5,11 @@ use std::{
     fs,
     ops::Range,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, TryRecvError},
+    },
 };
 
 use golutra_agent_core::TurnId;
@@ -143,6 +148,45 @@ pub(crate) struct MentionCatalog {
     candidates: Vec<MentionCandidate>,
 }
 
+#[derive(Debug)]
+pub(crate) struct MentionDiscovery {
+    pub(crate) workspace: PathBuf,
+    result: Receiver<MentionCatalog>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl MentionDiscovery {
+    pub(crate) fn start(workspace: PathBuf) -> std::io::Result<Self> {
+        let (sender, result) = mpsc::sync_channel(1);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let root = workspace.clone();
+        let cancel = cancelled.clone();
+        std::thread::Builder::new()
+            .name("tui-mentions".to_owned())
+            .spawn(move || {
+                let catalog = MentionCatalog::discover_cancellable(&root, &cancel);
+                if !cancel.load(Ordering::Relaxed) {
+                    let _ = sender.send(catalog);
+                }
+            })?;
+        Ok(Self {
+            workspace,
+            result,
+            cancelled,
+        })
+    }
+
+    pub(crate) fn poll(&self) -> Result<MentionCatalog, TryRecvError> {
+        self.result.try_recv()
+    }
+}
+
+impl Drop for MentionDiscovery {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MentionCompletion {
     pub(crate) replacement: Range<usize>,
@@ -151,7 +195,12 @@ pub(crate) struct MentionCompletion {
 }
 
 impl MentionCatalog {
+    #[cfg(test)]
     pub(crate) fn discover(workspace: &Path) -> Self {
+        Self::discover_cancellable(workspace, &AtomicBool::new(false))
+    }
+
+    fn discover_cancellable(workspace: &Path, cancelled: &AtomicBool) -> Self {
         let mut candidates = Vec::new();
         let walker = WalkBuilder::new(workspace)
             .hidden(true)
@@ -161,6 +210,9 @@ impl MentionCatalog {
             .max_depth(Some(12))
             .build();
         for entry in walker.filter_map(Result::ok) {
+            if cancelled.load(Ordering::Relaxed) {
+                return Self::default();
+            }
             if candidates.len() >= MAX_MENTION_FILES {
                 break;
             }
@@ -182,7 +234,9 @@ impl MentionCatalog {
                 source_path: Some(entry.path().to_path_buf()),
             });
         }
-        discover_special_mentions(workspace, &mut candidates);
+        if !cancelled.load(Ordering::Relaxed) {
+            discover_special_mentions(workspace, &mut candidates);
+        }
         candidates.sort_by(|left, right| {
             mention_rank(left.kind)
                 .cmp(&mention_rank(right.kind))
@@ -525,6 +579,46 @@ mod tests {
             payload_ref: None,
             durable: true,
         }
+    }
+
+    #[test]
+    fn background_catalog_uses_latest_draft_and_discards_an_old_workspace() {
+        let workspace = tempdir().unwrap();
+        fs::write(workspace.path().join("apple.rs"), "").unwrap();
+        fs::write(workspace.path().join("banana.rs"), "").unwrap();
+        let discovery = MentionDiscovery::start(workspace.path().to_owned()).unwrap();
+        let catalog = discovery
+            .result
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let mut app = crate::TuiApp::new(
+            golutra_agent_core::ThreadId::new(),
+            SessionId::new(),
+            None,
+            false,
+            "mock".into(),
+            None,
+        );
+        app.workspace_path = workspace.path().to_owned();
+        app.input.set_text("@apple");
+        let (sender, result) = mpsc::sync_channel(1);
+        app.mention_discovery = Some(MentionDiscovery {
+            workspace: app.workspace_path.clone(),
+            result,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        });
+        assert!(!app.poll_mention_completion());
+        app.input.set_text("@banana");
+        sender.send(catalog).unwrap();
+        assert!(app.poll_mention_completion());
+        assert_eq!(
+            app.mention_completion.as_ref().unwrap().candidates[0].insertion,
+            "@banana.rs"
+        );
+        app.mention_discovery = Some(discovery);
+        app.workspace_path = workspace.path().join("different");
+        assert!(!app.poll_mention_completion());
+        assert!(app.mention_discovery.is_none());
     }
 
     #[test]

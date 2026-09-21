@@ -12,7 +12,9 @@
 
 本地运行时，模型选择立即用于当前会话，并保存到 `$GOLUTRA_AGENT_HOME/runtime.json`，重启后继续使用；若项目已存在 `.golutra-agent/runtime.json`，则更新该项目层，避免旧的项目覆盖使模型还原。显式切换 profile 时同时保存对应选择。保存复用锁、revision 校验和原子文件替换，只修改模型相关字段，不改写凭据、provider 定义或权限；失败时保留编辑框及草稿，不假报成功。`/model <model-id>` 使用同一机制。远程 TUI 保持会话覆盖，不写本地配置冒充修改远程主机。
 
-选择 `3 Custom Provider` 后，协议列表分别提供 `1 OpenAI Chat Completions`（`/chat/completions`）和 `2 OpenAI Responses`（`/responses`）。两者是独立协议，不自动互换；根据服务商支持的接口选择。确认页 Enter 只在本地校验并保存配置和凭据，不探测模型、不发送联网验证请求；保存成功后返回聊天输入，实际连通性由后续模型请求验证。`/auth login` 使用相同保存路径；本地保存失败则保留向导并在确认页顶部显示错误。保存的协议决定后续生成请求使用的接口。
+选择 `3 Custom Provider` 后，协议依次为 OpenAI Responses、Anthropic-compatible、Gemini-compatible、OpenAI Chat Completions、Vertex AI、rust-genai。Responses（`/responses`）与 Chat Completions（`/chat/completions`）是独立协议，不自动互换；根据服务商支持的接口选择。确认页 Enter 只在本地校验并保存配置和凭据，不探测模型、不发送联网验证请求；保存成功后返回聊天输入，实际连通性由后续模型请求验证。`/auth login` 使用相同保存路径；本地保存失败则保留向导并在确认页顶部显示错误。保存的协议决定后续生成请求使用的接口。
+
+API Key 配置默认直接进入密钥输入页，保存到 `$GOLUTRA_AGENT_HOME/credentials.json`，不再单独询问存储方式。在该页按 `Ctrl+E` 可切换到环境变量名称输入，再按一次切回本地 API Key；切换时清空密钥和旧确认计划。环境变量名称初始为空，不自动生成或补全，留空继续会提示填写；只保存用户输入的变量名，不创建或修改环境变量，须在启动 Agent 前设置。Esc 返回地址页，保留所选模式与手填变量名；从模型页返回时回到对应凭据输入页。确认页仍显示真实凭据来源，自定义配置共六步。
 
 Base URL 可填裸域名（默认 HTTPS）或完整基础地址。OpenAI Chat Completions、Responses、Anthropic 在没有路径时补 `/v1`，Gemini 补 `/v1beta`；已有版本号、自定义代理路径和 ChatGPT 的 `/backend-api/codex` 保持原样。按所选协议识别完整的 `/chat/completions`、`/responses`、`/messages` 或 Gemini `/models/<model>:generateContent` / `:streamGenerateContent` 地址，去掉操作后缀以避免重复拼接；实际模型仍以 Model 字段为准。带凭据、查询参数或 fragment 的地址拒绝保存。Vertex AI 需要明确的项目/区域基础路径，不能从裸域名猜测；rust-genai 按其已有模型路由为 OpenAI、Anthropic、Gemini、DeepSeek 补默认路径，其他路由要求明确 API 基础路径。确认页和保存内容显示规范化地址，运行时对已有配置及环境变量使用同一规则，不联网尝试多个端点。
 
@@ -41,6 +43,20 @@ Reasoning effort 在设置页和认证高级配置中的顺序统一为 `default
 | 终端生命周期 | `draw_interactive_frame`、`OverlayScreenState`、`terminal_integration.rs` | 同步归档/绘制，保存主屏 viewport，临时切换备用屏，退出和异常恢复 |
 
 归档正文与行身份事务性提交，写入失败时不推进归档游标。工具摘要是否简洁由独立展示策略控制，不依赖是否全屏。
+
+流式显示按内容复用解析与排版：`rich_text/cache.rs` 保留稳定语义块，可变尾部交给原 Markdown 解析器；新块首行收完整后才推进稳定边界，避免部分表格行造成过早冻结。后置引用定义或 HTML 等跨块状态回退完整解析。未变化块复用排版，增长代码块保留已完成行，仅重排最后一行和新增内容；最终正文修订及宽度变化重新计算。历史归档共用解析器记录的源边界，并校验渲染前缀。按宽度区分缓存，最多保留 32 份文档、累计 2 MiB 源码；超预算内容走完整渲染，不截断正文。
+
+换行阶段借用源字素，输出行形成时才分配文本；保留样式、组合字符和中文标点避头规则。交互 Backend 使用标准库缓冲写入以合并细碎字符/样式，帧结束和光标查询前显式 flush，继续用同步更新保护显示。参考实现与选择记录见 [Codex/pi 对比](benchmarks/2026-09-21-tui-codex-pi-comparison.md)。
+
+普通键入不重新归档未变更的历史；原生 scrollback 已接收的完整条目保留事件身份，不再排版。活动区高度与正文绘制共享本帧布局，事件投影按 revision 和命令锚点复用；正文、归档边界或宽度改变会重新计算。输入框布局按文本编辑、光标位置和宽度失效，撤销、重做和重置使用同一规则。
+
+首次 `@` 文件扫描在可取消的后台线程运行，结果用当前草稿重新匹配，工作区切换后丢弃旧扫描。交互事件批次最多 32 个，并在每个事件之后检查 2ms 时间预算；单个事件不能抢占，剩余事件保留 FIFO，无需等待新网络数据就会继续处理。绘制、键盘和 Runtime 三个就绪来源轮转优先级。120 FPS 是刷新上限，不是固定轮询间隔。Offscreen driver 继续完整同步快照。
+
+历史 payload 在新事件入队或回放加载时约束大小；总字节数在新增、替换和裁剪时记账，预算检查不再周期性序列化整段历史。连续同回合文本 delta 原地追加到活动正文投影；工具、重试、最终修订、历史替换和语义边界变化回退完整投影。仅行归档和布局变化不再废弃事件投影。
+
+对照 Codex 的稳定行队列做过逐行提交实验，但在当前原生历史与实时尾部预览上增加了等待：同条件突发场景 P95 从 31.72ms 上升到 67.22ms。因此不保留排队动画或隐藏开关，稳定前缀继续按帧批量归档，未换行正文实时预览；使用事件工作预算和公平调度避免 UI 饥饿。实验与最终实现分别记录，不能把撤回的候选结果当作最终效果。
+
+可选诊断 `GOLUTRA_AGENT_TUI_TIMING=/绝对路径/新文件.csv` 记录事件、批次、投影、历史、帧、输出 flush、输入和快照应用耗时。仅保存最近 16,384 个阶段样本；没有正文、按键或凭据，热路径不写磁盘，正常退出时用 create_new 写出，已有文件会明确报错。未启用时不收集样本。复现实测见 [基准工具](../scripts/tui_benchmark/README.md) 与 [稳定性验收](benchmarks/2026-09-21-tui-stability.md)。
 
 主屏不再重建 Ratatui Terminal，也不通过恢复阶段屏蔽 `append_lines` 修正位置。管理层直接更新矩形和缓冲区，继续使用 Ratatui 控件、换行算法与已有连续宽字符 Backend。一次帧更新依次处理物理窗口变化、准备稳定归档、按剩余活动尾部调整高度、写入历史、绘制活动区，整个过程仍由 synchronized update 包围。活动区在滚动前清理，候选、草稿和旧输入框不会被当作历史提交。
 

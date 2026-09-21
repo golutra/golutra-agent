@@ -15,9 +15,9 @@ categories.workspace = true
 [dependencies]
 async-trait.workspace = true
 golutra-agent-core.workspace = true
-golutra-agent-plugin = { path = "../golutra-agent-plugin", version = "0.3.2" }
+golutra-agent-plugin = { path = "../golutra-agent-plugin", version = "0.3.3" }
 golutra-agent-sandbox.workspace = true
-golutra-agent-tools = { path = "../golutra-agent-tools", version = "0.3.2" }
+golutra-agent-tools = { path = "../golutra-agent-tools", version = "0.3.3" }
 rmcp.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
@@ -26,5 +26,5 @@ tokio.workspace = true
 tokio-util.workspace = true
 
 [dev-dependencies]
-golutra-agent-policy = { path = "../golutra-agent-policy", version = "0.3.2" }
+golutra-agent-policy = { path = "../golutra-agent-policy", version = "0.3.3" }
 tempfile.workspace = true

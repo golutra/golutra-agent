@@ -9,7 +9,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use super::{
-    OperationId, TranscriptItem, TranscriptRole, TuiApp, detail_line, markdown_lines,
+    OperationId, TranscriptItem, TranscriptRole, TuiApp, detail_line,
     rendered_transcript_operation_projections, transcript_operation_projections,
     transcript_visible_window,
 };
@@ -138,7 +138,27 @@ impl TranscriptLayout {
 }
 
 pub(crate) fn transcript_layout(app: &TuiApp, area: Rect) -> TranscriptLayout {
-    transcript_layout_from_rows(transcript_render_rows_at_width(app, area.width), area)
+    if app.transcript.frame_cache_enabled
+        && let Some(cache) = &app.transcript.layout_cache
+        && cache.revision == app.transcript.revision
+        && cache.width == area.width
+    {
+        return cache.layout.clone();
+    }
+    if app.transcript.frame_cache_enabled
+        && let Some((revision, width, layout)) = app.transcript.frame_layout.borrow().as_ref()
+        && *revision == app.transcript.revision
+        && *width == area.width
+    {
+        return layout.clone();
+    }
+    let layout =
+        transcript_layout_from_rows(transcript_render_rows_at_width(app, area.width), area);
+    if app.transcript.frame_cache_enabled {
+        *app.transcript.frame_layout.borrow_mut() =
+            Some((app.transcript.revision, area.width, layout.clone()));
+    }
+    layout
 }
 
 pub(crate) fn expanded_tool_layout(
@@ -240,10 +260,6 @@ fn with_session_banner(
     } else {
         rows
     }
-}
-
-pub(crate) fn live_transcript_render_rows(app: &TuiApp, width: u16) -> Vec<TranscriptRenderRow> {
-    transcript_render_rows_at_width(app, width)
 }
 
 pub(crate) fn transcript_top_padding(app: &TuiApp, layout: &TranscriptLayout, area: Rect) -> u16 {
@@ -493,7 +509,7 @@ fn render_item_rows(
     );
     let diff_number_width = super::tool_preview::number_width(&item.body);
     let mut body_lines = match item.role {
-        TranscriptRole::Assistant => markdown_lines(
+        TranscriptRole::Assistant => app.transcript.markdown_cache.borrow_mut().render(
             &item.body.join("\n"),
             width
                 .saturating_sub(u16::try_from(marker_width).unwrap_or(u16::MAX))

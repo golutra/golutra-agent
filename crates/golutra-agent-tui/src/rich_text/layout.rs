@@ -65,7 +65,11 @@ fn needs_gap(current: &MarkdownBlock, context: BlockContext) -> bool {
     true
 }
 
-fn render_block(block: &MarkdownBlock, width: usize, base_style: Style) -> Vec<Line<'static>> {
+pub(super) fn render_block(
+    block: &MarkdownBlock,
+    width: usize,
+    base_style: Style,
+) -> Vec<Line<'static>> {
     match block {
         MarkdownBlock::Paragraph(content) => wrap_rich_text(content, width, base_style),
         MarkdownBlock::Heading { level, content } => {
@@ -179,6 +183,16 @@ fn render_code(language: Option<&str>, source: &str, width: usize) -> Vec<Line<'
         ));
     }
 
+    lines.extend(render_code_body(language, source, width));
+    lines
+}
+
+pub(super) fn render_code_body(
+    language: Option<&str>,
+    source: &str,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
     let code_prefix = if width >= 4 {
         "│ "
     } else if width >= 3 {

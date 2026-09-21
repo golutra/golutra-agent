@@ -356,7 +356,7 @@ pub(crate) fn draw_auth_dialog(
     frame.render_widget(paragraph, area);
 }
 
-fn auth_dialog_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
+pub(crate) fn auth_dialog_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
     match dialog.step {
         AuthDialogStep::GroupChoice => auth_group_lines(dialog),
         AuthDialogStep::ThirdPartyChoice => auth_third_party_lines(dialog),
@@ -381,25 +381,8 @@ fn auth_dialog_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
             },
             &dialog.base_url,
             dialog.error.as_deref(),
-            false,
         ),
-        AuthDialogStep::CredentialStore => auth_credential_store_lines(dialog),
-        AuthDialogStep::ApiKey => auth_input_lines(
-            &auth_step_title(dialog),
-            "API key",
-            "stored in $GOLUTRA_AGENT_HOME/credentials.json",
-            &dialog.api_key,
-            dialog.error.as_deref(),
-            true,
-        ),
-        AuthDialogStep::EnvKey => auth_input_lines(
-            &auth_step_title(dialog),
-            "Environment variable",
-            "for example OPENAI_API_KEY",
-            &dialog.api_key_env,
-            dialog.error.as_deref(),
-            false,
-        ),
+        AuthDialogStep::ApiKey | AuthDialogStep::EnvKey => auth_credential_lines(dialog),
         AuthDialogStep::Model => auth_model_lines(dialog),
         AuthDialogStep::AdvancedConfig => auth_advanced_config_lines(dialog),
         AuthDialogStep::Review => auth_review_lines(dialog),
@@ -477,15 +460,11 @@ fn auth_interactive_line_indexes(dialog: &AuthDialogState) -> Vec<(usize, usize)
         AuthDialogStep::ThirdPartyChoice => (2_usize, THIRD_PARTY_PROVIDER_PRESETS.len()),
         AuthDialogStep::AuthMethod => (2_usize, dialog.auth_method_count()),
         AuthDialogStep::Protocol => (2_usize, dialog.protocol_options().len()),
-        AuthDialogStep::CredentialStore => (2_usize, 2),
-        AuthDialogStep::Model if !dialog.model_options().is_empty() => {
-            (3_usize, dialog.custom_model_index().saturating_add(1))
-        }
+        AuthDialogStep::Model => (3_usize, dialog.model_options().len().saturating_add(1)),
         AuthDialogStep::AdvancedConfig => (2_usize, AUTH_ADVANCED_ITEMS),
         AuthDialogStep::BaseUrl
         | AuthDialogStep::ApiKey
         | AuthDialogStep::EnvKey
-        | AuthDialogStep::Model
         | AuthDialogStep::Review => return Vec::new(),
     };
     (0..count)
@@ -650,31 +629,48 @@ pub(crate) fn auth_protocol_lines(dialog: &AuthDialogState) -> Vec<Line<'static>
     lines
 }
 
-pub(crate) fn auth_credential_store_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
-    let mut lines = vec![Line::from(vec![Span::styled(
-        auth_step_title(dialog),
-        Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
-    )])];
-    lines.push(Line::from(""));
-    lines.push(auth_option_line(
-        0,
-        "Local disk",
-        "Store in $GOLUTRA_AGENT_HOME/credentials.json (owner-only)",
-        dialog.selected == 0,
-    ));
-    lines.push(auth_option_line(
-        1,
-        "Environment variable",
-        "Store only a read-only env reference for CI or managed shells",
-        dialog.selected == 1,
-    ));
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "Enter to select, Up/Down to navigate, Esc to go back",
-        Style::default().fg(Color::DarkGray),
-    )));
+pub(crate) fn auth_credential_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
+    let environment = dialog.step == AuthDialogStep::EnvKey;
+    let (label, description, shortcut) = if environment {
+        (
+            "Environment variable name",
+            "Reads an existing variable; never creates or changes it. Set it before starting Agent.",
+            "Ctrl+E use API key",
+        )
+    } else {
+        (
+            "API key",
+            "Saved in $GOLUTRA_AGENT_HOME/credentials.json (owner-only); loaded automatically next time.",
+            "Ctrl+E use environment variable",
+        )
+    };
+    let mut lines = vec![
+        Line::from(Span::styled(
+            auth_step_title(dialog),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(format!("{label}: "), Style::default().fg(Color::Cyan)),
+            Span::raw(if environment {
+                dialog.api_key_env.clone()
+            } else {
+                auth_composer_line(dialog)
+            }),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            description,
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("Enter continue   {shortcut}   Esc back   Ctrl+C twice quit"),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
     push_auth_error(&mut lines, dialog.error.as_deref());
     lines
 }
@@ -701,6 +697,12 @@ pub(crate) fn protocol_option_text(protocol: ProviderProtocol) -> (&'static str,
 }
 
 pub(crate) fn auth_model_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
+    let upstream = dialog.provider.is_some_and(|provider| {
+        matches!(
+            provider.source,
+            AuthProviderSource::Official | AuthProviderSource::Custom
+        )
+    });
     let mut lines = vec![Line::from(vec![Span::styled(
         auth_step_title(dialog),
         Style::default()
@@ -708,58 +710,51 @@ pub(crate) fn auth_model_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
             .add_modifier(Modifier::BOLD),
     )])];
     lines.push(Line::from(""));
-    if dialog.model_options().is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("Model: ", Style::default().fg(Color::Cyan)),
-            Span::styled(
-                if dialog.model.is_empty() {
-                    "model id, for example gpt-4.1 or qwen-coder".to_owned()
-                } else {
-                    dialog.model.clone()
-                },
-                Style::default().fg(if dialog.model.is_empty() {
-                    Color::DarkGray
-                } else {
-                    Color::White
-                }),
-            ),
-        ]));
-    } else {
-        lines.push(Line::from(Span::styled(
-            "Recommended models",
-            Style::default().fg(Color::DarkGray),
-        )));
-        lines.extend(
-            dialog
-                .model_options()
-                .iter()
-                .enumerate()
-                .map(|(index, model)| {
-                    auth_option_line(
-                        index,
-                        model,
-                        "built-in recommendation",
-                        index == dialog.selected,
-                    )
-                }),
-        );
-        let custom_value = if dialog.model.is_empty() {
-            "type a custom model id"
-        } else {
-            dialog.model.as_str()
-        };
-        lines.push(auth_option_line(
-            dialog.custom_model_index(),
-            "Custom model",
-            custom_value,
-            dialog.is_custom_model_selected(),
-        ));
-    }
-    lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "Enter continue   Type to use custom model   Esc back",
+        "Model",
         Style::default().fg(Color::DarkGray),
     )));
+    lines.push(auth_option_line(
+        dialog.custom_model_index(),
+        "Custom model",
+        &dialog.model,
+        dialog.is_custom_model_selected(),
+    ));
+    lines.extend(
+        dialog
+            .model_options()
+            .iter()
+            .enumerate()
+            .map(|(index, model)| {
+                auth_option_line(
+                    index + 1,
+                    model,
+                    if upstream {
+                        "from provider"
+                    } else {
+                        "built-in recommendation"
+                    },
+                    index + 1 == dialog.selected,
+                )
+            }),
+    );
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Type a model ID   Up/Down select   Enter continue   Esc back",
+        Style::default().fg(Color::DarkGray),
+    )));
+    let discovery_message = match &dialog.model_discovery {
+        ModelDiscoveryState::Loading(_) => Some("Loading models from provider… You can also type a model now.".to_owned()),
+        ModelDiscoveryState::Ready if dialog.models.is_empty() => Some("Provider returned no models. Enter a model manually, or Esc to check your key and retry.".to_owned()),
+        ModelDiscoveryState::Failed(error) => Some(format!("{error}. Enter a model manually, or Esc to check your key and retry.")),
+        _ => None,
+    };
+    if let Some(message) = discovery_message {
+        lines.push(Line::from(Span::styled(
+            message,
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
     push_auth_error(&mut lines, dialog.error.as_deref());
     lines
 }
@@ -775,58 +770,69 @@ pub(crate) fn auth_advanced_config_lines(dialog: &AuthDialogState) -> Vec<Line<'
         Line::from(""),
         auth_option_line(
             0,
+            "Continue",
+            "Review provider setup",
+            dialog.advanced_selected == 0,
+        ),
+        auth_option_line(
+            1,
             "Thinking",
             if dialog.enable_thinking {
                 "enabled"
             } else {
                 "default"
             },
-            dialog.advanced_selected == 0,
-        ),
-        auth_option_line(
-            1,
-            "Reasoning effort",
-            reasoning_effort_label(dialog.reasoning_effort),
             dialog.advanced_selected == 1,
         ),
         auth_option_line(
             2,
-            "Context window",
-            if dialog.context_window_size.is_empty() {
-                "default"
-            } else {
-                dialog.context_window_size.as_str()
-            },
+            "Reasoning effort",
+            reasoning_effort_label(dialog.reasoning_effort),
             dialog.advanced_selected == 2,
         ),
         auth_option_line(
             3,
-            "Max output tokens",
-            if dialog.max_tokens.is_empty() {
-                "default"
-            } else {
-                dialog.max_tokens.as_str()
-            },
+            "Context window",
+            dialog
+                .advanced_text_value(3)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("default"),
             dialog.advanced_selected == 3,
         ),
         auth_option_line(
             4,
-            "Custom headers",
-            if dialog.custom_headers.is_empty() {
-                "none"
-            } else {
-                dialog.custom_headers.as_str()
-            },
+            "Max output tokens",
+            dialog
+                .advanced_text_value(4)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("default"),
             dialog.advanced_selected == 4,
+        ),
+        auth_option_line(
+            5,
+            "Custom headers",
+            dialog
+                .advanced_text_value(5)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("none"),
+            dialog.advanced_selected == 5,
         ),
         Line::from(""),
         Line::from(Span::styled(
-            "Up/Down select   Space toggle/cycle   Enter continue   Esc back",
+            auth_advanced_help(dialog),
             Style::default().fg(Color::DarkGray),
         )),
     ];
     push_auth_error(&mut lines, dialog.error.as_deref());
     lines
+}
+
+fn auth_advanced_help(dialog: &AuthDialogState) -> &'static str {
+    if dialog.advanced_input.is_some() {
+        "Enter/Esc keep edit   Left/Right cursor   Ctrl+U clear"
+    } else {
+        "Up/Down select   Enter change/continue   Left/Right adjust   Esc back"
+    }
 }
 
 pub(crate) fn auth_review_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
@@ -958,14 +964,13 @@ pub(crate) fn auth_step_title(dialog: &AuthDialogState) -> String {
         Some(AuthProviderSource::Custom)
     ) {
         let step = match dialog.step {
-            AuthDialogStep::Protocol => "Step 1/7 · Protocol",
-            AuthDialogStep::BaseUrl => "Step 2/7 · Base URL",
-            AuthDialogStep::CredentialStore => "Step 3/7 · Credential storage",
-            AuthDialogStep::ApiKey => "Step 4/7 · API Key",
-            AuthDialogStep::EnvKey => "Step 4/7 · Environment variable",
-            AuthDialogStep::Model => "Step 5/7 · Model IDs",
-            AuthDialogStep::AdvancedConfig => "Step 6/7 · Advanced Config",
-            AuthDialogStep::Review => "Step 7/7 · Review",
+            AuthDialogStep::Protocol => "Step 1/6 · Protocol",
+            AuthDialogStep::BaseUrl => "Step 2/6 · Base URL",
+            AuthDialogStep::ApiKey => "Step 3/6 · API Key",
+            AuthDialogStep::EnvKey => "Step 3/6 · Environment variable",
+            AuthDialogStep::Model => "Step 4/6 · Model IDs",
+            AuthDialogStep::AdvancedConfig => "Step 5/6 · Advanced Config",
+            AuthDialogStep::Review => "Step 6/6 · Review",
             AuthDialogStep::GroupChoice
             | AuthDialogStep::ThirdPartyChoice
             | AuthDialogStep::AuthMethod => "",
@@ -986,17 +991,11 @@ pub(crate) fn auth_input_lines(
     hint: &'static str,
     value: &str,
     error: Option<&str>,
-    secret: bool,
 ) -> Vec<Line<'static>> {
-    let visible_value = if secret && !value.is_empty() {
-        "*".repeat(value.chars().count())
-    } else {
-        value.to_owned()
-    };
-    let input = if visible_value.is_empty() {
+    let input = if value.is_empty() {
         hint.to_owned()
     } else {
-        visible_value
+        value.to_owned()
     };
     let mut lines = vec![
         Line::from(vec![Span::styled(
@@ -2705,16 +2704,20 @@ pub(crate) fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
         Some(OverlaySurface::Help) => {
             Some("1-5 topic   Tab switch   Up/Down scroll   F1 or Esc close")
         }
-        Some(OverlaySurface::Auth)
-            if app
-                .auth_dialog
-                .as_ref()
-                .is_some_and(|dialog| dialog.step == AuthDialogStep::Review) =>
-        {
-            Some("Provider setup   Enter save   Esc back   Ctrl+C twice quit")
-        }
         Some(OverlaySurface::Auth) => {
-            Some("Provider setup   Enter continue   Esc back   Ctrl+C twice quit")
+            Some(match app.auth_dialog.as_ref().map(|dialog| dialog.step) {
+                Some(AuthDialogStep::Review) => {
+                    "Provider setup   Enter save   Esc back   Ctrl+C twice quit"
+                }
+                Some(AuthDialogStep::ApiKey) => {
+                    "Enter continue   Ctrl+E use environment variable   Esc back"
+                }
+                Some(AuthDialogStep::EnvKey) => "Enter continue   Ctrl+E use API key   Esc back",
+                Some(AuthDialogStep::AdvancedConfig) => {
+                    auth_advanced_help(app.auth_dialog.as_ref().expect("auth dialog"))
+                }
+                _ => "Provider setup   Enter continue   Esc back   Ctrl+C twice quit",
+            })
         }
         Some(OverlaySurface::Approval) => {
             Some("Enter choose   1 once   2 resource   3 task   4 deny")
@@ -2754,9 +2757,17 @@ pub(crate) fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
         ])]
     } else if surface == Some(OverlaySurface::Auth) {
         let dialog = app.auth_dialog.as_ref().expect("auth surface");
+        let text = if let Some(input) = &dialog.advanced_input {
+            input
+                .viewport(area.width.saturating_sub(COMPOSER_PREFIX_WIDTH), 1)
+                .lines
+                .join("")
+        } else {
+            auth_composer_line(dialog)
+        };
         vec![Line::from(vec![
             Span::styled(composer_prefix, Style::default().fg(palette.accent)),
-            Span::styled(auth_composer_line(dialog), composer_style(app)),
+            Span::styled(text, composer_style(app)),
         ])]
     } else if surface == Some(OverlaySurface::Approval) {
         vec![Line::from(vec![
@@ -2933,7 +2944,14 @@ pub(crate) fn composer_cursor_position(area: Rect, app: &TuiApp) -> Option<(u16,
     let text_width = area.width.saturating_sub(COMPOSER_PREFIX_WIDTH).max(1);
     let activity_rows = u16::from(live_status_text(app, usize::from(area.width)).is_some());
     let cursor = match app.overlay_surface() {
-        Some(OverlaySurface::Auth) => auth_cursor_column(app.auth_dialog.as_ref()?)?,
+        Some(OverlaySurface::Auth) => {
+            let dialog = app.auth_dialog.as_ref()?;
+            if let Some(input) = &dialog.advanced_input {
+                input.viewport(text_width, 1).cursor.0
+            } else {
+                auth_cursor_column(dialog)?
+            }
+        }
         Some(_) => return None,
         None if app.transcript.search.is_some() => {
             let search = app.transcript.search.as_ref()?;
@@ -3180,6 +3198,9 @@ fn attachment_line(
 }
 
 pub(crate) fn auth_composer_line(dialog: &AuthDialogState) -> String {
+    if let Some(input) = &dialog.advanced_input {
+        return input.text().to_owned();
+    }
     match dialog.step {
         AuthDialogStep::GroupChoice => "Select provider group".to_owned(),
         AuthDialogStep::ThirdPartyChoice => "Select provider".to_owned(),
@@ -3187,10 +3208,6 @@ pub(crate) fn auth_composer_line(dialog: &AuthDialogState) -> String {
         AuthDialogStep::Protocol => "Select protocol".to_owned(),
         AuthDialogStep::BaseUrl if dialog.base_url.is_empty() => "Base URL".to_owned(),
         AuthDialogStep::BaseUrl => dialog.base_url.clone(),
-        AuthDialogStep::CredentialStore => match dialog.selected {
-            1 => "Environment variable".to_owned(),
-            _ => "Local disk".to_owned(),
-        },
         AuthDialogStep::ApiKey if dialog.api_key.is_empty() => "API key".to_owned(),
         AuthDialogStep::ApiKey => "*".repeat(dialog.api_key.chars().count()),
         AuthDialogStep::EnvKey if dialog.api_key_env.is_empty() => {
@@ -3205,7 +3222,8 @@ pub(crate) fn auth_composer_line(dialog: &AuthDialogState) -> String {
             .unwrap_or("Custom model")
             .to_owned(),
         AuthDialogStep::AdvancedConfig => match dialog.advanced_selected {
-            0 => format!(
+            0 => "Continue to review".to_owned(),
+            1 => format!(
                 "Thinking: {}",
                 if dialog.enable_thinking {
                     "enabled"
@@ -3213,25 +3231,25 @@ pub(crate) fn auth_composer_line(dialog: &AuthDialogState) -> String {
                     "default"
                 }
             ),
-            1 => format!(
+            2 => format!(
                 "Reasoning effort: {}",
                 reasoning_effort_label(dialog.reasoning_effort)
             ),
-            2 => {
+            3 => {
                 if dialog.context_window_size.is_empty() {
                     "Context window".to_owned()
                 } else {
                     dialog.context_window_size.clone()
                 }
             }
-            3 => {
+            4 => {
                 if dialog.max_tokens.is_empty() {
                     "Max output tokens".to_owned()
                 } else {
                     dialog.max_tokens.clone()
                 }
             }
-            4 => {
+            5 => {
                 if dialog.custom_headers.is_empty() {
                     "Name=Value; X-Api-Key=@ENV".to_owned()
                 } else {
@@ -3547,8 +3565,7 @@ pub(crate) fn composer_style(app: &TuiApp) -> Style {
             AuthDialogStep::GroupChoice
             | AuthDialogStep::ThirdPartyChoice
             | AuthDialogStep::AuthMethod
-            | AuthDialogStep::Protocol
-            | AuthDialogStep::CredentialStore => true,
+            | AuthDialogStep::Protocol => true,
             AuthDialogStep::BaseUrl => dialog.base_url.is_empty(),
             AuthDialogStep::ApiKey => dialog.api_key.is_empty(),
             AuthDialogStep::EnvKey => dialog.api_key_env.is_empty(),
