@@ -319,15 +319,18 @@ impl AuthDialogState {
     }
 
     pub(crate) fn custom_model_index(&self) -> usize {
-        self.model_options().len()
+        0
     }
 
     pub(crate) fn selected_recommended_model(&self) -> Option<&str> {
-        self.model_options().get(self.selected).map(String::as_str)
+        self.selected
+            .checked_sub(1)
+            .and_then(|index| self.models.get(index))
+            .map(String::as_str)
     }
 
     pub(crate) fn is_custom_model_selected(&self) -> bool {
-        self.selected >= self.custom_model_index()
+        self.selected == self.custom_model_index()
     }
 
     pub(crate) fn move_selection(&mut self, direction: ResumeSelectionDirection) {
@@ -401,7 +404,7 @@ impl AuthDialogState {
             }
             AuthDialogStep::AuthMethod => self.auth_method_count().saturating_sub(1),
             AuthDialogStep::Protocol => self.protocol_options().len().saturating_sub(1),
-            AuthDialogStep::Model => self.custom_model_index(),
+            AuthDialogStep::Model => self.model_options().len(),
             AuthDialogStep::AdvancedConfig => AUTH_ADVANCED_ITEMS.saturating_sub(1),
             AuthDialogStep::BaseUrl
             | AuthDialogStep::ApiKey
