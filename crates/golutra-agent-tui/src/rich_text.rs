@@ -4,6 +4,7 @@
 //! the parser produces semantic blocks, the layout layer owns wrapping and indentation, and this
 //! module exposes the small facade consumed by transcript and history views.
 
+mod cache;
 mod code;
 mod layout;
 mod markdown;
@@ -13,6 +14,8 @@ mod theme;
 mod wrap;
 
 use ratatui::text::Line;
+
+pub(crate) use cache::MarkdownCache;
 
 // 渲染与流式冻结必须使用同一组 Markdown 扩展，否则两者可能认定不同的块边界。
 pub(crate) fn markdown_options() -> pulldown_cmark::Options {

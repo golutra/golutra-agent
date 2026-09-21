@@ -13,15 +13,15 @@ use super::{
 };
 
 #[derive(Clone)]
-struct StyledGrapheme {
-    text: String,
+struct StyledGrapheme<'a> {
+    text: &'a str,
     style: Style,
     width: usize,
     whitespace: bool,
 }
 
-struct Token {
-    graphemes: Vec<StyledGrapheme>,
+struct Token<'a> {
+    graphemes: Vec<StyledGrapheme<'a>>,
     whitespace: bool,
     width: usize,
 }
@@ -139,15 +139,10 @@ pub(super) fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Line<'sta
 
 pub(super) fn hard_wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
-    let graphemes = styled_graphemes(spans);
-    if graphemes.is_empty() {
-        return vec![Line::default()];
-    }
-
     let mut lines = Vec::new();
     let mut current = Vec::new();
     let mut current_width = 0_usize;
-    for grapheme in graphemes {
+    for grapheme in styled_graphemes(spans) {
         if current_width > 0 && current_width.saturating_add(grapheme.width) > width {
             finish_line(&mut lines, &mut current, &mut current_width);
         }
@@ -159,6 +154,9 @@ pub(super) fn hard_wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Line
     }
     if !current.is_empty() {
         lines.push(Line::from(current));
+    }
+    if lines.is_empty() {
+        lines.push(Line::default());
     }
     lines
 }
@@ -203,7 +201,7 @@ pub(super) fn push_span(spans: &mut Vec<Span<'static>>, span: Span<'static>) {
     }
 }
 
-fn tokens(spans: &[Span<'static>]) -> Vec<Token> {
+fn tokens<'a>(spans: &'a [Span<'_>]) -> Vec<Token<'a>> {
     let mut tokens: Vec<Token> = Vec::new();
     for grapheme in styled_graphemes(spans) {
         match tokens.last_mut() {
@@ -221,28 +219,31 @@ fn tokens(spans: &[Span<'static>]) -> Vec<Token> {
     tokens
 }
 
-fn styled_graphemes(spans: &[Span<'static>]) -> Vec<StyledGrapheme> {
-    spans
-        .iter()
-        .flat_map(|span| {
-            span.content
-                .graphemes(true)
-                .map(|grapheme| StyledGrapheme {
-                    text: grapheme.to_owned(),
-                    style: span.style,
-                    width: UnicodeWidthStr::width(grapheme),
-                    whitespace: grapheme.chars().all(char::is_whitespace),
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect()
+fn styled_graphemes<'a>(spans: &'a [Span<'_>]) -> impl Iterator<Item = StyledGrapheme<'a>> {
+    // 借用源文字直到构造输出行，避免每个字素分配 String 和中间数组。
+    spans.iter().flat_map(|span| {
+        span.content
+            .graphemes(true)
+            .map(move |grapheme| StyledGrapheme {
+                text: grapheme,
+                style: span.style,
+                width: UnicodeWidthStr::width(grapheme),
+                whitespace: grapheme.chars().all(char::is_whitespace),
+            })
+    })
 }
 
-fn push_grapheme(spans: &mut Vec<Span<'static>>, grapheme: StyledGrapheme) {
-    push_span(spans, Span::styled(grapheme.text, grapheme.style));
+fn push_grapheme(spans: &mut Vec<Span<'static>>, grapheme: StyledGrapheme<'_>) {
+    if let Some(previous) = spans.last_mut()
+        && previous.style == grapheme.style
+    {
+        previous.content.to_mut().push_str(grapheme.text);
+    } else {
+        spans.push(Span::styled(grapheme.text.to_owned(), grapheme.style));
+    }
 }
 
-fn prohibits_line_start(grapheme: &StyledGrapheme) -> bool {
+fn prohibits_line_start(grapheme: &StyledGrapheme<'_>) -> bool {
     grapheme.text.chars().next().is_some_and(|character| {
         matches!(
             character,

@@ -2,12 +2,12 @@
 
 use pulldown_cmark::{Alignment, HeadingLevel};
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct MarkdownDocument {
     pub(super) blocks: Vec<MarkdownBlock>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) enum MarkdownBlock {
     Paragraph(RichText),
     Heading {
@@ -24,31 +24,31 @@ pub(super) enum MarkdownBlock {
     Table(MarkdownTable),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct MarkdownList {
     pub(super) start: Option<u64>,
     pub(super) items: Vec<Vec<MarkdownBlock>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct MarkdownTable {
     pub(super) alignments: Vec<Alignment>,
     pub(super) header: Vec<RichText>,
     pub(super) rows: Vec<Vec<RichText>>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct RichText {
     pub(super) lines: Vec<Vec<TextRun>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct TextRun {
     pub(super) text: String,
     pub(super) style: InlineStyle,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(super) struct InlineStyle {
     pub(super) emphasis: bool,
     pub(super) strong: bool,
@@ -56,7 +56,7 @@ pub(super) struct InlineStyle {
     pub(super) tone: Option<InlineTone>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum InlineTone {
     Code,
     Link,
