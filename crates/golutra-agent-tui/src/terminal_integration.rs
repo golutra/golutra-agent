@@ -137,6 +137,8 @@ impl<W: Write> Backend for ContiguousCrosstermBackend<W> {
     }
 
     fn get_cursor_position(&mut self) -> io::Result<Position> {
+        // 光标查询会读取终端实际位置，必须先提交缓冲的移动和文字。
+        self.writer.flush()?;
         CrosstermBackend::new(&mut self.writer).get_cursor_position()
     }
 
@@ -545,6 +547,41 @@ fn bounded_utf8_prefix(value: &str, max_bytes: usize) -> (&str, bool) {
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+
+    #[derive(Default)]
+    struct CountingWriter {
+        bytes: Vec<u8>,
+        writes: usize,
+    }
+
+    impl Write for CountingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn buffered_draw_preserves_bytes_and_coalesces_cell_writes() {
+        let mut cell = Cell::default();
+        cell.set_symbol("字").set_fg(Color::Green);
+        let mut direct = ContiguousCrosstermBackend::new(CountingWriter::default());
+        let mut buffered =
+            ContiguousCrosstermBackend::new(io::BufWriter::new(CountingWriter::default()));
+        direct.draw((0..40).map(|i| (i * 2, 0, &cell))).unwrap();
+        buffered.draw((0..40).map(|i| (i * 2, 0, &cell))).unwrap();
+        Backend::flush(&mut buffered).unwrap();
+        let direct = direct.into_inner();
+        let buffered = buffered.into_inner().into_inner().ok().unwrap();
+        assert_eq!(buffered.bytes, direct.bytes);
+        assert_eq!(buffered.writes, 1);
+        assert!(direct.writes > 40);
+    }
 
     #[test]
     fn adjacent_cjk_cells_are_written_as_contiguous_text() {

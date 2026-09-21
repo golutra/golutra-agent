@@ -269,6 +269,46 @@ fn tui_history_bounds_a_single_oversized_event_payload() {
 }
 
 #[test]
+fn history_byte_accounting_tracks_trim_replay_and_reset() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "mock".into(),
+        None,
+    );
+    let task = TaskId::new();
+    for sequence in 1..=TUI_EVENT_HISTORY_LIMIT + 1 {
+        app.append_event_to_history(transcript_event(
+            sequence as u64,
+            app.session_id,
+            task,
+            RuntimeEventType::ProviderStreamed,
+            json!({"delta":{"kind":"text_delta","text":"中"}}),
+        ));
+    }
+    assert!(app.history_has_more_before);
+    assert!(app.events.len() < TUI_EVENT_HISTORY_LIMIT);
+    assert_eq!(
+        app.retained_event_bytes(),
+        app.events.iter().map(ui_event_memory_bytes).sum::<usize>()
+    );
+    let mut replay = app.events[..3].to_vec();
+    replay.reverse();
+    replay.push(replay[0].clone());
+    app.replace_event_history(replay, false);
+    assert_eq!(app.events.len(), 3);
+    assert_eq!(
+        app.retained_event_bytes(),
+        app.events.iter().map(ui_event_memory_bytes).sum::<usize>()
+    );
+    app.replace_event_history(Vec::new(), false);
+    assert_eq!(app.retained_event_bytes(), 0);
+    assert!(!app.history_has_more_before);
+}
+
+#[test]
 fn tui_history_preserves_oversized_assistant_content_for_resume() {
     let session_id = SessionId::new();
     let task_id = TaskId::new();
@@ -296,6 +336,51 @@ fn tui_history_preserves_oversized_assistant_content_for_resume() {
         Some(content.as_str())
     );
     assert_eq!(app.events[0].payload["_metadata_truncated"], json!(true));
+}
+
+#[test]
+fn live_and_replayed_events_are_bounded_once_without_rewriting_original_size() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        session_id,
+        None,
+        false,
+        "mock".into(),
+        None,
+    );
+    let event = transcript_event(
+        1,
+        session_id,
+        task_id,
+        RuntimeEventType::AssistantMessage,
+        json!({"content": "正文".repeat(20_000), "provider_metadata": "x".repeat(80_000)}),
+    );
+    let original_bytes = serde_json::to_vec(&event.payload).unwrap().len();
+    app.replace_event_history(vec![event.clone()], false);
+    assert_eq!(app.events[0].payload["original_bytes"], original_bytes);
+    let replayed = app.events[0].clone();
+    app.replace_event_history(Vec::new(), false);
+    app.append_event_to_history(event);
+    assert_eq!(app.events[0].payload, replayed.payload);
+    for sequence in 2..=TUI_EVENT_HISTORY_TRIM_BATCH as u64 {
+        app.append_event_to_history(transcript_event(
+            sequence,
+            session_id,
+            task_id,
+            RuntimeEventType::CommandAccepted,
+            json!({"summary":"next"}),
+        ));
+    }
+    assert_eq!(app.events[0].payload, replayed.payload);
+    assert!(
+        !app.events[0]
+            .payload
+            .as_object()
+            .unwrap()
+            .contains_key("provider_metadata")
+    );
 }
 
 #[tokio::test]

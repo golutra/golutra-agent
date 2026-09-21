@@ -1,6 +1,7 @@
 //! Shared Runtime attachment and event synchronization for interactive and
 //! offscreen TUI frontends.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use golutra_agent_client::{ClientError, RuntimeClient, RuntimeEventStream, RuntimeTransport};
@@ -17,13 +18,26 @@ struct InteractiveRuntimeRefresh {
 }
 
 const INTERACTIVE_REFRESH_RETRY_DELAY: Duration = Duration::from_millis(500);
+// Bound maintenance work so a continuously ready stream returns to keyboard
+// and frame scheduling. The remaining events stay in the subscription in order.
+const MAX_INTERACTIVE_EVENT_BATCH: usize = 32;
+// 每批最多占用约四分之一帧；单个事件不可抢占，处理后立即检查预算。
+const INTERACTIVE_EVENT_BUDGET: Duration = Duration::from_millis(2);
+
+// 每次只暂存一个唤醒并立即消费；避免为每个 token 的事件额外进行堆分配。
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum RuntimeWake {
+    Pending,
+    Received(Option<Result<RuntimeEvent, ClientError>>),
+}
 
 pub(crate) struct TuiRuntimeController {
     transport: RuntimeTransport,
     subscription: RuntimeEventStream,
     subscribed_session: SessionId,
     subscribed_task: Option<TaskId>,
-    pending_events: Vec<RuntimeEvent>,
+    pending_events: VecDeque<RuntimeEvent>,
+    reconnect_pending: bool,
     refresh_pending: bool,
     refresh_binding: RuntimeRefreshBinding,
     refresh_generation: u64,
@@ -45,7 +59,8 @@ impl TuiRuntimeController {
             subscription,
             subscribed_session: app.session_id,
             subscribed_task: app.task_id,
-            pending_events: Vec::new(),
+            pending_events: VecDeque::new(),
+            reconnect_pending: false,
             refresh_pending: false,
             refresh_binding,
             refresh_generation: 0,
@@ -68,8 +83,23 @@ impl TuiRuntimeController {
             .map_err(|error| miette::miette!("close runtime attachment: {error}"))
     }
 
-    pub(crate) async fn recv(&mut self) -> Option<Result<RuntimeEvent, ClientError>> {
-        self.subscription.recv().await
+    pub(crate) async fn recv(&mut self) -> RuntimeWake {
+        if !self.pending_events.is_empty() {
+            RuntimeWake::Pending
+        } else {
+            RuntimeWake::Received(self.subscription.recv().await)
+        }
+    }
+
+    pub(crate) async fn apply_wake(
+        &mut self,
+        app: &mut TuiApp,
+        wake: RuntimeWake,
+    ) -> miette::Result<()> {
+        match wake {
+            RuntimeWake::Pending => self.flush_pending(app, false, false).await,
+            RuntimeWake::Received(event) => self.apply_received(app, event).await,
+        }
     }
 
     pub(crate) async fn apply_received(
@@ -83,7 +113,7 @@ impl TuiRuntimeController {
                     return Ok(());
                 }
                 self.observe_refresh_event(&event);
-                self.pending_events.push(event);
+                self.pending_events.push_back(event);
                 false
             }
             Some(Err(error)) => {
@@ -112,7 +142,7 @@ impl TuiRuntimeController {
     pub(crate) async fn sync(&mut self, app: &mut TuiApp) -> miette::Result<bool> {
         self.abort_interactive_refresh();
         self.interactive_refresh_retry_at = None;
-        let mut changed = self.sync_refresh_binding(app);
+        let mut changed = self.sync_refresh_binding(app) | app.poll_mention_completion();
         if app.history_load_requested {
             app.load_older_history(&self.transport).await?;
             changed = true;
@@ -134,7 +164,7 @@ impl TuiRuntimeController {
             match self.subscription.try_recv() {
                 Ok(Ok(event)) => {
                     self.observe_refresh_event(&event);
-                    self.pending_events.push(event);
+                    self.pending_events.push_back(event);
                     changed = true;
                 }
                 Ok(Err(error)) => {
@@ -171,7 +201,7 @@ impl TuiRuntimeController {
     /// Synchronize the real terminal UI without awaiting projection/provider/debug I/O.
     /// The offscreen driver uses `sync` because each request needs a fully reconciled snapshot.
     pub(crate) async fn sync_interactive(&mut self, app: &mut TuiApp) -> miette::Result<bool> {
-        let mut changed = self.sync_refresh_binding(app);
+        let mut changed = self.sync_refresh_binding(app) | app.poll_mention_completion();
         if app.history_load_requested {
             app.load_older_history(&self.transport).await?;
             changed = true;
@@ -189,11 +219,12 @@ impl TuiRuntimeController {
         changed |= self.poll_interactive_refresh(app).await?;
 
         let mut reconnect_subscription = false;
-        loop {
+        changed |= !self.pending_events.is_empty();
+        for _ in self.pending_events.len()..MAX_INTERACTIVE_EVENT_BATCH {
             match self.subscription.try_recv() {
                 Ok(Ok(event)) => {
                     self.observe_refresh_event(&event);
-                    self.pending_events.push(event);
+                    self.pending_events.push_back(event);
                     changed = true;
                 }
                 Ok(Err(error)) => {
@@ -230,6 +261,7 @@ impl TuiRuntimeController {
 
     fn start_interactive_refresh(&mut self, app: &TuiApp) {
         if self.interactive_refresh.is_some()
+            || !self.pending_events.is_empty()
             || !self.refresh_pending
             || self
                 .interactive_refresh_retry_at
@@ -326,19 +358,37 @@ impl TuiRuntimeController {
         reconnect_subscription: bool,
         reconcile_projection: bool,
     ) -> miette::Result<()> {
-        for event in self.pending_events.drain(..) {
-            if event.session_id == app.session_id {
-                app.apply_runtime_event(event);
-            }
-        }
-        if reconnect_subscription {
+        let _timing = super::ui_timing::span("event_batch");
+        self.reconnect_pending |= reconnect_subscription;
+        self.apply_pending_events(
+            app,
+            (!reconcile_projection).then_some(INTERACTIVE_EVENT_BUDGET),
+        );
+        if self.reconnect_pending && self.pending_events.is_empty() {
             self.replay_from_cursor(app).await?;
+            self.reconnect_pending = false;
         }
         if reconcile_projection && self.refresh_pending {
             app.refresh(&self.transport).await?;
             self.refresh_pending = false;
         }
         Ok(())
+    }
+
+    fn apply_pending_events(&mut self, app: &mut TuiApp, budget: Option<Duration>) {
+        let started = Instant::now();
+        let mut count = 0;
+        while let Some(event) = self.pending_events.pop_front() {
+            if event.session_id == app.session_id {
+                app.apply_runtime_event(event);
+            }
+            count += 1;
+            if budget.is_some_and(|budget| {
+                started.elapsed() >= budget || count >= MAX_INTERACTIVE_EVENT_BATCH
+            }) {
+                break;
+            }
+        }
     }
 }
 
@@ -394,6 +444,94 @@ mod tests {
             payload_ref: None,
             durable: true,
         }
+    }
+
+    #[tokio::test]
+    async fn interactive_backlog_yields_between_ordered_batches_without_dropping_events() {
+        let transport = RuntimeTransport::in_memory().await.expect("transport");
+        let mut app = TuiApp::new(
+            ThreadId::new(),
+            SessionId::new(),
+            None,
+            false,
+            "mock".into(),
+            None,
+        );
+        let mut controller = TuiRuntimeController::attach(&mut app, transport)
+            .await
+            .unwrap();
+        let initial = app.cursor.unwrap_or(0);
+        let count = MAX_INTERACTIVE_EVENT_BATCH * 2 + 1;
+        let (sender, receiver) = tokio::sync::mpsc::channel(count);
+        controller.subscription = RuntimeEventStream::new(receiver);
+        for offset in 1..=count {
+            let mut event = runtime_event(initial + offset as u64, app.session_id);
+            event.event_type = RuntimeEventType::ProviderStreamed;
+            event.payload = json!({"delta":{"kind":"text_delta","text":"text"}});
+            sender.send(Ok(event)).await.unwrap();
+        }
+        controller.sync_interactive(&mut app).await.unwrap();
+        assert!(app.cursor.unwrap() > initial);
+        assert!(app.cursor.unwrap() <= initial + MAX_INTERACTIVE_EVENT_BATCH as u64);
+        app.input.insert_str("draft while streaming");
+        for _ in 0..count {
+            controller.sync_interactive(&mut app).await.unwrap();
+            if app.cursor == Some(initial + count as u64) {
+                break;
+            }
+        }
+        assert_eq!(app.input.text(), "draft while streaming");
+        assert_eq!(
+            app.events
+                .iter()
+                .filter(|event| event.sequence_no > initial)
+                .map(|event| event.sequence_no)
+                .collect::<Vec<_>>(),
+            (initial + 1..=initial + count as u64).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn elapsed_budget_keeps_fifo_and_wakes_without_new_network_events() {
+        let transport = RuntimeTransport::in_memory().await.unwrap();
+        let mut app = TuiApp::new(
+            ThreadId::new(),
+            SessionId::new(),
+            None,
+            false,
+            "mock".into(),
+            None,
+        );
+        let mut controller = TuiRuntimeController::attach(&mut app, transport)
+            .await
+            .unwrap();
+        let initial = app.cursor.unwrap_or(0);
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        controller.subscription = RuntimeEventStream::new(receiver);
+        for offset in 1..=3 {
+            controller
+                .pending_events
+                .push_back(runtime_event(initial + offset, app.session_id));
+        }
+        controller.apply_pending_events(&mut app, Some(Duration::ZERO));
+        assert_eq!(app.cursor, Some(initial + 1));
+        let wake = tokio::time::timeout(Duration::from_millis(100), controller.recv())
+            .await
+            .unwrap();
+        assert!(matches!(wake, RuntimeWake::Pending));
+        controller.apply_wake(&mut app, wake).await.unwrap();
+        controller.apply_pending_events(&mut app, None);
+        assert_eq!(app.cursor, Some(initial + 3));
+        assert!(controller.pending_events.is_empty());
+        assert_eq!(
+            app.events
+                .iter()
+                .filter(|event| event.sequence_no > initial)
+                .map(|event| event.sequence_no)
+                .collect::<Vec<_>>(),
+            vec![initial + 1, initial + 2, initial + 3]
+        );
+        drop(sender);
     }
 
     #[tokio::test]

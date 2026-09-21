@@ -171,6 +171,11 @@ impl Default for TranscriptHistoryState {
 
 #[derive(Debug, Clone)]
 pub(crate) struct TranscriptState {
+    pub(crate) frame_cache_enabled: bool,
+    frame_operations: std::cell::RefCell<Option<HistoryProjectionCache>>,
+    pub(crate) markdown_cache: std::cell::RefCell<super::rich_text::MarkdownCache>,
+    pub(crate) frame_layout:
+        std::cell::RefCell<Option<(u64, u16, super::transcript_widget::TranscriptLayout)>>,
     pub(crate) compact_tools: bool,
     pub(crate) fullscreen: bool,
     pub(crate) local_entries: Vec<LocalTranscriptEntry>,
@@ -190,6 +195,10 @@ pub(crate) struct TranscriptState {
 impl Default for TranscriptState {
     fn default() -> Self {
         Self {
+            markdown_cache: Default::default(),
+            frame_cache_enabled: false,
+            frame_operations: Default::default(),
+            frame_layout: Default::default(),
             expanded_operations: HashSet::new(),
             collapsed_operations: HashSet::new(),
             fullscreen: false,
@@ -213,8 +222,42 @@ impl Default for TranscriptState {
 
 impl TranscriptState {
     pub(crate) fn invalidate_layout(&mut self) {
+        self.frame_operations.get_mut().take();
+        self.invalidate_visual_layout();
+    }
+
+    pub(crate) fn invalidate_visual_layout(&mut self) {
+        self.frame_layout.get_mut().take();
         self.revision = self.revision.wrapping_add(1);
         self.layout_cache = None;
+        if let Some(cache) = self.frame_operations.get_mut() {
+            cache.revision = self.revision;
+        }
+    }
+
+    /// 只快进连续的同回合正文 delta；工具、重试、最终修订和历史裁剪均回退完整投影。
+    pub(crate) fn invalidate_for_event(&mut self, event: &RuntimeEvent, event_count: usize) {
+        let mut cache = self.frame_operations.get_mut().take();
+        self.invalidate_visual_layout();
+        if let Some(cached) = cache.as_mut()
+            && event.event_type == RuntimeEventType::ProviderStreamed
+            && event.turn_id.is_some()
+            && cached.stream_turn == event.turn_id
+            && cached.event_count + 1 == event_count
+            && cached.anchors == self.history.command_anchors
+            && let Some(record) = cached.entries.last_mut()
+            && !record.stable
+            && record.turn_id == event.turn_id
+            && record.projection.is_assistant_message()
+            && let Some(body) = record.projection.item_mut().body.first_mut()
+        {
+            if let Some(delta) = provider_stream_text_delta(event) {
+                body.push_str(delta);
+            }
+            cached.event_count = event_count;
+            cached.revision = self.revision;
+            *self.frame_operations.get_mut() = cache;
+        }
     }
 
     pub(crate) fn reset_view(&mut self) {
@@ -289,7 +332,7 @@ impl TranscriptState {
     pub(crate) fn set_committed_stream_lines(&mut self, lines: HashMap<EventId, usize>) {
         if self.history.committed_stream_lines != lines {
             self.history.committed_stream_lines = lines;
-            self.invalidate_layout();
+            self.invalidate_visual_layout();
         }
     }
 }
@@ -644,7 +687,7 @@ pub(crate) fn stable_event_operation_projection_count(events: &[RuntimeEvent]) -
         .count()
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct EventOperationEntry {
     process_id: Option<String>,
     terminal_wait: bool,
@@ -762,8 +805,25 @@ pub(crate) fn event_operation_entries(events: &[RuntimeEvent]) -> Vec<EventOpera
 }
 
 /// 已写入终端的工具单元是不可变边界，后来的调用只能进入新的单元。
+#[derive(Debug, Clone)]
+struct HistoryProjectionCache {
+    revision: u64,
+    event_count: usize,
+    stream_turn: Option<TurnId>,
+    anchors: HashSet<EventId>,
+    entries: Vec<EventOperationEntry>,
+}
+
 pub(crate) fn history_event_operations(app: &TuiApp) -> Vec<EventOperationEntry> {
-    event_operation_entries_with_boundary(
+    let _timing = super::ui_timing::span("projection");
+    if app.transcript.frame_cache_enabled
+        && let Some(cache) = app.transcript.frame_operations.borrow().as_ref()
+        && cache.revision == app.transcript.revision
+        && cache.anchors == app.transcript.history.command_anchors
+    {
+        return cache.entries.clone();
+    }
+    let entries = event_operation_entries_with_boundary(
         &app.events,
         &app.transcript.history.committed_event_ids,
         &app.transcript.history.command_anchors,
@@ -774,7 +834,21 @@ pub(crate) fn history_event_operations(app: &TuiApp) -> Vec<EventOperationEntry>
             .cloned()
             .chain(app.tool_detail.as_ref().map(|detail| detail.id.clone()))
             .collect(),
-    )
+    );
+    if app.transcript.frame_cache_enabled {
+        *app.transcript.frame_operations.borrow_mut() = Some(HistoryProjectionCache {
+            revision: app.transcript.revision,
+            event_count: app.events.len(),
+            stream_turn: app
+                .events
+                .last()
+                .filter(|event| event.event_type == RuntimeEventType::ProviderStreamed)
+                .and_then(|event| event.turn_id),
+            anchors: app.transcript.history.command_anchors.clone(),
+            entries: entries.clone(),
+        });
+    }
+    entries
 }
 
 fn event_operation_entries_with_boundary(
@@ -3069,6 +3143,80 @@ mod tests {
 
     fn tool_event(sequence_no: u64, event_type: RuntimeEventType, payload: Value) -> RuntimeEvent {
         tool_event_on_turn(sequence_no, None, event_type, payload)
+    }
+
+    #[test]
+    fn incremental_stream_projection_matches_replay_across_semantic_boundaries() {
+        let turn = TurnId::new();
+        let mut app = TuiApp::new(
+            golutra_agent_core::ThreadId::new(),
+            SessionId::new(),
+            None,
+            false,
+            "mock".into(),
+            None,
+        );
+        app.transcript.frame_cache_enabled = true;
+        let script = [
+            (
+                RuntimeEventType::ProviderStreamed,
+                json!({"delta":{"kind":"text_delta","text":"你好 "}}),
+            ),
+            (
+                RuntimeEventType::ProviderStreamed,
+                json!({"delta":{"kind":"text_delta","text":"世界\n\n"}}),
+            ),
+            (
+                RuntimeEventType::ProviderStreamed,
+                json!({"delta":{"kind":"reasoning_delta","text":"hidden"}}),
+            ),
+            (
+                RuntimeEventType::RetryScheduled,
+                json!({"recovery":{"reset_stream":true}}),
+            ),
+            (
+                RuntimeEventType::ProviderStreamed,
+                json!({"delta":{"kind":"text_delta","text":"重新开始 "}}),
+            ),
+            (
+                RuntimeEventType::ProviderStreamed,
+                json!({"delta":{"kind":"text_delta","text":"👩‍💻 é"}}),
+            ),
+            (
+                RuntimeEventType::AssistantMessage,
+                json!({"content":"最终修订"}),
+            ),
+            (
+                RuntimeEventType::ProviderStreamed,
+                json!({"delta":{"kind":"text_delta","text":"新片段"}}),
+            ),
+            (RuntimeEventType::TaskCompleted, json!({})),
+        ];
+        for (index, (kind, payload)) in script.into_iter().enumerate() {
+            let mut event = tool_event_on_turn(index as u64 + 1, Some(turn), kind, payload);
+            event.session_id = app.session_id;
+            event.task_id = None;
+            app.apply_runtime_event(event);
+            if index == 1 || index == 5 {
+                assert!(
+                    app.transcript.frame_operations.borrow().is_some(),
+                    "ordinary deltas should advance the cached projection"
+                );
+            }
+            assert_eq!(
+                history_event_operations(&app),
+                event_operation_entries(&app.events),
+                "event {index}"
+            );
+            // 归档前缀和光标布局变化不改变事件语义，不能强制回放所有历史。
+            app.transcript
+                .set_committed_stream_lines(HashMap::from([(app.events[0].id, index)]));
+        }
+        app.replace_event_history(app.events[3..].to_vec(), true);
+        assert_eq!(
+            history_event_operations(&app),
+            event_operation_entries(&app.events)
+        );
     }
 
     #[test]

@@ -14,6 +14,59 @@ pub(super) fn parse_markdown(source: &str) -> MarkdownDocument {
     parser.finish()
 }
 
+/// 保留最后一个顶层块为可变尾部；跨块引用和 HTML 走完整解析，避免冻结错误语义。
+pub(super) struct StreamDocument {
+    pub(super) document: MarkdownDocument,
+    pub(super) stable_source_len: usize,
+    pub(super) stable_blocks: usize,
+    pub(super) source_wide: bool,
+    pub(super) last_block_start: Option<usize>,
+}
+
+pub(super) fn parse_stream(source: &str) -> StreamDocument {
+    let events = Parser::new_ext(source, super::markdown_options());
+    let mut source_wide = events.reference_definitions().iter().next().is_some();
+    let mut parser = MarkdownParser::new();
+    let mut depth = 0usize;
+    let mut stable_source_len = 0;
+    let mut stable_blocks = 0;
+    let mut last_block_start = None;
+    let complete_line_end = source.rfind('\n').unwrap_or(0);
+    for (event, range) in events.into_offset_iter() {
+        if depth == 0 && matches!(event, Event::Start(_)) {
+            last_block_start = Some(range.start);
+        }
+        if depth == 0
+            && range.start < complete_line_end
+            && matches!(event, Event::Start(_) | Event::Rule)
+        {
+            // 未结束的新行可能暂时被识别为表格外的段落，后续 token 又使其成为表格行。
+            // 只有新块的首行已收完整，才允许冻结它之前的块。
+            // 包含块前缩进，尾部独立解析时保留原来的列位置。
+            stable_source_len = source[..range.start].rfind('\n').map_or(0, |i| i + 1);
+            if let Some(Container::Root(blocks)) = parser.containers.first() {
+                stable_blocks = blocks.len();
+            }
+        }
+        match &event {
+            Event::Start(tag) => {
+                source_wide |= matches!(tag, Tag::HtmlBlock | Tag::FootnoteDefinition(_));
+                depth += 1;
+            }
+            Event::End(_) => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        parser.event(event);
+    }
+    StreamDocument {
+        document: parser.finish(),
+        stable_source_len,
+        stable_blocks,
+        source_wide,
+        last_block_start,
+    }
+}
+
 enum Container {
     Root(Vec<MarkdownBlock>),
     Quote(Vec<MarkdownBlock>),

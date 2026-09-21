@@ -146,6 +146,7 @@ impl RenderedHistoryEntry {
 
 #[derive(Debug, Clone)]
 pub(crate) struct InlineHistoryState {
+    last_flush: Option<(u64, u16, usize)>,
     native_scrollback: bool,
     display_rows: Arc<Vec<HistoryDisplayRow>>,
     session_id: SessionId,
@@ -206,6 +207,7 @@ impl InlineHistoryState {
 
     pub(crate) fn new(session_id: SessionId) -> Self {
         Self {
+            last_flush: None,
             native_scrollback: false,
             display_rows: Arc::new(Vec::new()),
             session_id,
@@ -277,11 +279,25 @@ impl InlineHistoryState {
         prepare_insert: impl FnMut(&mut Terminal<B>, &TuiApp) -> io::Result<()>,
     ) -> io::Result<bool> {
         // 归档标记与本地命令只有在终端写入成功后才能提交；失败不能吞掉待显示内容。
+        let _timing = super::ui_timing::span("history");
+        let width = terminal.size()?.width;
+        if self.native_scrollback
+            && self.initialized
+            && self.session_id == app.session_id
+            && self.generation == app.transcript.history.replay_generation
+            && self.mode == InlineHistoryMode::from_app(app)
+            && self.last_flush == Some((app.transcript.revision, width, app.events.len()))
+            && app.transcript.history.replay_ready
+            && app.command_messages.is_empty()
+        {
+            return Ok(false);
+        }
         let mut next = self.clone();
         let previous_history = app.transcript.history.clone();
         let previous_commands = app.command_messages.clone();
         match next.flush_prepared(terminal, app, rebuild_terminal, prepare_insert) {
             Ok(changed) => {
+                next.last_flush = Some((app.transcript.revision, width, app.events.len()));
                 *self = next;
                 Ok(changed)
             }
@@ -498,7 +514,7 @@ impl InlineHistoryState {
         app.set_inline_history_committed_stream_lines(self.committed_stream_lines.clone());
         if app.transcript.history.tail != self.tail {
             app.transcript.history.tail = self.tail.clone();
-            app.invalidate_transcript_layout();
+            app.transcript.invalidate_visual_layout();
         }
         let changed = !lines.is_empty();
         if changed {
@@ -693,6 +709,24 @@ fn rendered_history_entries(
             entries
                 .into_iter()
                 .map(|entry| {
+                    // Native scrollback already owns completed entries. Keep their
+                    // identities for grouping/retention, but do not lay them out again.
+                    if app.transcript.history.native_render_width.is_some()
+                        && entry.stable
+                        && entry
+                            .event_ids
+                            .iter()
+                            .all(|id| app.transcript.history.committed_event_ids.contains(id))
+                    {
+                        return RenderedHistoryEntry {
+                            tool_id: entry.projection.id().cloned(),
+                            event_ids: entry.event_ids,
+                            lines: Vec::new(),
+                            stable_line_count: 0,
+                            commit_event: true,
+                            source_prefix: None,
+                        };
+                    }
                     history_entry_from_projection(
                         app,
                         entry.event_ids,
@@ -741,12 +775,19 @@ fn history_entry_from_projection(
     width: u16,
 ) -> RenderedHistoryEntry {
     let tool_id = projection.id().cloned();
+    // 先渲染完整活动正文，共用解析器记录的块边界，避免再扫描一次 Markdown。
+    let lines = render_operation_projection_lines(app, vec![projection.clone()], width);
     let source_prefix = projection.is_assistant_message().then(|| {
         let source = projection.item(false).body.join("\n");
         if stable {
             source
         } else {
-            source[..super::stream_commit::stable_source_end(&source)].to_owned()
+            let end = app
+                .transcript
+                .markdown_cache
+                .borrow()
+                .stable_source_end(&source);
+            source[..end].to_owned()
         }
     });
     let stable_source = source_prefix
@@ -757,7 +798,6 @@ fn history_entry_from_projection(
             item.body = vec![prefix.clone()];
             render_operation_projection_lines(app, vec![message_projection(item)], width)
         });
-    let lines = render_operation_projection_lines(app, vec![projection], width);
     RenderedHistoryEntry {
         tool_id,
         event_ids,
@@ -1269,14 +1309,8 @@ pub(crate) fn inline_viewport_height(app: &TuiApp, width: u16, screen_height: u1
 
 fn live_transcript_body_rows(app: &TuiApp, width: u16) -> u16 {
     // 高度必须按 live 渲染行计算，已经推进 scrollback 的流式前缀不能再把 composer 撑高。
-    let lines = live_transcript_render_rows(app, width)
-        .into_iter()
-        .map(|row| row.line)
-        .collect::<Vec<_>>();
-    if lines.is_empty() {
-        return 0;
-    }
-    u16::try_from(history_lines_height(&lines, width)).unwrap_or(u16::MAX)
+    let layout = transcript_layout(app, Rect::new(0, 0, width, 0));
+    u16::try_from(layout.row_count).unwrap_or(u16::MAX)
 }
 
 pub(crate) fn sync_inline_viewport_height(
@@ -1385,13 +1419,6 @@ fn history_line_height(line: &Line<'static>, width: u16) -> usize {
         .wrap(Wrap { trim: false })
         .line_count(width.max(1))
         .max(1)
-}
-
-fn history_lines_height(lines: &[Line<'static>], width: u16) -> usize {
-    lines
-        .iter()
-        .map(|line| history_line_height(line, width))
-        .sum()
 }
 
 #[cfg(test)]

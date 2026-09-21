@@ -1,4 +1,7 @@
-use std::ops::Range;
+use std::{
+    cell::{Ref, RefCell},
+    ops::Range,
+};
 
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -7,13 +10,25 @@ use unicode_width::UnicodeWidthStr;
 ///
 /// 文本仍以 UTF-8 字节索引保存，但所有编辑边界都按 grapheme cluster 计算。
 /// 这样组合字符、emoji 和中文输入法提交的字符串不会被拆成无效或半个字符。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct ComposerInput {
     text: String,
     cursor: usize,
     undo: Vec<ComposerSnapshot>,
     redo: Vec<ComposerSnapshot>,
+    layout_cache: RefCell<Option<(usize, usize, VisualLayout)>>,
 }
+
+impl PartialEq for ComposerInput {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text
+            && self.cursor == other.cursor
+            && self.undo == other.undo
+            && self.redo == other.redo
+    }
+}
+
+impl Eq for ComposerInput {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ComposerSnapshot {
@@ -29,7 +44,7 @@ pub(crate) struct ComposerViewport {
     pub(crate) cursor: (u16, u16),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct VisualLayout {
     lines: Vec<Range<usize>>,
     cursor_line: usize,
@@ -66,6 +81,7 @@ impl ComposerInput {
     }
 
     pub(crate) fn reset(&mut self) {
+        self.layout_cache.get_mut().take();
         self.text.clear();
         self.cursor = 0;
         self.undo.clear();
@@ -73,6 +89,7 @@ impl ComposerInput {
     }
 
     pub(crate) fn set_text(&mut self, text: impl Into<String>) {
+        self.layout_cache.get_mut().take();
         self.text = text.into();
         self.cursor = self.text.len();
         self.undo.clear();
@@ -333,6 +350,7 @@ impl ComposerInput {
     }
 
     fn record_edit(&mut self) {
+        self.layout_cache.get_mut().take();
         let snapshot = self.snapshot();
         if self.undo.last() != Some(&snapshot) {
             self.undo.push(snapshot);
@@ -351,6 +369,7 @@ impl ComposerInput {
     }
 
     fn restore(&mut self, snapshot: ComposerSnapshot) {
+        self.layout_cache.get_mut().take();
         self.text = snapshot.text;
         self.cursor = snapshot.cursor.min(self.text.len());
     }
@@ -377,7 +396,24 @@ impl ComposerInput {
         ComposerViewport { lines, cursor }
     }
 
-    fn visual_layout(&self, width: usize) -> VisualLayout {
+    fn visual_layout(&self, width: usize) -> Ref<'_, VisualLayout> {
+        let hit = self
+            .layout_cache
+            .borrow()
+            .as_ref()
+            .is_some_and(|(cached_width, cursor, _)| {
+                *cached_width == width && *cursor == self.cursor
+            });
+        if !hit {
+            *self.layout_cache.borrow_mut() =
+                Some((width, self.cursor, self.compute_visual_layout(width)));
+        }
+        Ref::map(self.layout_cache.borrow(), |cache| {
+            &cache.as_ref().expect("composer layout").2
+        })
+    }
+
+    fn compute_visual_layout(&self, width: usize) -> VisualLayout {
         let mut lines = Vec::new();
         let mut line_start = 0;
         let mut line_width = 0;
@@ -490,6 +526,37 @@ fn grapheme_offset(text: &str, count: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_viewport_tracks_edits_cursor_undo_reset_and_width() {
+        let mut input = ComposerInput::from_text("你好👨‍👩‍👧‍👦 e\u{301}\nsecond");
+        for step in 0..12 {
+            for width in [4, 12, 4] {
+                let mut uncached = input.clone();
+                uncached.layout_cache.get_mut().take();
+                assert_eq!(input.viewport(width, 3), uncached.viewport(width, 3));
+                assert_eq!(input, uncached);
+            }
+            match step {
+                0 => input.move_left(),
+                1 => input.insert_str("中"),
+                2 => input.delete_backward(),
+                3 => {
+                    input.undo();
+                }
+                4 => {
+                    input.redo();
+                }
+                5 => input.move_to_start(),
+                6 => input.delete_forward(),
+                7 => input.replace_range(0..0, "prefix"),
+                8 => input.clear(),
+                9 => input.set_text("new\ntext"),
+                10 => input.reset(),
+                _ => input.insert_char('新'),
+            }
+        }
+    }
 
     #[test]
     fn edits_graphemes_without_splitting_emoji_or_combining_marks() {
