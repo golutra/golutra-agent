@@ -15,10 +15,10 @@ categories.workspace = true
 [dependencies]
 chrono.workspace = true
 golutra-agent-core.workspace = true
-golutra-agent-eval = { path = "../golutra-agent-eval", version = "0.3.2" }
-golutra-agent-evolution = { path = "../golutra-agent-evolution", version = "0.3.2" }
-golutra-agent-governor = { path = "../golutra-agent-governor", version = "0.3.2" }
-golutra-agent-memory = { path = "../golutra-agent-memory", version = "0.3.2" }
+golutra-agent-eval = { path = "../golutra-agent-eval", version = "0.3.3" }
+golutra-agent-evolution = { path = "../golutra-agent-evolution", version = "0.3.3" }
+golutra-agent-governor = { path = "../golutra-agent-governor", version = "0.3.3" }
+golutra-agent-memory = { path = "../golutra-agent-memory", version = "0.3.3" }
 golutra-agent-protocol.workspace = true
 schemars.workspace = true
 serde.workspace = true

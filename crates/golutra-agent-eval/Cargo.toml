@@ -16,7 +16,7 @@ categories.workspace = true
 chrono.workspace = true
 fs2.workspace = true
 golutra-agent-core.workspace = true
-golutra-agent-eval-model = { path = "../golutra-agent-eval-model", version = "0.3.2" }
+golutra-agent-eval-model = { path = "../golutra-agent-eval-model", version = "0.3.3" }
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
