@@ -7,8 +7,10 @@
 mod cache;
 mod code;
 mod layout;
+mod local_links;
 mod markdown;
 mod model;
+mod syntax;
 mod table;
 mod theme;
 mod wrap;
@@ -23,6 +25,7 @@ pub(crate) fn markdown_options() -> pulldown_cmark::Options {
     Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS
 }
 
+#[cfg(test)]
 pub(crate) fn markdown_lines(markdown: &str, width: u16) -> Vec<Line<'static>> {
     let document = markdown::parse_markdown(markdown);
     layout::render_markdown_document(&document, usize::from(width.max(1)))
@@ -187,7 +190,7 @@ mod tests {
             lines[1]
                 .spans
                 .iter()
-                .any(|span| span.content == "let" && span.style.fg == Some(Color::Cyan))
+                .any(|span| span.content == "let" && matches!(span.style.fg, Some(Color::Rgb(..))))
         );
 
         assert_eq!(detail_line("+added").spans[0].style.fg, Some(Color::Green));

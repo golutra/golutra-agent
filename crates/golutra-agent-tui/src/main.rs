@@ -116,6 +116,7 @@ mod session;
 mod session_banner;
 mod settings;
 mod stream_commit;
+mod terminal_appearance;
 mod terminal_integration;
 mod tool_detail;
 mod tool_detail_data;
@@ -446,6 +447,7 @@ impl TuiApp {
     fn trim_event_history(&mut self) -> bool {
         if !self.transcript.history.enabled
             || !self.transcript.history.replay_ready
+            || self.transcript.history.reflow_pending
             || self.history_reload.is_some()
         {
             return false;
@@ -1340,12 +1342,14 @@ impl TuiApp {
                 }
                 RuntimeEventType::ProviderCompleted => {
                     self.render_metrics.record_stream_completed(turn_id);
+                    self.immediate_frame_pending = true;
                 }
                 RuntimeEventType::ProviderFailed if !event_type.is_task_terminal() => {
                     self.render_metrics.record_stream_ended(turn_id);
                 }
                 RuntimeEventType::AssistantMessage => {
                     self.render_metrics.record_final_message(turn_id);
+                    self.immediate_frame_pending = true;
                 }
                 _ if event_type.is_task_terminal() => {
                     self.render_metrics.record_stream_ended(turn_id);
@@ -4341,6 +4345,7 @@ async fn run_interactive(
     app.enable_inline_history();
     let (width, height) = crossterm::terminal::size()
         .map_err(|error| miette::miette!("read terminal size: {error}"))?;
+    terminal_appearance::initialize();
     let mut terminal = setup_terminal(inline_viewport_height(&app, width, height))?;
     let terminal_restore = TerminalRestoreCoordinator::new(false);
     let panic_restore = terminal_restore.clone();
@@ -4461,6 +4466,9 @@ async fn run_app(
         let frame_deadline = app
             .render_metrics
             .deadline()
+            .into_iter()
+            .chain(overlay_screen.resize_deadline())
+            .min()
             .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
         tokio::select! {
             ready = fair_select::next(
@@ -4479,7 +4487,7 @@ async fn run_app(
                 if app.take_immediate_frame_request() {
                     app.render_metrics.request_immediate_at(now);
                 } else {
-                    app.render_metrics.request_at(now);
+                    app.render_metrics.request_provider_at(now);
                 }
             }
             fair_select::Ready::Second(terminal_event) => {
@@ -4540,6 +4548,14 @@ async fn run_app(
                 }
             }
         }
+        if app.transcript.history.reflow_pending
+            && app.history_has_more_before
+            && app.history_reload.is_none()
+        {
+            // Large sessions may have evicted committed events from memory. Restore the
+            // complete source asynchronously before any destructive terminal replay.
+            app.start_history_reload(controller.transport());
+        }
         }
 
         Ok(())
@@ -4556,6 +4572,8 @@ struct OverlayScreenState {
     capture_mouse: bool,
     saved_inline: Option<Rect>,
     inline_screen_size: Option<ratatui::layout::Size>,
+    reflow_at: Option<Instant>,
+    size_recheck_at: Option<Instant>,
 }
 
 impl OverlayScreenState {
@@ -4565,7 +4583,16 @@ impl OverlayScreenState {
             capture_mouse: false,
             saved_inline: None,
             inline_screen_size: None,
+            reflow_at: None,
+            size_recheck_at: None,
         }
+    }
+
+    fn resize_deadline(&self) -> Option<Instant> {
+        if self.active {
+            return None;
+        }
+        self.reflow_at.into_iter().chain(self.size_recheck_at).min()
     }
 }
 
@@ -4609,7 +4636,7 @@ fn draw_interactive_frame_inner(
         || app.developer_detail.is_some()
         || app.transcript.fullscreen;
     if !overlay_screen.active {
-        prepare_inline_screen(terminal, overlay_screen, inline_history)
+        prepare_inline_screen(terminal, overlay_screen, inline_history, app)
             .map_err(|error| miette::miette!("prepare inline screen: {error}"))?;
     }
     // 历史写入内部先冻结待归档行，再按剩余尾部调整活动区；不能沿用已完成长块的旧高度。
@@ -4623,7 +4650,7 @@ fn draw_interactive_frame_inner(
     sync_overlay_screen(terminal, overlay_screen, overlay_visible, capture_mouse)?;
     if !overlay_screen.active {
         // 弹层内的尺寸变化留到主屏恢复后处理，不能用 alternate screen 的坐标更新历史锚点。
-        prepare_inline_screen(terminal, overlay_screen, inline_history)
+        prepare_inline_screen(terminal, overlay_screen, inline_history, app)
             .map_err(|error| miette::miette!("restore inline screen: {error}"))?;
         inline_history
             .flush_interactive(terminal, app)
@@ -4651,13 +4678,27 @@ fn prepare_inline_screen(
     terminal: &mut InteractiveTerminal,
     state: &mut OverlayScreenState,
     history: &mut InlineHistoryState,
+    app: &mut TuiApp,
 ) -> io::Result<()> {
+    const RESIZE_DEBOUNCE: Duration = Duration::from_millis(75);
     let size = terminal.size()?;
-    let area = terminal.current_buffer_mut().area;
+    let now = Instant::now();
+    if state
+        .size_recheck_at
+        .is_some_and(|deadline| now >= deadline)
+    {
+        state.size_recheck_at = None;
+    }
     if let Some(previous) = state.inline_screen_size
         && previous != size
     {
-        history.resize_visible_history(terminal, state.saved_inline.unwrap_or(area), size)?;
+        state.reflow_at = Some(now + RESIZE_DEBOUNCE);
+    }
+    if state.reflow_at.is_some_and(|deadline| now >= deadline) {
+        history.request_resize_reflow(app);
+        state.reflow_at = None;
+        // Some terminals report their settled geometry after the last resize event.
+        state.size_recheck_at = Some(now + RESIZE_DEBOUNCE);
     }
     state.inline_screen_size = Some(size);
     Ok(())
@@ -5759,7 +5800,7 @@ fn handle_paste(pasted: &str, app: &mut TuiApp) {
         return;
     }
 
-    app.input.insert_str(&normalized);
+    app.input.insert_paste(&normalized);
     app.reset_slash_selection();
     app.refresh_mention_completion();
     app.prompt_history.reset_navigation();

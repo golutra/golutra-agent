@@ -1,6 +1,29 @@
 use super::*;
 
 #[test]
+fn file_links_use_the_session_workspace_and_invalidate_on_workspace_change() {
+    let mut cache = MarkdownCache::default();
+    let source = "[main.rs](/work/src/main.rs#L12) and [entry point](/work/src/main.rs:12)";
+    cache.set_cwd(std::path::Path::new("/work"));
+    let plain = |lines: Vec<Line<'static>>| {
+        lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(
+        plain(cache.render(source, 120)),
+        "src/main.rs:12 and entry point (src/main.rs:12)"
+    );
+    cache.set_cwd(std::path::Path::new("/elsewhere"));
+    assert_eq!(
+        plain(cache.render(source, 120)),
+        "/work/src/main.rs:12 and entry point (/work/src/main.rs:12)"
+    );
+}
+
+#[test]
 fn incremental_layout_matches_canonical_markdown_at_every_character() {
     let documents = [
         "你好👨‍👩‍👧‍👦 e\u{301} **强调**\n\n第二段。\n\n# 标题\n\n结尾",
@@ -78,7 +101,8 @@ fn streaming_block_boundaries_match_full_render_across_chunk_sizes() {
                     );
                     assert_eq!(
                         cache.stable_source_end(partial),
-                        crate::stream_commit::stable_source_end(partial)
+                        crate::stream_commit::stable_source_end(partial),
+                        "archive boundary: {partial:?}"
                     );
                 }
             }

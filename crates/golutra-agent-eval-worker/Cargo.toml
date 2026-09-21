@@ -15,7 +15,7 @@ categories.workspace = true
 [dependencies]
 chrono.workspace = true
 clap.workspace = true
-golutra-agent-client = { path = "../golutra-agent-client", version = "0.3.4" }
+golutra-agent-client = { path = "../golutra-agent-client", version = "0.3.5" }
 golutra-agent-core.workspace = true
 golutra-agent-protocol.workspace = true
 serde_json.workspace = true

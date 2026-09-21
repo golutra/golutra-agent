@@ -6,6 +6,33 @@ follow [Semantic Versioning](https://semver.org/) where applicable.
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-09-22
+
+### Fixed
+
+- Rebuild terminal history from source after resizing so narrow-to-wide changes
+  restore the banner and conversation layout while retaining drafts and commands.
+- Replace genuinely revised assistant output with the final rendering instead of
+  appending duplicate replies. Trailing-newline normalization does not trigger a replay.
+- Archive complete fenced-code lines while the provider is still streaming.
+
+### Changed
+
+- Coalesce small streaming updates and accelerate refreshes when updates accumulate;
+  input, first content and completion retain responsive scheduling.
+- Command previews retain the output head, tail and omitted-line count.
+- Large pastes use compact previews while preserving full submitted text and undo.
+- Code highlighting preserves language state across lines and incremental updates.
+- Diff backgrounds adapt to light/dark terminals and supported color depth.
+- Local Markdown links avoid duplicate file labels, shorten workspace paths and
+  preserve line numbers. Explicit OSC 8 hyperlinks are not included.
+
+### Distribution and validation
+
+- Align npm, native artifacts and SDK metadata at 0.3.5 with no storage schema change.
+- Local TUI validation passed 503 tests, including 34 real PTY tests; one opt-in
+  live-provider test was skipped. Clippy and formatting checks passed.
+
 ## [0.3.4] - 2026-09-21
 
 ### Fixed
@@ -217,7 +244,8 @@ This is the initial public development baseline. See the repository history
 and [architecture documentation](docs/ARCHITECTURE.md) for the implementation
 details and current compatibility boundaries.
 
-[unreleased]: https://github.com/golutra/golutra-agent/compare/v0.3.4...HEAD
+[unreleased]: https://github.com/golutra/golutra-agent/compare/v0.3.5...HEAD
+[0.3.5]: https://github.com/golutra/golutra-agent/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/golutra/golutra-agent/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/golutra/golutra-agent/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/golutra/golutra-agent/compare/v0.3.1...v0.3.2

@@ -335,7 +335,7 @@ fn render_operation_projections(
                 let limit = if matches!(projection, super::OperationProjection::FileChange { .. }) {
                     15
                 } else {
-                    8
+                    17
                 };
                 if item.body.len() > limit {
                     item.body.truncate(limit - 1);
@@ -508,6 +508,10 @@ fn render_item_rows(
         TranscriptRole::User | TranscriptRole::Assistant | TranscriptRole::CommandResult
     );
     let diff_number_width = super::tool_preview::number_width(&item.body);
+    app.transcript
+        .markdown_cache
+        .borrow_mut()
+        .set_cwd(&app.workspace_path);
     let mut body_lines = match item.role {
         TranscriptRole::Assistant => app.transcript.markdown_cache.borrow_mut().render(
             &item.body.join("\n"),

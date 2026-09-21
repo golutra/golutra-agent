@@ -99,10 +99,28 @@ pub(crate) struct FrameScheduler {
     deadline: Option<Instant>,
     metrics: RenderMetrics,
     streams: HashMap<TurnId, StreamState>,
+    drawn_delta_events: u64,
 }
 
 impl FrameScheduler {
     pub(crate) fn request_at(&mut self, now: Instant) {
+        self.request_with_interval(now, MIN_FRAME_INTERVAL);
+    }
+
+    pub(crate) fn request_provider_at(&mut self, now: Instant) {
+        let pending = self
+            .metrics
+            .delta_events
+            .saturating_sub(self.drawn_delta_events);
+        let interval = if (1..8).contains(&pending) {
+            Duration::from_nanos(16_666_667)
+        } else {
+            MIN_FRAME_INTERVAL
+        };
+        self.request_with_interval(now, interval);
+    }
+
+    fn request_with_interval(&mut self, now: Instant, interval: Duration) {
         self.metrics.redraw_requests = self.metrics.redraw_requests.saturating_add(1);
         if self.deadline.is_some() {
             self.metrics.coalesced_redraws = self.metrics.coalesced_redraws.saturating_add(1);
@@ -111,7 +129,7 @@ impl FrameScheduler {
         self.metrics.pending_redraws = 1;
         let earliest = self
             .last_drawn_at
-            .and_then(|drawn| drawn.checked_add(MIN_FRAME_INTERVAL))
+            .and_then(|drawn| drawn.checked_add(interval))
             .map_or(now, |allowed| allowed.max(now));
         self.deadline = Some(
             self.deadline
@@ -136,6 +154,7 @@ impl FrameScheduler {
     }
 
     pub(crate) fn mark_drawn_at(&mut self, now: Instant) {
+        self.drawn_delta_events = self.metrics.delta_events;
         self.last_drawn_at = Some(now);
         self.deadline = None;
         self.metrics.redraws = self.metrics.redraws.saturating_add(1);
@@ -264,6 +283,62 @@ impl FrameScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_frames_coalesce_until_backlog_or_input_needs_a_faster_frame() {
+        let start = Instant::now();
+        let mut scheduler = FrameScheduler::default();
+        scheduler.mark_drawn_at(start);
+        scheduler.metrics.delta_events = 1;
+        scheduler.request_provider_at(start + Duration::from_millis(1));
+        assert_eq!(
+            scheduler.deadline(),
+            Some(start + Duration::from_nanos(16_666_667))
+        );
+        scheduler.metrics.delta_events = 8;
+        scheduler.request_provider_at(start + Duration::from_millis(7));
+        assert_eq!(scheduler.deadline(), Some(start + MIN_FRAME_INTERVAL));
+        scheduler.mark_drawn_at(start + MIN_FRAME_INTERVAL);
+        scheduler.metrics.delta_events += 1;
+        scheduler.request_provider_at(start + Duration::from_millis(10));
+        scheduler.request_at(start + Duration::from_millis(11));
+        assert_eq!(scheduler.deadline(), Some(start + MIN_FRAME_INTERVAL * 2));
+        scheduler.request_immediate_at(start + Duration::from_millis(12));
+        assert_eq!(
+            scheduler.deadline(),
+            Some(start + Duration::from_millis(12))
+        );
+    }
+
+    #[test]
+    fn provider_pacing_reduces_small_delta_redraws_with_bounded_latency() {
+        let start = Instant::now();
+        let simulate = |adaptive: bool| {
+            let mut scheduler = FrameScheduler::default();
+            scheduler.mark_drawn_at(start);
+            for millisecond in 1..=1000 {
+                let now = start + Duration::from_millis(millisecond);
+                if millisecond % 3 == 0 {
+                    scheduler.metrics.delta_events += 1;
+                    if adaptive {
+                        scheduler.request_provider_at(now);
+                    } else {
+                        scheduler.request_at(now);
+                    }
+                }
+                if scheduler.deadline().is_some_and(|deadline| deadline <= now) {
+                    scheduler.mark_drawn_at(now);
+                }
+                assert!(
+                    scheduler
+                        .deadline()
+                        .is_none_or(|deadline| deadline <= now + Duration::from_millis(17))
+                );
+            }
+            scheduler.metrics.redraws
+        };
+        assert!(simulate(true) < simulate(false) * 2 / 3);
+    }
 
     #[test]
     fn first_request_is_immediate() {

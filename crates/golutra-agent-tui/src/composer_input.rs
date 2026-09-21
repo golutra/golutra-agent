@@ -16,6 +16,7 @@ pub(crate) struct ComposerInput {
     cursor: usize,
     undo: Vec<ComposerSnapshot>,
     redo: Vec<ComposerSnapshot>,
+    pastes: Vec<PastedRange>,
     layout_cache: RefCell<Option<(usize, usize, VisualLayout)>>,
 }
 
@@ -25,6 +26,7 @@ impl PartialEq for ComposerInput {
             && self.cursor == other.cursor
             && self.undo == other.undo
             && self.redo == other.redo
+            && self.pastes == other.pastes
     }
 }
 
@@ -34,6 +36,13 @@ impl Eq for ComposerInput {}
 struct ComposerSnapshot {
     text: String,
     cursor: usize,
+    pastes: Vec<PastedRange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PastedRange {
+    range: Range<usize>,
+    characters: usize,
 }
 
 const MAX_UNDO_SNAPSHOTS: usize = 100;
@@ -46,6 +55,7 @@ pub(crate) struct ComposerViewport {
 
 #[derive(Debug, Clone)]
 struct VisualLayout {
+    text: String,
     lines: Vec<Range<usize>>,
     cursor_line: usize,
     cursor_col: usize,
@@ -77,12 +87,14 @@ impl ComposerInput {
         }
         self.record_edit();
         self.text.clear();
+        self.pastes.clear();
         self.cursor = 0;
     }
 
     pub(crate) fn reset(&mut self) {
         self.layout_cache.get_mut().take();
         self.text.clear();
+        self.pastes.clear();
         self.cursor = 0;
         self.undo.clear();
         self.redo.clear();
@@ -91,6 +103,7 @@ impl ComposerInput {
     pub(crate) fn set_text(&mut self, text: impl Into<String>) {
         self.layout_cache.get_mut().take();
         self.text = text.into();
+        self.pastes.clear();
         self.cursor = self.text.len();
         self.undo.clear();
         self.redo.clear();
@@ -101,37 +114,43 @@ impl ComposerInput {
     }
 
     pub(crate) fn insert_char(&mut self, character: char) {
-        self.record_edit();
-        self.text.insert(self.cursor, character);
-        self.cursor += character.len_utf8();
+        self.insert_str(character.encode_utf8(&mut [0; 4]));
     }
 
     pub(crate) fn insert_str(&mut self, text: &str) {
         if text.is_empty() {
             return;
         }
-        self.record_edit();
-        self.text.insert_str(self.cursor, text);
-        self.cursor += text.len();
+        self.replace_range(self.cursor..self.cursor, text);
+    }
+
+    pub(crate) fn insert_paste(&mut self, text: &str) {
+        let start = self.cursor;
+        self.insert_str(text);
+        let characters = text.chars().count();
+        if characters > 1000 {
+            self.pastes.push(PastedRange {
+                range: start..self.cursor,
+                characters,
+            });
+            self.pastes.sort_by_key(|paste| paste.range.start);
+        }
     }
 
     pub(crate) fn delete_backward(&mut self) {
         if self.cursor == 0 {
             return;
         }
-        self.record_edit();
         let start = previous_grapheme_boundary(&self.text, self.cursor);
-        self.text.replace_range(start..self.cursor, "");
-        self.cursor = start;
+        self.replace_range(start..self.cursor, "");
     }
 
     pub(crate) fn delete_forward(&mut self) {
         if self.cursor >= self.text.len() {
             return;
         }
-        self.record_edit();
         let end = next_grapheme_boundary(&self.text, self.cursor);
-        self.text.replace_range(self.cursor..end, "");
+        self.replace_range(self.cursor..end, "");
     }
 
     pub(crate) fn move_left(&mut self) {
@@ -219,9 +238,7 @@ impl ComposerInput {
         let start = self.cursor;
         self.cursor = end;
         if start < end {
-            self.record_edit();
-            self.text.replace_range(start..end, "");
-            self.cursor = start;
+            self.replace_range(start..end, "");
         }
     }
 
@@ -234,8 +251,7 @@ impl ComposerInput {
         let end = self.cursor;
         self.cursor = start;
         if start < end {
-            self.record_edit();
-            self.text.replace_range(start..end, "");
+            self.replace_range(start..end, "");
         }
     }
 
@@ -244,8 +260,7 @@ impl ComposerInput {
             .find('\n')
             .map_or(self.text.len(), |offset| self.cursor + offset);
         if end > self.cursor {
-            self.record_edit();
-            self.text.replace_range(self.cursor..end, "");
+            self.replace_range(self.cursor..end, "");
         }
     }
 
@@ -267,9 +282,7 @@ impl ComposerInput {
         if start == end {
             return;
         }
-        self.record_edit();
-        self.text.replace_range(start..end, "");
-        self.cursor = start.min(self.text.len());
+        self.replace_range(start..end, "");
     }
 
     pub(crate) fn insert_line_below(&mut self) {
@@ -327,6 +340,18 @@ impl ComposerInput {
             return;
         }
         self.record_edit();
+        self.pastes.retain_mut(|paste| {
+            let paste = &mut paste.range;
+            if paste.end <= range.start {
+                return true;
+            }
+            if paste.start >= range.end {
+                paste.start = paste.start - range.len() + value.len();
+                paste.end = paste.end - range.len() + value.len();
+                return true;
+            }
+            false
+        });
         self.text.replace_range(range.clone(), value);
         self.cursor = range.start.saturating_add(value.len());
     }
@@ -365,6 +390,7 @@ impl ComposerInput {
         ComposerSnapshot {
             text: self.text.clone(),
             cursor: self.cursor,
+            pastes: self.pastes.clone(),
         }
     }
 
@@ -372,6 +398,7 @@ impl ComposerInput {
         self.layout_cache.get_mut().take();
         self.text = snapshot.text;
         self.cursor = snapshot.cursor.min(self.text.len());
+        self.pastes = snapshot.pastes;
     }
 
     /// 根据终端可用列数计算可见行和真实光标位置。
@@ -387,7 +414,7 @@ impl ComposerInput {
         let end = (start + max_rows).min(layout.lines.len());
         let lines = layout.lines[start..end]
             .iter()
-            .map(|range| self.text[range.clone()].to_owned())
+            .map(|range| layout.text[range.clone()].to_owned())
             .collect();
         let cursor = (
             layout.cursor_col.min(u16::MAX as usize) as u16,
@@ -414,16 +441,34 @@ impl ComposerInput {
     }
 
     fn compute_visual_layout(&self, width: usize) -> VisualLayout {
+        let mut text = String::new();
+        let mut offset = 0;
+        let mut cursor = self.cursor;
+        for paste in &self.pastes {
+            let characters = paste.characters;
+            let paste = &paste.range;
+            if self.cursor > paste.start && self.cursor < paste.end {
+                continue;
+            }
+            text.push_str(&self.text[offset..paste.start]);
+            let label = format!("[Pasted Content {characters} chars]");
+            if self.cursor >= paste.end {
+                cursor = cursor - paste.len() + label.len();
+            }
+            text.push_str(&label);
+            offset = paste.end;
+        }
+        text.push_str(&self.text[offset..]);
         let mut lines = Vec::new();
         let mut line_start = 0;
         let mut line_width = 0;
         let mut cursor_line = 0;
         let mut cursor_col = 0;
-        let mut cursor_recorded = self.cursor == 0;
+        let mut cursor_recorded = cursor == 0;
 
-        for (start, grapheme) in self.text.grapheme_indices(true) {
+        for (start, grapheme) in text.grapheme_indices(true) {
             if grapheme == "\n" {
-                if !cursor_recorded && self.cursor == start {
+                if !cursor_recorded && cursor == start {
                     cursor_line = lines.len();
                     cursor_col = line_width;
                     cursor_recorded = true;
@@ -431,7 +476,7 @@ impl ComposerInput {
                 lines.push(line_start..start);
                 line_start = start + grapheme.len();
                 line_width = 0;
-                if self.cursor == line_start {
+                if cursor == line_start {
                     cursor_line = lines.len();
                     cursor_col = 0;
                     cursor_recorded = true;
@@ -444,14 +489,14 @@ impl ComposerInput {
                 lines.push(line_start..start);
                 line_start = start;
                 line_width = 0;
-                if self.cursor == start {
+                if cursor == start {
                     cursor_line = lines.len();
                     cursor_col = 0;
                     cursor_recorded = true;
                 }
             }
 
-            if !cursor_recorded && self.cursor == start {
+            if !cursor_recorded && cursor == start {
                 cursor_line = lines.len();
                 cursor_col = line_width;
                 cursor_recorded = true;
@@ -463,20 +508,20 @@ impl ComposerInput {
                 lines.push(line_start..end);
                 line_start = end;
                 line_width = 0;
-                if self.cursor == end {
+                if cursor == end {
                     cursor_line = lines.len();
                     cursor_col = 0;
                     cursor_recorded = true;
                 }
-            } else if self.cursor == end {
+            } else if cursor == end {
                 cursor_line = lines.len();
                 cursor_col = line_width;
                 cursor_recorded = true;
             }
         }
 
-        if line_start <= self.text.len() {
-            lines.push(line_start..self.text.len());
+        if line_start <= text.len() {
+            lines.push(line_start..text.len());
         }
         if lines.is_empty() {
             lines.push(0..0);
@@ -487,6 +532,7 @@ impl ComposerInput {
         }
 
         VisualLayout {
+            text,
             lines,
             cursor_line,
             cursor_col,
@@ -526,6 +572,72 @@ fn grapheme_offset(text: &str, count: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_paste_folding_preserves_submission_edits_and_undo() {
+        let pasted = "你好👩‍💻\n".repeat(300);
+        let mut input = ComposerInput::from_text("before ");
+        input.insert_paste(&pasted);
+        assert_eq!(input.text(), format!("before {pasted}"));
+        assert!(
+            input
+                .viewport(80, 3)
+                .lines
+                .join("\n")
+                .contains("[Pasted Content")
+        );
+        input.insert_str(" after");
+        input.move_to_start();
+        input.insert_str("prefix ");
+        assert!(
+            input
+                .viewport(80, 3)
+                .lines
+                .join("\n")
+                .contains("[Pasted Content")
+        );
+        assert_eq!(input.text(), format!("prefix before {pasted} after"));
+        assert!(input.undo());
+        assert_eq!(input.text(), format!("before {pasted} after"));
+        assert!(input.redo());
+        input.move_to_end();
+        for _ in 0..7 {
+            input.move_left();
+        }
+        assert!(
+            !input
+                .viewport(80, 3)
+                .lines
+                .join("\n")
+                .contains("[Pasted Content")
+        );
+        input.delete_backward();
+        assert!(input.pastes.is_empty());
+        assert!(input.undo());
+        input.move_to_end();
+        assert!(
+            input
+                .viewport(80, 3)
+                .lines
+                .join("\n")
+                .contains("[Pasted Content")
+        );
+    }
+
+    #[test]
+    fn adjacent_pastes_fold_independently() {
+        let mut input = ComposerInput::default();
+        input.insert_paste(&"a".repeat(1001));
+        input.insert_paste(&"中".repeat(1002));
+        assert_eq!(
+            input.viewport(100, 3).lines[0],
+            "[Pasted Content 1001 chars][Pasted Content 1002 chars]"
+        );
+        assert!(input.undo());
+        assert_eq!(input.text(), "a".repeat(1001));
+        assert!(input.redo());
+        assert_eq!(input.pastes.len(), 2);
+    }
 
     #[test]
     fn cached_viewport_tracks_edits_cursor_undo_reset_and_width() {

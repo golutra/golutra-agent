@@ -444,8 +444,50 @@ fn responses_failure_displays_full_cause_after_compact_runtime_summary() {
     );
 }
 
+#[test]
+fn resize_roundtrip_rerenders_banner_messages_and_preserves_draft() {
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let prompt = "#conversationId{01M250E65WS59RECCQ1720W01V}#senderId{01J00000000000000000000000}[owner]:你好";
+    let answer = "This entire answer must return to one wide line after repeated terminal resizing. 中文内容也应完整恢复。";
+    let server = FixtureServer::new(vec![answer.to_owned()]);
+    server.install(home.path());
+    let mut pty = PtyHarness::spawn_configured(home.path(), workspace.path(), 140, 40, true);
+    let mut parser = ScreenModel::new(40, 140);
+    wait_for_visible(&mut pty, &mut parser, "Ask Golutra");
+    submit(&mut pty, &mut parser, prompt);
+    wait_for_visible(&mut pty, &mut parser, "完整恢复");
+    parser.process(&pty.collect_for(Duration::from_millis(500)));
+    pty.write("保留草稿".as_bytes());
+    parser.process(&pty.collect_for(Duration::from_millis(200)));
+    for (width, height) in [(24, 12), (70, 24), (18, 8), (140, 40), (32, 16), (140, 40)] {
+        pty.resize(width, height);
+        parser.screen_mut().set_size(height, width);
+        parser.process(&pty.collect_for(Duration::from_millis(350)));
+        if width == 140 {
+            let text = all_terminal_rows(&mut parser);
+            for source in [
+                prompt,
+                answer,
+                "Tip: Use /help to view commands and interaction options.",
+                "██████╗   ██████╗",
+            ] {
+                assert_eq!(
+                    text.matches(source).count(),
+                    1,
+                    "source must be rerendered once: {source:?}\n{text}"
+                );
+            }
+            assert!(parser.screen().contents().contains("› 保留草稿"));
+            assert!(!text.contains("Updated response"), "{text}");
+        }
+    }
+    pty.write(b"\x15");
+    submit(&mut pty, &mut parser, "/quit");
+    assert!(pty.wait().1.success());
+}
+
 fn assert_once_in_order(text: &str, needles: &[String]) {
-    assert_message_spacing(text);
     assert_eq!(
         text.matches("SHELL_HISTORY_MARKER").count(),
         1,
@@ -456,6 +498,63 @@ fn assert_once_in_order(text: &str, needles: &[String]) {
         1,
         "launch command must survive:\n{text}"
     );
+    assert_app_history_once_in_order(text, needles);
+}
+
+#[test]
+fn resize_during_stream_repairs_final_source_once_without_repeating_messages() {
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let paragraphs = (1..=30)
+        .map(|n| {
+            format!("Paragraph {n:03}: 中文 and words must return to their original wide layout.")
+        })
+        .collect::<Vec<_>>();
+    let (server, release) = FixtureServer::with_held_first_stream(vec![format!(
+        "{}\n\nFINAL_RESIZE_MARKER",
+        paragraphs.join("\n\n")
+    )]);
+    server.install(home.path());
+    let mut pty = PtyHarness::spawn_configured(home.path(), workspace.path(), 140, 30, true);
+    let mut parser = ScreenModel::new(30, 140);
+    wait_for_visible(&mut pty, &mut parser, "Ask Golutra");
+    submit(&mut pty, &mut parser, "Resize streaming regression");
+    wait_for_visible(&mut pty, &mut parser, "Paragraph 001");
+    submit(&mut pty, &mut parser, "/status");
+    for (width, height) in [(22, 12), (60, 24), (140, 30)] {
+        pty.resize(width, height);
+        parser.screen_mut().set_size(height, width);
+        parser.process(&pty.collect_for(Duration::from_millis(350)));
+    }
+    wait_for_visible(&mut pty, &mut parser, "FINAL_RESIZE_MARKER");
+    assert_eq!(server.completed_streams.load(Ordering::Acquire), 0);
+    release.store(true, Ordering::Release);
+    parser.process(&pty.collect_for(Duration::from_millis(1000)));
+    let text = all_terminal_rows(&mut parser);
+    assert_reflowed_once_in_order(&text, &paragraphs);
+    assert_eq!(
+        text.matches("› Resize streaming regression").count(),
+        1,
+        "{text}"
+    );
+    assert_eq!(text.matches("• Status").count(), 1, "{text}");
+    assert_eq!(text.matches("FINAL_RESIZE_MARKER").count(), 1, "{text}");
+    assert!(!text.contains("Updated response"), "{text}");
+    let idle = pty.collect_for(Duration::from_millis(500));
+    assert!(!idle.windows(4).any(|bytes| bytes == b"\x1b[3J"));
+    submit(&mut pty, &mut parser, "/quit");
+    assert!(pty.wait().1.success());
+}
+
+fn assert_reflowed_once_in_order(text: &str, needles: &[String]) {
+    // Reflow replaces terminal scrollback with source-backed application history.
+    assert!(!text.contains("SHELL_HISTORY_MARKER"), "{text}");
+    assert!(!text.contains("START_COMMAND_MARKER"), "{text}");
+    assert_app_history_once_in_order(text, needles);
+}
+
+fn assert_app_history_once_in_order(text: &str, needles: &[String]) {
+    assert_message_spacing(text);
     let mut previous = 0;
     for needle in needles {
         assert_eq!(
@@ -674,7 +773,7 @@ fn slash_suggestions_expand_inline_complete_and_restore_history() {
     pty.write(b"\r");
     parser.process(&pty.collect_for(Duration::from_millis(500)));
     assert!(parser.screen().contents().contains("• Status"));
-    assert_once_in_order(&all_terminal_rows(&mut parser), &markers);
+    assert_reflowed_once_in_order(&all_terminal_rows(&mut parser), &markers);
     pty.write(b"/re\t");
     parser.process(&pty.collect_for(Duration::from_millis(350)));
     assert!(parser.screen().contents().contains("› /resume"));
@@ -689,7 +788,7 @@ fn slash_suggestions_expand_inline_complete_and_restore_history() {
         parser.screen().mouse_protocol_mode(),
         vt100::MouseProtocolMode::None
     );
-    assert_once_in_order(&all_terminal_rows(&mut parser), &markers);
+    assert_reflowed_once_in_order(&all_terminal_rows(&mut parser), &markers);
     submit(&mut pty, &mut parser, "/quit");
     assert!(pty.wait().1.success());
 }
@@ -980,10 +1079,68 @@ fn streaming_with_suggestions_and_status_preserves_every_message_once() {
 }
 
 #[test]
+fn open_code_fence_archives_complete_lines_before_provider_completion() {
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let markers = (0..60)
+        .map(|i| format!("CODE_LINE_{i:03}"))
+        .collect::<Vec<_>>();
+    let (server, release) =
+        FixtureServer::with_held_first_stream(vec![format!("```text\n{}\n", markers.join("\n"))]);
+    server.install(home.path());
+    let mut pty = PtyHarness::spawn_configured(home.path(), workspace.path(), 100, 24, true);
+    let mut parser = ScreenModel::new(24, 100);
+    wait_for_visible(&mut pty, &mut parser, "pty-model");
+    submit(&mut pty, &mut parser, "stream a long code block");
+    wait_for_visible(&mut pty, &mut parser, "CODE_LINE_059");
+    assert_eq!(server.completed_streams.load(Ordering::Acquire), 0);
+    assert!(!parser.screen().contents().contains("CODE_LINE_000"));
+    assert_once_in_order(&all_terminal_rows(&mut parser), &markers);
+    release.store(true, Ordering::Release);
+    wait_for_idle_reply(&mut pty, &mut parser, "CODE_LINE_059");
+    assert_once_in_order(&all_terminal_rows(&mut parser), &markers);
+    submit(&mut pty, &mut parser, "/quit");
+    assert!(pty.wait().1.success());
+}
+
+#[test]
+fn large_paste_is_compact_but_provider_receives_the_full_text() {
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    let server = FixtureServer::new(vec!["PASTE_ACCEPTED".into()]);
+    server.install(home.path());
+    let mut pty = PtyHarness::spawn_configured(home.path(), workspace.path(), 100, 24, true);
+    let mut parser = ScreenModel::new(24, 100);
+    wait_for_visible(&mut pty, &mut parser, "pty-model");
+    let pasted = format!("{}END_OF_PASTED_TEXT", "中文 paste payload\n".repeat(100));
+    pty.write(format!("\x1b[200~{pasted}\x1b[201~").as_bytes());
+    wait_for_visible(&mut pty, &mut parser, "[Pasted Content");
+    assert!(!parser.screen().contents().contains("END_OF_PASTED_TEXT"));
+    pty.write(b"\r");
+    wait_for_idle_reply(&mut pty, &mut parser, "PASTE_ACCEPTED");
+    let requests = server.requests.lock().unwrap();
+    let body = requests.last().unwrap().to_string();
+    assert!(body.contains("END_OF_PASTED_TEXT"));
+    assert!(!body.contains("[Pasted Content"));
+    assert!(
+        requests.last().unwrap()["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["role"] == "user"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains(&pasted)))
+    );
+    drop(requests);
+    submit(&mut pty, &mut parser, "/quit");
+    assert!(pty.wait().1.success());
+}
+
+#[test]
 fn completed_fullscreen_height_stream_does_not_leave_a_page_gap() {
     let home = tempdir().unwrap();
     let workspace = tempdir().unwrap();
-    // 单个长代码块在完成前全部属于活动尾部；完成后一次归档，不能继续为旧尾部保留一整屏。
     let markers = (1..=100)
         .map(|n| format!("TAIL_{n:03}"))
         .collect::<Vec<_>>();
@@ -1057,7 +1214,7 @@ fn compact_anchor_survives_completion_input_shrink_and_height_only_resize() {
         parser.process(&pty.collect_for(Duration::from_millis(800)));
         assert_idle_composer_compact(&parser, false);
         let text = all_terminal_rows(&mut parser);
-        assert_once_in_order(&text, &markers);
+        assert_reflowed_once_in_order(&text, &markers);
         assert_eq!(text.matches("• Status").count(), 1, "{text}");
     }
     submit(&mut pty, &mut parser, "/resume");
@@ -1068,7 +1225,7 @@ fn compact_anchor_survives_completion_input_shrink_and_height_only_resize() {
     pty.write(b"\x1b");
     parser.process(&pty.collect_for(Duration::from_millis(800)));
     assert_idle_composer_compact(&parser, false);
-    assert_once_in_order(&all_terminal_rows(&mut parser), &markers);
+    assert_reflowed_once_in_order(&all_terminal_rows(&mut parser), &markers);
     submit(&mut pty, &mut parser, "/quit");
     assert!(pty.wait().1.success());
 }
@@ -1170,12 +1327,12 @@ fn inline_scrollback_preserves_long_cjk_responses_prompts_and_status() {
     pty.resize(80, 30);
     parser.screen_mut().set_size(30, 80);
     parser.process(&pty.collect_for(Duration::from_millis(800)));
-    assert_once_in_order(&all_terminal_rows(&mut parser), &expected);
+    assert_reflowed_once_in_order(&all_terminal_rows(&mut parser), &expected);
     submit(&mut pty, &mut parser, "/resume");
     parser.process(&pty.collect_for(Duration::from_millis(500)));
     pty.write(b"\x1b");
     parser.process(&pty.collect_for(Duration::from_millis(500)));
-    assert_once_in_order(&all_terminal_rows(&mut parser), &expected);
+    assert_reflowed_once_in_order(&all_terminal_rows(&mut parser), &expected);
     submit(&mut pty, &mut parser, "/quit");
     let (_, status) = pty.wait();
     assert!(status.success());
@@ -1236,7 +1393,7 @@ fn status_during_stream_stays_between_the_same_paragraphs_after_resize() {
     parser.screen_mut().set_size(28, 72);
     parser.process(&pty.collect_for(Duration::from_millis(800)));
     let after = all_terminal_rows(&mut parser);
-    assert_once_in_order(&after, &markers);
+    assert_reflowed_once_in_order(&after, &markers);
     assert_eq!(after.matches("• Status").count(), 1);
     let status_offset = after.find("• Status").unwrap();
     assert_eq!(
@@ -1518,7 +1675,7 @@ fn narration_and_real_tool_results_remain_in_order_without_raw_file_previews() {
     assert!(!all_terminal_rows(&mut parser).contains("RAW_HTML_SHOULD_STAY_IN_DETAILS"));
     pty.write(b"\x15");
     parser.process(&pty.collect_for(Duration::from_millis(200)));
-    assert_once_in_order(
+    assert_reflowed_once_in_order(
         &all_terminal_rows(&mut parser),
         &[
             "› 检查两个文件".to_owned(),
@@ -1530,18 +1687,6 @@ fn narration_and_real_tool_results_remain_in_order_without_raw_file_previews() {
     assert_eq!(
         parser.screen().mouse_protocol_mode(),
         vt100::MouseProtocolMode::None
-    );
-    assert_eq!(
-        all_terminal_rows(&mut parser)
-            .matches("SHELL_HISTORY_MARKER")
-            .count(),
-        1
-    );
-    assert_eq!(
-        all_terminal_rows(&mut parser)
-            .matches("START_COMMAND_MARKER")
-            .count(),
-        1
     );
     pty.write(b"\x0f");
     parser.process(&pty.collect_for(Duration::from_millis(200)));
@@ -1604,6 +1749,8 @@ fn output_arriving_in_tool_details_is_archived_once_after_return() {
     assert!(!parser.screen().contents().contains("WHILE_DETAILS_DONE"));
     pty.write(b"\x1b");
     wait_for_visible(&mut pty, &mut parser, "WHILE_DETAILS_DONE");
+    // The history marker can arrive in a PTY chunk before the same frame's composer.
+    wait_for_visible(&mut pty, &mut parser, "pty-model");
     assert!(!parser.screen().alternate_screen());
     let text = all_terminal_rows(&mut parser);
     assert_once_in_order(&text, &markers);
@@ -2085,7 +2232,7 @@ fn auth_keeps_fullscreen_keyboard_navigation_and_native_mouse_selection() {
 }
 
 #[test]
-fn native_mouse_and_shell_prefix_survive_draft_growth_and_fullscreen_picker() {
+fn native_mouse_survives_draft_growth_resize_and_fullscreen_picker() {
     let home = tempdir().unwrap();
     let workspace = tempdir().unwrap();
     let server = FixtureServer::new(vec![]);
@@ -2107,7 +2254,7 @@ fn native_mouse_and_shell_prefix_survive_draft_growth_and_fullscreen_picker() {
     pty.resize(100, 36);
     parser.screen_mut().set_size(36, 100);
     parser.process(&pty.collect_for(Duration::from_millis(500)));
-    assert_once_in_order(&all_terminal_rows(&mut parser), &[]);
+    assert_reflowed_once_in_order(&all_terminal_rows(&mut parser), &[]);
     submit(&mut pty, &mut parser, "/help");
     parser.process(&pty.collect_for(Duration::from_millis(400)));
     assert!(parser.screen().alternate_screen());
@@ -2122,7 +2269,7 @@ fn native_mouse_and_shell_prefix_survive_draft_growth_and_fullscreen_picker() {
         parser.screen().mouse_protocol_mode(),
         vt100::MouseProtocolMode::None
     );
-    assert_once_in_order(&all_terminal_rows(&mut parser), &[]);
+    assert_reflowed_once_in_order(&all_terminal_rows(&mut parser), &[]);
     submit(&mut pty, &mut parser, "/terminal true");
     // 登录 shell 的初始化耗时取决于宿主环境；恢复 composer 后再检查归档，不能采样挂起帧。
     wait_for_visible(&mut pty, &mut parser, "Ask Golutra");
@@ -2130,7 +2277,7 @@ fn native_mouse_and_shell_prefix_survive_draft_growth_and_fullscreen_picker() {
         parser.screen().mouse_protocol_mode(),
         vt100::MouseProtocolMode::None
     );
-    assert_once_in_order(&all_terminal_rows(&mut parser), &[]);
+    assert_reflowed_once_in_order(&all_terminal_rows(&mut parser), &[]);
     submit(&mut pty, &mut parser, "/quit");
     assert!(pty.wait().1.success());
 }

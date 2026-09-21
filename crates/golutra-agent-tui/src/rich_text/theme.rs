@@ -6,7 +6,11 @@ use ratatui::style::{Color, Modifier, Style};
 use super::model::{InlineStyle, InlineTone};
 
 pub(super) fn body() -> Style {
-    Style::default().fg(Color::White)
+    Style::default().fg(if crate::terminal_appearance::current().light {
+        Color::Black
+    } else {
+        Color::White
+    })
 }
 
 pub(super) fn heading(level: HeadingLevel) -> Style {
@@ -60,26 +64,6 @@ pub(super) fn diff_addition() -> Style {
 
 pub(super) fn diff_deletion() -> Style {
     Style::default().fg(Color::Red)
-}
-
-pub(super) fn code_comment() -> Style {
-    muted()
-}
-
-pub(super) fn code_string() -> Style {
-    Style::default().fg(Color::Green)
-}
-
-pub(super) fn code_punctuation() -> Style {
-    Style::default().fg(Color::Gray)
-}
-
-pub(super) fn code_keyword() -> Style {
-    accent().add_modifier(Modifier::BOLD)
-}
-
-pub(super) fn code_number() -> Style {
-    Style::default().fg(Color::Magenta)
 }
 
 pub(super) fn inline(base: Style, semantic: InlineStyle) -> Style {

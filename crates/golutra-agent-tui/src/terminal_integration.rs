@@ -73,8 +73,12 @@ impl<W: Write> Backend for ContiguousCrosstermBackend<W> {
         let mut underline = Color::Reset;
         let mut modifier = Modifier::empty();
         let mut previous_end = None;
+        let appearance = crate::terminal_appearance::current();
 
         for (x, y, cell) in content {
+            let cell_fg = appearance.color(cell.fg);
+            let cell_bg = appearance.color(cell.bg);
+            let cell_underline = appearance.color(cell.underline_color);
             // `insert_before` draws the complete temporary buffer, including the reset cell
             // covered by a preceding wide grapheme. That cell is not a terminal character and
             // writing it would erase the grapheme's second column in scrollback.
@@ -97,20 +101,20 @@ impl<W: Write> Backend for ContiguousCrosstermBackend<W> {
                 .queue(&mut self.writer)?;
                 modifier = cell.modifier;
             }
-            if cell.fg != foreground || cell.bg != background {
+            if cell_fg != foreground || cell_bg != background {
                 queue!(
                     self.writer,
-                    SetColors(Colors::new(cell.fg.into(), cell.bg.into()))
+                    SetColors(Colors::new(cell_fg.into(), cell_bg.into()))
                 )?;
-                foreground = cell.fg;
-                background = cell.bg;
+                foreground = cell_fg;
+                background = cell_bg;
             }
-            if cell.underline_color != underline {
+            if cell_underline != underline {
                 queue!(
                     self.writer,
-                    SetUnderlineColor(CrosstermColor::from(cell.underline_color))
+                    SetUnderlineColor(CrosstermColor::from(cell_underline))
                 )?;
-                underline = cell.underline_color;
+                underline = cell_underline;
             }
             queue!(self.writer, Print(cell.symbol()))?;
         }
@@ -341,17 +345,21 @@ pub(crate) fn restored_inline_viewport(saved: Option<Rect>, size: Size) -> Rect 
     Rect::new(0, saved.y.min(max_y), width, height)
 }
 
-pub(crate) fn clear_inline_region(
+/// ANSI cannot selectively replace application-owned scrollback. As in Codex, purge it
+/// before replaying source-backed history; otherwise stale wrapped rows survive above the screen.
+pub(crate) fn rebuild_inline_history_terminal(
     terminal: &mut InteractiveTerminal,
-    start: u16,
-    height: u16,
 ) -> io::Result<()> {
     let size = terminal.size()?;
+    let height = terminal.current_buffer_mut().area.height;
+    terminal
+        .backend_mut()
+        .write_all(b"\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[3J\x1b[H")?;
     terminal.restore_inline(Rect::new(
         0,
-        start,
+        0,
         size.width,
-        height.max(1).min(size.height.saturating_sub(start).max(1)),
+        height.max(1).min(size.height.max(1)),
     ))
 }
 

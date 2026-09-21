@@ -97,7 +97,7 @@ impl PtyHarness {
         }
         command.env("TERM", "xterm-256color");
         // 样式验收不继承 CI/执行器的 NO_COLOR；生产程序仍尊重用户终端配置。
-        command.env("NO_COLOR", "");
+        command.env_remove("NO_COLOR");
         let child = pair.slave.spawn_command(command).expect("spawn TUI binary");
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader().expect("clone PTY reader");

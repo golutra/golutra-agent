@@ -6,8 +6,13 @@ use super::model::{
     InlineStyle, InlineTone, MarkdownBlock, MarkdownDocument, MarkdownList, MarkdownTable, RichText,
 };
 
+#[cfg(test)]
 pub(super) fn parse_markdown(source: &str) -> MarkdownDocument {
-    let mut parser = MarkdownParser::new();
+    parse_markdown_in(source, None)
+}
+
+pub(super) fn parse_markdown_in(source: &str, cwd: Option<&std::path::Path>) -> MarkdownDocument {
+    let mut parser = MarkdownParser::new(cwd);
     for event in Parser::new_ext(source, super::markdown_options()) {
         parser.event(event);
     }
@@ -23,17 +28,17 @@ pub(super) struct StreamDocument {
     pub(super) last_block_start: Option<usize>,
 }
 
-pub(super) fn parse_stream(source: &str) -> StreamDocument {
+pub(super) fn parse_stream(source: &str, cwd: Option<&std::path::Path>) -> StreamDocument {
     let events = Parser::new_ext(source, super::markdown_options());
     let mut source_wide = events.reference_definitions().iter().next().is_some();
-    let mut parser = MarkdownParser::new();
+    let mut parser = MarkdownParser::new(cwd);
     let mut depth = 0usize;
     let mut stable_source_len = 0;
     let mut stable_blocks = 0;
     let mut last_block_start = None;
     let complete_line_end = source.rfind('\n').unwrap_or(0);
     for (event, range) in events.into_offset_iter() {
-        if depth == 0 && matches!(event, Event::Start(_)) {
+        if depth == 0 && matches!(event, Event::Start(_) | Event::Rule) {
             last_block_start = Some(range.start);
         }
         if depth == 0
@@ -96,6 +101,7 @@ struct LinkState {
     destination: String,
     label: String,
     image: bool,
+    runs: Vec<(String, InlineStyle)>,
 }
 
 struct TableBuilder {
@@ -165,6 +171,7 @@ impl TableBuilder {
 }
 
 struct MarkdownParser {
+    cwd: Option<std::path::PathBuf>,
     containers: Vec<Container>,
     inline: Option<InlineBuilder>,
     code: Option<CodeBuilder>,
@@ -174,8 +181,9 @@ struct MarkdownParser {
 }
 
 impl MarkdownParser {
-    fn new() -> Self {
+    fn new(cwd: Option<&std::path::Path>) -> Self {
         Self {
+            cwd: cwd.map(std::path::Path::to_owned),
             containers: vec![Container::Root(Vec::new())],
             inline: None,
             code: None,
@@ -273,6 +281,7 @@ impl MarkdownParser {
                     destination: dest_url.into_string(),
                     label: String::new(),
                     image: false,
+                    runs: Vec::new(),
                 });
                 self.styles.push(InlineStyle::tone(InlineTone::Link));
             }
@@ -285,6 +294,7 @@ impl MarkdownParser {
                     destination: dest_url.into_string(),
                     label: String::new(),
                     image: true,
+                    runs: Vec::new(),
                 });
                 self.styles.push(InlineStyle::tone(InlineTone::Image));
             }
@@ -445,23 +455,45 @@ impl MarkdownParser {
         let Some(link) = self.links.pop() else {
             return;
         };
+        let target = (!link.image)
+            .then(|| super::local_links::display_target(&link.destination, self.cwd.as_deref()))
+            .flatten();
+        let redundant = target
+            .as_ref()
+            .is_some_and(|_| super::local_links::redundant_label(&link.label, &link.destination));
+        if !redundant {
+            for (text, style) in &link.runs {
+                self.append_text(text, *style);
+            }
+        }
         if link.image {
             let style = self
                 .current_style()
                 .patch(InlineStyle::tone(InlineTone::Image));
             self.append_text("]", style);
         }
-        if !link.destination.is_empty() && link.label.trim() != link.destination {
+        if redundant {
+            let style = link
+                .runs
+                .first()
+                .map_or_else(|| self.current_style(), |(_, style)| *style);
+            self.append_text(target.as_deref().unwrap_or(&link.destination), style);
+        } else if !link.destination.is_empty() && link.label.trim() != link.destination {
             let style = self
                 .current_style()
                 .patch(InlineStyle::tone(InlineTone::Link));
-            self.append_text(&format!(" ({})", link.destination), style);
+            self.append_text(
+                &format!(" ({})", target.as_deref().unwrap_or(&link.destination)),
+                style,
+            );
         }
     }
 
     fn append_text(&mut self, value: &str, style: InlineStyle) {
         if let Some(link) = self.links.last_mut() {
             link.label.push_str(value);
+            link.runs.push((value.to_owned(), style));
+            return;
         }
         if let Some(table) = &mut self.table {
             table
