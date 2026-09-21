@@ -29,6 +29,7 @@ pub(crate) async fn handle_auth_dialog_key(
             if let Some(dialog) = &mut app.auth_dialog {
                 dialog.go_back();
             }
+            app.cancel_auth_model_discovery();
         }
         KeyCode::Up | KeyCode::Char('k') => {
             if let Some(dialog) = &mut app.auth_dialog {
@@ -381,6 +382,14 @@ pub(crate) async fn advance_auth_dialog(
     {
         dialog.scroll = 0;
         dialog.manual_scroll = false;
+    }
+    if app
+        .auth_dialog
+        .as_ref()
+        .is_none_or(|dialog| dialog.step != AuthDialogStep::Model)
+    {
+        // 手填后继续无需等待维护轮询，更不能让目录请求延迟确认保存或实际推理。
+        app.cancel_auth_model_discovery();
     }
     if matches!(
         previous_step,

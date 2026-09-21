@@ -460,14 +460,11 @@ fn auth_interactive_line_indexes(dialog: &AuthDialogState) -> Vec<(usize, usize)
         AuthDialogStep::ThirdPartyChoice => (2_usize, THIRD_PARTY_PROVIDER_PRESETS.len()),
         AuthDialogStep::AuthMethod => (2_usize, dialog.auth_method_count()),
         AuthDialogStep::Protocol => (2_usize, dialog.protocol_options().len()),
-        AuthDialogStep::Model if !dialog.model_options().is_empty() => {
-            (3_usize, dialog.custom_model_index().saturating_add(1))
-        }
+        AuthDialogStep::Model => (3_usize, dialog.model_options().len().saturating_add(1)),
         AuthDialogStep::AdvancedConfig => (2_usize, AUTH_ADVANCED_ITEMS),
         AuthDialogStep::BaseUrl
         | AuthDialogStep::ApiKey
         | AuthDialogStep::EnvKey
-        | AuthDialogStep::Model
         | AuthDialogStep::Review => return Vec::new(),
     };
     (0..count)
@@ -700,9 +697,12 @@ pub(crate) fn protocol_option_text(protocol: ProviderProtocol) -> (&'static str,
 }
 
 pub(crate) fn auth_model_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
-    let upstream = dialog
-        .provider
-        .is_some_and(|provider| provider.source == AuthProviderSource::Official);
+    let upstream = dialog.provider.is_some_and(|provider| {
+        matches!(
+            provider.source,
+            AuthProviderSource::Official | AuthProviderSource::Custom
+        )
+    });
     let mut lines = vec![Line::from(vec![Span::styled(
         auth_step_title(dialog),
         Style::default()
@@ -710,64 +710,37 @@ pub(crate) fn auth_model_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
             .add_modifier(Modifier::BOLD),
     )])];
     lines.push(Line::from(""));
-    if dialog.model_options().is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("Model: ", Style::default().fg(Color::Cyan)),
-            Span::styled(
-                if dialog.model.is_empty() {
-                    "model id, for example gpt-4.1 or qwen-coder".to_owned()
-                } else {
-                    dialog.model.clone()
-                },
-                Style::default().fg(if dialog.model.is_empty() {
-                    Color::DarkGray
-                } else {
-                    Color::White
-                }),
-            ),
-        ]));
-    } else {
-        lines.push(Line::from(Span::styled(
-            if upstream {
-                "Available models from provider"
-            } else {
-                "Recommended models"
-            },
-            Style::default().fg(Color::DarkGray),
-        )));
-        lines.extend(
-            dialog
-                .model_options()
-                .iter()
-                .enumerate()
-                .map(|(index, model)| {
-                    auth_option_line(
-                        index,
-                        model,
-                        if upstream {
-                            ""
-                        } else {
-                            "built-in recommendation"
-                        },
-                        index == dialog.selected,
-                    )
-                }),
-        );
-        let custom_value = if dialog.model.is_empty() {
-            "type a custom model id"
-        } else {
-            dialog.model.as_str()
-        };
-        lines.push(auth_option_line(
-            dialog.custom_model_index(),
-            "Custom model",
-            custom_value,
-            dialog.is_custom_model_selected(),
-        ));
-    }
+    lines.push(Line::from(Span::styled(
+        "Model",
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(auth_option_line(
+        dialog.custom_model_index(),
+        "Custom model",
+        &dialog.model,
+        dialog.is_custom_model_selected(),
+    ));
+    lines.extend(
+        dialog
+            .model_options()
+            .iter()
+            .enumerate()
+            .map(|(index, model)| {
+                auth_option_line(
+                    index + 1,
+                    model,
+                    if upstream {
+                        "from provider"
+                    } else {
+                        "built-in recommendation"
+                    },
+                    index + 1 == dialog.selected,
+                )
+            }),
+    );
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "Enter continue   Type to use custom model   Esc back",
+        "Type a model ID   Up/Down select   Enter continue   Esc back",
         Style::default().fg(Color::DarkGray),
     )));
     let discovery_message = match &dialog.model_discovery {

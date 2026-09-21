@@ -1,19 +1,47 @@
-//! 读取 OpenAI 格式的模型目录；只做发现，不推断模型能力，也不验证推理请求。
+//! 按已选协议读取模型目录；只做可跳过的发现，不推断模型能力或验证推理请求。
 
 use std::{collections::HashSet, time::Duration};
 
 use serde::Deserialize;
 
-use crate::validate_openai_base_url;
+use crate::{ProviderProtocol, validate_provider_base_url};
 
 // 模型发现是可跳过的向导步骤，不能像长程推理一样无限等待或读取无限响应。
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CATALOG_BYTES: usize = 1024 * 1024;
 
-/// 从 API 基址的 `/models` 读取模型 ID，保留上游顺序并去重。
-/// 使用 Bearer Key，不跟随重定向；失败消息不包含密钥、URL 或上游响应正文。
-pub async fn discover_openai_models(base_url: &str, api_key: &str) -> Result<Vec<String>, String> {
-    let base = validate_openai_base_url(base_url)
+/// 按 OpenAI Chat/Responses、Anthropic 或 Gemini 协议读取 `/models` 返回的模型 ID。
+/// 不支持目录的协议返回错误，调用方应允许手动填写；不跟随重定向或泄露凭据。
+pub async fn discover_provider_models(
+    protocol: ProviderProtocol,
+    base_url: &str,
+    api_key: &str,
+) -> Result<Vec<String>, String> {
+    discover_provider_models_with_client_builder(
+        protocol,
+        base_url,
+        api_key,
+        reqwest::Client::builder(),
+    )
+    .await
+}
+
+/// 使用调用方的代理/TLS 配置读取目录；仍强制限制总时长、响应大小和重定向。
+/// 本地集成测试可传入 `Client::builder().no_proxy()`，避免依赖宿主系统代理。
+pub async fn discover_provider_models_with_client_builder(
+    protocol: ProviderProtocol,
+    base_url: &str,
+    api_key: &str,
+    client_builder: reqwest::ClientBuilder,
+) -> Result<Vec<String>, String> {
+    if matches!(
+        protocol,
+        ProviderProtocol::VertexAi | ProviderProtocol::Genai
+    ) {
+        // Vertex 的项目模型资源与生成模型 ID 不等价；Genai 在选择模型前没有确定协议。
+        return Err("Automatic model discovery is unavailable for this protocol".to_owned());
+    }
+    let base = validate_provider_base_url(protocol, base_url)
         .map_err(|_| "Invalid model catalog base URL".to_owned())?;
     if api_key.trim().is_empty() {
         return Err("API key is empty".to_owned());
@@ -21,34 +49,38 @@ pub async fn discover_openai_models(base_url: &str, api_key: &str) -> Result<Vec
     tokio::time::timeout(DISCOVERY_TIMEOUT, async {
         // macOS 系统代理读取可能同步阻塞。隔离客户端初始化，并将其纳入总时限；
         // 取消后即使系统读取尚未结束，也不会发送 Key（闭包只创建无凭据客户端）。
-        let client = tokio::task::spawn_blocking(|| catalog_client_builder().build())
-            .await
-            .map_err(|_| "Model catalog client initialization was interrupted".to_owned())?
-            .map_err(|_| "Cannot initialize model catalog client".to_owned())?;
-        fetch_models(&client, &base, api_key).await
+        let client = tokio::task::spawn_blocking(move || {
+            client_builder
+                .timeout(DISCOVERY_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+        })
+        .await
+        .map_err(|_| "Model catalog client initialization was interrupted".to_owned())?
+        .map_err(|_| "Cannot initialize model catalog client".to_owned())?;
+        fetch_models(&client, protocol, &base, api_key).await
     })
     .await
     .map_err(|_| "Model catalog request timed out".to_owned())?
 }
 
-fn catalog_client_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
-        .timeout(DISCOVERY_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
-}
-
 async fn fetch_models(
     client: &reqwest::Client,
+    protocol: ProviderProtocol,
     base: &str,
     api_key: &str,
 ) -> Result<Vec<String>, String> {
-    let mut response = client
+    let request = client
         .get(format!("{base}/models"))
-        .bearer_auth(api_key)
-        .header(reqwest::header::ACCEPT, "application/json")
-        .send()
-        .await
-        .map_err(discovery_http_error)?;
+        .header(reqwest::header::ACCEPT, "application/json");
+    let request = match protocol {
+        ProviderProtocol::Anthropic => request
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01"),
+        ProviderProtocol::Gemini => request.header("x-goog-api-key", api_key),
+        _ => request.bearer_auth(api_key),
+    };
+    let mut response = request.send().await.map_err(discovery_http_error)?;
     if !response.status().is_success() {
         return Err(format!("Model catalog returned HTTP {}", response.status()));
     }
@@ -66,7 +98,7 @@ async fn fetch_models(
         }
         bytes.extend_from_slice(&chunk);
     }
-    parse_models(&bytes)
+    parse_models(protocol, &bytes)
 }
 
 fn discovery_http_error(error: reqwest::Error) -> String {
@@ -79,7 +111,7 @@ fn discovery_http_error(error: reqwest::Error) -> String {
     }
 }
 
-fn parse_models(bytes: &[u8]) -> Result<Vec<String>, String> {
+fn parse_models(protocol: ProviderProtocol, bytes: &[u8]) -> Result<Vec<String>, String> {
     #[derive(Deserialize)]
     struct Catalog {
         data: Vec<Model>,
@@ -88,14 +120,40 @@ fn parse_models(bytes: &[u8]) -> Result<Vec<String>, String> {
     struct Model {
         id: String,
     }
-    let catalog: Catalog = serde_json::from_slice(bytes)
-        .map_err(|_| "Model catalog is not valid OpenAI models JSON".to_owned())?;
+    #[derive(Deserialize)]
+    struct GeminiCatalog {
+        models: Vec<GeminiModel>,
+    }
+    #[derive(Deserialize)]
+    struct GeminiModel {
+        name: String,
+    }
+    let ids: Vec<String> = if protocol == ProviderProtocol::Gemini {
+        let catalog: GeminiCatalog = serde_json::from_slice(bytes)
+            .map_err(|_| "Model catalog is not valid Gemini models JSON".to_owned())?;
+        catalog
+            .models
+            .into_iter()
+            .map(|model| {
+                model
+                    .name
+                    .trim()
+                    .strip_prefix("models/")
+                    .unwrap_or(model.name.trim())
+                    .to_owned()
+            })
+            .collect()
+    } else {
+        let catalog: Catalog = serde_json::from_slice(bytes).map_err(|_| {
+            "Model catalog is not valid models JSON (expected data[].id)".to_owned()
+        })?;
+        catalog.data.into_iter().map(|model| model.id).collect()
+    };
     let mut seen = HashSet::new();
-    Ok(catalog
-        .data
+    Ok(ids
         .into_iter()
         .filter_map(|model| {
-            let id = model.id.trim();
+            let id = model.trim();
             if id.is_empty() || id.chars().any(char::is_control) || !seen.insert(id.to_owned()) {
                 None
             } else {
@@ -162,6 +220,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_catalog_uses_each_protocol_endpoint_headers_and_ids() {
+        for (protocol, suffix, path, header, body, expected) in [
+            (
+                ProviderProtocol::OpenAiResponses,
+                "/v1/responses",
+                "/v1/models",
+                "authorization: bearer fake-secret\r\n",
+                r#"{"data":[{"id":"response-model"}]}"#,
+                "response-model",
+            ),
+            (
+                ProviderProtocol::Anthropic,
+                "/v1/messages",
+                "/v1/models",
+                "x-api-key: fake-secret\r\n",
+                r#"{"data":[{"id":"anthropic-model"}]}"#,
+                "anthropic-model",
+            ),
+            (
+                ProviderProtocol::Gemini,
+                "",
+                "/v1beta/models",
+                "x-goog-api-key: fake-secret\r\n",
+                r#"{"models":[{"name":"models/gemini-model"},{"name":"models/gemini-model"}]}"#,
+                "gemini-model",
+            ),
+        ] {
+            let (base, task) = server(response("200 OK", body)).await;
+            let models = discover_provider_models_with_client_builder(
+                protocol,
+                &format!("{base}{suffix}"),
+                "fake-secret",
+                reqwest::Client::builder().no_proxy(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(models, [expected]);
+            let request = task.await.unwrap().to_ascii_lowercase();
+            assert!(
+                request.starts_with(&format!("get {path} http/1.1\r\n")),
+                "{request}"
+            );
+            assert!(request.contains(header));
+            if protocol == ProviderProtocol::Anthropic {
+                assert!(request.contains("anthropic-version: 2023-06-01\r\n"));
+            }
+            if protocol != ProviderProtocol::OpenAiResponses {
+                assert!(!request.contains("authorization:"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn model_catalog_unsupported_protocols_return_without_network() {
+        for protocol in [ProviderProtocol::VertexAi, ProviderProtocol::Genai] {
+            let error = discover_provider_models(protocol, "http://127.0.0.1:1", "fake-secret")
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error,
+                "Automatic model discovery is unavailable for this protocol"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn model_catalog_reports_http_and_format_failures_without_echoing_secrets() {
         for (status, body, expected) in [
             ("401 Unauthorized", "fake-secret", "HTTP 401"),
@@ -169,12 +293,12 @@ mod tests {
             (
                 "200 OK",
                 "<html>fake-secret</html>",
-                "not valid OpenAI models JSON",
+                "not valid models JSON",
             ),
             (
                 "200 OK",
                 r#"{"models":["fake-secret"]}"#,
-                "not valid OpenAI models JSON",
+                "not valid models JSON",
             ),
         ] {
             let (base, task) = server(response(status, body)).await;
@@ -183,7 +307,11 @@ mod tests {
             assert!(!error.contains("fake-secret"));
             task.await.unwrap();
         }
-        assert!(parse_models(br#"{"data":[]}"#).unwrap().is_empty());
+        assert!(
+            parse_models(ProviderProtocol::OpenAiCompatible, br#"{"data":[]}"#)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -220,18 +348,27 @@ mod tests {
             .timeout(Duration::from_millis(100))
             .build()
             .unwrap();
-        let error = fetch_models(&client, &base, "fake-secret")
-            .await
-            .unwrap_err();
+        let error = fetch_models(
+            &client,
+            ProviderProtocol::OpenAiCompatible,
+            &base,
+            "fake-secret",
+        )
+        .await
+        .unwrap_err();
         task.abort();
         let _ = task.await;
         assert!(error.contains("timed out"));
     }
 
-    // 本地网络格式测试不依赖系统代理扫描耗时；TUI 集成测试仍验证公开入口。
+    // 公开入口的本地网络测试显式直连，避免依赖系统代理扫描耗时。
     async fn discover_local_models(base: &str) -> Result<Vec<String>, String> {
-        let base = validate_openai_base_url(base)?;
-        let client = catalog_client_builder().no_proxy().build().unwrap();
-        fetch_models(&client, &base, "fake-secret").await
+        discover_provider_models_with_client_builder(
+            ProviderProtocol::OpenAiCompatible,
+            base,
+            "fake-secret",
+            reqwest::Client::builder().no_proxy(),
+        )
+        .await
     }
 }

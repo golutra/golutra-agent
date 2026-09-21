@@ -43,6 +43,7 @@ unicode-width.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+reqwest.workspace = true
 golutra-agent-app-server = { path = "../golutra-agent-app-server", version = "0.3.2" }
 portable-pty = "0.9"
 vt100 = "0.16"

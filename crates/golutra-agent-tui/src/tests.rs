@@ -742,6 +742,13 @@ async fn auth_dialog_openai_flow_persists_user_key() {
     })
     .await
     .expect("model discovery");
+    handle_auth_dialog_key(
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         app.auth_dialog
             .as_ref()

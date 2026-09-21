@@ -32,7 +32,7 @@ mod response_contract;
 mod transport_error;
 
 pub use genai_adapter::{GenaiProviderAdapter, GenaiProviderConfig};
-pub use model_catalog::discover_openai_models;
+pub use model_catalog::{discover_provider_models, discover_provider_models_with_client_builder};
 pub use openai_responses::{OpenAiResponsesProvider, OpenAiResponsesProviderConfig};
 pub(crate) use provider_config::{
     apply_generation_config_to_openai_body, cache_capabilities_from_reader,
