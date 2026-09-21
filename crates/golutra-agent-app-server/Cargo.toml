@@ -20,11 +20,11 @@ chrono.workspace = true
 clap.workspace = true
 fs2.workspace = true
 futures-util.workspace = true
-golutra-agent-client = { path = "../golutra-agent-client", version = "0.3.3" }
+golutra-agent-client = { path = "../golutra-agent-client", version = "0.3.4" }
 golutra-agent-core.workspace = true
-golutra-agent-config = { path = "../golutra-agent-config", version = "0.3.3" }
+golutra-agent-config = { path = "../golutra-agent-config", version = "0.3.4" }
 golutra-agent-protocol.workspace = true
-golutra-agent-store = { path = "../golutra-agent-store", version = "0.3.3" }
+golutra-agent-store = { path = "../golutra-agent-store", version = "0.3.4" }
 miette.workspace = true
 secrecy.workspace = true
 serde.workspace = true

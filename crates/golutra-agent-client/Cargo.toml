@@ -20,19 +20,19 @@ futures-util.workspace = true
 fs2.workspace = true
 jsonschema.workspace = true
 golutra-agent-core.workspace = true
-golutra-agent-config = { path = "../golutra-agent-config", version = "0.3.3" }
-golutra-agent-context = { path = "../golutra-agent-context", version = "0.3.3" }
-golutra-agent-eval = { path = "../golutra-agent-eval", version = "0.3.3" }
-golutra-agent-evolution = { path = "../golutra-agent-evolution", version = "0.3.3" }
-golutra-agent-llm = { path = "../golutra-agent-llm", version = "0.3.3" }
-golutra-agent-memory = { path = "../golutra-agent-memory", version = "0.3.3" }
-golutra-agent-mcp = { path = "../golutra-agent-mcp", version = "0.3.3" }
-golutra-agent-policy = { path = "../golutra-agent-policy", version = "0.3.3" }
-golutra-agent-plugin = { path = "../golutra-agent-plugin", version = "0.3.3" }
+golutra-agent-config = { path = "../golutra-agent-config", version = "0.3.4" }
+golutra-agent-context = { path = "../golutra-agent-context", version = "0.3.4" }
+golutra-agent-eval = { path = "../golutra-agent-eval", version = "0.3.4" }
+golutra-agent-evolution = { path = "../golutra-agent-evolution", version = "0.3.4" }
+golutra-agent-llm = { path = "../golutra-agent-llm", version = "0.3.4" }
+golutra-agent-memory = { path = "../golutra-agent-memory", version = "0.3.4" }
+golutra-agent-mcp = { path = "../golutra-agent-mcp", version = "0.3.4" }
+golutra-agent-policy = { path = "../golutra-agent-policy", version = "0.3.4" }
+golutra-agent-plugin = { path = "../golutra-agent-plugin", version = "0.3.4" }
 golutra-agent-protocol.workspace = true
-golutra-agent-runtime = { path = "../golutra-agent-runtime", version = "0.3.3" }
-golutra-agent-store = { path = "../golutra-agent-store", version = "0.3.3" }
-golutra-agent-tools = { path = "../golutra-agent-tools", version = "0.3.3" }
+golutra-agent-runtime = { path = "../golutra-agent-runtime", version = "0.3.4" }
+golutra-agent-store = { path = "../golutra-agent-store", version = "0.3.4" }
+golutra-agent-tools = { path = "../golutra-agent-tools", version = "0.3.4" }
 reqwest.workspace = true
 ring.workspace = true
 secrecy.workspace = true
@@ -52,4 +52,4 @@ walkdir.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
-golutra-agent-auth = { path = "../golutra-agent-auth", version = "0.3.3" }
+golutra-agent-auth = { path = "../golutra-agent-auth", version = "0.3.4" }

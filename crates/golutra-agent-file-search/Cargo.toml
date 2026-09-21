@@ -14,7 +14,7 @@ categories.workspace = true
 
 [dependencies]
 golutra-agent-core.workspace = true
-golutra-agent-policy = { path = "../golutra-agent-policy", version = "0.3.3" }
+golutra-agent-policy = { path = "../golutra-agent-policy", version = "0.3.4" }
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true

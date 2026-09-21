@@ -1,6 +1,6 @@
 {
   "name": "@golutra/agent-sdk",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "private": true,
   "description": "TypeScript client for the Golutra Agent runtime protocol",
   "license": "Apache-2.0",

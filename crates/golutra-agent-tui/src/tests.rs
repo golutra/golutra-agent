@@ -3147,12 +3147,70 @@ fn debug_history_pairs_transcript_with_its_observation_in_terminal_scrollback() 
             .iter()
             .find(|row| row.contains("facts events=36"))
             .expect("expanded facts in terminal scrollback");
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Facts snapshot (at history load)"))
+        );
         let facts_column = facts.find("facts events=36").expect("facts column");
         assert_eq!(
             display_width(&facts[..facts_column]),
             usize::from(transcript_width),
             "{width}: {facts:?}"
         );
+    }
+}
+
+#[test]
+fn debug_observation_history_has_no_blank_rows_between_log_events() {
+    for body_view_mode in [BodyViewMode::Split, BodyViewMode::Developer] {
+        let session_id = SessionId::new();
+        let task_id = TaskId::new();
+        let mut app = TuiApp::new(
+            ThreadId::new(),
+            session_id,
+            Some(task_id),
+            true,
+            "mock".into(),
+            None,
+        );
+        app.body_view_mode = body_view_mode;
+        app.events = (1..=20)
+            .map(|sequence| {
+                transcript_event(
+                    sequence,
+                    session_id,
+                    task_id,
+                    RuntimeEventType::StepStarted,
+                    json!({"summary":"runtime step started"}),
+                )
+            })
+            .collect();
+        app.developer_projection = Some(debug_projection_with_events(
+            session_id,
+            Some(task_id),
+            app.events.clone(),
+        ));
+        app.enable_inline_history();
+        let mut terminal = Terminal::with_options(
+            TestBackend::new(120, 160),
+            TerminalOptions {
+                viewport: Viewport::Inline(12),
+            },
+        )
+        .unwrap();
+        let mut history = InlineHistoryState::new(session_id);
+        history.flush(&mut terminal, &mut app).unwrap();
+        let rows = terminal_buffer_display_rows(&terminal);
+        let start = rows
+            .iter()
+            .position(|line| line.contains("#1 StepStarted/Runtime"))
+            .unwrap();
+        for index in 0..20 {
+            assert!(
+                rows[start + index].contains(&format!("#{} StepStarted/Runtime", index + 1)),
+                "{rows:#?}"
+            );
+        }
     }
 }
 
@@ -3180,6 +3238,12 @@ fn debug_split_history_keeps_both_columns_inside_equal_halves() {
                 "{width}: {text:?}"
             );
             let boundary = usize::from(transcript_width);
+            assert!(
+                text[boundary - 2..boundary]
+                    .chars()
+                    .all(|character| character == ' '),
+                "debug panes need a gutter: {text:?}"
+            );
             let transcript_has_content = text[..boundary].contains('L');
             let observation_has_content = text[boundary..].contains('R');
             assert!(

@@ -37,6 +37,18 @@ impl TranscriptTail {
         target.extend_from_slice(fragment);
         self.observe(last, event_id);
     }
+
+    pub(crate) fn append_contiguous(
+        &mut self,
+        target: &mut Vec<Line<'static>>,
+        fragment: &[Line<'static>],
+        event_id: Option<EventId>,
+    ) {
+        if let Some(last) = fragment.last() {
+            target.extend_from_slice(fragment);
+            self.observe(last, event_id);
+        }
+    }
 }
 
 fn blank_line(line: &Line<'_>) -> bool {
