@@ -1722,6 +1722,31 @@ fn auth_credential_shortcut_saves_disk_or_env_without_storage_page() {
         wait_for_visible(&mut pty, &mut parser, "Step 4/6");
         submit(&mut pty, &mut parser, "gpt-golden");
         wait_for_visible(&mut pty, &mut parser, "Step 5/6");
+        wait_for_visible(&mut pty, &mut parser, "> 1 Continue");
+        if !environment {
+            // 真正的终端字节覆盖双向调整、Enter 编辑和 Esc 保留草稿；不修改时直接继续。
+            pty.write(b"\x1b[B\r");
+            wait_for_visible(&mut pty, &mut parser, "enabled");
+            pty.write(b"\x1b[B\r\x1b[C\x1b[C\x1b[D\x1b[C");
+            wait_for_visible(&mut pty, &mut parser, "high");
+            pty.write(b"\x1b[B\r");
+            wait_for_visible(&mut pty, &mut parser, "Enter/Esc keep edit");
+            pty.write(b"128000\x1b");
+            wait_for_visible(&mut pty, &mut parser, "Enter change/continue");
+            assert!(parser.screen().contents().contains("128000"));
+            pty.write(b"\x1b[B\r");
+            wait_for_visible(&mut pty, &mut parser, "Enter/Esc keep edit");
+            submit(&mut pty, &mut parser, "8192");
+            wait_for_visible(&mut pty, &mut parser, "Enter change/continue");
+            pty.write(b"\x1b[B\r");
+            wait_for_visible(&mut pty, &mut parser, "Enter/Esc keep edit");
+            submit(&mut pty, &mut parser, "X-Client=jk-test");
+            wait_for_visible(&mut pty, &mut parser, "Enter change/continue");
+            for _ in 0..5 {
+                pty.write(b"\x1b[A");
+            }
+            wait_for_visible(&mut pty, &mut parser, "> 1 Continue");
+        }
         pty.write(b"\r");
         wait_for_visible(&mut pty, &mut parser, "Review provider setup");
         assert!(!parser.screen().contents().contains(secret));
@@ -1739,6 +1764,21 @@ fn auth_credential_shortcut_saves_disk_or_env_without_storage_page() {
             .find(|profile| profile.name == "custom")
             .unwrap();
         let source = &profile.credential_ref.as_ref().unwrap().source;
+        if environment {
+            assert!(profile.generation_config.is_none());
+            assert!(profile.custom_headers.is_empty());
+        } else {
+            let generation = profile.generation_config.as_ref().unwrap();
+            assert!(generation.enable_thinking);
+            assert_eq!(
+                generation.reasoning_effort,
+                Some(golutra_agent_llm::ProviderReasoningEffort::High)
+            );
+            assert_eq!(generation.context_window_size, Some(128000));
+            assert_eq!(generation.max_tokens, Some(8192));
+            assert_eq!(profile.custom_headers.len(), 1);
+            assert_eq!(profile.custom_headers[0].name, "X-Client");
+        }
         if environment {
             assert!(
                 matches!(source, CredentialSource::Environment { key } if key == "GOLUTRA_AGENT_PTY_TEST_KEY")

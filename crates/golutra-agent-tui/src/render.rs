@@ -797,58 +797,69 @@ pub(crate) fn auth_advanced_config_lines(dialog: &AuthDialogState) -> Vec<Line<'
         Line::from(""),
         auth_option_line(
             0,
+            "Continue",
+            "Review provider setup",
+            dialog.advanced_selected == 0,
+        ),
+        auth_option_line(
+            1,
             "Thinking",
             if dialog.enable_thinking {
                 "enabled"
             } else {
                 "default"
             },
-            dialog.advanced_selected == 0,
-        ),
-        auth_option_line(
-            1,
-            "Reasoning effort",
-            reasoning_effort_label(dialog.reasoning_effort),
             dialog.advanced_selected == 1,
         ),
         auth_option_line(
             2,
-            "Context window",
-            if dialog.context_window_size.is_empty() {
-                "default"
-            } else {
-                dialog.context_window_size.as_str()
-            },
+            "Reasoning effort",
+            reasoning_effort_label(dialog.reasoning_effort),
             dialog.advanced_selected == 2,
         ),
         auth_option_line(
             3,
-            "Max output tokens",
-            if dialog.max_tokens.is_empty() {
-                "default"
-            } else {
-                dialog.max_tokens.as_str()
-            },
+            "Context window",
+            dialog
+                .advanced_text_value(3)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("default"),
             dialog.advanced_selected == 3,
         ),
         auth_option_line(
             4,
-            "Custom headers",
-            if dialog.custom_headers.is_empty() {
-                "none"
-            } else {
-                dialog.custom_headers.as_str()
-            },
+            "Max output tokens",
+            dialog
+                .advanced_text_value(4)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("default"),
             dialog.advanced_selected == 4,
+        ),
+        auth_option_line(
+            5,
+            "Custom headers",
+            dialog
+                .advanced_text_value(5)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("none"),
+            dialog.advanced_selected == 5,
         ),
         Line::from(""),
         Line::from(Span::styled(
-            "Up/Down select   Space toggle/cycle   Enter continue   Esc back",
+            auth_advanced_help(dialog),
             Style::default().fg(Color::DarkGray),
         )),
     ];
     push_auth_error(&mut lines, dialog.error.as_deref());
     lines
+}
+
+fn auth_advanced_help(dialog: &AuthDialogState) -> &'static str {
+    if dialog.advanced_input.is_some() {
+        "Enter/Esc keep edit   Left/Right cursor   Ctrl+U clear"
+    } else {
+        "Up/Down select   Enter change/continue   Left/Right adjust   Esc back"
+    }
 }
 
 pub(crate) fn auth_review_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
@@ -2729,6 +2740,9 @@ pub(crate) fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
                     "Enter continue   Ctrl+E use environment variable   Esc back"
                 }
                 Some(AuthDialogStep::EnvKey) => "Enter continue   Ctrl+E use API key   Esc back",
+                Some(AuthDialogStep::AdvancedConfig) => {
+                    auth_advanced_help(app.auth_dialog.as_ref().expect("auth dialog"))
+                }
                 _ => "Provider setup   Enter continue   Esc back   Ctrl+C twice quit",
             })
         }
@@ -2770,9 +2784,17 @@ pub(crate) fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
         ])]
     } else if surface == Some(OverlaySurface::Auth) {
         let dialog = app.auth_dialog.as_ref().expect("auth surface");
+        let text = if let Some(input) = &dialog.advanced_input {
+            input
+                .viewport(area.width.saturating_sub(COMPOSER_PREFIX_WIDTH), 1)
+                .lines
+                .join("")
+        } else {
+            auth_composer_line(dialog)
+        };
         vec![Line::from(vec![
             Span::styled(composer_prefix, Style::default().fg(palette.accent)),
-            Span::styled(auth_composer_line(dialog), composer_style(app)),
+            Span::styled(text, composer_style(app)),
         ])]
     } else if surface == Some(OverlaySurface::Approval) {
         vec![Line::from(vec![
@@ -2949,7 +2971,14 @@ pub(crate) fn composer_cursor_position(area: Rect, app: &TuiApp) -> Option<(u16,
     let text_width = area.width.saturating_sub(COMPOSER_PREFIX_WIDTH).max(1);
     let activity_rows = u16::from(live_status_text(app, usize::from(area.width)).is_some());
     let cursor = match app.overlay_surface() {
-        Some(OverlaySurface::Auth) => auth_cursor_column(app.auth_dialog.as_ref()?)?,
+        Some(OverlaySurface::Auth) => {
+            let dialog = app.auth_dialog.as_ref()?;
+            if let Some(input) = &dialog.advanced_input {
+                input.viewport(text_width, 1).cursor.0
+            } else {
+                auth_cursor_column(dialog)?
+            }
+        }
         Some(_) => return None,
         None if app.transcript.search.is_some() => {
             let search = app.transcript.search.as_ref()?;
@@ -3196,6 +3225,9 @@ fn attachment_line(
 }
 
 pub(crate) fn auth_composer_line(dialog: &AuthDialogState) -> String {
+    if let Some(input) = &dialog.advanced_input {
+        return input.text().to_owned();
+    }
     match dialog.step {
         AuthDialogStep::GroupChoice => "Select provider group".to_owned(),
         AuthDialogStep::ThirdPartyChoice => "Select provider".to_owned(),
@@ -3217,7 +3249,8 @@ pub(crate) fn auth_composer_line(dialog: &AuthDialogState) -> String {
             .unwrap_or("Custom model")
             .to_owned(),
         AuthDialogStep::AdvancedConfig => match dialog.advanced_selected {
-            0 => format!(
+            0 => "Continue to review".to_owned(),
+            1 => format!(
                 "Thinking: {}",
                 if dialog.enable_thinking {
                     "enabled"
@@ -3225,25 +3258,25 @@ pub(crate) fn auth_composer_line(dialog: &AuthDialogState) -> String {
                     "default"
                 }
             ),
-            1 => format!(
+            2 => format!(
                 "Reasoning effort: {}",
                 reasoning_effort_label(dialog.reasoning_effort)
             ),
-            2 => {
+            3 => {
                 if dialog.context_window_size.is_empty() {
                     "Context window".to_owned()
                 } else {
                     dialog.context_window_size.clone()
                 }
             }
-            3 => {
+            4 => {
                 if dialog.max_tokens.is_empty() {
                     "Max output tokens".to_owned()
                 } else {
                     dialog.max_tokens.clone()
                 }
             }
-            4 => {
+            5 => {
                 if dialog.custom_headers.is_empty() {
                     "Name=Value; X-Api-Key=@ENV".to_owned()
                 } else {

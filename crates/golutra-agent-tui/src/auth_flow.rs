@@ -7,6 +7,13 @@ pub(crate) async fn handle_auth_dialog_key(
     app: &mut TuiApp,
     transport: &RuntimeTransport,
 ) -> miette::Result<()> {
+    if let Some(dialog) = app.auth_dialog.as_mut()
+        && dialog.step == AuthDialogStep::AdvancedConfig
+        && dialog.advanced_input.is_some()
+    {
+        handle_auth_advanced_editor_key(dialog, key);
+        return Ok(());
+    }
     let page = usize::from(app.layout.transcript.height.saturating_sub(1)).max(1);
     let max_scroll = app
         .auth_dialog
@@ -48,6 +55,13 @@ pub(crate) async fn handle_auth_dialog_key(
                 .and_then(AuthDialogState::current_input_mut)
             {
                 delete_last_grapheme(input);
+            }
+        }
+        KeyCode::Left | KeyCode::Right => {
+            if let Some(dialog) = &mut app.auth_dialog
+                && dialog.step == AuthDialogStep::AdvancedConfig
+            {
+                dialog.cycle_advanced_item(key.code == KeyCode::Right);
             }
         }
         KeyCode::Enter => {
@@ -143,7 +157,9 @@ pub(crate) fn auth_step_accepts_vim_selection_keys(dialog: &AuthDialogState) -> 
 
 pub(crate) fn handle_auth_dialog_character(dialog: &mut AuthDialogState, character: char) {
     if dialog.step == AuthDialogStep::AdvancedConfig {
-        handle_auth_advanced_character(dialog, character);
+        if character == ' ' {
+            dialog.cycle_advanced_item(true);
+        }
     } else if dialog.step == AuthDialogStep::Model {
         dialog.prepare_custom_model_input().push(character);
     } else if let Some(input) = dialog.current_input_mut() {
@@ -151,37 +167,50 @@ pub(crate) fn handle_auth_dialog_character(dialog: &mut AuthDialogState, charact
     }
 }
 
-pub(crate) fn handle_auth_advanced_character(dialog: &mut AuthDialogState, character: char) {
-    if dialog.advanced_selected == 4 {
-        dialog.custom_headers.push(character);
-        dialog.error = None;
+fn handle_auth_advanced_editor_key(dialog: &mut AuthDialogState, key: KeyEvent) {
+    if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+        dialog.finish_advanced_edit();
         return;
     }
-    match character {
-        ' ' => dialog.toggle_advanced_item(),
-        't' | 'T' => {
-            dialog.advanced_selected = 0;
-            dialog.toggle_advanced_item();
+    let input = dialog.advanced_input.as_mut().expect("advanced editor");
+    match key.code {
+        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            input.move_to_start()
         }
-        'r' | 'R' => {
-            dialog.advanced_selected = 1;
-            dialog.toggle_advanced_item();
+        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => input.move_to_end(),
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => input.clear(),
+        KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            input.delete_to_line_end()
         }
-        'c' | 'C' => {
-            dialog.advanced_selected = 2;
-            dialog.error = None;
+        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            input.delete_word_backward()
         }
-        'm' | 'M' => {
-            dialog.advanced_selected = 3;
-            dialog.error = None;
+        KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            input.undo();
         }
-        character if character.is_ascii_digit() => {
-            if let Some(input) = dialog.current_input_mut() {
-                input.push(character);
-            }
+        KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            input.redo();
+        }
+        KeyCode::Left => input.move_left(),
+        KeyCode::Right => input.move_right(),
+        KeyCode::Home => input.move_to_start(),
+        KeyCode::End => input.move_to_end(),
+        KeyCode::Backspace => input.delete_backward(),
+        KeyCode::Delete => input.delete_forward(),
+        KeyCode::Char(character)
+            if !key.modifiers.intersects(
+                KeyModifiers::CONTROL
+                    | KeyModifiers::ALT
+                    | KeyModifiers::SUPER
+                    | KeyModifiers::HYPER
+                    | KeyModifiers::META,
+            ) =>
+        {
+            input.insert_char(character);
         }
         _ => {}
     }
+    dialog.error = None;
 }
 
 pub(crate) async fn advance_auth_dialog(
@@ -310,9 +339,20 @@ pub(crate) async fn advance_auth_dialog(
                     AuthAdvanceAction::None
                 } else {
                     dialog.step = AuthDialogStep::AdvancedConfig;
+                    dialog.advanced_selected = 0;
+                    dialog.advanced_input = None;
                     dialog.error = None;
                     AuthAdvanceAction::None
                 }
+            }
+            AuthDialogStep::AdvancedConfig if dialog.advanced_input.is_some() => {
+                dialog.finish_advanced_edit();
+                AuthAdvanceAction::None
+            }
+            AuthDialogStep::AdvancedConfig if dialog.advanced_selected != 0 => {
+                dialog.cycle_advanced_item(true);
+                dialog.start_advanced_edit();
+                AuthAdvanceAction::None
             }
             AuthDialogStep::AdvancedConfig => {
                 match validate_generation_config(dialog).and_then(|_| build_auth_review(dialog)) {
