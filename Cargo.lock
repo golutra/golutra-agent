@@ -1274,7 +1274,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-app-server"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "async-stream",
  "axum",
@@ -1305,7 +1305,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-auth"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1327,7 +1327,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-cli"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "chrono",
  "clap",
@@ -1355,7 +1355,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-client"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1396,7 +1396,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-code-intelligence"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "chrono",
  "fs2",
@@ -1415,7 +1415,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-config"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "fs2",
  "golutra-agent-auth",
@@ -1431,7 +1431,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-context"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "chrono",
  "golutra-agent-core",
@@ -1444,7 +1444,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-core"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "chrono",
  "schemars 1.2.1",
@@ -1456,7 +1456,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-eval"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "chrono",
  "fs2",
@@ -1473,7 +1473,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-eval-model"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "chrono",
  "golutra-agent-core",
@@ -1485,7 +1485,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-eval-worker"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "chrono",
  "clap",
@@ -1500,14 +1500,14 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-event"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "golutra-agent-protocol",
 ]
 
 [[package]]
 name = "golutra-agent-evolution"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "chrono",
  "fs2",
@@ -1524,7 +1524,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-file-search"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "golutra-agent-core",
  "golutra-agent-policy",
@@ -1539,7 +1539,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-governor"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "golutra-agent-core",
  "schemars 1.2.1",
@@ -1548,7 +1548,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-llm"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1571,7 +1571,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-mcp"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "async-trait",
  "golutra-agent-core",
@@ -1589,7 +1589,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-memory"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "chrono",
  "fs2",
@@ -1604,7 +1604,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-plugin"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "chrono",
  "fs2",
@@ -1621,7 +1621,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-policy"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "golutra-agent-core",
  "shlex 1.3.0",
@@ -1633,7 +1633,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-project-service"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1651,7 +1651,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-protocol"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "chrono",
  "golutra-agent-core",
@@ -1664,7 +1664,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-protocol-fixtures"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "chrono",
  "golutra-agent-core",
@@ -1680,7 +1680,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-release"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "chrono",
  "fs2",
@@ -1699,7 +1699,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-runtime"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1732,7 +1732,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-sandbox"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -1742,7 +1742,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-store"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "chrono",
  "fs2",
@@ -1761,7 +1761,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-supervisor"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1787,7 +1787,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-test-client"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "chrono",
  "golutra-agent-client",
@@ -1801,7 +1801,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-tools"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1826,7 +1826,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-tui"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -1867,7 +1867,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-verify"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "chrono",
  "golutra-agent-core",
@@ -1875,7 +1875,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-vis"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "chrono",
  "clap",
