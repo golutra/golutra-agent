@@ -82,6 +82,7 @@ mod activity_view;
 mod activity_widget;
 mod approval_dialog;
 mod auth_flow;
+mod auth_models;
 mod auth_state;
 mod change_projection;
 mod composer_input;
@@ -376,6 +377,7 @@ struct TuiApp {
     export_operation: Option<PendingExportOperation>,
     auth_dialog: Option<AuthDialogState>,
     auth_operation: Option<PendingAuthOperation>,
+    auth_model_discovery: Option<PendingModelDiscovery>,
     input: ComposerInput,
     prompt_history: PromptHistory,
     history_search: Option<HistorySearchState>,
@@ -492,6 +494,10 @@ impl TuiApp {
     }
 
     pub(crate) async fn shutdown_pending_operations(&mut self) {
+        if let Some(pending) = self.auth_model_discovery.take() {
+            pending.task.abort();
+            let _ = pending.task.await;
+        }
         if let Some(operation) = self.auth_operation.take() {
             operation.cancellation.cancel();
             shutdown_join_handle(operation.task).await;
@@ -504,6 +510,9 @@ impl TuiApp {
 
 impl Drop for TuiApp {
     fn drop(&mut self) {
+        if let Some(pending) = self.auth_model_discovery.as_ref() {
+            pending.task.abort();
+        }
         // 正常退出由 shutdown_pending_operations 等待；Drop 只负责取消仍未交接的任务，
         // 避免 panic 或构造失败路径把 OAuth/export JoinHandle 变成 detached task。
         if let Some(operation) = self.auth_operation.as_ref() {
@@ -688,6 +697,7 @@ impl TuiApp {
             export_operation: None,
             auth_dialog,
             auth_operation: None,
+            auth_model_discovery: None,
             input: ComposerInput::default(),
             prompt_history: PromptHistory::default(),
             history_search: None,
@@ -5609,7 +5619,12 @@ fn handle_paste(pasted: &str, app: &mut TuiApp) {
         | Some(OverlaySurface::Dashboard) => return,
         Some(OverlaySurface::Auth) => {
             let dialog = app.auth_dialog.as_mut().expect("auth surface");
-            if let Some(input) = dialog.current_input_mut() {
+            let input = if dialog.step == AuthDialogStep::Model {
+                Some(dialog.prepare_custom_model_input())
+            } else {
+                dialog.current_input_mut()
+            };
+            if let Some(input) = input {
                 input.push_str(&normalized.replace('\n', ""));
                 dialog.error = None;
             }

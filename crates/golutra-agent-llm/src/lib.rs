@@ -25,12 +25,14 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 mod genai_adapter;
+mod model_catalog;
 mod openai_responses;
 mod provider_config;
 mod response_contract;
 mod transport_error;
 
 pub use genai_adapter::{GenaiProviderAdapter, GenaiProviderConfig};
+pub use model_catalog::discover_openai_models;
 pub use openai_responses::{OpenAiResponsesProvider, OpenAiResponsesProviderConfig};
 pub(crate) use provider_config::{
     apply_generation_config_to_openai_body, cache_capabilities_from_reader,
