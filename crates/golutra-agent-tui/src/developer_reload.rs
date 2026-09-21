@@ -53,6 +53,7 @@ impl TuiApp {
     pub(crate) fn cancel_history_reload(&mut self) {
         if self.history_reload.take().is_some() {
             self.transcript.history.replay_ready = true;
+            self.transcript.history.reflow_pending = false;
             self.status_message =
                 "history reload cancelled; retained history is still available".to_owned();
         }
@@ -92,6 +93,7 @@ impl TuiApp {
             }
             Err(error) => {
                 self.transcript.history.replay_ready = true;
+                self.transcript.history.reflow_pending = false;
                 self.status_message =
                     format!("history reload failed; retained history kept: {error}");
                 if self.debug_mode {
@@ -220,17 +222,20 @@ mod tests {
         let mut app = app();
         let first = event(&app, 1);
         app.replace_event_history(vec![first.clone()], false);
+        app.transcript.history.reflow_pending = true;
         install_pending(
             &mut app,
             tokio::spawn(async { Err("storage unavailable".to_owned()) }),
         );
         app.poll_history_reload(true).await;
+        assert!(!app.transcript.history.reflow_pending);
         assert_eq!(app.events, vec![first]);
         assert!(app.status_message.contains("storage unavailable"));
         install_pending(
             &mut app,
             tokio::spawn(std::future::pending::<ReloadResult>()),
         );
+        app.transcript.history.reflow_pending = true;
         let transport = RuntimeTransport::in_memory().await.unwrap();
         handle_key(
             KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
@@ -240,6 +245,7 @@ mod tests {
         .await
         .unwrap();
         assert!(app.history_reload.is_none());
+        assert!(!app.transcript.history.reflow_pending);
         assert_eq!(app.events.len(), 1);
         assert!(app.transcript.history.replay_ready);
     }
