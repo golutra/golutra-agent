@@ -35,8 +35,8 @@ pub(crate) fn render_diff_line(
 ) -> Option<Vec<Line<'static>>> {
     let (sign, number, content) = numbered_parts(value)?;
     let background = match sign {
-        '+' => Color::Rgb(33, 41, 34),
-        '-' => Color::Rgb(60, 23, 15),
+        '+' => super::terminal_appearance::current().diff_background(true),
+        '-' => super::terminal_appearance::current().diff_background(false),
         _ => Color::Reset,
     };
     let foreground = match sign {

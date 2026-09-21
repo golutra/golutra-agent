@@ -116,6 +116,7 @@ mod session;
 mod session_banner;
 mod settings;
 mod stream_commit;
+mod terminal_appearance;
 mod terminal_integration;
 mod tool_detail;
 mod tool_detail_data;
@@ -1341,12 +1342,14 @@ impl TuiApp {
                 }
                 RuntimeEventType::ProviderCompleted => {
                     self.render_metrics.record_stream_completed(turn_id);
+                    self.immediate_frame_pending = true;
                 }
                 RuntimeEventType::ProviderFailed if !event_type.is_task_terminal() => {
                     self.render_metrics.record_stream_ended(turn_id);
                 }
                 RuntimeEventType::AssistantMessage => {
                     self.render_metrics.record_final_message(turn_id);
+                    self.immediate_frame_pending = true;
                 }
                 _ if event_type.is_task_terminal() => {
                     self.render_metrics.record_stream_ended(turn_id);
@@ -4342,6 +4345,7 @@ async fn run_interactive(
     app.enable_inline_history();
     let (width, height) = crossterm::terminal::size()
         .map_err(|error| miette::miette!("read terminal size: {error}"))?;
+    terminal_appearance::initialize();
     let mut terminal = setup_terminal(inline_viewport_height(&app, width, height))?;
     let terminal_restore = TerminalRestoreCoordinator::new(false);
     let panic_restore = terminal_restore.clone();
@@ -4483,7 +4487,7 @@ async fn run_app(
                 if app.take_immediate_frame_request() {
                     app.render_metrics.request_immediate_at(now);
                 } else {
-                    app.render_metrics.request_at(now);
+                    app.render_metrics.request_provider_at(now);
                 }
             }
             fair_select::Ready::Second(terminal_event) => {
@@ -5796,7 +5800,7 @@ fn handle_paste(pasted: &str, app: &mut TuiApp) {
         return;
     }
 
-    app.input.insert_str(&normalized);
+    app.input.insert_paste(&normalized);
     app.reset_slash_selection();
     app.refresh_mention_completion();
     app.prompt_history.reset_navigation();

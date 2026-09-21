@@ -7,8 +7,8 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use super::{
-    code::highlight_code,
     model::{MarkdownBlock, MarkdownDocument, MarkdownList},
+    syntax::highlight,
     table::render_table,
     theme,
     wrap::{hard_wrap_spans, prefix_lines, wrap_rich_text},
@@ -192,6 +192,15 @@ pub(super) fn render_code_body(
     source: &str,
     width: usize,
 ) -> Vec<Line<'static>> {
+    render_code_body_from(language, source, 0, width)
+}
+
+pub(super) fn render_code_body_from(
+    language: Option<&str>,
+    source: &str,
+    offset: usize,
+    width: usize,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let code_prefix = if width >= 4 {
         "│ "
@@ -202,15 +211,15 @@ pub(super) fn render_code_body(
     };
     let prefix_width = UnicodeWidthStr::width(code_prefix);
     let content_width = width.saturating_sub(prefix_width).max(1);
-    let mut source_lines = source.split('\n').collect::<Vec<_>>();
-    if source_lines.last() == Some(&"") && source_lines.len() > 1 {
-        source_lines.pop();
+    let mut source_lines = highlight(source, language);
+    if source_lines.is_empty() && offset == 0 {
+        source_lines.push(Vec::new());
     }
-    if source_lines.is_empty() {
-        source_lines.push("");
-    }
-    for source_line in source_lines {
-        let highlighted = highlight_code(source_line, language);
+    let skip = source[..offset]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count();
+    for highlighted in source_lines.into_iter().skip(skip) {
         let wrapped = hard_wrap_spans(&highlighted, content_width);
         if prefix_width > 0 && width > prefix_width {
             lines.extend(prefix_lines(

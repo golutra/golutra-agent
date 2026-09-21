@@ -2044,7 +2044,20 @@ fn default_tool_preview(details: &[String], show_output: bool, running: bool) ->
                 .map(|line| format!("│ {line}")),
         );
         if output.len() > 5 {
-            preview.push("… more output · Ctrl+O to view".to_owned());
+            let tail = if running {
+                0
+            } else {
+                output.len().saturating_sub(5).min(5)
+            };
+            let omitted = output.len().saturating_sub(5 + tail);
+            if omitted > 0 {
+                preview.push(format!("… {omitted} more lines · Ctrl+O to view"));
+            }
+            preview.extend(
+                output[output.len() - tail..]
+                    .iter()
+                    .map(|line| format!("│ {line}")),
+            );
         }
     }
     preview
@@ -3030,6 +3043,43 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn command_preview_retains_the_first_and_last_output_lines() {
+        for count in [0_usize, 5, 6, 10, 11, 30] {
+            let mut details = vec!["cargo test".to_owned(), "Output".to_owned()];
+            details.extend((0..count).map(|i| format!("output-{i}")));
+            let preview = default_tool_preview(&details, true, false);
+            let output = preview
+                .iter()
+                .filter(|line| line.starts_with("│ "))
+                .cloned()
+                .collect::<Vec<_>>();
+            let expected = (0..count)
+                .filter(|i| *i < 5 || *i >= count.saturating_sub(5))
+                .map(|i| format!("│ output-{i}"))
+                .collect::<Vec<_>>();
+            assert_eq!(output, expected);
+            if count > 10 {
+                assert!(
+                    preview
+                        .iter()
+                        .any(|line| line.contains(&format!("{} more lines", count - 10)))
+                );
+            }
+            let running = default_tool_preview(&details, true, true);
+            assert_eq!(
+                running
+                    .iter()
+                    .filter(|line| line.starts_with("│ "))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                (count.saturating_sub(5)..count)
+                    .map(|i| format!("│ output-{i}"))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
 
     #[test]
     fn provider_recovery_events_have_distinct_user_facing_labels() {

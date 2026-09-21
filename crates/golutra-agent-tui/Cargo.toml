@@ -35,6 +35,9 @@ serde_json.workspace = true
 secrecy.workspace = true
 sha2.workspace = true
 shlex.workspace = true
+syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
+termbg = "0.6.2"
+supports-color = "3.0"
 tempfile.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

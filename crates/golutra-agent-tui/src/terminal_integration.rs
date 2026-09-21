@@ -73,8 +73,12 @@ impl<W: Write> Backend for ContiguousCrosstermBackend<W> {
         let mut underline = Color::Reset;
         let mut modifier = Modifier::empty();
         let mut previous_end = None;
+        let appearance = crate::terminal_appearance::current();
 
         for (x, y, cell) in content {
+            let cell_fg = appearance.color(cell.fg);
+            let cell_bg = appearance.color(cell.bg);
+            let cell_underline = appearance.color(cell.underline_color);
             // `insert_before` draws the complete temporary buffer, including the reset cell
             // covered by a preceding wide grapheme. That cell is not a terminal character and
             // writing it would erase the grapheme's second column in scrollback.
@@ -97,20 +101,20 @@ impl<W: Write> Backend for ContiguousCrosstermBackend<W> {
                 .queue(&mut self.writer)?;
                 modifier = cell.modifier;
             }
-            if cell.fg != foreground || cell.bg != background {
+            if cell_fg != foreground || cell_bg != background {
                 queue!(
                     self.writer,
-                    SetColors(Colors::new(cell.fg.into(), cell.bg.into()))
+                    SetColors(Colors::new(cell_fg.into(), cell_bg.into()))
                 )?;
-                foreground = cell.fg;
-                background = cell.bg;
+                foreground = cell_fg;
+                background = cell_bg;
             }
-            if cell.underline_color != underline {
+            if cell_underline != underline {
                 queue!(
                     self.writer,
-                    SetUnderlineColor(CrosstermColor::from(cell.underline_color))
+                    SetUnderlineColor(CrosstermColor::from(cell_underline))
                 )?;
-                underline = cell.underline_color;
+                underline = cell_underline;
             }
             queue!(self.writer, Print(cell.symbol()))?;
         }
