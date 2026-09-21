@@ -342,6 +342,16 @@ pub(crate) async fn advance_auth_dialog(
         dialog.scroll = 0;
         dialog.manual_scroll = false;
     }
+    if matches!(
+        previous_step,
+        Some(AuthDialogStep::ApiKey | AuthDialogStep::EnvKey)
+    ) && app
+        .auth_dialog
+        .as_ref()
+        .is_some_and(|dialog| dialog.step == AuthDialogStep::Model)
+    {
+        app.start_auth_model_discovery();
+    }
     match action {
         AuthAdvanceAction::None => {}
         AuthAdvanceAction::SaveMock => {

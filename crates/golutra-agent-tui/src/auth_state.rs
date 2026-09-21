@@ -10,8 +10,24 @@ use golutra_agent_llm::{ProviderGenerationConfig, ProviderProtocol, ProviderReas
 use golutra_agent_tui::{AuthCredentialStore, OpenAiCompatibleLogin};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use super::ResumeSelectionDirection;
+
+#[derive(Debug)]
+pub(crate) struct PendingModelDiscovery {
+    pub(crate) id: Uuid,
+    pub(crate) task: JoinHandle<Result<Vec<String>, String>>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) enum ModelDiscoveryState {
+    #[default]
+    Idle,
+    Loading(Uuid),
+    Ready,
+    Failed(String),
+}
 
 #[derive(Debug)]
 pub(crate) struct PendingAuthOperation {
@@ -44,6 +60,9 @@ pub(crate) struct AuthDialogState {
     pub(crate) protocol: ProviderProtocol,
     pub(crate) base_url: String,
     pub(crate) model: String,
+    pub(crate) models: Vec<String>,
+    pub(crate) model_discovery: ModelDiscoveryState,
+    pub(crate) manual_model_input: bool,
     pub(crate) api_key: String,
     pub(crate) api_key_env: String,
     pub(crate) credential_store: AuthCredentialStore,
@@ -149,6 +168,9 @@ impl AuthDialogState {
             protocol: ProviderProtocol::OpenAiCompatible,
             base_url: String::new(),
             model: String::new(),
+            models: Vec::new(),
+            model_discovery: ModelDiscoveryState::Idle,
+            manual_model_input: false,
             api_key: String::new(),
             api_key_env: String::new(),
             credential_store: default_auth_credential_store(),
@@ -188,6 +210,13 @@ impl AuthDialogState {
             .unwrap_or(ProviderProtocol::OpenAiCompatible);
         self.base_url = provider.base_url.unwrap_or_default().to_owned();
         self.model = provider.model.unwrap_or_default().to_owned();
+        self.models = provider
+            .recommended_models
+            .iter()
+            .map(|model| (*model).to_owned())
+            .collect();
+        self.model_discovery = ModelDiscoveryState::Idle;
+        self.manual_model_input = false;
         self.api_key.clear();
         self.api_key_env.clear();
         self.credential_store = default_auth_credential_store();
@@ -282,18 +311,16 @@ impl AuthDialogState {
         }
     }
 
-    pub(crate) fn model_options(&self) -> &'static [&'static str] {
-        self.provider
-            .map(|provider| provider.recommended_models)
-            .unwrap_or(&[])
+    pub(crate) fn model_options(&self) -> &[String] {
+        &self.models
     }
 
     pub(crate) fn custom_model_index(&self) -> usize {
         self.model_options().len()
     }
 
-    pub(crate) fn selected_recommended_model(&self) -> Option<&'static str> {
-        self.model_options().get(self.selected).copied()
+    pub(crate) fn selected_recommended_model(&self) -> Option<&str> {
+        self.model_options().get(self.selected).map(String::as_str)
     }
 
     pub(crate) fn is_custom_model_selected(&self) -> bool {
@@ -379,7 +406,10 @@ impl AuthDialogState {
             AuthDialogStep::BaseUrl => Some(&mut self.base_url),
             AuthDialogStep::ApiKey => Some(&mut self.api_key),
             AuthDialogStep::EnvKey => Some(&mut self.api_key_env),
-            AuthDialogStep::Model if self.is_custom_model_selected() => Some(&mut self.model),
+            AuthDialogStep::Model if self.is_custom_model_selected() => {
+                self.manual_model_input = true;
+                Some(&mut self.model)
+            }
             AuthDialogStep::AdvancedConfig => match self.advanced_selected {
                 2 => Some(&mut self.context_window_size),
                 3 => Some(&mut self.max_tokens),
@@ -397,18 +427,16 @@ impl AuthDialogState {
 
     pub(crate) fn prepare_custom_model_input(&mut self) -> &mut String {
         let was_custom_model_selected = self.is_custom_model_selected();
-        let model_matches_preset = self
-            .model_options()
-            .iter()
-            .any(|model| *model == self.model)
+        let model_matches_preset = self.model_options().contains(&self.model)
             || self
                 .provider
                 .and_then(|provider| provider.model)
                 .is_some_and(|model| model == self.model);
         self.selected = self.custom_model_index();
-        if !was_custom_model_selected || model_matches_preset {
+        if !was_custom_model_selected || (!self.manual_model_input && model_matches_preset) {
             self.model.clear();
         }
+        self.manual_model_input = true;
         self.error = None;
         &mut self.model
     }
@@ -435,6 +463,8 @@ impl AuthDialogState {
             },
             AuthDialogStep::ApiKey | AuthDialogStep::EnvKey => AuthDialogStep::BaseUrl,
             AuthDialogStep::Model => {
+                // 退回凭据页即使随后再次进入，也不能接受旧 Key 发起的目录请求。
+                self.model_discovery = ModelDiscoveryState::Idle;
                 if self.credential_store == AuthCredentialStore::Environment {
                     AuthDialogStep::EnvKey
                 } else {
@@ -467,7 +497,6 @@ pub(crate) const CUSTOM_PROTOCOL_OPTIONS: &[ProviderProtocol] = &[
     ProviderProtocol::VertexAi,
     ProviderProtocol::Genai,
 ];
-pub(crate) const OFFICIAL_MODELS: &[&str] = &["gpt-test", "gpt-4.1", "qwen-coder-plus"];
 pub(crate) const OPENAI_MODELS: &[&str] = &["gpt-5.5", "gpt-5.4", "gpt-4.1"];
 pub(crate) const OPENROUTER_MODELS: &[&str] = &[
     "openai/gpt-4.1",
@@ -492,8 +521,8 @@ pub(crate) const OFFICIAL_PROVIDER_PRESET: AuthProviderPreset = AuthProviderPres
     source: AuthProviderSource::Official,
     protocol_options: OPENAI_PROTOCOL_ONLY,
     base_url: Some("https://api.golutra.cn/v1"),
-    model: Some("gpt-test"),
-    recommended_models: OFFICIAL_MODELS,
+    model: None,
+    recommended_models: &[],
     oauth_provider_id: None,
     api_key_supported: true,
 };

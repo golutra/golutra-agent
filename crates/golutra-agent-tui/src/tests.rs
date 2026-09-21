@@ -20,6 +20,9 @@ mod history_test_backend;
 #[path = "pending_input_tests.rs"]
 mod pending_input_tests;
 
+#[path = "auth_model_tests.rs"]
+mod auth_model_tests;
+
 #[test]
 fn remote_subcommand_is_an_explicit_app_server_transport() {
     let args = Args::try_parse_from([
@@ -719,7 +722,6 @@ async fn auth_dialog_openai_flow_persists_user_key() {
         dialog.provider = Some(OFFICIAL_PROVIDER_PRESET);
         dialog.step = AuthDialogStep::BaseUrl;
         dialog.base_url = base_url;
-        dialog.model = "qwen-coder".to_owned();
         dialog.api_key = "test-key".to_owned();
     }
 
@@ -729,10 +731,21 @@ async fn auth_dialog_openai_flow_persists_user_key() {
     advance_auth_dialog(&mut app, &transport)
         .await
         .expect("api key");
-    {
-        let dialog = app.auth_dialog.as_mut().expect("dialog");
-        dialog.selected = dialog.custom_model_index();
-    }
+    tokio::time::timeout(Duration::from_secs(12), async {
+        while app.auth_model_discovery.is_some() {
+            app.poll_auth_model_discovery().await;
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("model discovery");
+    assert_eq!(
+        app.auth_dialog
+            .as_ref()
+            .unwrap()
+            .selected_recommended_model(),
+        Some("qwen-coder")
+    );
     advance_auth_dialog(&mut app, &transport)
         .await
         .expect("model");
@@ -6396,7 +6409,12 @@ async fn auth_dialog_advances_for_native_custom_protocols() {
 #[test]
 fn auth_dialog_exposes_recommended_models_and_custom_input() {
     let mut dialog = AuthDialogState::new();
-    dialog.select_provider(OFFICIAL_PROVIDER_PRESET);
+    dialog.select_provider(
+        *THIRD_PARTY_PROVIDER_PRESETS
+            .iter()
+            .find(|preset| preset.profile == "openai")
+            .unwrap(),
+    );
     dialog.step = AuthDialogStep::Model;
     let lines = auth_model_lines(&dialog)
         .into_iter()
@@ -6404,7 +6422,7 @@ fn auth_dialog_exposes_recommended_models_and_custom_input() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(lines.contains("gpt-test"));
+    assert!(lines.contains("gpt-5.5"));
     assert!(lines.contains("Custom model"));
 }
 
@@ -10248,6 +10266,7 @@ async fn auth_dialog_defaults_to_key_and_toggles_environment_reference() {
     assert_eq!(dialog.step, AuthDialogStep::EnvKey);
     assert!(dialog.error.is_some());
     dialog.api_key_env = "MY_CUSTOM_API_KEY".to_owned();
+    dialog.model = "explicit-model".to_owned();
 
     let review = build_auth_review(dialog).expect("review");
     assert_eq!(review.credential, "env:MY_CUSTOM_API_KEY");

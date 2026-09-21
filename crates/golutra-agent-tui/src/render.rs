@@ -700,6 +700,9 @@ pub(crate) fn protocol_option_text(protocol: ProviderProtocol) -> (&'static str,
 }
 
 pub(crate) fn auth_model_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
+    let upstream = dialog
+        .provider
+        .is_some_and(|provider| provider.source == AuthProviderSource::Official);
     let mut lines = vec![Line::from(vec![Span::styled(
         auth_step_title(dialog),
         Style::default()
@@ -725,7 +728,11 @@ pub(crate) fn auth_model_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
         ]));
     } else {
         lines.push(Line::from(Span::styled(
-            "Recommended models",
+            if upstream {
+                "Available models from provider"
+            } else {
+                "Recommended models"
+            },
             Style::default().fg(Color::DarkGray),
         )));
         lines.extend(
@@ -737,7 +744,11 @@ pub(crate) fn auth_model_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
                     auth_option_line(
                         index,
                         model,
-                        "built-in recommendation",
+                        if upstream {
+                            ""
+                        } else {
+                            "built-in recommendation"
+                        },
                         index == dialog.selected,
                     )
                 }),
@@ -759,6 +770,18 @@ pub(crate) fn auth_model_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
         "Enter continue   Type to use custom model   Esc back",
         Style::default().fg(Color::DarkGray),
     )));
+    let discovery_message = match &dialog.model_discovery {
+        ModelDiscoveryState::Loading(_) => Some("Loading models from provider… You can also type a model now.".to_owned()),
+        ModelDiscoveryState::Ready if dialog.models.is_empty() => Some("Provider returned no models. Enter a model manually, or Esc to check your key and retry.".to_owned()),
+        ModelDiscoveryState::Failed(error) => Some(format!("{error}. Enter a model manually, or Esc to check your key and retry.")),
+        _ => None,
+    };
+    if let Some(message) = discovery_message {
+        lines.push(Line::from(Span::styled(
+            message,
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
     push_auth_error(&mut lines, dialog.error.as_deref());
     lines
 }
