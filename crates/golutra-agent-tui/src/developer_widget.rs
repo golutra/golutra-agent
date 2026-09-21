@@ -328,5 +328,59 @@ fn event_lines(
                 .map(|summary| Line::from(vec![Span::raw("  "), Span::raw(summary)])),
         );
     }
+    // Wrap before the scrollback renderer's cell-safe segmentation. Otherwise that renderer
+    // hard-splits ordinary words at the pane boundary ("receiv" / "ed"). No Markdown parsing:
+    // diagnostic paths, underscores and backticks must stay literal.
     lines
+        .into_iter()
+        .flat_map(|line| rich_text::wrap_plain_spans(&line.spans, content_width))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagnostic_wrapping_keeps_words_styles_and_literal_content() {
+        let palette = TuiPreferences::default().palette();
+        for width in [40, 60, 80] {
+            let summary = "runtime command durably received with `file_name` 中文诊断";
+            let lines = event_lines(
+                2602,
+                2602,
+                "CommandReceived/Runtime",
+                summary,
+                width,
+                true,
+                palette,
+            );
+            assert!(lines.iter().all(|line| line.width() <= width));
+            let text = lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            for word in ["runtime", "command", "durably", "received", "`file_name`"] {
+                assert!(text.lines().any(|line| line.contains(word)), "{text}");
+            }
+            let compact = |value: &str| {
+                value
+                    .chars()
+                    .filter(|ch| !ch.is_whitespace())
+                    .collect::<String>()
+            };
+            assert_eq!(
+                compact(&text),
+                compact(&format!("#2602 CommandReceived/Runtime {summary}"))
+            );
+            assert!(
+                lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .any(|span| span.content.contains("CommandReceived")
+                        && span.style.fg == Some(palette.warning))
+            );
+        }
+    }
 }

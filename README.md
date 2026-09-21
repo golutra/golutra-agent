@@ -60,7 +60,7 @@ through an explicit `ModelInputEnvelope`, and determines completion from a
 the UI, debugging, replay, evaluation, and controlled improvement without
 polluting the conversation with internal governance data.
 
-> Status: `0.3.3` is an early, actively evolving release. Runtime and protocol
+> Status: `0.3.4` is an early, actively evolving release. Runtime and protocol
 > APIs may change before a stable compatibility policy is published.
 
 ## English

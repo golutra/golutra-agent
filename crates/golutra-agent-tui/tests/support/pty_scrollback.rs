@@ -112,6 +112,22 @@ impl FixtureServer {
         protocol: ProviderProtocol,
         first_stream_release: Option<Arc<AtomicBool>>,
     ) -> Self {
+        Self::with_stream_interval(
+            responses,
+            error,
+            protocol,
+            first_stream_release,
+            Duration::from_millis(8),
+        )
+    }
+
+    fn with_stream_interval(
+        responses: Vec<(String, Vec<serde_json::Value>)>,
+        error: Option<serde_json::Value>,
+        protocol: ProviderProtocol,
+        first_stream_release: Option<Arc<AtomicBool>>,
+        interval: Duration,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/v1", listener.local_addr().unwrap());
         listener.set_nonblocking(true).unwrap();
@@ -243,7 +259,7 @@ impl FixtureServer {
                     }
                     let _ = socket.flush();
                     // 以流起点计时，避免 macOS 每帧调度超时累计成几十秒的夹具延迟。
-                    let due = stream_started + Duration::from_millis(8 * (index as u64 + 1));
+                    let due = stream_started + interval * (index as u32 + 1);
                     if let Some(remaining) = due.checked_duration_since(Instant::now()) {
                         thread::sleep(remaining);
                     }
@@ -1805,6 +1821,111 @@ fn auth_credential_shortcut_saves_disk_or_env_without_storage_page() {
     }
     submit(&mut pty, &mut parser, "/quit");
     assert!(pty.wait().1.success());
+}
+
+#[test]
+fn debug_before_first_token_keeps_one_reply_in_live_view_and_scrollback() {
+    for expanded in [true, false] {
+        let home = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let answer = "Hi! I'm Golutra, ready to help with the project in golutra-agent. What would you like to work on — a bug fix, a new feature, refactoring, tests, or a question about the codebase?\n\n也可以用中文描述需要解决的问题。";
+        let release = Arc::new(AtomicBool::new(false));
+        let server = FixtureServer::with_stream_interval(
+            vec![(answer.into(), vec![])],
+            None,
+            ProviderProtocol::OpenAiCompatible,
+            Some(release.clone()),
+            Duration::from_millis(80),
+        );
+        server.install(home.path());
+        let mut pty = PtyHarness::spawn_configured(home.path(), workspace.path(), 120, 32, true);
+        let mut parser = ScreenModel::new(32, 120);
+        wait_for_visible(&mut pty, &mut parser, "pty-model");
+        if !expanded {
+            submit(&mut pty, &mut parser, "/debug switch");
+        }
+        submit(&mut pty, &mut parser, "/debug");
+        wait_for_visible(&mut pty, &mut parser, "Alt+D events");
+        submit(&mut pty, &mut parser, "hi");
+        wait_for_visible(&mut pty, &mut parser, "Hi! I'm");
+        wait_for_visible(&mut pty, &mut parser, "需要解决的问题。");
+        assert_eq!(
+            server.completed_streams.load(Ordering::Acquire),
+            0,
+            "text must be visible before completion"
+        );
+        let assert_reply = |parser: &mut ScreenModel| {
+            let text = all_terminal_rows(parser);
+            assert!(!text.contains("Updated response"), "{text}");
+            let left = text
+                .lines()
+                .map(|line| {
+                    let mut width = 0;
+                    line.chars()
+                        .take_while(|c| {
+                            width += c.width().unwrap_or(0);
+                            width <= 60
+                        })
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(left.matches("Hi! I'm").count(), 1, "{text}");
+            let compact = left
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect::<String>();
+            let expected = answer
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect::<String>();
+            assert!(
+                compact.contains(&expected),
+                "lost or duplicated reply:\n{text}"
+            );
+        };
+        assert_reply(&mut parser);
+        release.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            parser.process(&pty.collect_for(Duration::from_millis(50)));
+            let screen = parser.screen().contents();
+            if server.completed_streams.load(Ordering::Acquire) > 0
+                && screen.contains("Ask Golutra")
+                && !screen.contains("esc to interrupt")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "stream did not complete:\n{screen}"
+            );
+        }
+        assert_reply(&mut parser);
+        let text = all_terminal_rows(&mut parser);
+        assert!(text.contains("ProviderStreamed/Provider"), "{text}");
+        assert!(text.contains("AssistantMessage/Runtime"), "{text}");
+        let rows = text.lines().collect::<Vec<_>>();
+        let accepted = rows
+            .iter()
+            .position(|row| row.contains("CommandCompleted/Runtime"))
+            .unwrap();
+        let started = rows
+            .iter()
+            .position(|row| row.contains("StepStarted/Runtime"))
+            .unwrap();
+        assert_eq!(
+            started,
+            accepted + 1,
+            "diagnostic-only events must not add blank chat rows:\n{text}"
+        );
+        assert_eq!(
+            parser.screen().mouse_protocol_mode(),
+            vt100::MouseProtocolMode::None
+        );
+        submit(&mut pty, &mut parser, "/quit");
+        assert!(pty.wait().1.success());
+    }
 }
 
 #[test]

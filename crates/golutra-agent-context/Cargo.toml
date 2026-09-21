@@ -15,7 +15,7 @@ categories.workspace = true
 [dependencies]
 chrono.workspace = true
 golutra-agent-core.workspace = true
-golutra-agent-llm = { path = "../golutra-agent-llm", version = "0.3.3" }
+golutra-agent-llm = { path = "../golutra-agent-llm", version = "0.3.4" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

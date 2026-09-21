@@ -39,6 +39,14 @@ pub(crate) fn wrap_detail_spans(
     wrap::hard_wrap_spans(spans, width.max(1))
 }
 
+/// Plain diagnostic text shares word/grapheme wrapping with prose, without parsing Markdown.
+pub(crate) fn wrap_plain_spans(
+    spans: &[ratatui::text::Span<'static>],
+    width: usize,
+) -> Vec<Line<'static>> {
+    wrap::wrap_spans(spans, width.max(1))
+}
+
 #[cfg(test)]
 mod tests {
     use ratatui::{
