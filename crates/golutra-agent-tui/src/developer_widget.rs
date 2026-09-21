@@ -13,8 +13,8 @@ pub(crate) fn draw_debug_timeline(frame: &mut Frame<'_>, area: Rect, app: &mut T
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let mut lines = debug_split_live_lines(app, area.width, area.height);
-    if app.transcript.fullscreen {
+    let lines = debug_split_live_lines(app, area.width, area.height);
+    let visible = if app.transcript.fullscreen {
         app.debug_scroll.set_row_count(lines.len());
         app.debug_scroll.clamp(usize::from(area.height));
         let window = transcript_visible_window(
@@ -22,12 +22,14 @@ pub(crate) fn draw_debug_timeline(frame: &mut Frame<'_>, area: Rect, app: &mut T
             usize::from(area.height),
             app.debug_scroll.offset_from_bottom,
         );
-        lines = lines[window].to_vec();
-    }
-    if lines.is_empty() {
+        &lines[window]
+    } else {
+        lines.as_slice()
+    };
+    if visible.is_empty() {
         return;
     }
-    frame.render_widget(Paragraph::new(lines), area);
+    frame.render_widget(Paragraph::new(visible.to_vec()), area);
 }
 
 pub(crate) fn draw_developer_panel(frame: &mut Frame<'_>, area: Rect, app: &mut TuiApp) {
@@ -177,8 +179,12 @@ pub(crate) fn developer_fact_history_lines(app: &TuiApp, width: u16) -> Vec<Line
             app.history_has_more_before,
         );
     }
-    developer_panel_rows_with_changes(&projection, app.change_projection.summary(), 0)
-        .into_iter()
+    let mut rows =
+        developer_panel_rows_with_changes(&projection, app.change_projection.summary(), 0);
+    if let Some(error) = stale_projection_message(app) {
+        rows.insert(0, DeveloperPanelRow::Summary(error));
+    }
+    rows.into_iter()
         .filter_map(|row| match row {
             DeveloperPanelRow::Summary(summary) => Some(Line::from(Span::styled(
                 truncate_end_to_width(&summary, usize::from(width)),
@@ -207,6 +213,17 @@ pub(crate) fn developer_event_history_lines(
 }
 
 fn developer_rows(app: &TuiApp) -> Vec<DeveloperPanelRow> {
+    if let Some(projection) = &app.developer_projection {
+        let mut rows = developer_panel_rows_with_changes(
+            projection,
+            app.change_projection.summary(),
+            usize::MAX,
+        );
+        if let Some(error) = stale_projection_message(app) {
+            rows.insert(0, DeveloperPanelRow::Summary(error));
+        }
+        return rows;
+    }
     if let Some(error) = &app.developer_error {
         let mut rows = vec![DeveloperPanelRow::Summary(format!("error {error}"))];
         rows.extend(
@@ -230,6 +247,18 @@ fn developer_rows(app: &TuiApp) -> Vec<DeveloperPanelRow> {
             "loading developer projection".to_owned(),
         )]
     }
+}
+
+fn stale_projection_message(app: &TuiApp) -> Option<String> {
+    let error = app.developer_error.as_ref()?;
+    let updated = app
+        .developer_updated_at
+        .map(|time| time.to_rfc3339())
+        .unwrap_or_else(|| "never".to_owned());
+    Some(format!(
+        "update failed; last updated {updated}: {}",
+        developer_view::safe_diagnostic_text(error)
+    ))
 }
 
 fn visible_summary_count(

@@ -106,6 +106,28 @@ struct RenderedHistoryEntry {
     source_prefix: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DebugTimelineKey {
+    revision: u64,
+    generation: u64,
+    width: u16,
+    height: u16,
+    expanded: bool,
+    fullscreen: bool,
+    inline: bool,
+    committed: usize,
+    event_count: usize,
+    last_event: Option<EventId>,
+    updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    error: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct DebugTimelineCache {
+    key: DebugTimelineKey,
+    lines: Arc<Vec<Line<'static>>>,
+}
+
 /// 本地命令没有 runtime 事件；保留语义内容和归档锚点，窗口重排时不能丢掉 /status。
 #[derive(Debug, Clone)]
 struct LocalHistoryEntry {
@@ -845,6 +867,14 @@ fn debug_split_event_entries(
 ) -> Vec<RenderedHistoryEntry> {
     let mut operations = event_operation_entries(&app.events)
         .into_iter()
+        .filter(|entry| {
+            !entry.stable
+                || !entry.event_ids.iter().all(|id| {
+                    app.transcript.history.enabled
+                        && !app.transcript.fullscreen
+                        && app.transcript.history.committed_event_ids.contains(id)
+                })
+        })
         .flat_map(|entry| {
             let value = (entry.projection, entry.stable);
             entry
@@ -866,6 +896,25 @@ fn debug_split_event_entries(
             blocked = true;
         }
         let commit_event = !blocked;
+        // 已归档条目仍保留身份供分组和回收使用，但不再次构造文本或做 Markdown 排版。
+        if commit_event
+            && app.transcript.history.enabled
+            && !app.transcript.fullscreen
+            && event
+                .event_ids
+                .iter()
+                .all(|id| app.transcript.history.committed_event_ids.contains(id))
+        {
+            entries.push(RenderedHistoryEntry {
+                tool_id: None,
+                event_ids: event.event_ids,
+                lines: Vec::new(),
+                stable_line_count: 0,
+                commit_event: true,
+                source_prefix: None,
+            });
+            continue;
+        }
         let transcript = event
             .event_ids
             .iter()
@@ -897,7 +946,35 @@ pub(crate) fn debug_split_live_lines(
     app: &TuiApp,
     width: u16,
     visible_rows: u16,
-) -> Vec<Line<'static>> {
+) -> Arc<Vec<Line<'static>>> {
+    let key = DebugTimelineKey {
+        revision: app.transcript.revision,
+        generation: app.transcript.history.replay_generation,
+        width,
+        height: visible_rows,
+        expanded: app.developer_observations_expanded,
+        fullscreen: app.transcript.fullscreen,
+        inline: app.transcript.history.enabled,
+        committed: app.transcript.history.committed_event_ids.len(),
+        event_count: app.events.len(),
+        last_event: app.events.last().map(|event| event.id),
+        updated_at: app.developer_updated_at,
+        error: app.developer_error.clone(),
+    };
+    if let Some(cache) = app.debug_timeline_cache.borrow().as_ref()
+        && cache.key == key
+    {
+        return Arc::clone(&cache.lines);
+    }
+    let lines = Arc::new(build_debug_split_live_lines(app, width, visible_rows));
+    *app.debug_timeline_cache.borrow_mut() = Some(DebugTimelineCache {
+        key,
+        lines: Arc::clone(&lines),
+    });
+    lines
+}
+
+fn build_debug_split_live_lines(app: &TuiApp, width: u16, visible_rows: u16) -> Vec<Line<'static>> {
     let (transcript_width, developer_width) = debug_pane_widths(width);
     let facts = if !app.transcript.history.enabled || app.developer_error.is_some() {
         let mut facts = developer_fact_history_lines(app, developer_width);
@@ -916,7 +993,10 @@ pub(crate) fn debug_split_live_lines(
         app.developer_observations_expanded,
     )
     .into_iter()
-    .filter(|entry| !entry.is_committed(&app.transcript.history.committed_event_ids))
+    .filter(|entry| {
+        app.transcript.fullscreen
+            || !entry.is_committed(&app.transcript.history.committed_event_ids)
+    })
     .flat_map(|entry| entry.lines)
     .collect::<Vec<_>>();
 

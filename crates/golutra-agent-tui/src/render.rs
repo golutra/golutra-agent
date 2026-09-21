@@ -125,6 +125,10 @@ pub(crate) fn ui_layout(area: Rect, app: &TuiApp) -> UiLayoutSnapshot {
 }
 
 pub(crate) fn draw_ui(frame: &mut Frame<'_>, app: &mut TuiApp) {
+    if app.developer_detail.is_some() {
+        developer_detail::draw(frame, app);
+        return;
+    }
     if app.tool_detail.is_some() {
         super::tool_detail::draw_tool_detail(frame, app);
         return;
@@ -2706,6 +2710,9 @@ pub(crate) fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
         }
         Some(OverlaySurface::Auth) => {
             Some(match app.auth_dialog.as_ref().map(|dialog| dialog.step) {
+                Some(AuthDialogStep::GroupChoice) => {
+                    "Provider setup   Enter continue   Esc close   Ctrl+C twice quit"
+                }
                 Some(AuthDialogStep::Review) => {
                     "Provider setup   Enter save   Esc back   Ctrl+C twice quit"
                 }
@@ -3288,6 +3295,24 @@ pub(crate) fn footer_context_line(app: &TuiApp, max_width: usize) -> Line<'stati
 }
 
 pub(crate) fn footer_context_text(app: &TuiApp, max_width: usize) -> String {
+    if app.history_reload.is_some() {
+        return "loading complete history… · Esc cancel".to_owned();
+    }
+    if app.debug_mode
+        && let Some(error) = &app.developer_error
+    {
+        let updated = app
+            .developer_updated_at
+            .map(|time| time.format("%H:%M:%S UTC").to_string())
+            .unwrap_or_else(|| "never".to_owned());
+        return format!(
+            "debug update failed (last {updated}) · Alt+D events · {}",
+            developer_view::safe_diagnostic_text(error)
+        );
+    }
+    if app.status_message.starts_with("history reload failed") {
+        return app.status_message.clone();
+    }
     let model = if app.runtime_controls.effective_model().trim().is_empty() {
         "unconfigured"
     } else {
@@ -3304,6 +3329,9 @@ pub(crate) fn footer_context_text(app: &TuiApp, max_width: usize) -> String {
     };
     if let Some(mode) = app.composer_mode.label() {
         model = format!("[{mode}] {model}");
+    }
+    if app.debug_mode {
+        model.push_str(" · Alt+D events");
     }
     let workspace = workspace_path_label(&app.workspace_path);
     fit_model_and_workspace(&model, &workspace, max_width)

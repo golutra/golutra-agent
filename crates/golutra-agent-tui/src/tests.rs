@@ -26,6 +26,9 @@ mod auth_model_tests;
 #[path = "auth_advanced_tests.rs"]
 mod auth_advanced_tests;
 
+#[path = "developer_tests.rs"]
+mod developer_tests;
+
 #[test]
 fn remote_subcommand_is_an_explicit_app_server_transport() {
     let args = Args::try_parse_from([
@@ -285,14 +288,17 @@ fn history_byte_accounting_tracks_trim_replay_and_reset() {
         None,
     );
     let task = TaskId::new();
+    app.enable_inline_history();
     for sequence in 1..=TUI_EVENT_HISTORY_LIMIT + 1 {
-        app.append_event_to_history(transcript_event(
+        let event = transcript_event(
             sequence as u64,
             app.session_id,
             task,
             RuntimeEventType::ProviderStreamed,
             json!({"delta":{"kind":"text_delta","text":"中"}}),
-        ));
+        );
+        app.transcript.history.committed_event_ids.insert(event.id);
+        app.append_event_to_history(event);
     }
     assert!(app.history_has_more_before);
     assert!(app.events.len() < TUI_EVENT_HISTORY_LIMIT);
@@ -6358,6 +6364,98 @@ async fn auth_custom_responses_selection_persists_and_uses_responses_wire() {
     }
     result.expect("bounded auth and generation");
     server.await.expect("wire assertions");
+}
+
+#[tokio::test]
+async fn auth_escape_returns_to_start_then_closes_without_changing_provider() {
+    let _guard = env_lock_guard().await;
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "configured provider".to_owned(),
+        None,
+    );
+    app.execute_auth_command(&transport, SlashAuthCommand::Setup)
+        .await
+        .expect("open auth");
+    app.auth_dialog
+        .as_mut()
+        .expect("dialog")
+        .select_provider(CUSTOM_PROVIDER_PRESET);
+    assert_eq!(
+        app.auth_dialog.as_ref().expect("dialog").step,
+        AuthDialogStep::Protocol
+    );
+    let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    handle_auth_dialog_key(escape, &mut app, &transport)
+        .await
+        .expect("back to provider selection");
+    assert_eq!(
+        app.auth_dialog.as_ref().expect("dialog").step,
+        AuthDialogStep::GroupChoice
+    );
+    handle_auth_dialog_key(escape, &mut app, &transport)
+        .await
+        .expect("close auth");
+    assert!(app.auth_dialog.is_none());
+    assert!(app.overlay_surface().is_none());
+    assert_eq!(app.provider_message, "configured provider");
+}
+
+#[tokio::test]
+async fn auth_escape_stays_closed_during_waiting_authentication_refresh() {
+    let _guard = env_lock_guard().await;
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "unconfigured".to_owned(),
+        None,
+    );
+    let mut projection = UserProjection {
+        session_id: app.session_id,
+        task_id: Some(TaskId::new()),
+        status: golutra_agent_core::TaskStatus::WaitingAuthentication,
+        visible_steps: Vec::new(),
+        pending_approval: None,
+        final_message: None,
+        residual_risks: Vec::new(),
+    };
+    let refresh = |app: &mut TuiApp, projection: &UserProjection| {
+        app.apply_runtime_refresh_snapshot(RuntimeRefreshSnapshot {
+            binding: app.runtime_refresh_binding(),
+            projection: projection.clone(),
+            provider_status: None,
+            developer_projection: None,
+            remote: false,
+        });
+    };
+    refresh(&mut app, &projection);
+    assert!(app.auth_dialog.is_some());
+    handle_auth_dialog_key(
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("dismiss authentication");
+    refresh(&mut app, &projection);
+    assert!(app.auth_dialog.is_none());
+    app.execute_auth_command(&transport, SlashAuthCommand::Setup)
+        .await
+        .expect("manually reopen auth");
+    assert!(app.auth_dialog.is_some());
+    app.auth_dialog = None;
+    projection.status = golutra_agent_core::TaskStatus::Running;
+    refresh(&mut app, &projection);
+    projection.status = golutra_agent_core::TaskStatus::WaitingAuthentication;
+    refresh(&mut app, &projection);
+    assert!(app.auth_dialog.is_some());
 }
 
 #[tokio::test]

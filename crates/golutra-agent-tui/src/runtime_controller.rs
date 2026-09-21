@@ -143,6 +143,7 @@ impl TuiRuntimeController {
         self.abort_interactive_refresh();
         self.interactive_refresh_retry_at = None;
         let mut changed = self.sync_refresh_binding(app) | app.poll_mention_completion();
+        changed |= app.poll_history_reload(true).await;
         if app.history_load_requested {
             app.load_older_history(&self.transport).await?;
             changed = true;
@@ -203,6 +204,7 @@ impl TuiRuntimeController {
     /// The offscreen driver uses `sync` because each request needs a fully reconciled snapshot.
     pub(crate) async fn sync_interactive(&mut self, app: &mut TuiApp) -> miette::Result<bool> {
         let mut changed = self.sync_refresh_binding(app) | app.poll_mention_completion();
+        changed |= app.poll_history_reload(false).await;
         if app.history_load_requested {
             app.load_older_history(&self.transport).await?;
             changed = true;

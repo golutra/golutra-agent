@@ -70,9 +70,9 @@ static TUI_ACTOR_ID: LazyLock<String> = LazyLock::new(|| {
     )
 });
 const TUI_HISTORY_PAGE_SIZE: u32 = 256;
-// 恢复页与交互窗口使用同一预算，避免刚加载的完整会话立即被裁成最近几百 KB。
-const TUI_EVENT_HISTORY_LIMIT: usize = history_source::COMPLETE_HISTORY_EVENT_LIMIT;
-const TUI_EVENT_HISTORY_BYTE_LIMIT: usize = history_source::COMPLETE_HISTORY_BYTE_LIMIT;
+// 仅回收已写入终端的活动窗口；完整加载和未归档历史不受此软预算限制。
+const TUI_EVENT_HISTORY_LIMIT: usize = 32_768;
+const TUI_EVENT_HISTORY_BYTE_LIMIT: usize = 32 * 1024 * 1024;
 const TUI_EVENT_HISTORY_TRIM_BATCH: usize = 256;
 const TUI_EVENT_PAYLOAD_LIMIT: usize = 64 * 1024;
 const TUI_EVENT_PAYLOAD_PREVIEW_LIMIT: usize = 4 * 1024;
@@ -88,8 +88,10 @@ mod change_projection;
 mod composer_input;
 mod composer_support;
 mod dashboard;
+mod developer_detail;
 mod developer_projection;
 mod developer_query;
+mod developer_reload;
 mod developer_view;
 mod developer_widget;
 mod driver;
@@ -358,12 +360,16 @@ struct TuiApp {
     projection: Option<UserProjection>,
     developer_projection: Option<golutra_agent_protocol::DebugProjection>,
     developer_error: Option<String>,
+    developer_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    history_reload: Option<developer_reload::PendingHistoryReload>,
     debug_scroll: PaneScrollState,
+    debug_timeline_cache: std::cell::RefCell<Option<inline_history::DebugTimelineCache>>,
     // 生产路径只通过 append/replace/trim 修改历史，同时维护字节预算。
     events: Vec<RuntimeEvent>,
     event_history_bytes: usize,
     command_messages: Vec<TranscriptItem>,
     tool_detail: Option<tool_detail::ToolDetailState>,
+    developer_detail: Option<developer_detail::DeveloperDetailState>,
     resume_picker: Option<ResumePickerState>,
     queue_picker: Option<QueuePickerState>,
     approval_dialog: Option<ApprovalDialogState>,
@@ -438,6 +444,12 @@ impl TuiApp {
     }
 
     fn trim_event_history(&mut self) -> bool {
+        if !self.transcript.history.enabled
+            || !self.transcript.history.replay_ready
+            || self.history_reload.is_some()
+        {
+            return false;
+        }
         // 写入时增量记账，预算检查不再周期性扫描和序列化整段历史。
         let total_bytes = self.retained_event_bytes();
         if self.events.len() <= TUI_EVENT_HISTORY_LIMIT
@@ -451,6 +463,11 @@ impl TuiApp {
         let mut remove_count = 0_usize;
         let mut remaining_bytes = total_bytes;
         while remove_count + 1 < self.events.len()
+            && self
+                .transcript
+                .history
+                .committed_event_ids
+                .contains(&self.events[remove_count].id)
             && (self.events.len().saturating_sub(remove_count) > target_count
                 || remaining_bytes > target_bytes)
         {
@@ -476,8 +493,7 @@ impl TuiApp {
         }
         self.events = events;
         self.event_history_bytes = self.events.iter().map(ui_event_memory_bytes).sum();
-        let trimmed = self.trim_event_history();
-        self.history_has_more_before = has_more_before || trimmed;
+        self.history_has_more_before = has_more_before;
         self.history_start_cursor = self.events.first().map(|event| event.sequence_no);
     }
 
@@ -494,6 +510,7 @@ impl TuiApp {
     }
 
     pub(crate) async fn shutdown_pending_operations(&mut self) {
+        self.history_reload = None;
         if let Some(pending) = self.auth_model_discovery.take() {
             pending.task.abort();
             let _ = pending.task.await;
@@ -676,14 +693,18 @@ impl TuiApp {
             projection: None,
             developer_projection: None,
             developer_error: None,
+            developer_updated_at: None,
+            history_reload: None,
             debug_scroll: PaneScrollState {
                 follow_tail: true,
                 ..PaneScrollState::default()
             },
+            debug_timeline_cache: std::cell::RefCell::new(None),
             events: Vec::new(),
             event_history_bytes: 0,
             command_messages: Vec::new(),
             tool_detail: None,
+            developer_detail: None,
             resume_picker: None,
             queue_picker: None,
             approval_dialog: None,
@@ -1023,6 +1044,12 @@ impl TuiApp {
         }
 
         let previous_row_count = self.transcript.scroll.row_count;
+        // 同一任务等待认证期间只自动打开一次，尊重用户用 Esc 关闭向导。
+        let already_waiting_authentication = self.projection.as_ref().is_some_and(|previous| {
+            previous.session_id == snapshot.projection.session_id
+                && previous.task_id == snapshot.projection.task_id
+                && previous.status == golutra_agent_core::TaskStatus::WaitingAuthentication
+        });
         let projection = Some(snapshot.projection);
         if self.projection != projection {
             self.projection = projection;
@@ -1035,7 +1062,8 @@ impl TuiApp {
         }
         if self.projection.as_ref().is_some_and(|projection| {
             projection.status == golutra_agent_core::TaskStatus::WaitingAuthentication
-        }) && !snapshot.remote
+        }) && !already_waiting_authentication
+            && !snapshot.remote
             && self.auth_dialog.is_none()
             && self.auth_operation.is_none()
         {
@@ -1058,9 +1086,9 @@ impl TuiApp {
                     }
                     self.developer_projection = Some(projection);
                     self.developer_error = None;
+                    self.developer_updated_at = Some(chrono::Utc::now());
                 }
                 Some(Err(error)) => {
-                    self.developer_projection = None;
                     self.developer_error = Some(error);
                 }
                 None => {}
@@ -1068,6 +1096,8 @@ impl TuiApp {
         } else {
             self.developer_projection = None;
             self.developer_error = None;
+            self.developer_updated_at = None;
+            self.debug_timeline_cache.get_mut().take();
         }
         self.refresh_activity_snapshot();
         self.sync_transcript_row_count(previous_row_count);
@@ -1105,9 +1135,9 @@ impl TuiApp {
                 }
                 self.developer_projection = Some(projection);
                 self.developer_error = None;
+                self.developer_updated_at = Some(chrono::Utc::now());
             }
             Err(error) => {
-                self.developer_projection = None;
                 self.developer_error = Some(error.clone());
                 self.status_message = format!("runtime observations unavailable: {error}");
             }
@@ -1115,6 +1145,10 @@ impl TuiApp {
     }
 
     async fn reload_debug_history(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
+        if self.transcript.history.enabled {
+            self.start_history_reload(transport);
+            return Ok(());
+        }
         let (history, projection) = tokio::join!(
             load_complete_event_history(transport, self.session_id, self.task_id),
             load_debug_projection(transport, self.session_id, self.task_id),
@@ -1145,7 +1179,7 @@ impl TuiApp {
             match load_complete_event_history(transport, self.session_id, self.task_id).await {
                 Ok(history) => history,
                 Err(error) => {
-                    // 超预算时退回最近一页，并保留 has_more_before，让触顶继续分页。
+                    // 存储暂不可用时保留可读的一页，并明确提示历史尚不完整。
                     let mut history =
                         load_recent_event_history(transport, self.session_id, self.task_id)
                             .await
@@ -1164,6 +1198,10 @@ impl TuiApp {
         &mut self,
         transport: &RuntimeTransport,
     ) -> miette::Result<()> {
+        if self.transcript.history.enabled {
+            self.start_history_reload(transport);
+            return Ok(());
+        }
         self.begin_history_replay();
         self.load_session_history(transport).await?;
         if !self.status_message.starts_with("loaded recent history") {
@@ -1239,6 +1277,8 @@ impl TuiApp {
         } else {
             self.developer_projection = None;
             self.developer_error = None;
+            self.developer_updated_at = None;
+            self.debug_timeline_cache.get_mut().take();
             self.status_message = "developer runtime view hidden".to_owned();
         }
     }
@@ -1258,6 +1298,15 @@ impl TuiApp {
         self.history_start_cursor = self.history_start_cursor.or(Some(event.sequence_no));
         self.cursor = Some(event.sequence_no);
         let event_type = event.event_type;
+        if let Some(reload) = self.history_reload.as_mut()
+            && reload.binding.session_id == event.session_id
+            && reload
+                .binding
+                .task_id
+                .is_none_or(|task| event.task_id == Some(task))
+        {
+            reload.live_events.push(event.clone());
+        }
         if event_type.is_task_terminal()
             && self.pending_recovery.is_none()
             && !queued_prompts(&self.events).is_empty()
@@ -2776,6 +2825,8 @@ impl TuiApp {
                 self.projection = None;
                 self.developer_projection = None;
                 self.developer_error = None;
+                self.developer_updated_at = None;
+                self.debug_timeline_cache.get_mut().take();
                 self.replace_event_history(Vec::new(), false);
                 self.activity_projection = ActivityProjection::default();
                 self.invalidate_activity_snapshot();
@@ -3259,6 +3310,8 @@ impl TuiApp {
         self.projection = None;
         self.developer_projection = None;
         self.developer_error = None;
+        self.developer_updated_at = None;
+        self.debug_timeline_cache.get_mut().take();
         self.replace_event_history(Vec::new(), false);
         self.activity_projection = ActivityProjection::default();
         self.invalidate_activity_snapshot();
@@ -3299,6 +3352,8 @@ impl TuiApp {
         self.projection = None;
         self.developer_projection = None;
         self.developer_error = None;
+        self.developer_updated_at = None;
+        self.debug_timeline_cache.get_mut().take();
         self.replace_event_history(Vec::new(), false);
         self.activity_projection = ActivityProjection::default();
         self.invalidate_activity_snapshot();
@@ -4549,8 +4604,10 @@ fn draw_interactive_frame_inner(
     // Height calculation and drawing share layout inside this frame. Reset at
     // its boundary as local notices and overlays can change without runtime events.
     app.transcript.frame_layout.get_mut().take();
-    let overlay_visible =
-        app.overlay_surface().is_some() || app.tool_detail.is_some() || app.transcript.fullscreen;
+    let overlay_visible = app.overlay_surface().is_some()
+        || app.tool_detail.is_some()
+        || app.developer_detail.is_some()
+        || app.transcript.fullscreen;
     if !overlay_screen.active {
         prepare_inline_screen(terminal, overlay_screen, inline_history)
             .map_err(|error| miette::miette!("prepare inline screen: {error}"))?;
@@ -4776,6 +4833,10 @@ async fn handle_key(
         tool_detail::handle_tool_detail_key(key, app);
         return Ok(());
     }
+    if app.developer_detail.is_some() {
+        developer_detail::handle_key(key, app);
+        return Ok(());
+    }
     if app.transcript.fullscreen && app.overlay_surface().is_none() && key.code == KeyCode::Esc {
         app.transcript.fullscreen = false;
         app.transcript.scroll.reset(0);
@@ -4828,6 +4889,15 @@ async fn handle_key(
     }
     if app.history_search.is_some() {
         handle_history_search_key(key, app);
+        return Ok(());
+    }
+    if app.debug_mode && key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::ALT)
+    {
+        developer_detail::open(app);
+        return Ok(());
+    }
+    if key.code == KeyCode::Esc && app.history_reload.is_some() {
+        app.cancel_history_reload();
         return Ok(());
     }
     if app.transcript.search.is_some() {
@@ -5605,6 +5675,9 @@ async fn handle_export_key(
 }
 
 fn handle_paste(pasted: &str, app: &mut TuiApp) {
+    if app.developer_detail.is_some() {
+        return;
+    }
     if app.tool_detail.is_some() {
         tool_detail::paste_query(app, pasted);
         return;
