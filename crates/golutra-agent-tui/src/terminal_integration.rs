@@ -341,17 +341,21 @@ pub(crate) fn restored_inline_viewport(saved: Option<Rect>, size: Size) -> Rect 
     Rect::new(0, saved.y.min(max_y), width, height)
 }
 
-pub(crate) fn clear_inline_region(
+/// ANSI cannot selectively replace application-owned scrollback. As in Codex, purge it
+/// before replaying source-backed history; otherwise stale wrapped rows survive above the screen.
+pub(crate) fn rebuild_inline_history_terminal(
     terminal: &mut InteractiveTerminal,
-    start: u16,
-    height: u16,
 ) -> io::Result<()> {
     let size = terminal.size()?;
+    let height = terminal.current_buffer_mut().area.height;
+    terminal
+        .backend_mut()
+        .write_all(b"\x1b[r\x1b[0m\x1b[H\x1b[2J\x1b[3J\x1b[H")?;
     terminal.restore_inline(Rect::new(
         0,
-        start,
+        0,
         size.width,
-        height.max(1).min(size.height.saturating_sub(start).max(1)),
+        height.max(1).min(size.height.max(1)),
     ))
 }
 

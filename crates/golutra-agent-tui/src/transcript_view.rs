@@ -144,6 +144,7 @@ impl OperationId {
 
 #[derive(Debug, Clone)]
 pub(crate) struct TranscriptHistoryState {
+    pub(crate) reflow_pending: bool,
     pub(crate) native_render_width: Option<u16>,
     pub(crate) enabled: bool,
     pub(crate) committed_event_ids: HashSet<EventId>,
@@ -157,6 +158,7 @@ pub(crate) struct TranscriptHistoryState {
 impl Default for TranscriptHistoryState {
     fn default() -> Self {
         Self {
+            reflow_pending: false,
             native_render_width: None,
             enabled: false,
             committed_event_ids: HashSet::new(),

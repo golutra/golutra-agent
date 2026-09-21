@@ -20,60 +20,17 @@ use super::*;
 const MIN_INLINE_BOTTOM_ROWS: u16 = 3;
 const HISTORY_OMISSION_MARKER: &str = "…";
 
-#[derive(Debug, Clone)]
-pub(crate) struct HistoryDisplayRow {
-    line: Line<'static>,
-    pub(crate) tool_id: Option<OperationId>,
-}
-
-fn unpadded_history_line(mut spans: Vec<Span<'static>>) -> Line<'static> {
-    // 去掉物理补齐空格时保留整行底色，缩放重排后 diff 仍覆盖新行宽。
-    let background = spans
-        .last()
-        .and_then(|span| span.style.bg)
-        .filter(|color| *color != ratatui::style::Color::Reset);
-    // 缓存的是实际文字而非 Buffer 的补齐空格；缩窄时补齐格不能再次折成空白行。
-    while let Some(last) = spans.last_mut() {
-        last.content = last.content.trim_end().to_owned().into();
-        if !last.content.is_empty() {
-            break;
-        }
-        spans.pop();
-    }
-    let line = Line::from(spans);
-    if let Some(color) = background {
-        line.style(Style::default().bg(color))
-    } else {
-        line
-    }
-}
-
-fn retain_screen_rows(rows: &mut Vec<HistoryDisplayRow>, screen_height: u16) {
-    let remove = rows.len().saturating_sub(usize::from(screen_height));
-    rows.drain(..remove);
-}
-
-fn append_tool_fragment(
+fn append_history_fragment(
     tail: &mut super::transcript_spacing::TranscriptTail,
     lines: &mut Vec<Line<'static>>,
     fragment: &[Line<'static>],
     event_id: Option<EventId>,
-    tool_id: Option<&OperationId>,
-    ranges: &mut Vec<(std::ops::Range<usize>, OperationId)>,
     compact: bool,
 ) {
     if compact {
         tail.append_contiguous(lines, fragment, event_id);
     } else {
         tail.append(lines, fragment, event_id);
-    }
-    if let Some(id) = tool_id
-        && !fragment.is_empty()
-    {
-        ranges.push((
-            lines.len().saturating_sub(fragment.len())..lines.len(),
-            id.clone(),
-        ));
     }
 }
 
@@ -103,7 +60,6 @@ impl InlineHistoryMode {
 
 #[derive(Debug, Clone)]
 struct RenderedHistoryEntry {
-    tool_id: Option<OperationId>,
     event_ids: Vec<EventId>,
     lines: Vec<Line<'static>>,
     stable_line_count: usize,
@@ -177,7 +133,7 @@ impl RenderedHistoryEntry {
 pub(crate) struct InlineHistoryState {
     last_flush: Option<(u64, u16, usize)>,
     native_scrollback: bool,
-    display_rows: Arc<Vec<HistoryDisplayRow>>,
+    reflow_after_stream: bool,
     session_id: SessionId,
     generation: u64,
     mode: InlineHistoryMode,
@@ -197,48 +153,17 @@ pub(crate) struct InlineHistoryState {
 }
 
 impl InlineHistoryState {
-    /// 只重画缩放前主屏可见的应用行；已进入 scrollback 的正文和 shell 前缀均不清除。
-    pub(crate) fn resize_visible_history(
-        &mut self,
-        terminal: &mut InteractiveTerminal,
-        previous: Rect,
-        size: ratatui::layout::Size,
-    ) -> io::Result<()> {
-        let count = self.display_rows.len().min(usize::from(previous.y));
-        let start = previous
-            .y
-            .saturating_sub(count as u16)
-            .min(size.height.saturating_sub(1));
-        let visible = self.display_rows[self.display_rows.len() - count..].to_vec();
-        let mut rows = Vec::new();
-        for row in visible {
-            rows.extend(
-                wrapped_history_rows(vec![row.line], size.width)
-                    .into_iter()
-                    .map(|spans| HistoryDisplayRow {
-                        line: unpadded_history_line(spans),
-                        tool_id: row.tool_id.clone(),
-                    }),
-            );
-        }
-        clear_inline_region(terminal, start, previous.height.min(size.height))?;
-        insert_history_lines(
-            terminal,
-            rows.iter().map(|row| row.line.clone()).collect(),
-            size.width,
-        )?;
-        let display = Arc::make_mut(&mut self.display_rows);
-        display.truncate(display.len() - count);
-        display.extend(rows);
-        retain_screen_rows(display, size.height);
-        Ok(())
+    /// Rebuild from event/local-message source, never from previously wrapped screen rows.
+    pub(crate) fn request_resize_reflow(&mut self, app: &mut TuiApp) {
+        app.transcript.history.reflow_pending = true;
+        self.last_flush = None;
     }
 
     pub(crate) fn new(session_id: SessionId) -> Self {
         Self {
             last_flush: None,
             native_scrollback: false,
-            display_rows: Arc::new(Vec::new()),
+            reflow_after_stream: false,
             session_id,
             generation: 0,
             mode: InlineHistoryMode::Transcript,
@@ -282,10 +207,20 @@ impl InlineHistoryState {
         app: &mut TuiApp,
     ) -> io::Result<bool> {
         self.native_scrollback = true;
+        if self.reflow_after_stream && !has_active_task(app) {
+            self.reflow_after_stream = false;
+            self.request_resize_reflow(app);
+        }
+        let reflow = app.transcript.history.reflow_pending;
         self.flush_with_callbacks(
             terminal,
             app,
-            |_terminal| Ok(()),
+            |terminal| {
+                if reflow {
+                    rebuild_inline_history_terminal(terminal)?;
+                }
+                Ok(())
+            },
             sync_inline_viewport_height,
         )
     }
@@ -311,6 +246,7 @@ impl InlineHistoryState {
         let _timing = super::ui_timing::span("history");
         let width = terminal.size()?.width;
         if self.native_scrollback
+            && !app.transcript.history.reflow_pending
             && self.initialized
             && self.session_id == app.session_id
             && self.generation == app.transcript.history.replay_generation
@@ -349,15 +285,27 @@ impl InlineHistoryState {
         // 归档发生在普通帧绘制之前；独立调用也必须先同步尺寸，使换行与插入共享同一物理宽度。
         terminal.autoresize()?;
         let mode = InlineHistoryMode::from_app(app);
+        let source_ready = app.transcript.history.replay_ready
+            && (!matches!(
+                mode,
+                InlineHistoryMode::Developer { .. } | InlineHistoryMode::DebugSplit { .. }
+            ) || app.developer_projection.is_some()
+                || app.developer_error.is_some());
+        // Do not erase existing output while a resume/debug reload is still incomplete.
+        if app.transcript.history.reflow_pending && (!source_ready || app.history_has_more_before) {
+            self.rebuild_after_replay = true;
+            return Ok(false);
+        }
         let buffer_area = terminal.current_buffer_mut().area;
         let width = buffer_area.width.max(1);
-        // 原生历史只追加；布局刷新不能清除 shell 历史，也不能重复提交已显示消息。
+        // Ordinary frames append only; explicit physical resizes rebuild from source below.
         if self.native_scrollback && self.session_id == app.session_id {
             app.set_inline_history_committed_event_ids(self.committed_event_ids.clone());
             app.set_inline_history_committed_stream_lines(self.committed_stream_lines.clone());
             app.transcript.history.tail = self.tail.clone();
         }
         let layout_width = if self.native_scrollback
+            && !app.transcript.history.reflow_pending
             && self.session_id == app.session_id
             && !self.committed_stream_lines.is_empty()
         {
@@ -366,9 +314,10 @@ impl InlineHistoryState {
             width
         };
         app.transcript.history.native_render_width = self.native_scrollback.then_some(layout_width);
-        // 对照 Codex：viewport 高度变化（slash 弹层、overlay 进出、流式尾巴）不能重建 scrollback。
+        // Composer/overlay height changes do not request reflow. Physical terminal resizes do.
         let identity_changed = self.initialized
-            && (self.session_id != app.session_id
+            && (app.transcript.history.reflow_pending
+                || self.session_id != app.session_id
                 || (!self.native_scrollback
                     && (self.generation != app.transcript.history.replay_generation
                         || self.mode != mode
@@ -405,18 +354,14 @@ impl InlineHistoryState {
             app.set_inline_history_committed_stream_lines(HashMap::new());
         }
 
-        let source_ready = app.transcript.history.replay_ready
-            && (!matches!(
-                mode,
-                InlineHistoryMode::Developer { .. } | InlineHistoryMode::DebugSplit { .. }
-            ) || app.developer_projection.is_some()
-                || app.developer_error.is_some());
         if !source_ready {
-            // A resume/debug reload can render a provisional projection while canonical events
-            // are still loading. Rebuild once the source is ready so that frame is not folded
-            // into the next terminal scrollback insertion.
             self.rebuild_after_replay = true;
             return Ok(history_cleared);
+        }
+        if app.transcript.history.reflow_pending {
+            // A resize during streaming needs one final repair from the finalized source.
+            self.reflow_after_stream = has_active_task(app);
+            app.transcript.history.reflow_pending = false;
         }
         if self.rebuild_after_replay && !self.native_scrollback {
             if !history_cleared {
@@ -490,11 +435,7 @@ impl InlineHistoryState {
             .retain(|id, _| committable_ids.contains(id));
         self.committed_stream_sources
             .retain(|id, _| committable_ids.contains(id));
-        if history_cleared || !self.header_emitted {
-            self.display_rows = Arc::new(Vec::new());
-        }
         let mut lines = Vec::new();
-        let mut tool_ranges = Vec::new();
         let emit_header = !self.header_emitted;
         if emit_header {
             lines.extend(session_history_lines(app, width));
@@ -530,13 +471,7 @@ impl InlineHistoryState {
                 None,
             );
         }
-        self.append_event_lines(
-            app,
-            history_entries,
-            layout_width,
-            &mut lines,
-            &mut tool_ranges,
-        );
+        self.append_event_lines(app, history_entries, layout_width, &mut lines);
         self.append_local_messages(app, width, &mut lines);
 
         app.set_inline_history_committed_event_ids(self.committed_event_ids.clone());
@@ -551,23 +486,6 @@ impl InlineHistoryState {
             // 否则长代码块会先被旧的整屏活动区全部挤入 scrollback，收缩后只剩一屏空白。
             // 这里的提交标记仍在外层事务内，任何终端操作失败都会回滚。
             prepare_insert(terminal, app)?;
-            let display = Arc::make_mut(&mut self.display_rows);
-            for (index, line) in lines.iter().enumerate() {
-                let tool_id = tool_ranges
-                    .iter()
-                    .find(|(range, _)| range.contains(&index))
-                    .map(|(_, id)| id.clone());
-                display.extend(
-                    wrapped_history_rows(vec![line.clone()], width)
-                        .into_iter()
-                        .map(|spans| HistoryDisplayRow {
-                            line: unpadded_history_line(spans),
-                            tool_id: tool_id.clone(),
-                        }),
-                );
-            }
-            // 仅缓存一屏，缩放不会复制整段会话；更早正文由终端 scrollback 和持久事件保管。
-            retain_screen_rows(display, terminal.size()?.height);
             insert_history_lines(terminal, lines, width)?;
             self.header_emitted = true;
         }
@@ -596,7 +514,6 @@ impl InlineHistoryState {
         entries: Vec<RenderedHistoryEntry>,
         width: u16,
         lines: &mut Vec<Line<'static>>,
-        tool_ranges: &mut Vec<(std::ops::Range<usize>, OperationId)>,
     ) {
         for entry in self
             .local_entries
@@ -646,13 +563,11 @@ impl InlineHistoryState {
                         continue;
                     }
                     let offset = offset.max(cursor);
-                    append_tool_fragment(
+                    append_history_fragment(
                         &mut self.tail,
                         lines,
                         &entry.lines[cursor..offset],
                         event_id,
-                        entry.tool_id.as_ref(),
-                        tool_ranges,
                         compact,
                     );
                     self.tail
@@ -660,13 +575,11 @@ impl InlineHistoryState {
                     cursor = offset;
                     local.emitted = true;
                 }
-                append_tool_fragment(
+                append_history_fragment(
                     &mut self.tail,
                     lines,
                     &entry.lines[cursor..commit_until],
                     event_id,
-                    entry.tool_id.as_ref(),
-                    tool_ranges,
                     compact,
                 );
                 self.last_anchor = entry.event_ids.last().copied();
@@ -759,7 +672,6 @@ fn rendered_history_entries(
                             .all(|id| app.transcript.history.committed_event_ids.contains(id))
                     {
                         return RenderedHistoryEntry {
-                            tool_id: entry.projection.id().cloned(),
                             event_ids: entry.event_ids,
                             lines: Vec::new(),
                             stable_line_count: 0,
@@ -787,7 +699,6 @@ fn rendered_history_entries(
                         developer_event_history_lines(&event, width, expanded, app.palette());
                     let commit_event = !event.is_open_provider_stream();
                     RenderedHistoryEntry {
-                        tool_id: None,
                         event_ids: event.event_ids,
                         stable_line_count: if commit_event {
                             lines.len()
@@ -816,7 +727,6 @@ fn history_entry_from_projection(
     stable: bool,
     width: u16,
 ) -> RenderedHistoryEntry {
-    let tool_id = projection.id().cloned();
     // 先渲染完整活动正文，共用解析器记录的块边界，避免再扫描一次 Markdown。
     let lines = render_operation_projection_lines(app, vec![projection.clone()], width);
     let source_prefix = assistant_source_prefix(app, &projection, stable);
@@ -829,7 +739,6 @@ fn history_entry_from_projection(
             render_operation_projection_lines(app, vec![message_projection(item)], width)
         });
     RenderedHistoryEntry {
-        tool_id,
         event_ids,
         stable_line_count: if stable {
             lines.len()
@@ -934,7 +843,6 @@ fn debug_split_event_entries(
                 .all(|id| app.transcript.history.committed_event_ids.contains(id))
         {
             entries.push(RenderedHistoryEntry {
-                tool_id: None,
                 event_ids: event.event_ids,
                 lines: Vec::new(),
                 stable_line_count: 0,
@@ -960,7 +868,6 @@ fn debug_split_event_entries(
             developer_event_history_lines(&event, developer_width, expanded, app.palette());
         let lines = debug_split_history_lines(transcript, developer, width);
         entries.push(RenderedHistoryEntry {
-            tool_id: None,
             event_ids: event.event_ids,
             stable_line_count: if commit_event {
                 lines.len()
@@ -1627,6 +1534,53 @@ fn history_line_height(line: &Line<'static>, width: u16) -> usize {
 #[cfg(test)]
 mod boundary_tests {
     use super::*;
+
+    #[test]
+    fn resize_reflow_waits_for_complete_source_and_retains_request_after_write_failure() {
+        let session_id = SessionId::new();
+        let mut app = TuiApp::new(
+            ThreadId::new(),
+            session_id,
+            None,
+            false,
+            "mock".into(),
+            None,
+        );
+        app.enable_inline_history();
+        let mut terminal = Terminal::with_options(
+            ratatui::backend::TestBackend::new(100, 40),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Inline(3),
+            },
+        )
+        .unwrap();
+        let mut history = InlineHistoryState::new(session_id);
+        history.native_scrollback = true;
+        history.flush(&mut terminal, &mut app).unwrap();
+        let before = terminal.backend().buffer().clone();
+        history.request_resize_reflow(&mut app);
+        app.history_has_more_before = true;
+        assert!(
+            !history
+                .flush_with_rebuild(&mut terminal, &mut app, |_| {
+                    panic!("incomplete source must not clear terminal history")
+                })
+                .unwrap()
+        );
+        assert_eq!(terminal.backend().buffer(), &before);
+        assert!(app.transcript.history.reflow_pending);
+        app.history_has_more_before = false;
+        assert!(
+            history
+                .flush_with_rebuild(&mut terminal, &mut app, |_| {
+                    Err(io::Error::other("write failed"))
+                })
+                .is_err()
+        );
+        assert!(app.transcript.history.reflow_pending);
+        assert!(history.flush(&mut terminal, &mut app).unwrap());
+        assert!(!app.transcript.history.reflow_pending);
+    }
 
     #[test]
     fn debug_stream_append_never_archives_mutable_rows_or_reports_a_revision() {
