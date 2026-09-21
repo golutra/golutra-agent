@@ -192,27 +192,35 @@ impl RuntimeControls {
     }
 
     pub(crate) fn cycle_effort(&mut self, forward: bool) {
-        const EFFORTS: [Option<ProviderReasoningEffort>; 7] = [
-            None,
-            Some(ProviderReasoningEffort::Low),
-            Some(ProviderReasoningEffort::Medium),
-            Some(ProviderReasoningEffort::High),
-            Some(ProviderReasoningEffort::Xhigh),
-            Some(ProviderReasoningEffort::Max),
-            Some(ProviderReasoningEffort::Ultra),
-        ];
-        let current = EFFORTS
-            .iter()
-            .position(|effort| *effort == self.reasoning_effort)
-            .unwrap_or_default();
-        let next = if forward {
-            (current + 1) % EFFORTS.len()
-        } else {
-            current.checked_sub(1).unwrap_or(EFFORTS.len() - 1)
-        };
-        self.reasoning_effort = EFFORTS[next];
+        self.reasoning_effort = cycle_reasoning_effort(self.reasoning_effort, forward);
         self.reasoning_overridden = true;
     }
+}
+
+/// /model 与认证向导共用同一思考程度顺序，支持双向循环。
+pub(crate) fn cycle_reasoning_effort(
+    value: Option<ProviderReasoningEffort>,
+    forward: bool,
+) -> Option<ProviderReasoningEffort> {
+    const EFFORTS: [Option<ProviderReasoningEffort>; 7] = [
+        None,
+        Some(ProviderReasoningEffort::Low),
+        Some(ProviderReasoningEffort::Medium),
+        Some(ProviderReasoningEffort::High),
+        Some(ProviderReasoningEffort::Xhigh),
+        Some(ProviderReasoningEffort::Max),
+        Some(ProviderReasoningEffort::Ultra),
+    ];
+    let current = EFFORTS
+        .iter()
+        .position(|effort| *effort == value)
+        .unwrap_or_default();
+    let next = if forward {
+        (current + 1) % EFFORTS.len()
+    } else {
+        current.checked_sub(1).unwrap_or(EFFORTS.len() - 1)
+    };
+    EFFORTS[next]
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

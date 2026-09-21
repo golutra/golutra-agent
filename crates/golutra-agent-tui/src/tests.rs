@@ -23,6 +23,9 @@ mod pending_input_tests;
 #[path = "auth_model_tests.rs"]
 mod auth_model_tests;
 
+#[path = "auth_advanced_tests.rs"]
+mod auth_advanced_tests;
+
 #[test]
 fn remote_subcommand_is_an_explicit_app_server_transport() {
     let args = Args::try_parse_from([
@@ -3699,7 +3702,7 @@ fn reasoning_effort_order_and_saved_payload_include_lowercase_max_and_ultra() {
     let mut auth_effort = None;
     for expected in ["low", "medium", "high", "xhigh", "max", "ultra", "default"] {
         app.runtime_controls.cycle_effort(true);
-        auth_effort = next_reasoning_effort(auth_effort);
+        auth_effort = cycle_reasoning_effort(auth_effort, true);
         assert_eq!(
             effort_label(app.runtime_controls.reasoning_effort),
             expected
@@ -6440,18 +6443,6 @@ fn auth_advanced_custom_headers_parse_without_persisting_literal_secrets() {
             if key == "GOLUTRA_AGENT_PROVIDER_HEADER_KEY"
     ));
     assert!(parse_dialog_custom_headers("X-Api-Key=inline-secret").is_err());
-}
-
-#[test]
-fn auth_advanced_header_field_accepts_full_text_input() {
-    let mut dialog = AuthDialogState::new();
-    dialog.step = AuthDialogStep::AdvancedConfig;
-    dialog.advanced_selected = 4;
-    for character in "X-Client=golutra".chars() {
-        handle_auth_advanced_character(&mut dialog, character);
-    }
-
-    assert_eq!(dialog.custom_headers, "X-Client=golutra");
 }
 
 #[tokio::test]

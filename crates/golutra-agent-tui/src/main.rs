@@ -5619,6 +5619,11 @@ fn handle_paste(pasted: &str, app: &mut TuiApp) {
         | Some(OverlaySurface::Dashboard) => return,
         Some(OverlaySurface::Auth) => {
             let dialog = app.auth_dialog.as_mut().expect("auth surface");
+            if let Some(input) = &mut dialog.advanced_input {
+                input.insert_str(&single_line);
+                dialog.error = None;
+                return;
+            }
             let input = if dialog.step == AuthDialogStep::Model {
                 Some(dialog.prepare_custom_model_input())
             } else {

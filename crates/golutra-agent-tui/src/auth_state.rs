@@ -12,7 +12,7 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::ResumeSelectionDirection;
+use super::{ComposerInput, ResumeSelectionDirection, cycle_reasoning_effort};
 
 #[derive(Debug)]
 pub(crate) struct PendingModelDiscovery {
@@ -72,6 +72,7 @@ pub(crate) struct AuthDialogState {
     pub(crate) max_tokens: String,
     pub(crate) custom_headers: String,
     pub(crate) advanced_selected: usize,
+    pub(crate) advanced_input: Option<ComposerInput>,
     pub(crate) review: Option<AuthReview>,
     pub(crate) error: Option<String>,
 }
@@ -180,6 +181,7 @@ impl AuthDialogState {
             max_tokens: String::new(),
             custom_headers: String::new(),
             advanced_selected: 0,
+            advanced_input: None,
             review: None,
             error: None,
         }
@@ -226,6 +228,7 @@ impl AuthDialogState {
         self.max_tokens.clear();
         self.custom_headers.clear();
         self.advanced_selected = 0;
+        self.advanced_input = None;
         self.review = None;
         self.error = None;
         self.step = if !self.oauth_methods().is_empty() {
@@ -328,6 +331,9 @@ impl AuthDialogState {
     }
 
     pub(crate) fn move_selection(&mut self, direction: ResumeSelectionDirection) {
+        if self.advanced_input.is_some() {
+            return;
+        }
         let last_index = self.last_selection_index();
         let current = if self.step == AuthDialogStep::AdvancedConfig {
             self.advanced_selected
@@ -360,6 +366,9 @@ impl AuthDialogState {
     }
 
     pub(crate) fn set_interactive_selection(&mut self, index: usize) {
+        if self.advanced_input.is_some() {
+            return;
+        }
         if self.step == AuthDialogStep::AdvancedConfig {
             self.advanced_selected = index.min(AUTH_ADVANCED_ITEMS.saturating_sub(1));
         } else {
@@ -410,12 +419,7 @@ impl AuthDialogState {
                 self.manual_model_input = true;
                 Some(&mut self.model)
             }
-            AuthDialogStep::AdvancedConfig => match self.advanced_selected {
-                2 => Some(&mut self.context_window_size),
-                3 => Some(&mut self.max_tokens),
-                4 => Some(&mut self.custom_headers),
-                _ => None,
-            },
+            AuthDialogStep::AdvancedConfig => None,
             AuthDialogStep::GroupChoice
             | AuthDialogStep::ThirdPartyChoice
             | AuthDialogStep::AuthMethod
@@ -442,6 +446,10 @@ impl AuthDialogState {
     }
 
     pub(crate) fn go_back(&mut self) {
+        if self.advanced_input.is_some() {
+            self.finish_advanced_edit();
+            return;
+        }
         self.error = None;
         self.review = None;
         self.scroll = 0;
@@ -477,17 +485,54 @@ impl AuthDialogState {
         };
     }
 
-    pub(crate) fn toggle_advanced_item(&mut self) {
+    pub(crate) fn cycle_advanced_item(&mut self, forward: bool) {
         match self.advanced_selected {
-            0 => self.enable_thinking = !self.enable_thinking,
-            1 => self.reasoning_effort = next_reasoning_effort(self.reasoning_effort),
+            1 => self.enable_thinking = !self.enable_thinking,
+            2 => self.reasoning_effort = cycle_reasoning_effort(self.reasoning_effort, forward),
+            _ => {}
+        }
+        self.error = None;
+    }
+
+    pub(crate) fn advanced_text_value(&self, index: usize) -> Option<&str> {
+        if index == self.advanced_selected
+            && let Some(input) = &self.advanced_input
+        {
+            return Some(input.text());
+        }
+        match index {
+            3 => Some(&self.context_window_size),
+            4 => Some(&self.max_tokens),
+            5 => Some(&self.custom_headers),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn start_advanced_edit(&mut self) {
+        if let Some(value) = self.advanced_text_value(self.advanced_selected) {
+            self.advanced_input = Some(ComposerInput::from_text(value));
+            self.error = None;
+            self.manual_scroll = false;
+        }
+    }
+
+    pub(crate) fn finish_advanced_edit(&mut self) {
+        let Some(input) = self.advanced_input.take() else {
+            return;
+        };
+        // Enter/Esc 只保留本页草稿，最终校验和落盘仍分别由 Continue 与确认页负责。
+        let value = input.trimmed();
+        match self.advanced_selected {
+            3 => self.context_window_size = value,
+            4 => self.max_tokens = value,
+            5 => self.custom_headers = value,
             _ => {}
         }
         self.error = None;
     }
 }
 
-pub(crate) const AUTH_ADVANCED_ITEMS: usize = 5;
+pub(crate) const AUTH_ADVANCED_ITEMS: usize = 6;
 pub(crate) const OPENAI_PROTOCOL_ONLY: &[ProviderProtocol] = &[ProviderProtocol::OpenAiCompatible];
 pub(crate) const CUSTOM_PROTOCOL_OPTIONS: &[ProviderProtocol] = &[
     ProviderProtocol::OpenAiResponses,
@@ -640,20 +685,6 @@ pub(crate) const AUTH_GROUP_ITEMS: &[(&str, &str)] = &[
     ("Continue with mock", "Use local deterministic provider"),
     ("Quit", "Leave without changing provider settings"),
 ];
-
-pub(crate) fn next_reasoning_effort(
-    value: Option<ProviderReasoningEffort>,
-) -> Option<ProviderReasoningEffort> {
-    match value {
-        None => Some(ProviderReasoningEffort::Low),
-        Some(ProviderReasoningEffort::Low) => Some(ProviderReasoningEffort::Medium),
-        Some(ProviderReasoningEffort::Medium) => Some(ProviderReasoningEffort::High),
-        Some(ProviderReasoningEffort::High) => Some(ProviderReasoningEffort::Xhigh),
-        Some(ProviderReasoningEffort::Xhigh) => Some(ProviderReasoningEffort::Max),
-        Some(ProviderReasoningEffort::Max) => Some(ProviderReasoningEffort::Ultra),
-        Some(ProviderReasoningEffort::Ultra) => None,
-    }
-}
 
 pub(crate) fn reasoning_effort_label(value: Option<ProviderReasoningEffort>) -> &'static str {
     match value {
