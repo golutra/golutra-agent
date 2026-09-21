@@ -60,8 +60,13 @@ fn append_tool_fragment(
     event_id: Option<EventId>,
     tool_id: Option<&OperationId>,
     ranges: &mut Vec<(std::ops::Range<usize>, OperationId)>,
+    compact: bool,
 ) {
-    tail.append(lines, fragment, event_id);
+    if compact {
+        tail.append_contiguous(lines, fragment, event_id);
+    } else {
+        tail.append(lines, fragment, event_id);
+    }
     if let Some(id) = tool_id
         && !fragment.is_empty()
     {
@@ -104,6 +109,30 @@ struct RenderedHistoryEntry {
     stable_line_count: usize,
     commit_event: bool,
     source_prefix: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DebugTimelineKey {
+    revision: u64,
+    generation: u64,
+    width: u16,
+    height: u16,
+    expanded: bool,
+    fullscreen: bool,
+    inline: bool,
+    committed: usize,
+    event_count: usize,
+    last_event: Option<EventId>,
+    updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    error: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct DebugTimelineCache {
+    key: DebugTimelineKey,
+    lines: Arc<Vec<Line<'static>>>,
+    facts: Vec<Line<'static>>,
+    timeline: Vec<Line<'static>>,
 }
 
 /// 本地命令没有 runtime 事件；保留语义内容和归档锚点，窗口重排时不能丢掉 /status。
@@ -471,13 +500,13 @@ impl InlineHistoryState {
             lines.extend(session_history_lines(app, width));
             let fact_lines = match mode {
                 InlineHistoryMode::Developer { expanded: true } => {
-                    developer_fact_history_lines(app, width)
+                    developer_fact_snapshot_lines(app, width)
                 }
                 InlineHistoryMode::DebugSplit { expanded: true } => {
                     let (_, developer_width) = debug_pane_widths(width);
                     debug_split_history_lines(
                         Vec::new(),
-                        developer_fact_history_lines(app, developer_width),
+                        developer_fact_snapshot_lines(app, developer_width),
                         width,
                     )
                 }
@@ -580,6 +609,15 @@ impl InlineHistoryState {
         }
         for entry in entries {
             let event_id = entry.event_ids.first().copied();
+            // Diagnostic-only events are log rows, not new chat messages. Keep spacing at
+            // visible user/assistant/tool boundaries without inserting a blank per observation.
+            let compact = match InlineHistoryMode::from_app(app) {
+                InlineHistoryMode::Transcript => false,
+                InlineHistoryMode::Developer { .. } => true,
+                InlineHistoryMode::DebugSplit { .. } => !entry.lines.iter().any(|line| {
+                    debug_line_has_content_in_range(line, 0, debug_pane_widths(width).0)
+                }),
+            };
             if entry.commit_event && entry.is_committed(&self.committed_event_ids) {
                 continue;
             }
@@ -615,6 +653,7 @@ impl InlineHistoryState {
                         event_id,
                         entry.tool_id.as_ref(),
                         tool_ranges,
+                        compact,
                     );
                     self.tail
                         .append(lines, &local_entry_lines(app, &local.items, width), None);
@@ -628,6 +667,7 @@ impl InlineHistoryState {
                     event_id,
                     entry.tool_id.as_ref(),
                     tool_ranges,
+                    compact,
                 );
                 self.last_anchor = entry.event_ids.last().copied();
                 self.last_source_prefix = entry.source_prefix.clone();
@@ -752,7 +792,9 @@ fn rendered_history_entries(
                         stable_line_count: if commit_event {
                             lines.len()
                         } else {
-                            lines.len().saturating_sub(1)
+                            // The range and event count can change even on the first row.
+                            // Keep the entire open observation in the mutable viewport.
+                            0
                         },
                         commit_event,
                         lines,
@@ -777,19 +819,7 @@ fn history_entry_from_projection(
     let tool_id = projection.id().cloned();
     // 先渲染完整活动正文，共用解析器记录的块边界，避免再扫描一次 Markdown。
     let lines = render_operation_projection_lines(app, vec![projection.clone()], width);
-    let source_prefix = projection.is_assistant_message().then(|| {
-        let source = projection.item(false).body.join("\n");
-        if stable {
-            source
-        } else {
-            let end = app
-                .transcript
-                .markdown_cache
-                .borrow()
-                .stable_source_end(&source);
-            source[..end].to_owned()
-        }
-    });
+    let source_prefix = assistant_source_prefix(app, &projection, stable);
     let stable_source = source_prefix
         .as_ref()
         .filter(|prefix| !prefix.is_empty())
@@ -812,6 +842,26 @@ fn history_entry_from_projection(
         lines,
         source_prefix,
     }
+}
+
+fn assistant_source_prefix(
+    app: &TuiApp,
+    projection: &OperationProjection,
+    stable: bool,
+) -> Option<String> {
+    projection.is_assistant_message().then(|| {
+        let source = projection.item(false).body.join("\n");
+        if stable {
+            source
+        } else {
+            let end = app
+                .transcript
+                .markdown_cache
+                .borrow()
+                .stable_source_end(&source);
+            source[..end].to_owned()
+        }
+    })
 }
 
 fn debug_split_history_entries(
@@ -845,6 +895,14 @@ fn debug_split_event_entries(
 ) -> Vec<RenderedHistoryEntry> {
     let mut operations = event_operation_entries(&app.events)
         .into_iter()
+        .filter(|entry| {
+            !entry.stable
+                || !entry.event_ids.iter().all(|id| {
+                    app.transcript.history.enabled
+                        && !app.transcript.fullscreen
+                        && app.transcript.history.committed_event_ids.contains(id)
+                })
+        })
         .flat_map(|entry| {
             let value = (entry.projection, entry.stable);
             entry
@@ -866,12 +924,36 @@ fn debug_split_event_entries(
             blocked = true;
         }
         let commit_event = !blocked;
-        let transcript = event
+        // 已归档条目仍保留身份供分组和回收使用，但不再次构造文本或做 Markdown 排版。
+        if commit_event
+            && app.transcript.history.enabled
+            && !app.transcript.fullscreen
+            && event
+                .event_ids
+                .iter()
+                .all(|id| app.transcript.history.committed_event_ids.contains(id))
+        {
+            entries.push(RenderedHistoryEntry {
+                tool_id: None,
+                event_ids: event.event_ids,
+                lines: Vec::new(),
+                stable_line_count: 0,
+                commit_event: true,
+                source_prefix: None,
+            });
+            continue;
+        }
+        let (transcript, source_prefix) = event
             .event_ids
             .iter()
             .find_map(|event_id| operations.remove(event_id))
-            .map(|(projection, _)| {
-                render_operation_projection_lines(app, vec![projection], transcript_width)
+            .map(|(projection, stable)| {
+                let lines = render_operation_projection_lines(
+                    app,
+                    vec![projection.clone()],
+                    debug_transcript_content_width(transcript_width),
+                );
+                (lines, assistant_source_prefix(app, &projection, stable))
             })
             .unwrap_or_default();
         let developer =
@@ -883,11 +965,14 @@ fn debug_split_event_entries(
             stable_line_count: if commit_event {
                 lines.len()
             } else {
-                lines.len().saturating_sub(1)
+                // A shared physical row is immutable only when BOTH projections are closed.
+                // Wrapped row counts say nothing about the stability of either the Markdown
+                // or the diagnostic range/count. Continue drawing this block live instead.
+                0
             },
             commit_event,
             lines,
-            source_prefix: None,
+            source_prefix,
         });
     }
     entries
@@ -897,7 +982,61 @@ pub(crate) fn debug_split_live_lines(
     app: &TuiApp,
     width: u16,
     visible_rows: u16,
-) -> Vec<Line<'static>> {
+) -> Arc<Vec<Line<'static>>> {
+    let key = DebugTimelineKey {
+        revision: app.transcript.revision,
+        generation: app.transcript.history.replay_generation,
+        width,
+        height: visible_rows,
+        expanded: app.developer_observations_expanded,
+        fullscreen: app.transcript.fullscreen,
+        inline: app.transcript.history.enabled,
+        committed: app.transcript.history.committed_event_ids.len(),
+        event_count: app.events.len(),
+        last_event: app.events.last().map(|event| event.id),
+        updated_at: app.developer_updated_at,
+        error: app.developer_error.clone(),
+    };
+    let mut cached = app.debug_timeline_cache.borrow_mut();
+    if let Some(cache) = cached.as_mut() {
+        let content_key = DebugTimelineKey {
+            height: key.height,
+            ..cache.key.clone()
+        };
+        if content_key == key {
+            if cache.key.height != key.height {
+                // Viewport measurement and drawing use the same projection even when their
+                // height budgets differ. Typing must not replay the entire event history.
+                cache.lines = Arc::new(layout_debug_split_live_lines(
+                    app,
+                    width,
+                    visible_rows,
+                    cache.facts.clone(),
+                    cache.timeline.clone(),
+                ));
+                cache.key = key;
+            }
+            return Arc::clone(&cache.lines);
+        }
+    }
+    let (facts, timeline) = debug_split_live_content(app, width);
+    let lines = Arc::new(layout_debug_split_live_lines(
+        app,
+        width,
+        visible_rows,
+        facts.clone(),
+        timeline.clone(),
+    ));
+    *cached = Some(DebugTimelineCache {
+        key,
+        lines: Arc::clone(&lines),
+        facts,
+        timeline,
+    });
+    lines
+}
+
+fn debug_split_live_content(app: &TuiApp, width: u16) -> (Vec<Line<'static>>, Vec<Line<'static>>) {
     let (transcript_width, developer_width) = debug_pane_widths(width);
     let facts = if !app.transcript.history.enabled || app.developer_error.is_some() {
         let mut facts = developer_fact_history_lines(app, developer_width);
@@ -916,8 +1055,28 @@ pub(crate) fn debug_split_live_lines(
         app.developer_observations_expanded,
     )
     .into_iter()
-    .filter(|entry| !entry.is_committed(&app.transcript.history.committed_event_ids))
-    .flat_map(|entry| entry.lines)
+    .filter(|entry| {
+        app.transcript.fullscreen
+            || !entry.is_committed(&app.transcript.history.committed_event_ids)
+    })
+    .flat_map(|entry| {
+        let already = if app.transcript.fullscreen {
+            0
+        } else {
+            entry
+                .event_ids
+                .first()
+                .and_then(|id| {
+                    app.transcript
+                        .history
+                        .committed_stream_lines
+                        .get(id)
+                        .copied()
+                })
+                .unwrap_or(0)
+        };
+        entry.lines.into_iter().skip(already)
+    })
     .collect::<Vec<_>>();
 
     let live_event_operation_count = event_operation_entries(&app.events)
@@ -936,11 +1095,24 @@ pub(crate) fn debug_split_live_lines(
         .skip(live_event_operation_count)
         .collect::<Vec<_>>();
     timeline.extend(debug_split_history_lines(
-        render_operation_projection_lines(app, transcript_only, transcript_width),
+        render_operation_projection_lines(
+            app,
+            transcript_only,
+            debug_transcript_content_width(transcript_width),
+        ),
         Vec::new(),
         width,
     ));
+    (facts, timeline)
+}
 
+fn layout_debug_split_live_lines(
+    app: &TuiApp,
+    width: u16,
+    visible_rows: u16,
+    facts: Vec<Line<'static>>,
+    mut timeline: Vec<Line<'static>>,
+) -> Vec<Line<'static>> {
     if app.transcript.fullscreen {
         let mut lines = facts;
         lines.extend(timeline);
@@ -1069,7 +1241,8 @@ pub(crate) fn debug_split_history_lines(
         return vec![Line::from(HISTORY_OMISSION_MARKER)];
     }
     let (transcript_width, developer_width) = debug_pane_widths(width);
-    let transcript_rows = wrapped_history_rows(transcript, transcript_width);
+    let transcript_rows =
+        wrapped_history_rows(transcript, debug_transcript_content_width(transcript_width));
     let developer_rows = wrapped_history_rows(developer, developer_width);
     let row_count = transcript_rows.len().max(developer_rows.len());
     let mut rows = Vec::with_capacity(row_count);
@@ -1084,6 +1257,23 @@ pub(crate) fn debug_split_history_lines(
         rows.push(Line::from(spans));
     }
     rows
+}
+
+// Leave a gutter inside the left half, preserving the observation column and hit-test layout.
+fn debug_transcript_content_width(pane_width: u16) -> u16 {
+    if pane_width >= 4 {
+        pane_width - 2
+    } else {
+        pane_width
+    }
+}
+
+fn developer_fact_snapshot_lines(app: &TuiApp, width: u16) -> Vec<Line<'static>> {
+    let mut lines = developer_fact_history_lines(app, width);
+    if !lines.is_empty() {
+        lines.insert(0, Line::from("Facts snapshot (at history load)"));
+    }
+    lines
 }
 
 fn append_debug_pane_row(
@@ -1303,7 +1493,20 @@ fn clear_history_terminal<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<
 pub(crate) fn inline_viewport_height(app: &TuiApp, width: u16, screen_height: u16) -> u16 {
     // 候选属于活动输入区，必须计入高度；通过原生视口扩缩腾出空间，不覆盖历史或切入备用屏。
     let bottom = bottom_pane_height_for_width(app, width).max(MIN_INLINE_BOTTOM_ROWS);
-    let live = live_transcript_body_rows(app, width);
+    let live = if app.overlay_surface().is_none()
+        && matches!(
+            InlineHistoryMode::from_app(app),
+            InlineHistoryMode::DebugSplit { .. }
+        ) {
+        // Debug wraps at half width and includes diagnostic-only rows. Measuring the normal
+        // full-width transcript here crops the beginning of an otherwise short live reply.
+        debug_split_live_lines(app, width, screen_height.saturating_sub(bottom));
+        let cached = app.debug_timeline_cache.borrow();
+        let cache = cached.as_ref().expect("debug layout was just cached");
+        u16::try_from(cache.facts.len().saturating_add(cache.timeline.len())).unwrap_or(u16::MAX)
+    } else {
+        live_transcript_body_rows(app, width)
+    };
     bottom.saturating_add(live).min(screen_height).max(1)
 }
 
@@ -1426,6 +1629,101 @@ mod boundary_tests {
     use super::*;
 
     #[test]
+    fn debug_stream_append_never_archives_mutable_rows_or_reports_a_revision() {
+        for mode in [BodyViewMode::Split, BodyViewMode::Developer] {
+            for expanded in [false, true] {
+                for chunks in [
+                    vec!["Hi", "! I'm Gol", "utra, ready to help."],
+                    vec!["你好", "，我可以帮助你检查项目。", "\n\n下一段内容。"],
+                    vec![
+                        "Introduction.\n\n| Name | Value |\n| --- | --- |\n| a | b |",
+                        "\n| longer | wider value |",
+                    ],
+                ] {
+                    let session_id = SessionId::new();
+                    let turn_id = TurnId::new();
+                    let mut app =
+                        TuiApp::new(ThreadId::new(), session_id, None, true, "mock".into(), None);
+                    app.enable_inline_history();
+                    app.body_view_mode = mode;
+                    app.developer_observations_expanded = expanded;
+                    // The fixture has no backing store; an error also makes the history source ready.
+                    app.developer_error = Some("test snapshot unavailable".into());
+                    let mut terminal = Terminal::with_options(
+                        ratatui::backend::TestBackend::new(80, 200),
+                        ratatui::TerminalOptions {
+                            viewport: ratatui::Viewport::Inline(3),
+                        },
+                    )
+                    .unwrap();
+                    let mut history = InlineHistoryState::new(session_id);
+                    history.native_scrollback = true;
+                    let mut answer = String::new();
+                    for (index, chunk) in chunks.iter().enumerate() {
+                        answer.push_str(chunk);
+                        app.events.push(RuntimeEvent {
+                            schema_version: golutra_agent_core::RUNTIME_EVENT_SCHEMA_VERSION,
+                            causal_context: Default::default(),
+                            causal_links: vec![],
+                            id: EventId::new(),
+                            sequence_no: index as u64 + 1,
+                            session_id,
+                            turn_id: Some(turn_id),
+                            task_id: None,
+                            parent_event_id: None,
+                            event_type: golutra_agent_protocol::RuntimeEventType::ProviderStreamed,
+                            timestamp: chrono::Utc::now(),
+                            source: golutra_agent_protocol::RuntimeEventSource::Provider,
+                            payload: json!({"delta":{"kind":"text_delta","text":chunk}}),
+                            payload_ref: None,
+                            durable: false,
+                        });
+                        history
+                            .flush_with_rebuild(&mut terminal, &mut app, |_| {
+                                panic!("must preserve scrollback")
+                            })
+                            .unwrap();
+                        assert!(
+                            history.committed_stream_lines.is_empty(),
+                            "mutable diagnostic range must stay live: {mode:?}, {expanded}, {answer}"
+                        );
+                        if index == 0 {
+                            terminal.backend_mut().resize(64, 200);
+                        }
+                    }
+                    let mut event = app.events.last().unwrap().clone();
+                    event.id = EventId::new();
+                    event.sequence_no += 1;
+                    event.event_type = golutra_agent_protocol::RuntimeEventType::AssistantMessage;
+                    event.payload = json!({"content": answer});
+                    app.events.push(event);
+                    history
+                        .flush_with_rebuild(&mut terminal, &mut app, |_| {
+                            panic!("must preserve scrollback")
+                        })
+                        .unwrap();
+                    let text = terminal
+                        .backend()
+                        .buffer()
+                        .content
+                        .iter()
+                        .map(|cell| cell.symbol())
+                        .collect::<String>();
+                    assert!(!text.contains("Updated response"), "{text}");
+                    assert_eq!(history.committed_event_ids.len(), app.events.len());
+                    assert!(
+                        !history
+                            .flush_with_rebuild(&mut terminal, &mut app, |_| panic!(
+                                "unexpected reset"
+                            ))
+                            .unwrap()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn growing_stream_table_and_terminal_resize_do_not_duplicate_the_final_answer() {
         let session_id = SessionId::new();
         let turn_id = TurnId::new();
@@ -1511,84 +1809,90 @@ mod boundary_tests {
 
     #[test]
     fn native_history_preserves_commits_and_labels_a_revised_final_without_clearing() {
-        let session_id = SessionId::new();
-        let turn_id = TurnId::new();
-        let mut app = TuiApp::new(
-            ThreadId::new(),
-            session_id,
-            None,
-            false,
-            "mock".into(),
-            None,
-        );
-        app.enable_inline_history();
-        let mut event = RuntimeEvent {
-            schema_version: golutra_agent_core::RUNTIME_EVENT_SCHEMA_VERSION,
-            causal_context: Default::default(),
-            causal_links: vec![],
-            id: EventId::new(),
-            sequence_no: 1,
-            session_id,
-            turn_id: Some(turn_id),
-            task_id: None,
-            parent_event_id: None,
-            event_type: golutra_agent_protocol::RuntimeEventType::ProviderStreamed,
-            timestamp: chrono::Utc::now(),
-            source: golutra_agent_protocol::RuntimeEventSource::Tool,
-            payload: json!({"delta":{"kind":"text_delta","text":"Earlier paragraph.\n\nUnfinished"}}),
-            payload_ref: None,
-            durable: false,
-        };
-        app.events.push(event.clone());
-        let mut terminal = Terminal::with_options(
-            ratatui::backend::TestBackend::new(100, 80),
-            ratatui::TerminalOptions {
-                viewport: ratatui::Viewport::Inline(3),
-            },
-        )
-        .unwrap();
-        let mut history = InlineHistoryState::new(session_id);
-        history.native_scrollback = true;
-        history
-            .flush_with_rebuild(&mut terminal, &mut app, |_| {
-                panic!("native history must not clear terminal")
-            })
+        for finish_in_debug in [false, true] {
+            let session_id = SessionId::new();
+            let turn_id = TurnId::new();
+            let mut app = TuiApp::new(
+                ThreadId::new(),
+                session_id,
+                None,
+                false,
+                "mock".into(),
+                None,
+            );
+            app.enable_inline_history();
+            let mut event = RuntimeEvent {
+                schema_version: golutra_agent_core::RUNTIME_EVENT_SCHEMA_VERSION,
+                causal_context: Default::default(),
+                causal_links: vec![],
+                id: EventId::new(),
+                sequence_no: 1,
+                session_id,
+                turn_id: Some(turn_id),
+                task_id: None,
+                parent_event_id: None,
+                event_type: golutra_agent_protocol::RuntimeEventType::ProviderStreamed,
+                timestamp: chrono::Utc::now(),
+                source: golutra_agent_protocol::RuntimeEventSource::Tool,
+                payload: json!({"delta":{"kind":"text_delta","text":"Earlier paragraph.\n\nUnfinished"}}),
+                payload_ref: None,
+                durable: false,
+            };
+            app.events.push(event.clone());
+            let mut terminal = Terminal::with_options(
+                ratatui::backend::TestBackend::new(100, 80),
+                ratatui::TerminalOptions {
+                    viewport: ratatui::Viewport::Inline(3),
+                },
+            )
             .unwrap();
-        assert!(!history.committed_stream_prefixes.is_empty());
-        app.request_history_rebuild();
-        event.id = EventId::new();
-        event.sequence_no = 2;
-        event.event_type = golutra_agent_protocol::RuntimeEventType::AssistantMessage;
-        event.payload = json!({"content":"Corrected final answer."});
-        app.events.push(event);
-        history
-            .flush_with_rebuild(&mut terminal, &mut app, |_| {
-                panic!("native history must not clear terminal")
-            })
-            .unwrap();
-        let text = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(
-            text.contains("Earlier paragraph."),
-            "already emitted facts stay in native history"
-        );
-        let notice = text.find("Updated response").expect("revision marker");
-        assert!(
-            notice
-                < text
-                    .find("Corrected final answer.")
-                    .expect("complete final answer")
-        );
-        assert!(
-            !history
-                .flush_with_rebuild(&mut terminal, &mut app, |_| panic!("unexpected reset"))
-                .unwrap()
-        );
+            let mut history = InlineHistoryState::new(session_id);
+            history.native_scrollback = true;
+            history
+                .flush_with_rebuild(&mut terminal, &mut app, |_| {
+                    panic!("native history must not clear terminal")
+                })
+                .unwrap();
+            assert!(!history.committed_stream_prefixes.is_empty());
+            app.request_history_rebuild();
+            if finish_in_debug {
+                app.debug_mode = true;
+                app.developer_error = Some("test snapshot unavailable".into());
+            }
+            event.id = EventId::new();
+            event.sequence_no = 2;
+            event.event_type = golutra_agent_protocol::RuntimeEventType::AssistantMessage;
+            event.payload = json!({"content":"Corrected final answer."});
+            app.events.push(event);
+            history
+                .flush_with_rebuild(&mut terminal, &mut app, |_| {
+                    panic!("native history must not clear terminal")
+                })
+                .unwrap();
+            let text = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(
+                text.contains("Earlier paragraph."),
+                "already emitted facts stay in native history"
+            );
+            let notice = text.find("Updated response").expect("revision marker");
+            assert!(
+                notice
+                    < text
+                        .find("Corrected final answer.")
+                        .expect("complete final answer")
+            );
+            assert!(
+                !history
+                    .flush_with_rebuild(&mut terminal, &mut app, |_| panic!("unexpected reset"))
+                    .unwrap()
+            );
+        }
     }
 
     #[test]

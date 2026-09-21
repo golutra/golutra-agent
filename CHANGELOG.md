@@ -6,6 +6,35 @@ follow [Semantic Versioning](https://semver.org/) where applicable.
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-09-21
+
+### Fixed
+
+- Esc closes the root `/auth` and `/login` setup page without reopening it on
+  every authentication-state refresh; nested pages still navigate back.
+- Debug streaming no longer archives mutable event ranges or unfinished text,
+  preventing false "Updated response" notices and duplicate answers.
+- Measure the live viewport using the actual two-column layout, so short
+  streaming replies are not cropped by full-width height calculations.
+
+### Changed
+
+- Make the Debug timeline denser: diagnostic-only events have no blank chat
+  separators, and plain diagnostic text wraps at word and Unicode boundaries.
+  Keep chat spacing, column gutters, literal text, event IDs and full details.
+- Reload complete debug history asynchronously, with cancellation and merging
+  of live events. Remove total history-load caps while retaining cursor guards
+  and reclaiming only already archived events from the active window.
+- Alt+D opens redacted event details with keyboard navigation, scrolling and
+  copying. Preserve native mouse selection and the original chat draft.
+- Deduplicate tool/job projections by identity, retain the last good snapshot
+  on refresh errors, cache debug layout, and label archived facts as snapshots.
+
+### Distribution
+
+- Release the npm launcher, six platform packages and matching native desktop
+  archives as 0.3.4 through the existing build, smoke-test and publish pipeline.
+
 ## [0.3.3] - 2026-09-21
 
 ### Changed
@@ -188,7 +217,8 @@ This is the initial public development baseline. See the repository history
 and [architecture documentation](docs/ARCHITECTURE.md) for the implementation
 details and current compatibility boundaries.
 
-[unreleased]: https://github.com/golutra/golutra-agent/compare/v0.3.3...HEAD
+[unreleased]: https://github.com/golutra/golutra-agent/compare/v0.3.4...HEAD
+[0.3.4]: https://github.com/golutra/golutra-agent/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/golutra/golutra-agent/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/golutra/golutra-agent/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/golutra/golutra-agent/compare/v0.3.0...v0.3.1

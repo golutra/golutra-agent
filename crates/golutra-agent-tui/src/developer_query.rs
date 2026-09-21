@@ -48,6 +48,9 @@ pub(crate) fn merge_debug_projection(
     mut previous: DebugProjection,
     latest: DebugProjection,
 ) -> DebugProjection {
+    if previous.session_id != latest.session_id || previous.task_id != latest.task_id {
+        return latest;
+    }
     previous.events.extend(latest.events);
     previous.events.sort_by_key(|event| event.sequence_no);
     previous.events.dedup_by_key(|event| event.sequence_no);
@@ -75,8 +78,9 @@ pub(crate) fn merge_debug_projection(
     previous
         .busy_policy_decisions
         .dedup_by_key(|decision| decision.decision_id);
-    previous.tool_results.extend(latest.tool_results);
-    previous.tool_results.dedup();
+    previous.tool_results = merge_records(previous.tool_results, latest.tool_results, |result| {
+        result.tool_call_id
+    });
     previous.artifacts.extend(latest.artifacts);
     previous
         .artifacts
@@ -97,9 +101,11 @@ pub(crate) fn merge_debug_projection(
     previous
         .loop_decisions
         .dedup_by_key(|decision| decision.decision_id);
-    previous.post_task_jobs.extend(latest.post_task_jobs);
+    previous.post_task_jobs =
+        merge_records(previous.post_task_jobs, latest.post_task_jobs, |job| {
+            job.job_id
+        });
     previous.post_task_jobs.sort_by_key(|job| job.created_at);
-    previous.post_task_jobs.dedup_by_key(|job| job.job_id);
     if latest.failure_diagnosis.is_some() {
         previous.failure_diagnosis = latest.failure_diagnosis;
     }
@@ -117,6 +123,17 @@ pub(crate) fn merge_debug_projection(
     previous.retention_losses = latest.retention_losses;
     refresh_debug_completeness(&mut previous);
     previous
+}
+
+// 状态快照以最新记录为准；普通 Vec::dedup 既无法去掉非相邻重复，也会保留过期状态。
+fn merge_records<T, K: Ord>(previous: Vec<T>, latest: Vec<T>, key: impl Fn(&T) -> K) -> Vec<T> {
+    previous
+        .into_iter()
+        .chain(latest)
+        .map(|record| (key(&record), record))
+        .collect::<std::collections::BTreeMap<_, _>>()
+        .into_values()
+        .collect()
 }
 
 pub(crate) fn replace_debug_event_history_with_window(
