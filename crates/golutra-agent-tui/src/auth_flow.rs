@@ -26,10 +26,17 @@ pub(crate) async fn handle_auth_dialog_key(
             }
         }
         KeyCode::Esc => {
-            if let Some(dialog) = &mut app.auth_dialog {
+            app.cancel_auth_model_discovery();
+            if app
+                .auth_dialog
+                .as_ref()
+                .is_some_and(|dialog| dialog.step == AuthDialogStep::GroupChoice)
+            {
+                app.auth_dialog = None;
+                app.status_message = "provider setup cancelled".to_owned();
+            } else if let Some(dialog) = &mut app.auth_dialog {
                 dialog.go_back();
             }
-            app.cancel_auth_model_discovery();
         }
         KeyCode::Up | KeyCode::Char('k') => {
             if let Some(dialog) = &mut app.auth_dialog {

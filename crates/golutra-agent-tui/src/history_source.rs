@@ -16,10 +16,7 @@ pub(crate) struct LoadedEventHistory {
     pub(crate) has_more_before: bool,
 }
 
-pub(crate) const COMPLETE_HISTORY_EVENT_LIMIT: usize = 32_768;
-pub(crate) const COMPLETE_HISTORY_BYTE_LIMIT: usize = 32 * 1024 * 1024;
-
-/// 默认仍可只读最近一页。会话恢复优先走完整历史；超预算时才退回这一页。
+/// 完整读取失败时可回退到最近一页，并明确标记仍有未加载历史。
 pub(crate) async fn load_recent_event_history(
     transport: &RuntimeTransport,
     session_id: SessionId,
@@ -72,7 +69,6 @@ where
 {
     let mut cursor = None;
     let mut events = BTreeMap::<u64, RuntimeEvent>::new();
-    let mut event_bytes = 0_usize;
 
     loop {
         let page = load_page(EventPageRequest {
@@ -89,15 +85,6 @@ where
             if events.contains_key(&event.sequence_no) {
                 continue;
             }
-            event_bytes = event_bytes.saturating_add(runtime_event_size(&event));
-            if events.len() >= COMPLETE_HISTORY_EVENT_LIMIT
-                || event_bytes > COMPLETE_HISTORY_BYTE_LIMIT
-            {
-                return Err(format!(
-                    "event history exceeds the bounded replay budget ({} events or {} bytes)",
-                    COMPLETE_HISTORY_EVENT_LIMIT, COMPLETE_HISTORY_BYTE_LIMIT
-                ));
-            }
             events.insert(event.sequence_no, event);
         }
 
@@ -113,6 +100,8 @@ where
             ));
         }
         cursor = Some(next_cursor);
+        // 内存 transport 也可能立即返回页面；主动让出执行权，使取消和键盘处理可推进。
+        tokio::task::yield_now().await;
     }
 
     let events = events.into_values().collect::<Vec<_>>();
@@ -122,16 +111,6 @@ where
         events,
         has_more_before: false,
     })
-}
-
-fn runtime_event_size(event: &RuntimeEvent) -> usize {
-    // 负载通常占事件内存的大头；固定余量覆盖 ID、时间戳和因果元数据，
-    // 避免为预算计算再次序列化完整事件。
-    256_usize.saturating_add(
-        serde_json::to_vec(&event.payload)
-            .map(|payload| payload.len())
-            .unwrap_or_default(),
-    )
 }
 
 #[cfg(test)]
@@ -249,6 +228,40 @@ mod tests {
         assert_eq!(history.end_cursor, Some(600));
         assert_eq!(history.events[255].sequence_no, 256);
         assert_eq!(history.events[512].sequence_no, 513);
+    }
+
+    #[tokio::test]
+    async fn complete_history_exceeds_former_event_and_byte_limits() {
+        let session_id = SessionId::new();
+        let history = load_complete_event_history_with(session_id, None, |request| {
+            let end = request.cursor.unwrap_or(33_001).saturating_sub(1);
+            let start = end.saturating_sub(u64::from(request.limit) - 1).max(1);
+            ready(Ok(EventPage {
+                direction: EventPageDirection::Backward,
+                events: (start..=end)
+                    .map(|sequence| {
+                        let mut event = event(sequence, session_id);
+                        event.payload = json!({"summary": "x".repeat(1024)});
+                        event
+                    })
+                    .collect(),
+                start_cursor: Some(start),
+                end_cursor: Some(end),
+                has_more: start > 1,
+            }))
+        })
+        .await
+        .expect("complete history above 32768 events and 32 MiB");
+        assert_eq!(history.events.len(), 33_000);
+        assert_eq!(history.start_cursor, Some(1));
+        assert_eq!(history.end_cursor, Some(33_000));
+        assert!(!history.has_more_before);
+        assert!(
+            history
+                .events
+                .windows(2)
+                .all(|pair| pair[0].sequence_no + 1 == pair[1].sequence_no)
+        );
     }
 
     #[tokio::test]

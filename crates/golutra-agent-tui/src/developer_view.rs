@@ -24,6 +24,7 @@ pub(crate) struct DeveloperEventProjection {
     pub(crate) label: String,
     summary: String,
     event_type: RuntimeEventType,
+    stream_closed: bool,
 }
 
 impl DeveloperEventProjection {
@@ -35,6 +36,7 @@ impl DeveloperEventProjection {
             label: format!("{:?}/{:?}", event.event_type, event.source),
             summary: developer_event_summary(event),
             event_type: event.event_type,
+            stream_closed: false,
         }
     }
 
@@ -52,7 +54,7 @@ impl DeveloperEventProjection {
     }
 
     pub(crate) fn is_open_provider_stream(&self) -> bool {
-        self.event_type == RuntimeEventType::ProviderStreamed
+        self.event_type == RuntimeEventType::ProviderStreamed && !self.stream_closed
     }
 }
 
@@ -69,6 +71,10 @@ pub(crate) fn developer_event_projections<'a>(
                 .expect("a previous event has a developer projection")
                 .push(event);
         } else {
+            // 后继事件出现后，前一段流的观测摘要已固定；正文是否稳定仍由 operation 判断。
+            if let Some(previous) = projections.last_mut() {
+                previous.stream_closed = true;
+            }
             projections.push(DeveloperEventProjection::from_event(event));
         }
         previous = Some(event);
@@ -230,12 +236,103 @@ fn developer_event_row(event: DeveloperEventProjection) -> DeveloperPanelRow {
 }
 
 pub(crate) fn developer_event_summary(event: &RuntimeEvent) -> String {
-    event
+    let summary = event
         .payload
         .get("summary")
         .and_then(|value| value.as_str())
         .or_else(|| event.payload.get("error").and_then(|value| value.as_str()))
-        .map_or_else(|| "runtime event recorded".to_owned(), str::to_owned)
+        .or_else(|| {
+            event
+                .payload
+                .pointer("/error/message")
+                .and_then(|value| value.as_str())
+        })
+        .unwrap_or("runtime event recorded");
+    let mut text = summary.to_owned();
+    if let Some(error) = event
+        .payload
+        .get("error")
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            event
+                .payload
+                .pointer("/error/message")
+                .and_then(|value| value.as_str())
+        })
+        && error != summary
+    {
+        text.push_str(&format!(" · {error}"));
+    }
+    for (label, value) in diagnostic_fields(event) {
+        if label != "request_id"
+            && let Some(value) = value
+        {
+            text.push_str(&format!(" · {label}={value}"));
+        }
+    }
+    safe_diagnostic_text(&text)
+}
+
+pub(crate) fn diagnostic_fields(event: &RuntimeEvent) -> Vec<(&'static str, Option<String>)> {
+    let value = |paths: &[&str]| {
+        paths.iter().find_map(|path| {
+            event
+                .payload
+                .pointer(path)
+                .filter(|value| !value.is_null())
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map_or_else(|| value.to_string(), str::to_owned)
+                })
+        })
+    };
+    vec![
+        ("phase", value(&["/recovery/phase", "/phase"])),
+        (
+            "elapsed_ms",
+            value(&[
+                "/metrics/duration_ms",
+                "/elapsed_ms",
+                "/duration_ms",
+                "/recovery/waited_ms",
+            ]),
+        ),
+        (
+            "http_status",
+            value(&[
+                "/error_metadata/http_status",
+                "/recovery/error_metadata/http_status",
+                "/http_status",
+            ]),
+        ),
+        (
+            "request_id",
+            value(&[
+                "/error_metadata/request_id",
+                "/recovery/error_metadata/request_id",
+                "/request_id",
+            ])
+            .or_else(|| {
+                event
+                    .causal_context
+                    .provider_request_id
+                    .map(|id| id.to_string())
+            }),
+        ),
+        ("retry_in_ms", value(&["/recovery/delay_ms", "/delay_ms"])),
+    ]
+}
+
+pub(crate) fn safe_diagnostic_text(text: &str) -> String {
+    let mut value = serde_json::Value::String(text.to_owned());
+    golutra_agent_client::redact_runtime_value(&mut value);
+    value
+        .as_str()
+        .unwrap_or("<redacted>")
+        .chars()
+        .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))
+        .collect()
 }
 
 fn compact_text(value: &str, max_chars: usize) -> String {
@@ -320,7 +417,8 @@ mod tests {
             projected[0].summary(),
             "provider response delta received (2 events)"
         );
-        assert!(projected[0].is_open_provider_stream());
+        assert!(!projected[0].is_open_provider_stream());
+        assert!(developer_event_projections(&events[..2])[0].is_open_provider_stream());
         assert_eq!(projected[1].event_ids, vec![events[2].id]);
     }
 
