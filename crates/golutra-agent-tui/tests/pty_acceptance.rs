@@ -96,6 +96,10 @@ impl PtyHarness {
             command.env("GOLUTRA_AGENT_PROVIDER_MODE", "mock");
         }
         command.env("TERM", "xterm-256color");
+        // 测试模拟普通 xterm，不能继承宿主的 tmux/Emacs 探测分支。
+        command.env_remove("TMUX");
+        command.env_remove("STY");
+        command.env_remove("INSIDE_EMACS");
         // 样式验收不继承 CI/执行器的 NO_COLOR；生产程序仍尊重用户终端配置。
         command.env_remove("NO_COLOR");
         let child = pair.slave.spawn_command(command).expect("spawn TUI binary");
@@ -541,6 +545,49 @@ fn offline_recovery_and_partial_stream_boundaries_survive_pty_and_resume() {
     assert!(!text.contains("Waiting for network"), "{text}");
     resumed.write(b"/quit\r");
     assert!(resumed.wait().1.success());
+}
+
+#[test]
+fn startup_does_not_query_background_or_pollute_the_composer() {
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    install_mock_provider(home.path());
+    let mut pty = PtyHarness::spawn(home.path(), workspace.path(), 110, 32);
+    let startup = pty.collect_until(b"Ask Golutra", Duration::from_secs(10));
+    let mut screen = vt100::Parser::new(32, 110, 0);
+    screen.process(&startup);
+    assert!(
+        screen.screen().contents().contains("Ask Golutra"),
+        "TUI did not become ready"
+    );
+    let queried_background = contains_bytes(&startup, b"\x1b]11;?");
+    if queried_background {
+        // 只对真实查询回包：模拟回复在旧版 50ms 探测结束之后到达。
+        thread::sleep(Duration::from_millis(150));
+        pty.write(b"\x1b]11;rgb:0b0b/0f0f/1414\x07");
+    }
+    screen.process(&pty.collect_for(Duration::from_millis(250)));
+    let visible = screen.screen().contents();
+    assert!(
+        !visible.contains("11;rgb:"),
+        "terminal reply entered composer:\n{visible}"
+    );
+    assert!(
+        !queried_background,
+        "startup must not solicit color replies on the keyboard input stream"
+    );
+
+    // 不靠匹配用户文本来掩盖问题；用户仍能正常输入相同的字符串。
+    pty.write("你好 11;rgb:0b0b/0f0f/1414".as_bytes());
+    screen.process(&pty.collect_for(Duration::from_millis(250)));
+    assert!(
+        screen
+            .screen()
+            .contents()
+            .contains("你好 11;rgb:0b0b/0f0f/1414")
+    );
+    pty.write(b"\x15/quit\r");
+    assert!(pty.wait().1.success());
 }
 
 #[test]
