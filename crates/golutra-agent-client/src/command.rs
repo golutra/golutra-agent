@@ -6,7 +6,7 @@ use golutra_agent_core::{
 };
 use golutra_agent_protocol::pending_user_question;
 
-const EXPLICIT_COMPACTION_TOKEN_BUDGET: u64 = 2_048;
+const EXPLICIT_COMPACTION_TOKEN_BUDGET: u64 = DEFAULT_COMPACTION_SUMMARY_TOKENS;
 
 fn queued_turn_id_from_payload(payload: &Value) -> Option<TurnId> {
     payload
@@ -2681,6 +2681,8 @@ impl RuntimeHost {
             .or_else(|| events.iter().rev().find_map(|event| event.task_id))
             .zip(events.iter().rev().find_map(|event| event.turn_id));
         let mut strategy = "fallback_facts";
+        let mut summary_failure = Some(SummaryFailure::SourceUnavailable.to_string());
+        let mut summary_attempts = 0;
         if !self.force_mock_provider
             && let Some((task_id, turn_id)) = trace_ids
         {
@@ -2715,115 +2717,51 @@ impl RuntimeHost {
                         &source_messages,
                         EXPLICIT_COMPACTION_TOKEN_BUDGET,
                     )
-                    && let Some(context_snapshot) = compaction_summary_context_snapshot(
-                        &provider_plan.context_builder,
-                        session_id,
-                        &provider_request,
+                    && let Some(mut summary_plan) = CompactionSummaryPlan::new(
+                        provider_request,
+                        &summary,
+                        EXPLICIT_COMPACTION_TOKEN_BUDGET,
                     )
                 {
-                    let budget_snapshot_ref = context_snapshot.budget_snapshot.snapshot_id;
-                    let request_id = provider_request.request_id;
                     let trace_task = HostedAgentTask {
                         session_id,
                         task_id,
                         turn_id,
                         payload: json!({}),
                     };
-                    self.record_auxiliary_trace_observation(
-                        &trace_task,
-                        AgentLoopTraceEvent::ContextSnapshotCaptured {
-                            snapshot: context_snapshot,
-                            request: provider_request.clone(),
-                        },
-                    )
-                    .await?;
-                    self.record_auxiliary_trace_observation(
-                        &trace_task,
-                        AgentLoopTraceEvent::ProviderStarted {
-                            request_id,
-                            provider_id: contract.provider_id.clone(),
-                            model_id: contract.model_id.clone(),
-                        },
-                    )
-                    .await?;
-                    let cache_identity = provider_plan
-                        .provider
-                        .cache_identity_for_request(&provider_request);
-                    match tokio::time::timeout(
-                        provider_plan.provider_session_policy.request_timeout,
-                        provider_plan.provider.complete(provider_request.clone()),
-                    )
-                    .await
-                    {
-                        Ok(Ok(response)) => {
-                            let usage = auxiliary_provider_usage_record(
-                                &provider_request,
-                                &response,
-                                Some(session_id),
-                                budget_snapshot_ref,
-                                &contract.cost_model,
-                                cache_identity,
-                            );
-                            self.record_auxiliary_trace_observation(
-                                &trace_task,
-                                AgentLoopTraceEvent::TokenUsageRecorded(usage),
-                            )
-                            .await?;
-                            let model_summary = response
-                                .message
-                                .as_ref()
-                                .map(|message| message.content.trim().to_owned())
-                                .filter(|content| !content.is_empty());
-                            self.record_auxiliary_trace_observation(
-                                &trace_task,
-                                AgentLoopTraceEvent::ProviderCompleted {
-                                    request_id,
-                                    provider_id: contract.provider_id,
-                                    model_id: contract.model_id,
-                                    response,
-                                },
-                            )
-                            .await?;
-                            if let Some(model_summary) = model_summary {
-                                let candidate = compaction_summary_envelope(
-                                    &model_summary,
-                                    source_range,
-                                    source_tokens,
-                                    source_checksum,
-                                    EXPLICIT_COMPACTION_TOKEN_BUDGET,
-                                );
-                                if !candidate.is_empty() {
-                                    summary = candidate;
-                                    strategy = "model_summary";
-                                }
-                            }
+                    let cancellation = self
+                        .execution
+                        .task_controls
+                        .lock()
+                        .await
+                        .get(&session_id)
+                        .map(|control| control.execution.cancellation_token())
+                        .unwrap_or_else(|| self.execution.shutdown.clone());
+                    let result = self
+                        .complete_explicit_summary(
+                            &trace_task,
+                            &provider_plan.provider,
+                            &provider_plan.context_builder,
+                            provider_plan.provider_session_policy.request_timeout,
+                            &mut summary_plan,
+                            &cancellation,
+                        )
+                        .await?;
+                    summary_attempts = summary_plan.attempts();
+                    match result {
+                        Ok(model_summary) => {
+                            summary = model_summary;
+                            strategy = "model_summary";
+                            summary_failure = None;
                         }
-                        Ok(Err(error)) => {
-                            self.record_auxiliary_trace_observation(
-                                &trace_task,
-                                AgentLoopTraceEvent::ProviderFailed {
-                                    request_id,
-                                    provider_id: contract.provider_id,
-                                    model_id: contract.model_id,
-                                    error: error.to_string(),
-                                    metadata: error.metadata().cloned(),
-                                },
-                            )
-                            .await?;
+                        Err(SummaryFailure::Cancelled) => {
+                            return Ok(CommandAck {
+                                command_id: command.command_id,
+                                accepted: false,
+                                reason: Some(SummaryFailure::Cancelled.to_string()),
+                            });
                         }
-                        Err(_) => {
-                            self.record_auxiliary_trace_observation(
-                                &trace_task,
-                                AgentLoopTraceEvent::ProviderFailed {
-                                    request_id,
-                                    provider_id: contract.provider_id,
-                                    model_id: contract.model_id,
-                                    error: "compaction summary request timed out".to_owned(),
-                                    metadata: None,
-                                },
-                            )
-                            .await?;
-                        }
+                        Err(failure) => summary_failure = Some(failure.to_string()),
                     }
                 }
             }
@@ -2840,6 +2778,8 @@ impl RuntimeHost {
                 "command_id": command.command_id,
                 "mode": "explicit",
                 "strategy": strategy,
+                "summary_attempts": summary_attempts,
+                "summary_failure": summary_failure,
             }),
         ))
         .await?;

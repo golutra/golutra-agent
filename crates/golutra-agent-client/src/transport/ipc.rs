@@ -233,6 +233,19 @@ impl UnixIpcTransport {
         .await
     }
 
+    pub async fn handoff_thread(
+        &self,
+        thread_id: ThreadId,
+        request: HandoffRequest,
+    ) -> Result<HandoffResult, ClientError> {
+        self.attached_json(
+            "POST",
+            &format!("/threads/{thread_id}/handoff"),
+            Some(serde_json::to_value(request)?),
+        )
+        .await
+    }
+
     pub async fn export_thread_rollout(
         &self,
         thread_id: ThreadId,
@@ -689,7 +702,13 @@ async fn exchange(
         let body = collect_frames(&mut reader).await?;
         Ok(IpcResponse { status, body })
     };
-    tokio::time::timeout(Duration::from_secs(30), future)
+    // 交接需要等待模型，使用独立辅助操作期限，不改变普通 IPC 或主任务的期限。
+    let timeout = if path.ends_with("/handoff") {
+        crate::handoff::HANDOFF_TRANSPORT_TIMEOUT
+    } else {
+        Duration::from_secs(30)
+    };
+    tokio::time::timeout(timeout, future)
         .await
         .map_err(|_| ClientError::Daemon("IPC request timed out".to_owned()))?
 }
@@ -767,7 +786,12 @@ async fn open_exchange_with_cancellation(
             .await
             .map_err(|error| ClientError::Daemon(error.to_string()))?;
         let mut reader = BufReader::new(reader);
-        let head = read_response_head(&mut reader, IPC_RESPONSE_HEAD_TIMEOUT).await?;
+        let timeout = if path.ends_with("/handoff") {
+            crate::handoff::HANDOFF_TRANSPORT_TIMEOUT
+        } else {
+            IPC_RESPONSE_HEAD_TIMEOUT
+        };
+        let head = read_response_head(&mut reader, timeout).await?;
         match head {
             IpcHttpResponseFrame::Head { status, .. } => Ok((status, reader)),
             IpcHttpResponseFrame::Error { message } => Err(ClientError::Daemon(message)),

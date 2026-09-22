@@ -316,6 +316,17 @@ impl EmbeddedTransport {
             .await
     }
 
+    pub async fn handoff_thread(
+        &self,
+        thread_id: ThreadId,
+        request: HandoffRequest,
+    ) -> Result<HandoffResult, ClientError> {
+        self.application
+            .session_service()
+            .handoff_thread(thread_id, request)
+            .await
+    }
+
     pub async fn export_thread_rollout(
         &self,
         thread_id: ThreadId,
@@ -703,6 +714,25 @@ impl HttpSseTransport {
                 .header(APP_SERVER_ATTACHMENT_HEADER, attachment_id)
                 .json(&json!({"from_turn_id": from_turn_id}))
                 .timeout(Duration::from_secs(30))
+            })
+            .await?;
+        decode_http_response(response).await
+    }
+
+    pub async fn handoff_thread(
+        &self,
+        thread_id: ThreadId,
+        request: HandoffRequest,
+    ) -> Result<HandoffResult, ClientError> {
+        let response = self
+            .send_attached(|attachment_id| {
+                self.authenticated(
+                    self.client
+                        .post(self.url(&format!("/threads/{thread_id}/handoff"))),
+                )
+                .header(APP_SERVER_ATTACHMENT_HEADER, attachment_id)
+                .json(&request)
+                .timeout(crate::handoff::HANDOFF_TRANSPORT_TIMEOUT)
             })
             .await?;
         decode_http_response(response).await
@@ -1862,6 +1892,21 @@ impl RuntimeTransport {
             Self::LocalIpc(transport) => transport.fork_thread(thread_id, from_turn_id).await,
             Self::LocalDaemon(transport) | Self::Remote(transport) => {
                 transport.fork_thread(thread_id, from_turn_id).await
+            }
+        }
+    }
+
+    pub async fn handoff_thread(
+        &self,
+        thread_id: ThreadId,
+        request: HandoffRequest,
+    ) -> Result<HandoffResult, ClientError> {
+        match self {
+            Self::Embedded(transport) => transport.handoff_thread(thread_id, request).await,
+            #[cfg(unix)]
+            Self::LocalIpc(transport) => transport.handoff_thread(thread_id, request).await,
+            Self::LocalDaemon(transport) | Self::Remote(transport) => {
+                transport.handoff_thread(thread_id, request).await
             }
         }
     }

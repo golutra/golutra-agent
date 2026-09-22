@@ -40,7 +40,7 @@ The matrix tests use actual local HTTP/SSE endpoints and verify returned content
 
 Protocol continuation creates another model request in the same task and turn. It retains completed tool results, original budgets, cancellation and context-compaction behavior. Output-limit continuation adds a small runtime message requesting the remaining work; explicit provider continuation reuses history without injecting another user instruction. Eight consecutive text-only continuations are allowed before reporting failure; complete tool responses reset this counter, steering does not. This bound is separate from the existing task time/tool/cost limits. Empty responses and repeated identical no-progress output remain subject to existing guards.
 
-Auxiliary summaries are installed only after normal completion with no tool calls. Truncated or nonterminal summaries fall back to the existing local summary instead of recursively extending summary requests.
+Auxiliary summaries are installed only after normal completion with no tool calls and when the complete envelope fits its storage budget. Length or storage overflow gets one shorter rewrite from the original history; repeated failure and other nonterminal results use the local fallback. Automatic and explicit compaction share this policy. See [compaction reliability](compaction-reliability.md) for budgets, cancellation and validation boundaries.
 
 ## Verification scenarios
 

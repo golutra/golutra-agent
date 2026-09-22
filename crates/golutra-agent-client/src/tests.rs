@@ -7634,6 +7634,58 @@ async fn explicit_compaction_extends_the_latest_automatic_summary() {
 }
 
 #[tokio::test]
+async fn saved_summary_loads_whole_after_cache_eviction_and_with_a_smaller_window() {
+    let host = RuntimeHost::in_memory().await.unwrap();
+    let session_id = host.default_session_id();
+    let text = format!(
+        "## Goal\nPreserve API.\n{}\n## Remaining Work\nVerify migrations; tests still fail.",
+        "Observed module state. ".repeat(500)
+    );
+    let summary = test_compaction_summary(&text);
+    assert!(estimate_tokens(&summary) > 2_048);
+    assert!(estimate_tokens(&summary) < DEFAULT_COMPACTION_SUMMARY_TOKENS);
+    host.record_event(host_event(
+        host.next_sequence_no(),
+        session_id,
+        None,
+        RuntimeEventType::CompactionCompleted,
+        RuntimeEventSource::Runtime,
+        json!({"content":summary,"mode":"explicit","strategy":"model_summary"}),
+    ))
+    .await
+    .unwrap();
+    for budget in [16_384, 1_024] {
+        *host.execution.context_resources.lock().unwrap() = Default::default();
+        let contributors = host
+            .context_contributors_for_task_with_budget(
+                session_id,
+                TaskId::new(),
+                "continue migration validation".into(),
+                None,
+                budget,
+            )
+            .await
+            .unwrap();
+        let loaded = contributors
+            .iter()
+            .find(|contributor| contributor.name == "working_summary")
+            .unwrap();
+        let envelope =
+            golutra_agent_context::compaction_summary_from_context_content(&loaded.content)
+                .unwrap();
+        assert_eq!(
+            envelope.summary, text,
+            "a smaller window must reach the runtime compactor without a clipped checkpoint"
+        );
+        assert!(
+            contributors
+                .iter()
+                .any(|contributor| contributor.content == "continue migration validation")
+        );
+    }
+}
+
+#[tokio::test]
 async fn prompt_with_new_explicit_session_preserves_the_existing_thread() {
     let workspace = tempdir().expect("workspace");
     let _provider = IsolatedGlobalMockProvider::install().await;
@@ -12001,7 +12053,7 @@ async fn yolo_turn_writes_outside_the_workspace_without_approval() {
         .expect("yolo command");
     assert!(ack.accepted);
     let state = wait_for_terminal_status(&transport, session_id).await;
-    assert_eq!(projection_status(&state), Some(TaskStatus::Partial));
+    assert_eq!(projection_status(&state), Some(TaskStatus::Completed));
 
     assert_eq!(
         fs::read_to_string(&target).expect("outside result"),
@@ -12015,6 +12067,13 @@ async fn yolo_turn_writes_outside_the_workspace_without_approval() {
         .load(session_id, None, None)
         .await
         .expect("events");
+    assert!(
+        events.iter().any(|event| {
+            event.event_type == RuntimeEventType::VerificationCompleted
+                && event.payload["record"]["result"] == "partial"
+        }),
+        "best-effort completion must not promote missing verification evidence"
+    );
     assert!(
         !events
             .iter()
@@ -12418,6 +12477,8 @@ fn context_compaction_persists_a_redacted_baseline_outside_the_event_payload() {
         turn_id: task.turn_id,
         mode: "automatic".to_owned(),
         strategy: "fallback_facts_tail".to_owned(),
+        summary_attempts: 0,
+        summary_failure: None,
         original_message_count: 3,
         replacement_message_count: 2,
         dropped_message_count: 1,

@@ -1700,6 +1700,56 @@ async fn thread_metadata_and_event_commit_or_rollback_together() {
             .is_some()
     );
     assert_eq!(store.max_sequence_no().await.expect("sequence"), 1);
+
+    // 创建专用接口不能覆盖已有 thread/session，首事件失败也不能留下半个会话。
+    let mut child = thread.clone();
+    child.thread_id = ThreadId::new();
+    child.session_id = SessionId::new();
+    let mut created = event(RuntimeEventType::SessionCreated);
+    created.session_id = child.session_id;
+    assert!(
+        store
+            .create_thread_with_event(&child, created.clone())
+            .await
+            .is_err()
+    );
+    assert!(store.thread_by_id(child.thread_id).await.unwrap().is_none());
+    created.id = EventId::new();
+    assert!(
+        store
+            .create_thread_with_event(&child, created.clone())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    child.title = "must not replace".into();
+    created.id = EventId::new();
+    assert!(
+        store
+            .create_thread_with_event(&child, created.clone())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_ne!(
+        store
+            .thread_by_id(child.thread_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .title,
+        child.title
+    );
+    child.thread_id = ThreadId::new();
+    assert!(
+        store
+            .create_thread_with_event(&child, created)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.thread_by_id(child.thread_id).await.unwrap().is_none());
+    assert_eq!(store.max_sequence_no().await.unwrap(), 2);
 }
 
 #[tokio::test]

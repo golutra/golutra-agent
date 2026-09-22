@@ -829,6 +829,8 @@ pub(crate) fn trace_event_payload(
                 "summary": "automatic context compaction completed",
                 "mode": record.mode,
                 "strategy": record.strategy,
+                "summary_attempts": record.summary_attempts,
+                "summary_failure": record.summary_failure,
                 "content": record.summary,
                 "original_message_count": record.original_message_count,
                 "replacement_message_count": record.replacement_message_count,

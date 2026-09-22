@@ -115,3 +115,31 @@ fn correction_feedback_keeps_failure_at_end_of_a_long_verifier_log() {
     assert!(content.contains("Build started"));
     assert!(content.contains("omitted"));
 }
+
+#[test]
+fn missing_validation_feedback_does_not_recycle_historical_tool_errors() {
+    let (mut record, reports) = fixture(1);
+    record.checks[0].kind = VerificationCheckKind::ToolExecution;
+    record.residual_risks = vec!["task contract requires objective validation".into()];
+    let content = model_instruction(&correction_envelope(&record, 1, None), &record, &reports);
+    assert!(content.contains("No objective validation result was recognized"));
+    assert!(content.contains("without piping"));
+    assert!(!content.contains("case_0"));
+    assert!(!content.contains("tool_call_id"));
+}
+
+#[test]
+fn feedback_keeps_distinct_delivery_paths_and_omits_superseded_checks() {
+    let (mut record, reports) = fixture(3);
+    for (index, check) in record.checks.iter_mut().enumerate() {
+        check.name = "objective:content:write_file".into();
+        check.command = Some(format!("file-{index}.txt"));
+    }
+    let mut recovered = record.checks[0].clone();
+    recovered.passed = true;
+    record.checks.push(recovered);
+    let content = model_instruction(&correction_envelope(&record, 1, None), &record, &reports);
+    assert!(!content.contains("case_0"));
+    assert!(content.contains("case_1"));
+    assert!(content.contains("case_2"));
+}

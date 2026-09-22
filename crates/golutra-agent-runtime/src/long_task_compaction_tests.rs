@@ -21,11 +21,10 @@ struct CompactionProvider {
 #[async_trait]
 impl LlmProvider for CompactionProvider {
     async fn complete(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
-        if request
-            .messages
-            .first()
-            .is_some_and(|m| m.content == COMPACTION_SUMMARY_SYSTEM_PROMPT)
-        {
+        if request.messages.first().is_some_and(|m| {
+            m.content
+                .starts_with("You are a context summarization assistant")
+        }) {
             self.summaries.fetch_add(1, Ordering::SeqCst);
             let source: Value =
                 serde_json::from_str(&request.messages.last().unwrap().content).unwrap();

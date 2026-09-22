@@ -2419,6 +2419,29 @@ impl RuntimeStore {
         Ok(event)
     }
 
+    /// 在同一 SQLite 快照内检查冲突并提交 thread 与首个事件，防止并发 upsert 覆盖会话。
+    pub async fn create_thread_with_event(
+        &self,
+        thread: &ThreadRecord,
+        event: RuntimeEvent,
+    ) -> StoreResult<Option<RuntimeEvent>> {
+        let mut transaction = self.pool.begin().await?;
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM threads WHERE thread_id = ? OR session_id = ?)",
+        )
+        .bind(thread.thread_id.to_string())
+        .bind(thread.session_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await?;
+        if exists {
+            return Ok(None);
+        }
+        upsert_thread_in_transaction(&mut transaction, thread).await?;
+        let event = append_event_assigning_sequence_in_transaction(&mut transaction, event).await?;
+        transaction.commit().await?;
+        Ok(Some(event))
+    }
+
     pub async fn delete_thread(&self, thread_id: ThreadId) -> StoreResult<bool> {
         let now = chrono::Utc::now();
         let result = sqlx::query(

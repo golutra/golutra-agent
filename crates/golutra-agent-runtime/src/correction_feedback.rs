@@ -17,16 +17,23 @@ pub(super) fn model_instruction(
     let instruction = correction.as_model_instruction();
     let mut diagnostics = Vec::new();
     let mut seen = HashSet::new();
-    // 正式验收比重复的工具执行失败更有用；已经恢复的 check.passed 不再作为阻塞反馈。
+    // 工具错误已经作为 tool result 交给模型，不能在交付门重复升级成待办。
+    // 纠偏只引用验收、输出格式和权限事实；检查被重跑后以最新结果为准。
+    let mut seen_checks = HashSet::new();
     for kind in [
         VerificationCheckKind::ObjectiveValidation,
-        VerificationCheckKind::ToolExecution,
+        VerificationCheckKind::Schema,
+        VerificationCheckKind::Policy,
     ] {
         for check in verification
             .checks
             .iter()
-            .filter(|check| !check.passed && check.kind == kind)
+            .rev()
+            .filter(|check| check.kind == kind)
         {
+            if !seen_checks.insert((&check.name, &check.command)) || check.passed {
+                continue;
+            }
             let Some(report) = reports.iter().rev().find(|report| {
                 report
                     .envelope
@@ -85,6 +92,22 @@ pub(super) fn model_instruction(
         }
     }
     if diagnostics.is_empty() {
+        if !verification
+            .checks
+            .iter()
+            .any(|check| check.kind == VerificationCheckKind::ObjectiveValidation)
+            && verification.residual_risks.iter().any(|risk| {
+                matches!(
+                    risk.as_str(),
+                    "task contract requires objective validation"
+                        | "behavioral changes were not objectively validated"
+                )
+            })
+        {
+            return format!(
+                "{instruction}\nNo objective validation result was recognized. This is missing evidence, not proof that the implementation or tests failed. Run the existing relevant validation directly using the tool's workdir, without piping it through tail/grep or masking its exit status. If validation cannot be performed, report that limitation; do not expand the task or add unrelated tests to satisfy this gate."
+            );
+        }
         return instruction;
     }
     format!(

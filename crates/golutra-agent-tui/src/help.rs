@@ -91,6 +91,7 @@ pub(crate) fn help_lines(topic: HelpTopic, keymap: KeymapMode, context: &str) ->
             "/auth /login     connect an LLM provider".to_owned(),
             "/logout          clear current provider config and reconnect".to_owned(),
             "/resume          full-screen session picker".to_owned(),
+            "/handoff [goal]  edit a handoff draft for a new session".to_owned(),
             "/plan            execution and verification plan".to_owned(),
             "/tasks           foreground and background activity".to_owned(),
             "/usage           tokens, context, cost and rate limits".to_owned(),

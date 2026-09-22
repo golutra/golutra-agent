@@ -23,6 +23,43 @@ cancellation or unrecoverable boundary still applies. A passing unit test does
 not override a failing external delivery check. No additional model judge is
 started for this feedback loop.
 
+## Completion and optional evidence
+
+Ordinary `open` tasks use `best_effort` verification. A model that has finished
+its tools can finish the task when its contract and blocking assertions are
+satisfied, even if changes have no recognized objective validation. Execution
+is `Completed`, while the original `VerificationRecord` stays `Partial` with
+its evidence limitation. This is not a verified success for evaluation or
+promotion. The runtime preserves the assistant's final answer without forcing
+another model call or relabeling old tool errors as the cause of failure.
+
+This exception does not waive observed test failures, required validation,
+independent verification, delivery paths/content, output schemas, permission
+decisions, runtime budgets, or deferred external acceptance. Checking a required
+file's contents does not implicitly require a new test suite as well.
+
+An unchanged failed candidate receives correction feedback once. If the model
+then finishes with the same verification requirements, check results and
+candidate state, runtime ends with an unresolved result and a `NoProgress`
+event instead of repeating the feedback. Event IDs, elapsed time and repeated
+claims of completion are not progress. A changed candidate for an observed
+check, or changed validation results, can continue through any number of
+correction rounds. Writing more files alone cannot satisfy missing validation.
+Steering/new turns reset this comparison; normal tool execution is not capped.
+
+Correction feedback quotes current failed validation/schema/policy checks,
+not historical tool execution failures already delivered to the model. Missing
+validation feedback explains that evidence was not recognized and recommends
+running the existing relevant check directly, without expanding task scope.
+
+`node --test` is recognized, with positive executed-test evidence from TAP or
+the default Node reporter. Zero/all-skipped tests are not a passing test run.
+Commands such as `npm test | tail -20`, `node --test | grep pass`, or
+`test-command || true` remain unsuitable as authoritative validation: the final
+shell exit status can hide the test's failure. Use a direct command and the
+tool's `workdir`; tool output limits already bound the displayed output. These
+commands still run normally and their outputs remain available to the model.
+
 ## Phase boundaries and delivery order
 
 Review dependent implementation and relevant checks **before** closing a phase

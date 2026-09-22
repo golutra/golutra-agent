@@ -492,6 +492,15 @@ impl ThreadRepository {
         self.store.upsert_thread_with_event(thread, event).await
     }
 
+    /// 只创建新会话并原子保存首个事件；ID 冲突返回 None，不更新已有数据。
+    pub async fn create_with_event(
+        &self,
+        thread: &ThreadRecord,
+        event: RuntimeEvent,
+    ) -> StoreResult<Option<RuntimeEvent>> {
+        self.store.create_thread_with_event(thread, event).await
+    }
+
     pub async fn delete(&self, thread_id: ThreadId) -> StoreResult<bool> {
         self.store.delete_thread(thread_id).await
     }

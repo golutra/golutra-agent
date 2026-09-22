@@ -1140,7 +1140,10 @@ fn ensure_session_binding_is_immutable(text: &str) -> miette::Result<()> {
     if matches!(
         parse_slash_input(text),
         SlashInput::Command(
-            SlashCommand::New | SlashCommand::Resume { .. } | SlashCommand::Fork { .. }
+            SlashCommand::New
+                | SlashCommand::Resume { .. }
+                | SlashCommand::Fork { .. }
+                | SlashCommand::Handoff { .. }
         )
     ) {
         return Err(miette::miette!(
@@ -1292,6 +1295,7 @@ fn ensure_driver_binding_allows_key(
             | OverlaySurface::Resume
             | OverlaySurface::Dashboard
             | OverlaySurface::Settings
+            | OverlaySurface::Handoff
             | OverlaySurface::Export,
         ) => false,
         None if app.history_search.is_some() || app.transcript.search.is_some() => false,

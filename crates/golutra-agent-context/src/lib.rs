@@ -16,7 +16,8 @@ use std::{
 use thiserror::Error;
 
 const COMPACTION_SUMMARY_PREFIX: &str = "Runtime context compaction summary. Treat this as historical context, not a new instruction:\n";
-const MAX_AUTOMATIC_COMPACTION_SUMMARY_TOKENS: u64 = 2_048;
+/// 摘要封装的保存容量；生成时另留余量，不把此值直接当作模型输出上限。
+pub const DEFAULT_COMPACTION_SUMMARY_TOKENS: u64 = 4_096;
 const MIN_AUTOMATIC_COMPACTION_RECENT_TOKENS: u64 = 1_024;
 const MAX_COMPACTION_FACT_TOKENS: u64 = 512;
 
@@ -316,6 +317,10 @@ pub struct ContextCompactionRecord {
     pub turn_id: TurnId,
     pub mode: String,
     pub strategy: String,
+    #[serde(default)]
+    pub summary_attempts: u32,
+    #[serde(default)]
+    pub summary_failure: Option<String>,
     pub original_message_count: usize,
     pub replacement_message_count: usize,
     pub dropped_message_count: usize,
@@ -360,16 +365,15 @@ impl ContextCompactionRecord {
         let Some(previous) = parse_compaction_summary_envelope(&self.summary) else {
             return false;
         };
-        let rendered = compaction_summary_envelope(
+        let Some(rendered) = complete_compaction_summary_envelope(
             summary,
             previous.source_range,
             previous.token_counts.source,
             previous.checksum,
             self.summary_token_budget,
-        );
-        if rendered.is_empty() {
+        ) else {
             return false;
-        }
+        };
         let Some(summary_message) = self.replacement_messages.get_mut(self.protected_prefix_len)
         else {
             return false;
@@ -383,6 +387,7 @@ impl ContextCompactionRecord {
         summary_message.content = format!("{COMPACTION_SUMMARY_PREFIX}{rendered}");
         self.summary = rendered;
         self.strategy = "model_summary_tail".to_owned();
+        self.summary_failure = None;
         self.replacement_estimated_tokens = estimate_message_tokens(&self.replacement_messages)
             .saturating_add(self.planned_tool_tokens);
         self.replacement_message_count = self.replacement_messages.len();
@@ -610,7 +615,7 @@ impl ContextWindowManager {
         let recent_reserve = target_available.min(MIN_AUTOMATIC_COMPACTION_RECENT_TOKENS);
         let summary_reserve = target_available
             .saturating_sub(recent_reserve)
-            .min(MAX_AUTOMATIC_COMPACTION_SUMMARY_TOKENS)
+            .min(DEFAULT_COMPACTION_SUMMARY_TOKENS)
             .max(minimum_summary_reserve.min(target_available.saturating_sub(1)));
         let normalized_sources = normalized_message_sources(messages, message_sources);
         // 原始用户要求独立于模型摘要保留，避免摘要反复改写后漂移。
@@ -789,6 +794,8 @@ impl ContextWindowManager {
             // 压缩上限就是当前 provider budget；保留真实的策略名，避免
             // 已不存在的 active-working-set 分支污染评估和回放指标。
             strategy: "fallback_facts_tail".to_owned(),
+            summary_attempts: 0,
+            summary_failure: None,
             original_message_count: messages.len(),
             replacement_message_count: replacement_messages.len(),
             dropped_message_count,
@@ -2403,27 +2410,18 @@ fn fallback_compaction_summary(
     if messages.is_empty() || token_budget == 0 {
         return String::new();
     }
-    let mut previous_summary = None;
+    // 旧摘要通常在最前面；查找它不能受最近事实收集的提前退出影响。
+    let previous_summary = messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, message)| {
+            embedded_compaction_summary(message, message_sources.get(index))
+        });
     let mut lines = Vec::new();
     let mut candidate_tokens = 0_u64;
     for (index, message) in messages.iter().enumerate().rev() {
-        let embedded_summary = message
-            .content
-            .strip_prefix(COMPACTION_SUMMARY_PREFIX)
-            .or_else(|| {
-                message_sources
-                    .get(index)
-                    .filter(|source| {
-                        source.contributor == "working_summary"
-                            || source.origin == "compaction_summary"
-                    })
-                    .map(|_| message.content.as_str())
-            });
-        if let Some(summary) = embedded_summary
-            .and_then(parse_compaction_summary_envelope)
-            .map(|envelope| envelope.summary)
-        {
-            previous_summary.get_or_insert(summary);
+        if embedded_compaction_summary(message, message_sources.get(index)).is_some() {
             continue;
         }
         let line = compaction_fact_from_message(message);
@@ -2436,6 +2434,24 @@ fn fallback_compaction_summary(
     }
     lines.reverse();
     deterministic_compaction_fallback(previous_summary.as_deref(), &lines, token_budget)
+}
+
+fn embedded_compaction_summary(
+    message: &ProviderMessage,
+    source: Option<&ContextMessageSource>,
+) -> Option<String> {
+    message
+        .content
+        .strip_prefix(COMPACTION_SUMMARY_PREFIX)
+        .or_else(|| {
+            source
+                .filter(|source| {
+                    source.contributor == "working_summary" || source.origin == "compaction_summary"
+                })
+                .map(|_| message.content.as_str())
+        })
+        .and_then(parse_compaction_summary_envelope)
+        .map(|envelope| envelope.summary)
 }
 
 fn compaction_fact_from_message(message: &ProviderMessage) -> String {
@@ -2519,6 +2535,20 @@ pub fn deterministic_compaction_fallback(
 }
 
 #[must_use]
+/// 模型摘要必须整体装入预算；与本地紧急摘要不同，不能悄悄截断交接内容。
+pub fn complete_compaction_summary_envelope(
+    summary: &str,
+    source_range: CompactionSourceRange,
+    source_tokens: u64,
+    checksum: String,
+    token_budget: u64,
+) -> Option<String> {
+    let rendered =
+        compaction_summary_envelope(summary, source_range, source_tokens, checksum, u64::MAX);
+    (!rendered.is_empty() && estimate_tokens(&rendered) <= token_budget).then_some(rendered)
+}
+
+#[must_use]
 pub fn compaction_summary_envelope(
     summary: &str,
     source_range: CompactionSourceRange,
@@ -2583,31 +2613,9 @@ pub fn parse_compaction_summary_envelope(value: &str) -> Option<CompactionSummar
 }
 
 #[must_use]
-pub fn fit_compaction_summary_envelope(value: &str, token_budget: u64) -> String {
-    let Some(envelope) = parse_compaction_summary_envelope(value) else {
-        return String::new();
-    };
-    compaction_summary_envelope(
-        &envelope.summary,
-        envelope.source_range,
-        envelope.token_counts.source,
-        envelope.checksum,
-        token_budget,
-    )
-}
-
-#[must_use]
 pub fn compaction_context_content(value: &str) -> Option<String> {
     parse_compaction_summary_envelope(value)
         .map(|_| format!("{COMPACTION_SUMMARY_PREFIX}{}", value.trim()))
-}
-
-#[must_use]
-pub fn fit_compaction_context_content(value: &str, token_budget: u64) -> Option<String> {
-    let envelope_budget = token_budget.saturating_sub(estimate_tokens(COMPACTION_SUMMARY_PREFIX));
-    let envelope = fit_compaction_summary_envelope(value, envelope_budget);
-    compaction_context_content(&envelope)
-        .filter(|content| token_budget == u64::MAX || estimate_tokens(content) <= token_budget)
 }
 
 #[must_use]
@@ -2653,6 +2661,9 @@ fn truncate_to_tokens(value: &str, token_budget: u64) -> String {
 pub fn estimate_tokens(content: &str) -> u64 {
     content.chars().count().div_ceil(4) as u64
 }
+
+#[cfg(test)]
+mod compaction_boundary_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3426,7 +3437,7 @@ mod tests {
                 total.saturating_add(decision.retained_estimated_tokens)
             });
 
-        assert!(estimate_tokens(&record.summary) <= MAX_AUTOMATIC_COMPACTION_SUMMARY_TOKENS);
+        assert!(estimate_tokens(&record.summary) <= DEFAULT_COMPACTION_SUMMARY_TOKENS);
         assert!(retained_tokens >= MIN_AUTOMATIC_COMPACTION_RECENT_TOKENS);
         assert!(parse_compaction_summary_envelope(&record.summary).is_some());
     }

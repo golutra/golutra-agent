@@ -1,7 +1,7 @@
 //! Context construction, task supervision, AgentLoop, and provider auth lifecycles.
 
 use super::*;
-use golutra_agent_context::{estimate_tokens, fit_compaction_context_content};
+use golutra_agent_context::{compaction_context_content, estimate_tokens};
 use golutra_agent_llm::{
     LlmProvider, PromptCacheScope, ProviderMessage, ProviderRequest, ProviderRole,
 };
@@ -16,10 +16,8 @@ const MEMORY_CANDIDATE_MAX: usize = 64;
 // 上限不是预留配额，未命中或未用完的 token 会全部回流给活动历史。
 const MAX_MEMORY_CONTEXT_TOKENS: u64 = 1_024;
 const MAX_SKILL_CONTEXT_TOKENS: u64 = 1_024;
-// compaction 保存旧事实，最近尾部保存当前工作状态；绝对边界避免随大窗口膨胀，
-// 同时让 summary 未用额度继续留给最近历史。
+// 最近尾部保存当前工作状态；完整摘要的保存上限由共用压缩策略负责。
 const MIN_RECENT_HISTORY_TOKENS: u64 = 1_024;
-const MAX_WORKING_SUMMARY_TOKENS: u64 = 2_048;
 const ACTIVE_PATH_COMPACTION_MAX_DEPTH: u32 = 65_536;
 const MAX_RESUME_PROVIDER_REQUEST_BYTES: u64 = 16 * 1024 * 1024;
 pub(super) const MAX_RESUME_PROVIDER_MESSAGES: usize = 16_384;
@@ -860,14 +858,10 @@ impl RuntimeHost {
                 })
                 .collect::<Vec<_>>()
         });
-        let recent_reserve = recent_history_reserve.min(token_budget);
-        let summary_budget = token_budget
-            .saturating_sub(recent_reserve)
-            .min(MAX_WORKING_SUMMARY_TOKENS);
         let mut contributors = Vec::new();
         let mut summary_tokens = 0;
         if let Some((sequence_no, summary)) = compaction
-            && let Some(content) = fit_compaction_context_content(&summary, summary_budget)
+            && let Some(content) = compaction_context_content(&summary)
         {
             summary_tokens = estimate_tokens(&content);
             contributors.push(ContextContributor {
@@ -878,7 +872,11 @@ impl RuntimeHost {
                 source_refs: vec![format!("event-sequence:{sequence_no}")],
             });
         }
-        let history_budget = token_budget.saturating_sub(summary_tokens);
+        // 保存后的交接摘要不能在跨回合加载时再次截断。窗口变小时保留完整摘要
+        // 和最近保留额，让 runtime 对完整输入执行同一套压缩/失败策略。
+        let history_budget = token_budget
+            .saturating_sub(summary_tokens)
+            .max(recent_history_reserve.min(token_budget));
         let history = if let Some(facts) = history_facts {
             history_contributors_from_cached_facts(facts, history_budget)
         } else {

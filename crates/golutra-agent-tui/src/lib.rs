@@ -223,6 +223,9 @@ pub enum SlashCommand {
     Approve,
     Deny,
     Compact,
+    Handoff {
+        goal: Option<String>,
+    },
     Queue,
     Attach {
         path: String,
@@ -481,6 +484,11 @@ const SEARCHABLE_SLASH_HINTS: &[SlashCommandHint] = &[
         selection: SlashCommandSelection::Execute,
     },
     SlashCommandHint {
+        command: "/handoff",
+        description: "prepare an editable handoff for a new session",
+        selection: SlashCommandSelection::Execute,
+    },
+    SlashCommandHint {
         command: "/queue",
         description: "edit or cancel queued prompts",
         selection: SlashCommandSelection::Execute,
@@ -709,6 +717,13 @@ pub fn parse_slash_input(input: &str) -> SlashInput {
         "/approve" => SlashInput::Command(SlashCommand::Approve),
         "/deny" => SlashInput::Command(SlashCommand::Deny),
         "/compact" => SlashInput::Command(SlashCommand::Compact),
+        "/handoff" => SlashInput::Command(SlashCommand::Handoff {
+            goal: trimmed
+                .strip_prefix("/handoff")
+                .map(str::trim)
+                .filter(|goal| !goal.is_empty())
+                .map(str::to_owned),
+        }),
         "/queue" => SlashInput::Command(SlashCommand::Queue),
         "/attach" => match tokens.get(1..) {
             Some(path) if !path.is_empty() => SlashInput::Command(SlashCommand::Attach {
