@@ -2460,7 +2460,7 @@ fn is_sensitive_header(name: &str) -> bool {
 pub fn provider_tool_description(tool_name: &str) -> &'static str {
     match tool_name {
         "read_file" => {
-            "Read workspace files instead of cat/sed; use offset/limit. Follow continuation.next_offset only when the task needs more content or the full file. Read relevant sections; do not drain unrelated files."
+            "Prefer this tool for workspace files; use offset/limit. Shell may combine related reads when useful. Follow continuation.next_offset only when more content is needed. Read relevant sections; do not drain unrelated files."
         }
         "write_file" => {
             "Create a new UTF-8 file or completely rewrite one; returns status and digest."

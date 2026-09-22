@@ -2,6 +2,48 @@
 use super::*;
 use crate::correction_feedback::model_instruction;
 
+#[test]
+fn correction_actions_follow_failure_types_and_latest_results() {
+    let (mut record, _) = fixture(1);
+    record.assertions.clear();
+    record.residual_risks.clear();
+    record.checks[0].kind = VerificationCheckKind::Schema;
+    let action = correction_envelope(&record, 1, None).requested_action;
+    assert!(action.contains("Correct the final response"));
+    assert!(!action.contains("rerun"));
+
+    let mut validation = record.checks[0].clone();
+    validation.kind = VerificationCheckKind::ObjectiveValidation;
+    record.checks.push(validation.clone());
+    let action = correction_envelope(&record, 1, None).requested_action;
+    assert!(action.contains("Correct the final response"));
+    assert!(action.contains("rerun only the affected checks"));
+
+    validation.passed = true;
+    record.checks.push(validation);
+    assert!(
+        !correction_envelope(&record, 1, None)
+            .requested_action
+            .contains("rerun")
+    );
+
+    record.checks[0].kind = VerificationCheckKind::Policy;
+    let action = correction_envelope(&record, 1, None).requested_action;
+    assert!(action.contains("permission boundary"));
+    assert!(!action.contains("rerun"));
+}
+
+#[test]
+fn missing_evidence_requests_validation_without_claiming_tests_failed() {
+    let (mut record, _) = fixture(0);
+    record.assertions.clear();
+    record.residual_risks = vec!["behavioral changes were not objectively validated".into()];
+    let action = correction_envelope(&record, 1, None).requested_action;
+    assert!(action.contains("missing relevant validation evidence"));
+    assert!(!action.contains("tests failed"));
+    assert!(!action.contains("rerun"));
+}
+
 fn fixture(count: usize) -> (VerificationRecord, Vec<ToolExecutionReport>) {
     let reports = (0..count)
         .map(|index| {

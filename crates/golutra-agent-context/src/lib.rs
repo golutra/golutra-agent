@@ -1239,6 +1239,10 @@ fn truncate_contributor(name: &str, content: &str, token_limit: u64) -> String {
     if characters.len() <= character_limit {
         return content.to_owned();
     }
+    // 技能指导包含前提与失败限制；Trim 模式只能整体省略，不能截成一条新的指令。
+    if name == "project_skills" {
+        return String::new();
+    }
     if matches!(name, "conversation_history" | "memory") {
         characters[characters.len().saturating_sub(character_limit)..]
             .iter()
@@ -3904,6 +3908,31 @@ mod tests {
         assert_eq!(plan.trimmed_contributors, vec!["conversation_history"]);
         assert!(plan.messages[0].content.ends_with("latest"));
         assert!(plan.original_planned_input_tokens > plan.budget_snapshot.planned_input_tokens);
+    }
+
+    #[test]
+    fn trim_omits_oversized_skill_guidance_without_cutting_its_constraints() {
+        let content = format!("{}\nDo not change public APIs", "Skill steps ".repeat(100));
+        let plan = ContextBuilder::new(ContextBudgetPolicy {
+            context_window: 256,
+            max_output: 32,
+            budget_limit: 64,
+            action_if_exceeded: BudgetOverflowAction::Trim,
+        })
+        .build(
+            TaskId::new(),
+            TurnId::new(),
+            vec![ContextContributor {
+                name: "project_skills".into(),
+                role: ProviderRole::User,
+                content,
+                token_budget_hint: 0,
+                source_refs: vec!["runtime:active_skills".into()],
+            }],
+        )
+        .unwrap();
+        assert!(plan.messages[0].content.is_empty());
+        assert_eq!(plan.trimmed_contributors, ["project_skills"]);
     }
 
     #[test]

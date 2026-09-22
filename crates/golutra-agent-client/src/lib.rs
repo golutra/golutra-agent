@@ -202,7 +202,7 @@ pub(crate) use context::{
     load_project_instruction_bundle, memory_context_with_budget, model_prompt_from_payload,
     preview_from_payload, project_instruction_fingerprint, prompt_from_payload,
     select_memories_for_context_with_budget, system_prompt, task_contract_from_payload,
-    title_from_payload, truncate_to_token_budget,
+    title_from_payload,
 };
 pub use debug_export::{
     DebugExportCoordinator, DebugExportManifest, DebugExportReceipt, DebugExportRequest,

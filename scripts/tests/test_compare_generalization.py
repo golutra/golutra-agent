@@ -12,6 +12,20 @@ import generalization_tasks as tasks
 
 
 class GeneralizationTests(unittest.TestCase):
+    def test_configured_provider_copy_preserves_protocol_and_generation(self):
+        import argparse
+        import json
+        with tempfile.TemporaryDirectory() as source, tempfile.TemporaryDirectory() as destination:
+            root, home = Path(source), Path(destination)
+            config = {"active_profile": "custom", "profiles": [{"name": "custom",
+                      "protocol": "anthropic", "model_id": "fixture", "base_url": "https://example.invalid/v1",
+                      "generation_config": {"reasoning_effort": "high"}}]}
+            (root / "provider.json").write_text(json.dumps(config))
+            (root / "credentials.json").write_text('{"credentials": {}}')
+            suite.prepare_home(argparse.Namespace(configured_provider=True, golutra_agent_home_source=root), home)
+            self.assertEqual(json.loads((home / "provider.json").read_text()), config)
+            self.assertEqual((home / "credentials.json").read_bytes(), (root / "credentials.json").read_bytes())
+
     def test_recovery_count_uses_runtime_retries_not_successful_adapter_attempts(self):
         import json
         events = []

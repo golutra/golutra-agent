@@ -539,10 +539,7 @@ impl RuntimeHost {
             source_refs: vec![format!("workspace:{}", workspace_root.display())],
         });
         let project_instructions = self.cached_project_instruction_bundle(&workspace_root);
-        let skill_context =
-            self.active_skill_context_with_budget(&objective, MAX_SKILL_CONTEXT_TOKENS);
-
-        // 四路来源互不依赖且只读取已有状态，并行加载可把首次 provider 请求
+        // 三路来源互不依赖且只读取已有状态，并行加载可把首次 provider 请求
         // 的准备时间收敛到最慢一路；MemoryRetrieved 仍在选择完成后有序落库。
         let memory_store = self.storage.memory_store.clone();
         let memory_query = objective.clone();
@@ -555,8 +552,8 @@ impl RuntimeHost {
             .map_err(ClientError::from)
         };
         let history = self.cached_history_events(session_id);
-        let (project_instructions, skill_context, memories, history) =
-            tokio::join!(project_instructions, skill_context, memories, history);
+        let (project_instructions, memories, history) =
+            tokio::join!(project_instructions, memories, history);
         let history = history?;
         if let Some(project_instructions) = project_instructions? {
             contributors.push(ContextContributor {
@@ -630,11 +627,13 @@ impl RuntimeHost {
             remaining_budget = remaining_budget.saturating_sub(memory_tokens);
         }
 
-        let skill_context = skill_context?
-            .map(|content| {
-                truncate_to_token_budget(&content, optional_budget.min(MAX_SKILL_CONTEXT_TOKENS))
-            })
-            .filter(|content| !content.is_empty());
+        // 实际剩余额度决定整份技能选择；先按最大额度渲染再截取会丢失末尾限制。
+        let skill_context = self
+            .active_skill_context_with_budget(
+                &objective_contributor.content,
+                optional_budget.min(MAX_SKILL_CONTEXT_TOKENS),
+            )
+            .await?;
         if let Some(skill_context) = skill_context.as_ref() {
             let skill_tokens = estimate_tokens(skill_context);
             remaining_budget = remaining_budget.saturating_sub(skill_tokens);
@@ -689,7 +688,7 @@ impl RuntimeHost {
                 name: "project_skills".to_owned(),
                 role: ProviderRole::User,
                 content: skill_context,
-                token_budget_hint: 1_024,
+                token_budget_hint: 0,
                 source_refs: vec!["runtime:active_skills".to_owned()],
             });
         }

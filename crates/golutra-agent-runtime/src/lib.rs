@@ -5047,7 +5047,7 @@ fn correction_envelope(
         remaining_attempts,
         failed_requirements,
         evidence_refs,
-        requested_action: "use the available tools to satisfy the failed requirements, then re-run objective validation".to_owned(),
+        requested_action: correction_feedback::requested_action(verification),
     }
 }
 

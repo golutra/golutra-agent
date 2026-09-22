@@ -56,6 +56,118 @@ fn endpoint(case: ProtocolCase, base_url: String) -> Box<dyn LlmProvider> {
     }
 }
 
+fn dynamic_request(model: &str) -> ProviderRequest {
+    let mut request = simple_request(model);
+    let message = |role, content: &str| ProviderMessage {
+        role,
+        content: content.into(),
+        tool_call_id: None,
+        tool_name: None,
+        tool_calls: Vec::new(),
+        metadata: Default::default(),
+    };
+    request.messages = vec![
+        message(ProviderRole::System, "fixed-system-rules"),
+        message(ProviderRole::User, "original-user-goal"),
+        message(ProviderRole::Assistant, "completed-work-evidence"),
+        message(ProviderRole::User, "runtime-recovery-context"),
+    ];
+    request
+}
+
+fn assert_dynamic_context_stays_after_history(body: &Value) {
+    let mut static_text = String::new();
+    for key in [
+        "system",
+        "systemInstruction",
+        "system_instruction",
+        "instructions",
+    ] {
+        if let Some(value) = body.get(key) {
+            static_text.push_str(&value.to_string());
+        }
+    }
+    let messages = body
+        .get("messages")
+        .or_else(|| body.get("contents"))
+        .or_else(|| body.get("input"))
+        .and_then(Value::as_array)
+        .expect("wire messages");
+    for message in messages
+        .iter()
+        .filter(|message| matches!(message["role"].as_str(), Some("system" | "developer")))
+    {
+        static_text.push_str(&message.to_string());
+    }
+    assert!(static_text.contains("fixed-system-rules"), "{body}");
+    assert!(!static_text.contains("runtime-recovery-context"), "{body}");
+    let history = messages
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        history.find("original-user-goal").unwrap()
+            < history.find("completed-work-evidence").unwrap()
+    );
+    assert!(
+        history.find("completed-work-evidence").unwrap()
+            < history.find("runtime-recovery-context").unwrap()
+    );
+    assert_eq!(history.matches("runtime-recovery-context").count(), 1);
+}
+
+#[tokio::test]
+async fn dynamic_context_preserves_system_prefix_and_history_across_protocols() {
+    for (case, wire) in routes() {
+        for streaming in [false, true] {
+            let response = if streaming {
+                TestProviderResponse::sse(200, stream(wire, Some(reasons(wire)[0].0), false, true))
+            } else {
+                TestProviderResponse::json(
+                    200,
+                    body(wire, Some(reasons(wire)[0].0), false).to_string(),
+                )
+            };
+            let (url, captured) = spawn_provider_sequence(vec![response]).await;
+            let provider = endpoint(case, url);
+            if streaming {
+                provider
+                    .complete_stream(dynamic_request(case.model), &mut |_| {})
+                    .await
+                    .unwrap();
+            } else {
+                provider
+                    .complete(dynamic_request(case.model))
+                    .await
+                    .unwrap();
+            }
+            assert_dynamic_context_stays_after_history(&captured.await.unwrap()[0].body);
+        }
+    }
+    // Responses 原生请求使用 input，与 Chat 的 messages 结构单独验收。
+    for streaming in [false, true] {
+        let (url, captured) = spawn_provider_sequence(vec![TestProviderResponse::sse(
+            200,
+            include_str!("../fixtures/openai-responses/text-response.sse"),
+        )])
+        .await;
+        let provider = openai_responses_provider(url);
+        if streaming {
+            provider
+                .complete_stream(dynamic_request("gpt-golden"), &mut |_| {})
+                .await
+                .unwrap();
+        } else {
+            provider
+                .complete(dynamic_request("gpt-golden"))
+                .await
+                .unwrap();
+        }
+        assert_dynamic_context_stays_after_history(&captured.await.unwrap()[0].body);
+    }
+}
+
 fn body(wire: Wire, reason: Option<&str>, tool: bool) -> Value {
     match wire {
         Wire::Chat => json!({

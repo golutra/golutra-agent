@@ -1,0 +1,622 @@
+{
+  "schema_version": 1,
+  "baseline_commit": "7cc1e9c",
+  "environment": {
+    "os": "macOS",
+    "architecture": "arm64",
+    "build_profile": "debug",
+    "protocol": "anthropic",
+    "model": "cd-fable-5.1"
+  },
+  "experiment_notes": [
+    "First experiment interleaves baseline and intermediate candidate, with 3 tasks repeated twice. All failures are preserved.",
+    "After first experiment, final prompt adds a general exact-output-format instruction. CSV is a new transfer task, added before the final follow-up.",
+    "Final follow-up runs final binary only: 4 tasks repeated twice. It is not a paired speed comparison.",
+    "Independent judges inspect final answers and workspace state. Tool counts are observations, not acceptance limits.",
+    "Only selected nonsecret report fields retained here; no credentials or user configuration contents included."
+  ],
+  "experiments": [
+    {
+      "name": "initial_paired_comparison",
+      "started_at": "2026-09-22T14:07:48.250041Z",
+      "model": "cd-fable-5.1",
+      "reasoning_effort": null,
+      "base_url": "https://mmu.vod-qcloud.com/v1",
+      "task_digests": {
+        "analysis_scope": "62aa0d4c63391ad2e55fe1ba82d2a9ad2474310f2559ab3fc2b40dba5767b27a",
+        "comment_scope": "bd0fab5e52238138e8b3c69813f968aa1f205d0eceb66fd86229ee7ecbd3acac",
+        "nested_rules": "a40a38a1896f6d3ad9227bbb7f5d2ffe4c2e455e04f1a9f19cd2634ed856f6be"
+      },
+      "versions": {
+        "baseline": "golutra-agent 0.3.5",
+        "candidate": "golutra-agent 0.3.5"
+      },
+      "binary_or_launcher_sha256": {
+        "baseline": "16652bec284e93a5b14073a1be7fa4571b68c8dc829e3753be813487a3109d43",
+        "candidate": "4b6d0fc9dce6c0d3a5dce9492b2f7fc9b7c7855365a21ca638330368618521e7"
+      },
+      "finished_at": "2026-09-22T14:12:19.605306Z",
+      "attempts": [
+        {
+          "variant": "baseline",
+          "task": "analysis_scope",
+          "repeat": 0,
+          "strict_pass": false,
+          "independent_pass": false,
+          "immutable_inputs_preserved": true,
+          "detail": "answer is not the requested JSON",
+          "metrics": {
+            "elapsed_ms": 26485.3,
+            "request_count": 2,
+            "tool_call_count": 1,
+            "tool_names": [
+              "read_file"
+            ],
+            "uncached_input_tokens": 877,
+            "output_tokens": 173,
+            "final_message": "```json\n{\"actual\": 3.0, \"expected\": 6, \"cause\": \"total 函数名含义为求和，但实现为 sum(values) / len(values)，即计算平均值；对 [2, 4] 返回 3.0 而非 2+4=6。\"}\n```",
+            "avoidable_repeat_tool_call_count": 0,
+            "background_wait_count": 0,
+            "runtime_recovery": {
+              "retry_attempts": 0,
+              "network_retry_attempts": 0,
+              "http_statuses": []
+            }
+          }
+        },
+        {
+          "variant": "candidate",
+          "task": "analysis_scope",
+          "repeat": 0,
+          "strict_pass": false,
+          "independent_pass": false,
+          "immutable_inputs_preserved": true,
+          "detail": "answer is not the requested JSON",
+          "metrics": {
+            "elapsed_ms": 13523.9,
+            "request_count": 2,
+            "tool_call_count": 1,
+            "tool_names": [
+              "read_file"
+            ],
+            "uncached_input_tokens": 865,
+            "output_tokens": 171,
+            "final_message": "```json\n{\"actual\": 3.0, \"expected\": 6, \"cause\": \"total 函数名含义是求和，但实现为 sum(values) / len(values)，即求平均值：sum([2, 4]) = 6 后又除以 len = 2，得到 3.0；应直接返回 sum(values) 即 6。\"}\n```",
+            "avoidable_repeat_tool_call_count": 0,
+            "background_wait_count": 0,
+            "runtime_recovery": {
+              "retry_attempts": 0,
+              "network_retry_attempts": 0,
+              "http_statuses": []
+            }
+          }
+        },
+        {
+          "variant": "candidate",
+          "task": "comment_scope",
+          "repeat": 0,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "comment changed; executable line and user draft preserved",
+          "metrics": {
+            "elapsed_ms": 22076.3,
+            "request_count": 3,
+            "tool_call_count": 2,
+            "tool_names": [
+              "edit_file",
+              "read_file"
+            ],
+            "uncached_input_tokens": 5110,
+            "output_tokens": 217,
+            "final_message": "已完成：`greet.py` 中的注释 `# 打印问候语` 已改为 `# Print a greeting`，`print(\"Hello, world!\")` 等其他内容未作改动。",
+            "avoidable_repeat_tool_call_count": 0,
+            "background_wait_count": 0,
+            "runtime_recovery": {
+              "retry_attempts": 0,
+              "network_retry_attempts": 0,
+              "http_statuses": []
+            }
+          }
+        },
+        {
+          "variant": "baseline",
+          "task": "comment_scope",
+          "repeat": 0,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "comment changed; executable line and user draft preserved",
+          "metrics": {
+            "elapsed_ms": 14482.3,
+            "request_count": 3,
+            "tool_call_count": 2,
+            "tool_names": [
+              "edit_file",
+              "read_file"
+            ],
+            "uncached_input_tokens": 5082,
+            "output_tokens": 261,
+            "final_message": "已完成：`greet.py` 中唯一的中文注释 `# 打印问候语` 已改为 `# Print a greeting`，其余内容（`print(\"Hello, world!\")`）保持不变。",
+            "avoidable_repeat_tool_call_count": 0,
+            "background_wait_count": 0,
+            "runtime_recovery": {
+              "retry_attempts": 0,
+              "network_retry_attempts": 0,
+              "http_statuses": []
+            }
+          }
+        },
+        {
+          "variant": "baseline",
+          "task": "nested_rules",
+          "repeat": 0,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "nested rule and independent calculation checks passed",
+          "metrics": {
+            "elapsed_ms": 31028.6,
+            "request_count": 5,
+            "tool_call_count": 4,
+            "tool_names": [
+              "edit_file",
+              "read_file",
+              "shell"
+            ],
+            "uncached_input_tokens": 5948,
+            "output_tokens": 742,
+            "final_message": "已完成。\n\n**改动**（仅 `packages/calc.py`）：\n- `total(values)` 现在遍历 `values` 累加并返回和；空序列返回 `0`。\n- 公共签名 `total(values)` 未变，模块 docstring `\"\"\"Public calculation API.\"\"\"` 未改，未新增文件或依赖，未修改测试和 AGENTS.md。\n\n**验证**：按 `packages/AGENTS.md` 约定运行 `python3 -B packages/test_existing.py` → 1 个测试通过（覆盖 `total([2, 4]) == 6` 与 `total([]) == 0`）。",
+            "avoidable_repeat_tool_call_count": 0,
+            "background_wait_count": 0,
+            "runtime_recovery": {
+              "retry_attempts": 0,
+              "network_retry_attempts": 0,
+              "http_statuses": []
+            }
+          }
+        },
+        {
+          "variant": "candidate",
+          "task": "nested_rules",
+          "repeat": 0,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "nested rule and independent calculation checks passed",
+          "metrics": {
+            "elapsed_ms": 31366.1,
+            "request_count": 5,
+            "tool_call_count": 4,
+            "tool_names": [
+              "edit_file",
+              "shell"
+            ],
+            "uncached_input_tokens": 10521,
+            "output_tokens": 765,
+            "final_message": "已完成。\n\n**改动**（仅 `packages/calc.py`）：\n```python\ndef total(values):\n    \"\"\"Return the sum of all numbers in ``values``; an empty sequence yields 0.\"\"\"\n    result = 0\n    for value in values:\n        result += value\n    return result\n```\n- 公共签名 `total(values)` 不变；空序列返回 `0`；模块 docstring `\"\"\"Public calculation API.\"\"\"` 未动。\n- 遵守 `packages/AGENTS.md`：未新增依赖或文件，未修改测试/指令文件。\n\n**验证**：按项目约定运行 `python3 -B packages/test_existing.py` → `Ran 1 test … OK`（覆盖 `total([2, 4]) == 6` 与 `total([]) == 0`）。",
+            "avoidable_repeat_tool_call_count": 0,
+            "background_wait_count": 0,
+            "runtime_recovery": {
+              "retry_attempts": 0,
+              "network_retry_attempts": 0,
+              "http_statuses": []
+            }
+          }
+        },
+        {
+          "variant": "candidate",
+          "task": "analysis_scope",
+          "repeat": 1,
+          "strict_pass": false,
+          "independent_pass": false,
+          "immutable_inputs_preserved": true,
+          "detail": "answer is not the requested JSON",
+          "metrics": {
+            "elapsed_ms": 15464.2,
+            "request_count": 2,
+            "tool_call_count": 1,
+            "tool_names": [
+              "read_file"
+            ],
+            "uncached_input_tokens": 4532,
+            "output_tokens": 156,
+            "final_message": "```json\n{\"actual\": 3.0, \"expected\": 6, \"cause\": \"total 在 sum(values) 之后又除以了 len(values)，实际计算的是平均值而不是总和；[2, 4] 的和为 6，被 2 除后得到 3.0。应直接返回 sum(values)。\"}\n```",
+            "avoidable_repeat_tool_call_count": 0,
+            "background_wait_count": 0,
+            "runtime_recovery": {
+              "retry_attempts": 0,
+              "network_retry_attempts": 0,
+              "http_statuses": []
+            }
+          }
+        },
+        {
+          "variant": "baseline",
+          "task": "analysis_scope",
+          "repeat": 1,
+          "strict_pass": false,
+          "independent_pass": false,
+          "immutable_inputs_preserved": true,
+          "detail": "answer is not the requested JSON",
+          "metrics": {
+            "elapsed_ms": 11786.8,
+            "request_count": 2,
+            "tool_call_count": 1,
+            "tool_names": [
+              "read_file"
+            ],
+            "uncached_input_tokens": 4466,
+            "output_tokens": 180,
+            "final_message": "```json\n{\"actual\": 3.0, \"expected\": 6, \"cause\": \"total 函数名含义是求和，但实现为 sum(values) / len(values)，即计算平均值；对 [2, 4] 返回 (2+4)/2 = 3.0，而按函数名应返回 sum(values) = 6。\"}\n```",
+            "avoidable_repeat_tool_call_count": 0,
+            "background_wait_count": 0,
+            "runtime_recovery": {
+              "retry_attempts": 0,
+              "network_retry_attempts": 0,
+              "http_statuses": []
+            }
+          }
+        },
+        {
+          "variant": "baseline",
+          "task": "comment_scope",
+          "repeat": 1,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "comment changed; executable line and user draft preserved",
+          "metrics": {
+            "elapsed_ms": 15899.8,
+            "request_count": 3,
+            "tool_call_count": 2,
+            "tool_names": [
+              "edit_file",
+              "read_file"
+            ],
+            "uncached_input_tokens": 1482,
+            "output_tokens": 259,
+            "final_message": "已完成：`greet.py` 中的注释 `# 打印问候语` 已改为 `# Print a greeting`，其余内容（`print(\"Hello, world!\")`）保持不变。",
+            "avoidable_repeat_tool_call_count": 0,
+            "background_wait_count": 0,
+            "runtime_recovery": {
+              "retry_attempts": 0,
+              "network_retry_attempts": 0,
+              "http_statuses": []
+            }
+          }
+        },
+        {
+          "variant": "candidate",
+          "task": "comment_scope",
+          "repeat": 1,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "comment changed; executable line and user draft preserved",
+          "metrics": {
+            "elapsed_ms": 14896.1,
+            "request_count": 3,
+            "tool_call_count": 2,
+            "tool_names": [
+              "edit_file",
+              "read_file"
+            ],
+            "uncached_input_tokens": 5110,
+            "output_tokens": 217,
+            "final_message": "已完成。`greet.py` 中的注释 `# 打印问候语` 已改为 `# Print a greeting`，其余内容（`print(\"Hello, world!\")`）保持不变。",
+            "avoidable_repeat_tool_call_count": 0,
+            "background_wait_count": 0,
+            "runtime_recovery": {
+              "retry_attempts": 0,
+              "network_retry_attempts": 0,
+              "http_statuses": []
+            }
+          }
+        },
+        {
+          "variant": "candidate",
+          "task": "nested_rules",
+          "repeat": 1,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "nested rule and independent calculation checks passed",
+          "metrics": {
+            "elapsed_ms": 36377.5,
+            "request_count": 5,
+            "tool_call_count": 4,
+            "tool_names": [
+              "edit_file",
+              "read_file",
+              "shell"
+            ],
+            "uncached_input_tokens": 9847,
+            "output_tokens": 749,
+            "final_message": "已完成。\n\n**改动**（仅 `packages/calc.py`）：\n```python\ndef total(values):\n    result = 0\n    for value in values:\n        result += value\n    return result\n```\n- 逐项累加，空序列返回 `0`；接受任意可迭代对象。\n- 签名 `total(values)` 与模块 docstring 均未改动；未新增文件或依赖，未触碰测试与 AGENTS.md（遵循根目录及 `packages/AGENTS.md` 约定）。\n\n**验证**：按 `packages/AGENTS.md` 要求运行 `python3 -B packages/test_existing.py` → 1 个测试通过（覆盖 `total([2, 4]) == 6` 与 `total([]) == 0`）。",
+            "avoidable_repeat_tool_call_count": 0,
+            "background_wait_count": 0,
+            "runtime_recovery": {
+              "retry_attempts": 0,
+              "network_retry_attempts": 0,
+              "http_statuses": []
+            }
+          }
+        },
+        {
+          "variant": "baseline",
+          "task": "nested_rules",
+          "repeat": 1,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "nested rule and independent calculation checks passed",
+          "metrics": {
+            "elapsed_ms": 34483.7,
+            "request_count": 5,
+            "tool_call_count": 5,
+            "tool_names": [
+              "edit_file",
+              "read_file",
+              "shell"
+            ],
+            "uncached_input_tokens": 6433,
+            "output_tokens": 727,
+            "final_message": "已完成。\n\n**改动**（仅 `packages/calc.py`）：\n- `total(values)` 现在遍历 `values` 累加并返回和；空序列返回 `0`。签名不变，模块 docstring 未动，未新增依赖或文件。\n\n**验证**：按 `packages/AGENTS.md` 约定运行 `python3 -B packages/test_existing.py`，1 个测试通过（覆盖 `total([2, 4]) == 6` 和 `total([]) == 0`）。",
+            "avoidable_repeat_tool_call_count": 0,
+            "background_wait_count": 0,
+            "runtime_recovery": {
+              "retry_attempts": 0,
+              "network_retry_attempts": 0,
+              "http_statuses": []
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "final_followup",
+      "started_at": "2026-09-22T14:14:03.950470Z",
+      "model": "cd-fable-5.1",
+      "reasoning_effort": null,
+      "base_url": "https://mmu.vod-qcloud.com/v1",
+      "task_digests": {
+        "analysis_scope": "62aa0d4c63391ad2e55fe1ba82d2a9ad2474310f2559ab3fc2b40dba5767b27a",
+        "comment_scope": "bd0fab5e52238138e8b3c69813f968aa1f205d0eceb66fd86229ee7ecbd3acac",
+        "nested_rules": "a40a38a1896f6d3ad9227bbb7f5d2ffe4c2e455e04f1a9f19cd2634ed856f6be",
+        "csv_scope": "322cf365fc5f5091df247954452982bde30ddbfc1f3d07f8fd8dfd03acac0533"
+      },
+      "versions": {
+        "final": "golutra-agent 0.3.5"
+      },
+      "binary_or_launcher_sha256": {
+        "final": "79a354830a595fecda539fc63ba643548f32c840b94f40804151b3607d486218"
+      },
+      "finished_at": "2026-09-22T14:16:42.077568Z",
+      "attempts": [
+        {
+          "variant": "final",
+          "task": "analysis_scope",
+          "repeat": 0,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "read-only answer and source checked",
+          "metrics": {
+            "elapsed_ms": 11586.6,
+            "request_count": 2,
+            "tool_call_count": 1,
+            "tool_names": [
+              "read_file"
+            ],
+            "uncached_input_tokens": 864,
+            "output_tokens": 161,
+            "final_message": "{\"actual\": 3.0, \"expected\": 6, \"cause\": \"total() 将 sum(values) 除以 len(values)，计算的是平均值而非总和；对 [2, 4] 得到 6/2=3.0，而函数名 total 表示应返回 sum(values)=6。\"}",
+            "avoidable_repeat_tool_call_count": 0,
+            "background_wait_count": 0,
+            "runtime_recovery": {
+              "retry_attempts": 0,
+              "network_retry_attempts": 0,
+              "http_statuses": []
+            }
+          }
+        },
+        {
+          "variant": "final",
+          "task": "comment_scope",
+          "repeat": 0,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "comment changed; executable line and user draft preserved",
+          "metrics": {
+            "elapsed_ms": 14740.1,
+            "request_count": 3,
+            "tool_call_count": 2,
+            "tool_names": [
+              "edit_file",
+              "read_file"
+            ],
+            "uncached_input_tokens": 1443,
+            "output_tokens": 222,
+            "final_message": "已完成：`greet.py` 中唯一的中文注释 `# 打印问候语` 已改为 `# Print a greeting`，`print(\"Hello, world!\")` 等其他内容保持不变。",
+            "avoidable_repeat_tool_call_count": 0,
+            "background_wait_count": 0,
+            "runtime_recovery": {
+              "retry_attempts": 0,
+              "network_retry_attempts": 0,
+              "http_statuses": []
+            }
+          }
+        },
+        {
+          "variant": "final",
+          "task": "nested_rules",
+          "repeat": 0,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "nested rule and independent calculation checks passed",
+          "metrics": {
+            "elapsed_ms": 36738.5,
+            "request_count": 5,
+            "tool_call_count": 5,
+            "tool_names": [
+              "edit_file",
+              "read_file",
+              "shell"
+            ],
+            "uncached_input_tokens": 6490,
+            "output_tokens": 878,
+            "final_message": "已完成。\n\n**改动**（仅 `packages/calc.py`）：\n```python\ndef total(values):\n    result = 0\n    for value in values:\n        result += value\n    return result\n```\n- 逐项累加，空序列返回 `0`；接受任意可迭代对象（不限于 list）。\n- 公共签名 `total(values)` 与模块 docstring 均未改动。\n\n**遵守的约定**：\n- 根 `AGENTS.md`：未改测试和指令文件，保持公共签名。\n- `packages/AGENTS.md`：未新增依赖或文件，未改 docstring。\n\n**验证**：按 `packages/AGENTS.md` 要求运行 `python3 -B packages/test_existing.py` → `Ran 1 test … OK`（覆盖 `total([2, 4]) == 6` 和 `total([]) == 0`）。",
+            "avoidable_repeat_tool_call_count": 0,
+            "background_wait_count": 0,
+            "runtime_recovery": {
+              "retry_attempts": 0,
+              "network_retry_attempts": 0,
+              "http_statuses": []
+            }
+          }
+        },
+        {
+          "variant": "final",
+          "task": "csv_scope",
+          "repeat": 0,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "exact CSV and unchanged source checked",
+          "metrics": {
+            "elapsed_ms": 13985,
+            "request_count": 2,
+            "tool_call_count": 1,
+            "tool_names": [
+              "read_file"
+            ],
+            "uncached_input_tokens": 4510,
+            "output_tokens": 90,
+            "final_message": "timeout,retries\n9,2",
+            "avoidable_repeat_tool_call_count": 0,
+            "background_wait_count": 0,
+            "runtime_recovery": {
+              "retry_attempts": 0,
+              "network_retry_attempts": 0,
+              "http_statuses": []
+            }
+          }
+        },
+        {
+          "variant": "final",
+          "task": "analysis_scope",
+          "repeat": 1,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "read-only answer and source checked",
+          "metrics": {
+            "elapsed_ms": 13771.1,
+            "request_count": 2,
+            "tool_call_count": 1,
+            "tool_names": [
+              "read_file"
+            ],
+            "uncached_input_tokens": 4520,
+            "output_tokens": 159,
+            "final_message": "{\"actual\": 3.0, \"expected\": 6, \"cause\": \"total 的实现为 sum(values) / len(values)，返回的是平均值而非总和；对 [2, 4] 得到 6/2 = 3.0。按函数名含义应直接返回 sum(values) = 6，不应除以 len(values)。\"}",
+            "avoidable_repeat_tool_call_count": 0,
+            "background_wait_count": 0,
+            "runtime_recovery": {
+              "retry_attempts": 0,
+              "network_retry_attempts": 0,
+              "http_statuses": []
+            }
+          }
+        },
+        {
+          "variant": "final",
+          "task": "comment_scope",
+          "repeat": 1,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "comment changed; executable line and user draft preserved",
+          "metrics": {
+            "elapsed_ms": 20003.8,
+            "request_count": 3,
+            "tool_call_count": 2,
+            "tool_names": [
+              "edit_file",
+              "read_file"
+            ],
+            "uncached_input_tokens": 1443,
+            "output_tokens": 217,
+            "final_message": "已完成：`greet.py` 中的注释 `# 打印问候语` 已改为 `# Print a greeting`，其余内容（`print(\"Hello, world!\")`）保持不变。",
+            "avoidable_repeat_tool_call_count": 0,
+            "background_wait_count": 0,
+            "runtime_recovery": {
+              "retry_attempts": 0,
+              "network_retry_attempts": 0,
+              "http_statuses": []
+            }
+          }
+        },
+        {
+          "variant": "final",
+          "task": "nested_rules",
+          "repeat": 1,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "nested rule and independent calculation checks passed",
+          "metrics": {
+            "elapsed_ms": 34262.2,
+            "request_count": 5,
+            "tool_call_count": 5,
+            "tool_names": [
+              "edit_file",
+              "read_file",
+              "shell"
+            ],
+            "uncached_input_tokens": 10481,
+            "output_tokens": 841,
+            "final_message": "已完成。\n\n**改动**（`packages/calc.py`）：`total(values)` 现在从 0 开始累加序列中所有数值并返回，因此空序列返回 `0`。公共签名 `total(values)` 未变，模块 docstring 未动。\n\n**遵循的项目约定**：\n- 根 AGENTS.md：保持公共签名，未编辑测试或指令文件。\n- packages/AGENTS.md：未新增依赖或文件，未修改模块 docstring，并用指定命令验证。\n\n**验证**：`python3 -B packages/test_existing.py` → 1 个测试通过（覆盖 `total([2, 4]) == 6` 和 `total([]) == 0`）。",
+            "avoidable_repeat_tool_call_count": 0,
+            "background_wait_count": 0,
+            "runtime_recovery": {
+              "retry_attempts": 0,
+              "network_retry_attempts": 0,
+              "http_statuses": []
+            }
+          }
+        },
+        {
+          "variant": "final",
+          "task": "csv_scope",
+          "repeat": 1,
+          "strict_pass": true,
+          "independent_pass": true,
+          "immutable_inputs_preserved": true,
+          "detail": "exact CSV and unchanged source checked",
+          "metrics": {
+            "elapsed_ms": 11199.2,
+            "request_count": 2,
+            "tool_call_count": 1,
+            "tool_names": [
+              "read_file"
+            ],
+            "uncached_input_tokens": 4510,
+            "output_tokens": 62,
+            "final_message": "timeout,retries\n9,2",
+            "avoidable_repeat_tool_call_count": 0,
+            "background_wait_count": 0,
+            "runtime_recovery": {
+              "retry_attempts": 0,
+              "network_retry_attempts": 0,
+              "http_statuses": []
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

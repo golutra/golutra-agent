@@ -14,12 +14,15 @@ import compare_long_benchmark as bench
 import compare_optimization_variants as development
 import compare_pi_benchmark as process
 import generalization_tasks as holdout
+import prompt_behavior_tasks as behavior
 
 
 def task_spec(name):
     """开发集与留出集共用调度，但各自保留独立验收器。"""
     if name in holdout.TASKS:
         return holdout.TASKS[name]
+    if name in behavior.TASKS:
+        return behavior.TASKS[name]
     return {**development.TASKS[name], "files": development.task_files(name)}
 
 
@@ -44,6 +47,16 @@ def recovery_summary(stdout):
             "http_statuses": [item.get("error_metadata", {}).get("http_status") for item in retries]}
 
 
+def prepare_home(args, home):
+    """配置路由模式不把 Anthropic 等现有凭据强行送到 Responses 地址。"""
+    if getattr(args, "configured_provider", False):
+        source = args.golutra_agent_home_source.resolve(strict=True)
+        for name in ["provider.json", "credentials.json"]:
+            bench.copy_private(source / name, home / name)
+    else:
+        bench.prepare_golutra_home(args, home)
+
+
 def run_attempt(args, root, label, binary, task, repeat):
     """凭据仅进入临时私有目录和子进程环境，报告只保留执行事实与验收结果。"""
     spec = task_spec(task)
@@ -60,7 +73,7 @@ def run_attempt(args, root, label, binary, task, repeat):
     artifacts.mkdir()
     with tempfile.TemporaryDirectory(prefix="golutra-suite-auth-") as sensitive:
         home = Path(sensitive)
-        bench.prepare_golutra_home(args, home)
+        prepare_home(args, home)
         env = os.environ.copy()
         engine = "codex" if label == "codex" else "golutra"
         state = bench.EngineState(engine, workspace, artifacts, env)
@@ -90,8 +103,11 @@ def run_attempt(args, root, label, binary, task, repeat):
         metrics["tool_count_source"] = "completed_cli_items" if engine == "codex" else "runtime_tool_calls"
         metrics["runtime_recovery"] = recovery_summary(captured.stdout) if engine == "golutra" else None
         bench.write_private_text(artifacts / "arrival-times.json", json.dumps(captured.stdout_line_times_ms))
-    verify = holdout.verify if task in holdout.TASKS else development.verify
-    accepted, detail = verify(task, workspace)
+    if task in behavior.TASKS:
+        accepted, detail = behavior.verify(task, workspace, metrics)
+    else:
+        verify = holdout.verify if task in holdout.TASKS else development.verify
+        accepted, detail = verify(task, workspace)
     preserved = all((workspace / name).is_file() and bench.file_digest(workspace / name) == digest
                     for name, digest in protected.items())
     return {"variant": label, "task": task, "repeat": repeat,
@@ -102,6 +118,14 @@ def run_attempt(args, root, label, binary, task, repeat):
 
 def run(args):
     """交替执行冻结版本；失败样本也落盘，不自动追加提示或替换结果。"""
+    if getattr(args, "configured_provider", False):
+        if args.include_codex:
+            raise ValueError("configured-provider compares Golutra variants only")
+        payload = json.loads((args.golutra_agent_home_source / "provider.json").read_text())
+        profile = next(p for p in payload["profiles"] if p["name"] == payload["active_profile"])
+        args.model = profile["model_id"]
+        args.base_url = profile.get("base_url")
+        args.reasoning_effort = profile.get("generation_config", {}).get("reasoning_effort")
     variants = [(name, Path(path).resolve(strict=True))
                 for name, path in (value.split("=", 1) for value in args.variant)]
     if any(name == "codex" for name, _ in variants):
@@ -140,9 +164,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--variant", action="append", default=[])
     parser.add_argument("--include-codex", action="store_true")
+    parser.add_argument("--configured-provider", action="store_true",
+                        help="Preserve the source provider's protocol, model, endpoint and generation settings")
     parser.add_argument("--codex", default="codex")
     parser.add_argument("--codex-model-catalog", type=Path)
-    parser.add_argument("--task", action="append", choices=list(holdout.TASKS) + ["parser_fix", "multi_file"])
+    parser.add_argument("--task", action="append", choices=list(holdout.TASKS) + list(behavior.TASKS) + ["parser_fix", "multi_file"])
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--timeout", type=float, default=600)
     parser.add_argument("--model", default="gpt-5.6-sol")
