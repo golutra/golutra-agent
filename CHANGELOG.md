@@ -6,6 +6,37 @@ follow [Semantic Versioning](https://semver.org/) where applicable.
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-09-23
+
+### Fixed
+
+- Keep verification records, residual risks and internal result assessments in
+  debug history instead of adding system cards to ordinary conversations.
+- Display one accurate terminal failure per task, retain full diagnostics and
+  avoid showing recovered provider errors as task failures.
+- Prevent terminal background-color replies from appearing in the input field.
+- Connect loopback provider, model catalog, OAuth and app-server endpoints
+  directly while preserving proxy support for remote services.
+- Distinguish missing validation evidence from a failed check, preserve evidence
+  freshness after compaction and stop repeated correction cycles without progress.
+
+### Changed
+
+- Reuse transcript projections for streamed text and observational events, with
+  full replay on tool, retry, final-response and terminal state changes.
+- Keep tool previews compact and retain complete saved details through Ctrl+O.
+- Improve long-task recovery, context compaction and prompt scope; add `/handoff`
+  for carrying task context into a new conversation.
+- Remove obsolete benchmark artifacts and refresh runtime documentation.
+
+### Distribution and validation
+
+- Align npm, native artifacts and SDK metadata at 0.3.6.
+- Local auth, client, provider and TUI validation passed 1,121 tests, including
+  35 real macOS PTY tests; one optional live-provider test was skipped.
+- Formatting and Clippy checks passed. Release automation gates publication on
+  six-platform packaging, offline startup, payload parity and shared-data checks.
+
 ## [0.3.5] - 2026-09-22
 
 ### Fixed
@@ -244,7 +275,8 @@ This is the initial public development baseline. See the repository history
 and [architecture documentation](docs/ARCHITECTURE.md) for the implementation
 details and current compatibility boundaries.
 
-[unreleased]: https://github.com/golutra/golutra-agent/compare/v0.3.5...HEAD
+[unreleased]: https://github.com/golutra/golutra-agent/compare/v0.3.6...HEAD
+[0.3.6]: https://github.com/golutra/golutra-agent/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/golutra/golutra-agent/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/golutra/golutra-agent/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/golutra/golutra-agent/compare/v0.3.2...v0.3.3
