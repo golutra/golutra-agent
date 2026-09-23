@@ -144,7 +144,7 @@ mod tests {
     use crate::OutputRate;
 
     #[test]
-    fn elapsed_formats_like_codex() {
+    fn elapsed_format_is_stable() {
         assert_eq!(format_elapsed(0), "0s");
         assert_eq!(format_elapsed(61), "1m 01s");
         assert_eq!(format_elapsed(3_661), "1h 01m 01s");

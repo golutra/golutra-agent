@@ -1214,8 +1214,6 @@
   ],
   "fixture_sha256": "99be54e3f414a59ba885ffbfeda525e351cd4f7405cbdc2fedec9e992f1657c3",
   "source_sha256": {
-    "scripts/compare_optimization_variants.py": "59e9fb5d39c137bd5ba2b8e0c2d7e8c815ceb89a6f096b62ce0ffb6112635dce",
-    "scripts/compare_continuous_tasks.py": "e320a2b61bcb0d49f41830da17d68dc17d3b8f910fd6dd912a496167a1e4281d",
     "crates/golutra-agent-client/src/context.rs": "a87497dc61530c8fbd6267c43410f8736716bfebc3333d435694c3ebb2eae904"
   },
   "trace_summary": [
@@ -1337,7 +1335,7 @@
   },
   "limitations": [
     "Three paired autonomous tasks are not a multi-hour coding or cross-platform claim.",
-    "No new Codex run; this compares frozen Golutra versions.",
+    "No external product run; this compares frozen Golutra versions.",
     "Final was slower in repeat 1; tool calls and uncached input increased in aggregate.",
     "Compound-command validation identity still caused two correction rounds in final repeat 1.",
     "Prompt and runtime changes are combined here; their individual effects are not isolated."

@@ -6964,7 +6964,7 @@ fn coding_profile_keeps_builtin_coding_capabilities_and_hides_undeclared_extensi
             AgentToolProfile::Full,
             executor.registry(),
         ),
-        Some("tool is not part of the active Pi-plus provider surface")
+        Some("tool is not part of the active provider surface")
     );
     assert_eq!(
         tool_profile_rejection_reason(

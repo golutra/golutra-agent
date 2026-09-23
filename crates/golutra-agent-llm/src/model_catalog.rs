@@ -17,13 +17,12 @@ pub async fn discover_provider_models(
     base_url: &str,
     api_key: &str,
 ) -> Result<Vec<String>, String> {
-    discover_provider_models_with_client_builder(
-        protocol,
-        base_url,
-        api_key,
-        reqwest::Client::builder(),
-    )
-    .await
+    let builder = if crate::endpoint_is_loopback(base_url) {
+        reqwest::Client::builder().no_proxy()
+    } else {
+        reqwest::Client::builder()
+    };
+    discover_provider_models_with_client_builder(protocol, base_url, api_key, builder).await
 }
 
 /// 使用调用方的代理/TLS 配置读取目录；仍强制限制总时长、响应大小和重定向。
@@ -195,6 +194,16 @@ mod tests {
             "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         )
+    }
+
+    #[tokio::test]
+    async fn default_catalog_client_connects_directly_to_local_gateway() {
+        let (base, task) = server(response("200 OK", r#"{"data":[{"id":"local-model"}]}"#)).await;
+        let models = discover_provider_models(ProviderProtocol::OpenAiResponses, &base, "test-key")
+            .await
+            .unwrap();
+        assert_eq!(models, vec!["local-model"]);
+        assert!(task.await.unwrap().starts_with("GET /v1/models "));
     }
 
     #[tokio::test]

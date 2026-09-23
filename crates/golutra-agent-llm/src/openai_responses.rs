@@ -16,9 +16,9 @@ use secrecy::ExposeSecret;
 use serde_json::{Value, json};
 
 use super::genai_adapter::{
-    genai_chat_options, genai_chat_request, genai_error_http_status, genai_error_metadata,
-    genai_stream_error_requires_auth_refresh, map_genai_error, provider_response_from_genai_stream,
-    restore_wire_tool_name,
+    genai_chat_options, genai_chat_request, genai_client_for_base_url, genai_error_http_status,
+    genai_error_metadata, genai_stream_error_requires_auth_refresh, map_genai_error,
+    provider_response_from_genai_stream, restore_wire_tool_name,
 };
 use super::{
     GOLUTRA_AGENT_PROVIDER_AUTH_PROVIDER, GOLUTRA_AGENT_PROVIDER_ROUTE_ID, LlmProvider,
@@ -30,7 +30,7 @@ use super::{
     ProviderStreamEvent, ProviderTransportDiagnostics, ProviderUsage, RESERVED_AFFINITY_HEADERS,
     cache_capabilities_from_reader, configured_or_first_env, custom_headers_from_reader,
     env_mapping, first_env, generation_config_from_reader, missing_env_error,
-    protocol_capabilities, provider_credential_error, provider_http_client,
+    protocol_capabilities, provider_credential_error, provider_http_client_for_base_url,
     provider_http_error_with_headers, provider_transport_error, response_json_or_error,
     sanitize_provider_error, validate_provider_base_url,
 };
@@ -138,15 +138,14 @@ impl OpenAiResponsesProvider {
             ProviderProtocol::OpenAiResponses,
             capabilities,
         );
+        let client = genai_client_for_base_url(web_config, &config.base_url);
+        let probe_client = provider_http_client_for_base_url(&config.base_url);
         Self {
             credential,
             config,
             cache_profile,
-            client: Client::builder()
-                .with_web_config(web_config)
-                .build()
-                .expect("static genai client configuration is valid"),
-            probe_client: provider_http_client(),
+            client,
+            probe_client,
         }
     }
 

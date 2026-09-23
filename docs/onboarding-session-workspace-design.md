@@ -8,48 +8,13 @@
 - LLM provider 凭据、配置和运行时状态应该持久化在哪里。
 - resume、多 session、多工作区应该如何设计，避免 CLI/TUI/Web 各自维护状态。
 
-结论：Golutra 已具备 provider onboarding、SecretRef/OAuth、thread resume、完整 fork、rollout export 和 cwd rebind 闭环。默认仍可使用 `mock` provider；真实 provider 通过全局 `$GOLUTRA_AGENT_HOME/provider.json` v2 保存 selection 和 credential ref，运行时再从 owner-only `$GOLUTRA_AGENT_HOME/credentials.json` 或进程 env 动态解析 secret。TUI 首次进入会检查 active provider profile；没有显式配置时打开 provider setup，支持 qwen-code 风格的 provider 分组、第三方 provider 选型、OpenAI-compatible/OpenAI Responses/Anthropic/Gemini/Vertex AI/genai 协议、base URL、disk/env 凭据、model/advanced config、保存前 review，或选择 mock provider。OpenAI、xAI、GitHub Copilot 会按 opencode 风格展示各自受审计的 browser/device OAuth 方法，Custom Provider 不推断 OAuth。已有 provider 时首屏不打断，输入 `/auth` 或 `/auth setup` 可随时重新打开并覆盖同名 profile；显式 `/auth oauth-login` 和 `/auth logout` 管理扩展 descriptor 与 OAuth token set。
+结论：Golutra 已具备 provider onboarding、SecretRef/OAuth、thread resume、完整 fork、rollout export 和 cwd rebind 闭环。默认仍可使用 `mock` provider；真实 provider 通过全局 `$GOLUTRA_AGENT_HOME/provider.json` v2 保存 selection 和 credential ref，运行时再从 owner-only `$GOLUTRA_AGENT_HOME/credentials.json` 或进程 env 动态解析 secret。TUI 首次进入会检查 active provider profile；没有显式配置时打开 provider setup，支持 provider 分组、协议选择、base URL、disk/env 凭据、model/advanced config、保存前 review，或选择 mock provider。Custom Provider 不推断 OAuth。已有 provider 时首屏不打断，输入 `/auth` 或 `/auth setup` 可随时重新打开并覆盖同名 profile；显式 `/auth oauth-login` 和 `/auth logout` 管理扩展 descriptor 与 OAuth token set。
 
-## qwen-code 参考结论
-
-参考项目：[Qwen Code](https://github.com/QwenLM/qwen-code)。
-
-### 首次认证触发
-
-qwen-code 的 CLI 认证状态由 `config.getAuthType()` 决定：
-
-- 未设置 auth type 时，`useAuthCommand` 将 `isAuthDialogOpen` 初始化为 `true`。
-- `AuthDialog` 首屏不是直接输入 key，而是先选择 provider 分组：Alibaba ModelStudio、Third-party Providers、Custom Provider。
-- provider setup 是配置驱动流程，步骤包括 protocol、baseUrl、apiKey、models、advancedConfig、review。
-- Escape 不能绕过首次认证；没有 auth type 时会提示必须 connect provider。
-
-Golutra 应吸收这个体验：首次进入 TUI 时，如果没有可用 live provider，不直接进入空白聊天界面，而是展示 provider setup。CLI 仍要支持脚本模式，因此 `golutra-agent chat` 默认 mock 不应被交互弹窗阻塞；`golutra tui` 和显式 `golutra-agent provider login` 进入 setup flow。Web 首次 provider onboarding 不在当前产品范围，已有 Web attach 页面继续只消费 projection 和 event stream。
+首次进入 TUI 时，如果没有可用 live provider，会展示 provider setup；CLI 脚本模式继续使用 mock 或返回结构化配置错误，Web attach 页面只消费 projection 和 event stream。
 
 ### 配置和凭据持久化
 
-qwen-code 的关键路径：
-
-| 类型 | qwen-code 路径 |
-| --- | --- |
-| 全局目录 | `QWEN_HOME`，否则 `~/.qwen` |
-| 运行时目录 | `QWEN_RUNTIME_DIR`，否则 settings 指定目录，否则全局目录 |
-| 全局设置 | `~/.qwen/settings.json` |
-| workspace 设置 | `<workspace>/.qwen/settings.json` |
-| OAuth 文件 | `~/.qwen/oauth_creds.json` |
-| MCP OAuth | `~/.qwen/mcp-oauth-tokens.json` |
-| 项目运行数据 | `<runtimeBase>/projects/<sanitized-cwd>` |
-
-qwen-code 的 settings 写入要点：
-
-- `settings.json` 允许 JSONC 风格读入，但写出为标准 JSON。
-- 写入采用 temp file + rename，避免半写文件。
-- 文件权限收紧为 owner-only，避免 API key 短暂暴露。
-- `ProviderInstallPlan` 一次性描述 env、modelProviders、authType、legacyCredentials、modelSelection 和 providerState。
-- 应用 install plan 时先备份 settings 和 process env；persist、reload、refreshAuth 任一步失败都会 rollback settings、env 和 runtime provider registry。
-- 禁止 install plan 写 `NODE_OPTIONS`、`LD_PRELOAD`、`PATH`、`HOME` 等进程劫持 env。
-- Custom Provider 的 envKey 由 `(protocol, baseUrl)` 加 hash 后缀派生，避免 `api.example.com`、`api-example.com` 这类规范化碰撞覆盖同一份 key。
-
-Golutra 不应照搬把明文 key 默认写入 workspace。推荐持久化分层：
+Golutra 的配置和凭据分层如下：
 
 | 类型 | Golutra 路径 | 允许内容 |
 | --- | --- | --- |
@@ -63,27 +28,6 @@ Golutra 不应照搬把明文 key 默认写入 workspace。推荐持久化分层
 | 全局凭据文件 | `$GOLUTRA_AGENT_HOME/credentials.json`；CI 可使用进程 env | owner-only 明文 API key、OAuth access/refresh token set；项目目录和 provider config 禁止 secret |
 
 当前实现使用 v2，并删除明文 `provider.json.env`：交互输入默认写 `$GOLUTRA_AGENT_HOME/credentials.json`，CI/非交互模式可保存 env ref，profile 只保存 `credential_ref` 和非敏感 OAuth descriptor。凭据文件使用独立锁、大小上限和原子替换，Unix 下目录为 `0700`、文件为 `0600`。首次读取 v1 时在 provider settings lock 内把明文 env map 原子迁移到 disk SecretRef；失败会恢复 secret snapshot 并保留原配置，整个过程不访问 OS keychain。若显式 `/auth` 或 provider login 遇到已删除 backend 导致的不可读 JSON 配置，Review 会标明替换计划；保存成功后只保留新 profile，probe 失败则原样恢复旧文件和 secret snapshot，同样不会读取已删除 backend。
-
-## Codex 参考结论
-
-参考项目：[OpenAI Codex](https://github.com/openai/codex)。
-
-### Thread / session 分层
-
-Codex SDK 暴露 `startThread()` 和 `resumeThread(id)`；文档明确 thread 持久化在 `~/.codex/sessions`。Rust 实现里，完整历史主要是 rollout JSONL，SQLite state 维护 thread 元数据和列表索引。
-
-核心设计点：
-
-- thread 是用户可恢复的会话单位，不等同于单个 turn。
-- rollout JSONL 是可重建历史；SQLite 是索引、列表、状态和查询加速。
-- thread 元数据包含 `id`、`rollout_path`、`created_at`、`updated_at`、`recency_at`、`source`、`model_provider`、`model`、`cwd`、`title`、`preview`、sandbox、approval、tokens、git info、archived 状态。
-- thread/list 支持分页 cursor、cwd 过滤、model provider 过滤、source 过滤、archived 过滤、search、parent/ancestor 关系。
-- Codex TUI resume picker 默认按当前 cwd 过滤并允许切换 All；Golutra 只采纳当前 cwd 的 Resume/Fork，不采纳 All Workspaces 入口。
-- resume 对正在运行的 thread 走 listener attach，避免重建；对已卸载 thread 从 rollout/history 重建并重新创建 runtime。
-- fork 从已有 rollout 截断或复制历史，生成新的 thread；可以继承名称和配置，但拥有独立运行时和 rollout。
-- app-server 线程 listener 有卸载延迟：无订阅且非 active 一段时间后卸载，避免长期占用内存。
-
-Golutra 应吸收 thread 视图，而不是继续只有 workspace 默认 session。`SessionId` 可以保留为 runtime lane scope，但用户入口应面向 `ThreadId` 或 `ConversationId`，并允许一个 workspace 有多个 thread。
 
 ## Golutra 目标模型
 
@@ -179,7 +123,7 @@ WorkspaceId
 - `runtime_events` 是 canonical facts；每个持久化事件同步物化为 rollout envelope，包含格式版本、thread/session/sequence、脱敏后的完整事件和 SHA-256 checksum。
 - rollout 单行上限 20 MiB，目录/文件分别使用 owner-only 权限；增量 append 与原子重建共享跨进程锁，启动和显式 export 可从 SQLite 修复缺失或陈旧文件。
 
-rollout 是可删除、可重建的导出层，不反向覆盖 SQLite。这样保留 Codex 式可携带历史，同时不引入 SQLite/JSONL 双主真相。
+rollout 是可删除、可重建的导出层，不反向覆盖 SQLite，避免 SQLite 和 JSONL 形成双主真相。
 
 `threads` 最小字段：
 
@@ -310,7 +254,7 @@ TUI 输入框现在先经过 slash command parser：
 | `/export` | 按 `/resume` 风格选择当前 cwd 的 anchor session，输入 `1`、`+N` 或 `-N`，再输入绝对目录，导出对话和治理事实 |
 | `/status`、`/debug [switch]`、`/abort`、`/clear`、`/quit` | 本地状态、debug 模式/详情切换、abort 和退出控制 |
 
-输入体验对齐 Codex：
+输入体验：
 
 - 输入 `/` 或 `/auth ` 时，底部输入框下方显示候选命令列表，而不是只显示一行 help 文案。
 - Up/Down 或 Tab 可移动候选，Enter 会启动可直接执行的命令；需要参数的命令会先补全命令文本并等待用户继续输入。
@@ -328,7 +272,7 @@ TUI 输入框现在先经过 slash command parser：
 
 ## 当前状态与边界
 
-- 当前 TUI 已有 qwen-code 风格 provider setup：Golutra API、Third-party Providers、Custom Provider、mock 分组选择；第三方内置 OpenAI、OpenRouter、DeepSeek、Qwen/DashScope compatible、xAI、GitHub Copilot 和本地 OpenAI-compatible preset；OpenAI 展示 ChatGPT browser/headless OAuth/API key，xAI 展示 browser/device OAuth/API key，GitHub Copilot 只展示 device OAuth。Custom Provider 可选 OpenAI-compatible、Anthropic、Gemini、Vertex AI、genai，但不自动获得 OAuth。setup 的 API key 路径按 protocol/baseUrl -> credential storage/API key 或 envKey -> model -> advanced config -> review -> install 执行；OAuth 路径直接启动后台授权并在成功后 verified probe/install。review 展示脱敏 `ProviderInstallPlan`、保存路径和同名 profile 覆盖提示；secret/config/probe 失败自动 rollback，成功覆盖会删除旧 credential。
+- 当前 TUI 已有 provider setup：Golutra API、Third-party Providers、Custom Provider、mock 分组选择；第三方内置 OpenAI、OpenRouter、DeepSeek、Qwen/DashScope compatible、xAI、GitHub Copilot 和本地 OpenAI-compatible preset；OpenAI 展示 ChatGPT browser/headless OAuth/API key，xAI 展示 browser/device OAuth/API key，GitHub Copilot 只展示 device OAuth。Custom Provider 可选 OpenAI-compatible、Anthropic、Gemini、Vertex AI、genai，但不自动获得 OAuth。setup 的 API key 路径按 protocol/baseUrl -> credential storage/API key 或 envKey -> model -> advanced config -> review -> install 执行；OAuth 路径直接启动后台授权并在成功后 verified probe/install。review 展示脱敏 `ProviderInstallPlan`、保存路径和同名 profile 覆盖提示；secret/config/probe 失败自动 rollback，成功覆盖会删除旧 credential。
 - 当前 provider/auth 持久化已收敛为全局用户级 `$GOLUTRA_AGENT_HOME/provider.json` v2和 disk/env SecretRef；磁盘 secret 位于 `$GOLUTRA_AGENT_HOME/credentials.json`，OAuth browser/device、refresh、revoke/logout 已接通。项目 `.golutra-agent/runtime.json` 只保存经过严格校验的非敏感运行默认，不能保存 provider 或 runtime secret；项目值覆盖全局值，session 内存控制和显式 CLI 参数继续拥有更高优先级。
 - 当前全局 `threads` 表、`golutra-agent thread list`、`golutra-agent resume [THREAD_ID]`、`golutra fork THREAD_ID [--from-turn TURN_ID]`、`golutra-agent thread export`、`golutra export <ABSOLUTE_DIR> [--thread-id ID] [--range 1|+N|-N]` 和 `golutra-agent thread rebind --from` 已可用；默认按当前 canonical cwd 过滤，每个显式新 session 使用独立 thread 主键，daemon 重新 attach 会刷新最近 thread/session。Session page/window 通过 Embedded、HTTP 和 Unix IPC 使用同一稳定 cursor/anchor 语义。
 - 当前完成任务会写入 `AssistantMessage`，`UserProjection.final_message` 和 TUI transcript 可在 resume 后恢复最终回复；下一轮 prompt 会携带当前 session 的压缩历史摘要。

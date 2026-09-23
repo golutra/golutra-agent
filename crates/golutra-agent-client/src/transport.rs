@@ -514,12 +514,15 @@ impl HttpSseTransport {
         cwd: impl AsRef<Path>,
         transport_token: SecretString,
     ) -> Result<Self, ClientError> {
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(2))
-            .build()
-            .map_err(|error| ClientError::Http(error.to_string()))?;
         let base_url = base_url.into().trim_end_matches('/').to_owned();
         validate_remote_app_server_base_url(&base_url)?;
+        let mut client_builder = reqwest::Client::builder().connect_timeout(Duration::from_secs(2));
+        if loopback_url(&base_url) {
+            client_builder = client_builder.no_proxy();
+        }
+        let client = client_builder
+            .build()
+            .map_err(|error| ClientError::Http(error.to_string()))?;
         validate_transport_token(transport_token.expose_secret())?;
         let requested_cwd = cwd.as_ref().to_path_buf();
         if !requested_cwd.is_absolute() {
@@ -1036,6 +1039,13 @@ fn loopback_host(host: &str) -> bool {
             .is_ok_and(|address| address.is_loopback())
 }
 
+fn loopback_url(base_url: &str) -> bool {
+    reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(loopback_host))
+        .unwrap_or(false)
+}
+
 pub(crate) fn validate_local_app_server_base_url(base_url: &str) -> Result<(), ClientError> {
     let parsed = reqwest::Url::parse(base_url).map_err(|error| {
         ClientError::Daemon(format!("runtime endpoint base URL is invalid: {error}"))
@@ -1374,7 +1384,10 @@ mod lifecycle_tests {
 
     fn test_http_transport() -> HttpSseTransport {
         HttpSseTransport {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("local test client"),
             base_url: "http://127.0.0.1:9".to_owned(),
             server_info: test_server_info(),
             protocol_version: crate::RUNTIME_PROTOCOL_VERSION,

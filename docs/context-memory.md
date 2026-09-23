@@ -446,16 +446,12 @@ MemoryPromotionRecord
 
 P2.5 已禁止单次成功任务直接 active：所有 project candidate 先进入 quarantine，至少需要两个独立 task 的一致 evidence 或一次显式 human approval；检索默认排除 quarantined、expired、rolled_back 和 invalidated 记录。
 
-## 六个项目带来的边界
+## Context 与 Memory 边界
 
-- Pi：compact boundary、recent tokens 保留、不能切断 tool result。
-- Kimi Code：durable wire event 和 context projection。
-- OpenCode：结构化 compaction summary、工具输出截断、compaction event。
-- cg：Rust runtime 内把 compaction 作为事件接入 normal/debug/replay。
-- Claude Code Best：token 阈值、warning/blocking、auto-compact 失败熔断。
-- Hermes Agent：memory provider、context engine、memory 注入清洗和作用域隔离。
-
-Golutra 只吸收这些边界，不照搬六套系统。
+- compact 必须保留最近的完整工具结果，不能截断工具调用与结果的配对关系。
+- durable wire event 与 context projection 分开保存，恢复时由事实事件重建投影。
+- summary、工具输出截断、token 阈值和失败熔断都由统一 runtime contract 管理。
+- memory provider、context engine、注入清洗和作用域隔离必须经过同一权限与验证边界。
 
 ## 与 Runtime Loop 的关系
 

@@ -788,6 +788,14 @@ fn observation_catalog_classifies_loop_facts_before_persistence() {
     assert_eq!(candidate.event_type, RuntimeEventType::CandidateReady);
     assert_eq!(candidate.integrity, ObservationIntegrityClass::Required);
 
+    let compaction = observation_descriptor(&RuntimeObservation::ContextCompactionStarted {
+        compaction_id: "compaction-test".to_owned(),
+        original_input_tokens: 100,
+        budget_limit: 80,
+    });
+    assert_eq!(compaction.event_type, RuntimeEventType::CompactionStarted);
+    assert_eq!(compaction.integrity, ObservationIntegrityClass::Required);
+
     let verification = observation_descriptor(&RuntimeObservation::VerificationReady {
         plan_id: golutra_agent_core::VerificationPlanId::new(),
     });
@@ -867,6 +875,21 @@ fn provider_recovery_boundary_is_required_and_preserves_request_identity() {
     assert_eq!(payload["recovery"]["error_metadata"]["http_status"], 429);
     assert_eq!(payload["recovery"]["phase"], "waiting");
     assert_eq!(payload["recovery"]["reset_stream"], true);
+}
+
+#[test]
+fn empty_response_retry_keeps_the_previous_request_identity() {
+    let request_id = golutra_agent_core::ProviderRequestId::new();
+    let (kind, source, payload) = trace_event_payload(AgentLoopTraceEvent::RetryScheduled {
+        attempt: 1,
+        after_request_id: Some(request_id),
+        reason: "provider returned an empty response".to_owned(),
+    })
+    .expect("retry event");
+
+    assert_eq!(kind, RuntimeEventType::RetryScheduled);
+    assert_eq!(source, RuntimeEventSource::Runtime);
+    assert_eq!(payload["after_request_id"], request_id.to_string());
 }
 
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
@@ -12471,6 +12494,7 @@ fn context_compaction_persists_a_redacted_baseline_outside_the_event_payload() {
     };
     let record = ContextCompactionRecord {
         turn_id: task.turn_id,
+        compaction_id: "compaction-test".to_owned(),
         mode: "automatic".to_owned(),
         strategy: "fallback_facts_tail".to_owned(),
         summary_attempts: 0,
@@ -12517,8 +12541,10 @@ fn context_compaction_persists_a_redacted_baseline_outside_the_event_payload() {
         artifact_payload["source_checksum"],
         compaction_source_checksum("provider call completed")
     );
+    assert_eq!(artifact_payload["compaction_id"], "compaction-test");
     assert_ne!(artifact_payload["checksum"], "sha256:source");
     let summary = payload["content"].as_str().expect("summary envelope");
+    assert_eq!(payload["compaction_id"], "compaction-test");
     assert_eq!(
         parse_compaction_summary_envelope(summary)
             .expect("current envelope")

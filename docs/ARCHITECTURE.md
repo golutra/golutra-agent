@@ -10,8 +10,7 @@ Golutra 的核心系统是什么，
 哪些能力属于核心，哪些能力属于扩展。
 ```
 
-外部项目影响和调研结论保留在 `framework-comparison.md`。实现时优先以本文档作为架构真相。
-具体落地顺序、最小 schema 和同步/后台/离线边界见 `implementation-blueprint.md`。
+实现时优先以本文档作为架构真相。具体落地顺序、最小 schema 和同步/后台/离线边界见 `implementation-blueprint.md`。
 P0-P2 骨架到可信治理闭环之间的 P2.5 实施边界见 `runtime-governance-completion-design.md`。
 
 ## 核心结论
@@ -585,4 +584,3 @@ Evaluation / Improvement 模式使用 `Evaluation / Improvement Projection`：
 - `supervisor-operations.md`：P3 本地控制面的持久化、命令、构建、canary、launcher 和回滚操作。
 - `research-self-evolving-agent-systems.md`：自修改 agent、防过拟合和发布完整性的一手资料研究。
 - `extensions-sdk-delivery.md`：Plugin/MCP、IPC、TypeScript/Python SDK、安装与交付门禁。
-- `framework-comparison.md`：六个外部 agent 项目的架构影响。

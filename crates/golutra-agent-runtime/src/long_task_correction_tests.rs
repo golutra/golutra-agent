@@ -88,6 +88,23 @@ fn validation_after_edits_is_required_but_documentation_does_not_expire_code_tes
 }
 
 #[test]
+fn direct_file_validation_survives_an_unrelated_source_edit() {
+    let previous = objective_test_report_with_output("test -f generated/report.json", "");
+    let mut unrelated = objective_test_report("write_file", None);
+    unrelated.changed_files = vec![PathBuf::from("src/other.rs")];
+    assert!(validation_is_current(
+        &previous,
+        &[previous.clone(), unrelated]
+    ));
+    let mut target = objective_test_report("write_file", None);
+    target.changed_files = vec![PathBuf::from("generated/report.json")];
+    assert!(!validation_is_current(
+        &previous,
+        &[previous.clone(), target]
+    ));
+}
+
+#[test]
 fn passing_python_tests_do_not_expire_previous_checks_by_writing_bytecode_cache() {
     let previous = objective_test_report_with_output(
         "python3 -m unittest test_existing",

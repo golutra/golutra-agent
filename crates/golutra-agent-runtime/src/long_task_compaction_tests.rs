@@ -261,6 +261,25 @@ async fn multiple_compactions_preserve_objective_steering_tool_pairs_and_network
             .count()
             >= 3
     );
+    let started_compactions = trace
+        .iter()
+        .filter_map(|event| match event {
+            AgentLoopTraceEvent::ContextCompactionStarted { compaction_id, .. } => {
+                Some(compaction_id.clone())
+            }
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let completed_compactions = trace
+        .iter()
+        .filter_map(|event| match event {
+            AgentLoopTraceEvent::ContextAutoCompacted(record) => Some(record.compaction_id.clone()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    assert!(started_compactions.len() >= 3);
+    assert!(completed_compactions.iter().all(|id| !id.is_empty()));
+    assert_eq!(started_compactions, completed_compactions);
     assert_eq!(
         trace
             .iter()

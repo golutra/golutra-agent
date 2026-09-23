@@ -309,4 +309,18 @@ async fn cancelling_automatic_summary_does_not_commit_a_compaction_boundary() {
             .iter()
             .any(|event| matches!(event, AgentLoopTraceEvent::ContextAutoCompacted(_)))
     );
+    let started = events.iter().find_map(|event| match event {
+        AgentLoopTraceEvent::ContextCompactionStarted { compaction_id, .. } => {
+            Some(compaction_id.clone())
+        }
+        _ => None,
+    });
+    let failed = events.iter().find_map(|event| match event {
+        AgentLoopTraceEvent::ContextCompactionFailed { compaction_id, .. } => {
+            Some(compaction_id.clone())
+        }
+        _ => None,
+    });
+    assert!(started.as_ref().is_some_and(|id| !id.is_empty()));
+    assert_eq!(started, failed);
 }

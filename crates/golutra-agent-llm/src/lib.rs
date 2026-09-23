@@ -152,7 +152,7 @@ impl ProviderCacheCapabilities {
         Self::default()
     }
 
-    /// 通用 Responses 配置，等价于 Pi 的默认 session cache 约定。
+    /// 通用 Responses 配置，使用稳定的 session cache 约定。
     #[must_use]
     pub fn responses() -> Self {
         Self {
@@ -166,7 +166,7 @@ impl ProviderCacheCapabilities {
         }
     }
 
-    /// ChatGPT/Codex Responses 后端使用连字符形式的 session header，且不
+    /// ChatGPT Responses 后端使用连字符形式的 session header，且不
     /// 假定通用 Responses 的 retention 扩展字段。
     #[must_use]
     pub fn codex_responses() -> Self {
@@ -1480,6 +1480,7 @@ impl OpenAiCompatibleProvider {
     ) -> Self {
         let api_key = api_key.into();
         let base_url = normalize_openai_base_url(&base_url.into());
+        let client = provider_http_client_for_base_url(&base_url);
         Self {
             credential: Arc::new(FixedCredentialProvider::new(
                 api_key,
@@ -1495,7 +1496,7 @@ impl OpenAiCompatibleProvider {
             model_id: model_id.into(),
             generation_config: ProviderGenerationConfig::default(),
             custom_headers: ProviderHttpHeaders::default(),
-            client: provider_http_client(),
+            client,
         }
     }
 
@@ -1514,6 +1515,7 @@ impl OpenAiCompatibleProvider {
         credential: Arc<dyn CredentialProvider>,
     ) -> Self {
         let base_url = normalize_openai_base_url(&config.base_url);
+        let client = provider_http_client_for_base_url(&base_url);
         let default_capabilities = ProviderCacheCapabilities::for_protocol(config.protocol);
         let capabilities = config
             .cache_capabilities
@@ -1529,7 +1531,7 @@ impl OpenAiCompatibleProvider {
             model_id: config.model_id,
             generation_config: config.generation_config,
             custom_headers: config.custom_headers,
-            client: provider_http_client(),
+            client,
         }
     }
 
@@ -3655,14 +3657,38 @@ fn provider_transport_error(error: reqwest::Error) -> ProviderError {
     }
 }
 
-fn provider_http_client() -> reqwest::Client {
+fn provider_http_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
         // Streaming requests are bounded by ProviderSession's idle deadline;
         // a total HTTP deadline would incorrectly kill active long turns.
         .read_timeout(std::time::Duration::from_secs(300))
+}
+
+pub(crate) fn provider_http_client_for_base_url(base_url: &str) -> reqwest::Client {
+    let builder = if endpoint_is_loopback(base_url) {
+        // 本地网关和桌面 sidecar 不应经过用户代理；外部端点仍沿用
+        // reqwest 的代理环境约定，避免破坏企业网络配置。
+        provider_http_client_builder().no_proxy()
+    } else {
+        provider_http_client_builder()
+    };
+    builder
         .build()
         .expect("static reqwest client configuration is valid")
+}
+
+pub(crate) fn endpoint_is_loopback(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+    url.host_str().is_some_and(|host| {
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    })
 }
 
 fn provider_http_error_with_headers(

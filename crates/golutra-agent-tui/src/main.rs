@@ -3148,7 +3148,7 @@ impl TuiApp {
         }
 
         if items.is_empty() {
-            // 对照 Claude Code：没有可恢复会话时，在 › /resume 下面给出结果，不打开空 picker。
+            // 没有可恢复会话时，在 › /resume 下面给出结果，不打开空 picker。
             self.push_command_result("No sessions in this cwd yet");
             return Ok(());
         }
@@ -3404,7 +3404,7 @@ impl TuiApp {
         thread_id: ThreadId,
     ) -> miette::Result<()> {
         self.resume_thread(transport, thread_id).await?;
-        // 对照 Claude Code：slash / picker 成功后新会话留下 › /resume 和结果行。
+        // slash / picker 成功后新会话留下 › /resume 和结果行。
         // retry fork 走 resume_thread，不能把 /resume 记进新会话。
         self.record_slash_command("/resume");
         self.push_command_result(format!("Resumed {}", short_id(&self.thread_id.to_string())));
@@ -3553,7 +3553,7 @@ impl TuiApp {
 
     fn close_resume_picker(&mut self) {
         self.resume_picker = None;
-        // 对照 Claude Code：取消 picker 后留下 › /resume，下面再跟 ⎿ Resume cancelled。
+        // 取消 picker 后留下 › /resume，下面再跟 ⎿ Resume cancelled。
         // 提交时已经 reset 过 composer；这里再清一次，避免退出全屏后把 › /re 叠在分隔线上。
         self.input.reset();
         self.push_command_result("Resume cancelled");

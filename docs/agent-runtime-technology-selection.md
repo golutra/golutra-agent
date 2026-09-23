@@ -11,7 +11,7 @@
 - 工具、权限、状态、恢复、预算、trace 和 verification 应集中在 runtime。
 - 选型优先满足可恢复、可治理、可验证、可演化，而不是短期拼装速度。
 - 主线采用 `cg` 式 Rust native runtime：核心执行、TUI、状态、沙箱、观测和 provider adapter 统一在 Rust 内治理。
-- 其他项目只吸收能力，不改变 Rust-first 主线：Kimi Code 的 wire/state/vis、OpenCode 的事件化 session/API、多端共享核心、Pi 的 harness/provider 分层、Claude Code Best 的终端体验、Hermes Agent 的 SQLite 和插件 provider。
+- 所有入口共享同一套 Rust runtime、事件、状态、权限、恢复和 provider contract，不在入口层复制状态机。
 - 第一阶段按 coding agent 收敛，不按通用 agent 平台做全入口同优先级铺开。
 
 ## 总体推荐
@@ -304,13 +304,7 @@ trait LlmProvider {
 - 不同模型对 tool call、usage、reasoning token 的返回差异很大，必须在 Golutra contract 层归一化。
 - `genai` 可以作为 provider 调用层，但不要让它的类型进入 runtime core。
 
-Provider 层不直接照搬某个项目：
-
-- 吸收 Maka 的分层方式：底层用统一 provider runtime，上层用自己的 contract 反腐归一化。
-- 吸收 OpenCode 的 provider 覆盖意识，但不把 AI SDK 或第三方 SDK 类型作为 Rust core 依赖。
-- 吸收 Pi 的 provider contract 思路，但不采用 Pi 式多协议自研矩阵。
-- 吸收 Hermes Agent 的 plugin discovery，但插件必须经过 capability matrix 和 policy gate。
-- 吸收 Claude Code Best 对 provider 深能力的经验，但不为单一 provider 单独维护手写 adapter 类型。
+Provider 层保持统一的反腐适配边界：底层 provider client 只负责协议通信，上层 contract 负责消息、工具、usage、错误和能力归一化。
 
 `genai` 的定位是 Golutra 长期默认 LLM provider adapter，不是 Golutra 的核心 Provider 协议。推荐采用一层反腐适配：
 
@@ -337,7 +331,7 @@ Golutra 保留独立 `OpenAiCompatibleProvider`，并保留 ChatGPT OAuth 专用
 
 ### Custom Provider 设置与验证
 
-Custom Provider 的交互流程要对齐 qwen-code 的协议优先设计，不能只做一个 OpenAI-compatible 表单。推荐流程：
+Custom Provider 的交互流程采用协议优先设计，不能只做一个 OpenAI-compatible 表单。推荐流程：
 
 ```text
 Step 1/6 Protocol
@@ -401,8 +395,7 @@ provider_quirks
 
 - SQLite 适合查询、索引、跨会话检索、权限审计和 UI 列表。
 - append-only event log 适合 replay、benchmark、trace diff 和失败复现。
-- 可吸收 Hermes Agent 的跨会话搜索目标，但第一阶段不引入额外全文索引层。
-- Kimi Code 的 `wire/state` 分离说明，运行轨迹和当前状态必须分开保存。
+- 运行轨迹和当前状态必须分开保存，全文检索只作为按需索引层。
 
 对于 coding agent，建议 task 级查询和回放优先：
 
@@ -648,47 +641,9 @@ Extension
 18. 建 `golutra-agent-eval`：eval_runner、trajectory_recorder、deep post_task_reviewer、vcr/golden fixture。
 19. 建 `golutra-agent-evolution`、`golutra-agent-plugin`、`golutra-agent-mcp` 和 TypeScript/Python SDK；Web/IDE 产品入口不在当前范围。
 
-## 结合 Codex 的实施加权
-
-在上面的顺序基础上，再加一个现实优先级判断。Codex 的工程经验说明，下面这些模块不是“可有可无的补充”，而是 runtime-first 多前端系统真正落地的骨架：
-
-### 第一优先级
-
-1. `golutra-agent-protocol`
-2. `golutra-agent-client`
-3. `golutra-agent-app-server`
-4. `golutra-agent-test-client`
-
-原因：
-
-- 没有协议、client、app-server、test-client，多前端一致性就只是文档承诺。
-- 这四层是 `RuntimeCore` 向外提供统一能力的基础设施。
-
-### 第二优先级
-
-1. `golutra-agent-store`
-2. `golutra-agent-file-search`
-3. `golutra-agent-policy`
-
-原因：
-
-- store/event/search/policy 决定 coding agent 能否长期运行、恢复、定位和受控执行。
-- 搜索应独立成模块，不要散在 TUI、CLI 或 memory 里。
-
-### 第三优先级
-
-1. `golutra-agent-vis`
-2. `golutra-agent-eval`
-3. `golutra-agent-evolution`
-
-原因：
-
-- 这三层决定系统是否真正可调试、可回放、可评估。
-- 没有它们，观测体系很容易停留在字段定义层。
-
 ## 已显式落地的模块
 
-结合 Codex 的实际工程结构，下列能力已经从“隐含能力”升级为显式模块：
+下列能力已经从“隐含能力”升级为显式模块：
 
 - `golutra-agent-file-search` 与 `golutra-agent-code-intelligence`：分别承载 rg/ignore metadata 和 tree-sitter symbol/reference graph。
 - `golutra-agent-app-server`：作为 `RuntimeHost` 的用户级 daemon 承载方式，不新增语义，只提供 IPC/HTTP attach、query、command 和 subscribe。

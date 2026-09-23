@@ -72,21 +72,31 @@ fn latest_check_failed(verification: &VerificationRecord, kind: VerificationChec
         .iter()
         .rev()
         .filter(|check| check.kind == kind)
-        .any(|check| seen.insert((&check.name, &check.command)) && !check.passed)
+        .any(|check| {
+            seen.insert((&check.name, &check.command))
+                && !check.passed
+                && !is_unknown_validation(check)
+        })
 }
 
 fn missing_validation(verification: &VerificationRecord) -> bool {
-    !verification
-        .checks
-        .iter()
-        .any(|check| check.kind == VerificationCheckKind::ObjectiveValidation)
-        && verification.residual_risks.iter().any(|risk| {
-            matches!(
-                risk.as_str(),
-                "task contract requires objective validation"
-                    | "behavioral changes were not objectively validated"
-            )
-        })
+    verification.checks.iter().any(is_unknown_validation)
+        || (!verification
+            .checks
+            .iter()
+            .any(|check| check.kind == VerificationCheckKind::ObjectiveValidation)
+            && verification.residual_risks.iter().any(|risk| {
+                matches!(
+                    risk.as_str(),
+                    "task contract requires objective validation"
+                        | "behavioral changes were not objectively validated"
+                )
+            }))
+}
+
+fn is_unknown_validation(check: &golutra_agent_core::VerificationCheck) -> bool {
+    check.kind == VerificationCheckKind::ObjectiveValidation
+        && check.name.starts_with("objective:unknown:")
 }
 
 pub(super) fn model_instruction(
@@ -111,7 +121,10 @@ pub(super) fn model_instruction(
             .rev()
             .filter(|check| check.kind == kind)
         {
-            if !seen_checks.insert((&check.name, &check.command)) || check.passed {
+            if !seen_checks.insert((&check.name, &check.command))
+                || check.passed
+                || is_unknown_validation(check)
+            {
                 continue;
             }
             let Some(report) = reports.iter().rev().find(|report| {

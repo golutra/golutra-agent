@@ -46,13 +46,25 @@ const MAX_CALLBACK_ATTEMPTS: usize = 16;
 const MAX_OAUTH_RESPONSE_BYTES: usize = 1024 * 1024;
 const DEVICE_POLL_SAFETY_MARGIN: Duration = Duration::from_secs(3);
 static OAUTH_HTTP_CLIENT: OnceCell<oauth2::reqwest::Client> = OnceCell::const_new();
+static LOCAL_OAUTH_HTTP_CLIENT: OnceCell<oauth2::reqwest::Client> = OnceCell::const_new();
 
-async fn oauth_http_client() -> Result<oauth2::reqwest::Client, AuthError> {
+async fn oauth_http_client_for_endpoint(
+    endpoint: &str,
+) -> Result<oauth2::reqwest::Client, AuthError> {
+    let local = oauth_endpoint_is_loopback(endpoint);
+    // 本地 OAuth 不应经过系统代理；分别缓存两种客户端，保留连接池与初始化超时。
+    let cache = if local {
+        &LOCAL_OAUTH_HTTP_CLIENT
+    } else {
+        &OAUTH_HTTP_CLIENT
+    };
     let client = tokio::time::timeout(
         OAUTH_HTTP_CLIENT_INIT_TIMEOUT,
-        OAUTH_HTTP_CLIENT.get_or_try_init(|| async {
-            tokio::task::spawn_blocking(|| {
-                oauth2::reqwest::ClientBuilder::new()
+        cache.get_or_try_init(|| async {
+            tokio::task::spawn_blocking(move || {
+                let builder = oauth2::reqwest::ClientBuilder::new();
+                let builder = if local { builder.no_proxy() } else { builder };
+                builder
                     .redirect(oauth2::reqwest::redirect::Policy::none())
                     .connect_timeout(Duration::from_secs(10))
                     .timeout(OAUTH_HTTP_TIMEOUT)
@@ -66,6 +78,19 @@ async fn oauth_http_client() -> Result<oauth2::reqwest::Client, AuthError> {
     .await
     .map_err(|_| AuthError::Timeout)??;
     Ok(client.clone())
+}
+
+fn oauth_endpoint_is_loopback(endpoint: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(endpoint) else {
+        return false;
+    };
+    url.host_str().is_some_and(|host| {
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    })
 }
 
 fn is_false(value: &bool) -> bool {
@@ -385,7 +410,13 @@ impl AuthService {
         if let Some(audience) = &descriptor.audience {
             request = request.add_extra_param("audience", audience);
         }
-        let http_client = oauth_http_client().await?;
+        let http_client = oauth_http_client_for_endpoint(
+            descriptor
+                .device_authorization_endpoint
+                .as_deref()
+                .unwrap_or_default(),
+        )
+        .await?;
         let details: StandardDeviceAuthorizationResponse =
             tokio::time::timeout(OAUTH_HTTP_TIMEOUT, request.request_async(&http_client))
                 .await
@@ -416,7 +447,7 @@ impl AuthService {
                     "OpenAI device-auth configuration is missing from descriptor".to_owned(),
                 )
             })?;
-        let http_client = oauth_http_client().await?;
+        let http_client = oauth_http_client_for_endpoint(&device.user_code_endpoint).await?;
         let response = tokio::time::timeout(
             OAUTH_HTTP_TIMEOUT,
             http_client
@@ -567,7 +598,7 @@ impl AuthService {
             request = request.add_scope(Scope::new(scope.clone()));
         }
         self.clear_cached_token(reference);
-        let http_client = oauth_http_client().await?;
+        let http_client = oauth_http_client_for_endpoint(&descriptor.token_endpoint).await?;
         let token_result =
             tokio::time::timeout(OAUTH_HTTP_TIMEOUT, request.request_async(&http_client))
                 .await
@@ -623,7 +654,13 @@ impl AuthService {
         } else {
             return Ok(());
         };
-        let http_client = oauth_http_client().await?;
+        let http_client = oauth_http_client_for_endpoint(
+            descriptor
+                .revocation_endpoint
+                .as_deref()
+                .unwrap_or_default(),
+        )
+        .await?;
         tokio::time::timeout(
             OAUTH_HTTP_TIMEOUT,
             client
@@ -798,7 +835,7 @@ impl BrowserOAuthLogin {
             AuthError::Validation("oauth PKCE verifier was already consumed".to_owned())
         })?;
         let client = oauth_client(&self.descriptor, Some(&self.redirect_url))?;
-        let http_client = oauth_http_client().await?;
+        let http_client = oauth_http_client_for_endpoint(&self.descriptor.token_endpoint).await?;
         let token = tokio::time::timeout(
             OAUTH_HTTP_TIMEOUT,
             client
@@ -863,7 +900,7 @@ impl DeviceOAuthLogin {
 
     pub async fn complete(self) -> Result<OAuthLoginResult, AuthError> {
         let client = oauth_device_client(&self.descriptor)?;
-        let http_client = oauth_http_client().await?;
+        let http_client = oauth_http_client_for_endpoint(&self.descriptor.token_endpoint).await?;
         let token = tokio::time::timeout(
             DEVICE_LOGIN_TIMEOUT,
             client
@@ -943,7 +980,7 @@ impl OpenAiDeviceOAuthLogin {
         )?;
         validate_non_empty(&grant.code_verifier, "OpenAI device code verifier")?;
         let client = oauth_client(&self.descriptor, Some(&self.device.redirect_uri))?;
-        let http_client = oauth_http_client().await?;
+        let http_client = oauth_http_client_for_endpoint(&self.descriptor.token_endpoint).await?;
         let token = tokio::time::timeout(
             OAUTH_HTTP_TIMEOUT,
             client
@@ -960,7 +997,7 @@ impl OpenAiDeviceOAuthLogin {
     }
 
     async fn poll_authorization(&self) -> Result<OpenAiDeviceAuthorizationGrant, AuthError> {
-        let http_client = oauth_http_client().await?;
+        let http_client = oauth_http_client_for_endpoint(&self.device.token_poll_endpoint).await?;
         loop {
             let response = tokio::time::timeout(
                 OAUTH_HTTP_TIMEOUT,
@@ -1599,6 +1636,25 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn loopback_oauth_endpoints_bypass_proxy_without_matching_remote_hosts() {
+        for endpoint in [
+            "http://localhost/token",
+            "http://127.0.0.2/token",
+            "http://[::1]/token",
+        ] {
+            assert!(oauth_endpoint_is_loopback(endpoint), "{endpoint}");
+        }
+        for endpoint in [
+            "https://oauth.example.com/token",
+            "http://localhost.example.com",
+            "http://[2001:db8::1]",
+            "invalid",
+        ] {
+            assert!(!oauth_endpoint_is_loopback(endpoint), "{endpoint}");
+        }
+    }
 
     #[derive(Debug, Clone)]
     struct FakeOAuthOptions {

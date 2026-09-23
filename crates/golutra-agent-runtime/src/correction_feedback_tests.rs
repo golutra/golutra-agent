@@ -44,6 +44,24 @@ fn missing_evidence_requests_validation_without_claiming_tests_failed() {
     assert!(!action.contains("rerun"));
 }
 
+#[test]
+fn unknown_validation_is_evidence_gap_not_a_failed_test() {
+    let (mut record, _) = fixture(0);
+    record.assertions.clear();
+    record.residual_risks.clear();
+    record.checks = vec![VerificationCheck {
+        kind: VerificationCheckKind::ObjectiveValidation,
+        name: "objective:unknown:test:shell:identity:x".into(),
+        command: Some("custom-test-runner".into()),
+        passed: false,
+        evidence_refs: Vec::new(),
+        message: "test command exited successfully but no executed test was observed".into(),
+    }];
+    let action = correction_envelope(&record, 1, None).requested_action;
+    assert!(action.contains("missing relevant validation evidence"));
+    assert!(!action.contains("reported delivery or validation issue"));
+}
+
 fn fixture(count: usize) -> (VerificationRecord, Vec<ToolExecutionReport>) {
     let reports = (0..count)
         .map(|index| {

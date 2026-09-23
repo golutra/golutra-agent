@@ -243,10 +243,9 @@ fn native_node_tests_need_actual_execution_and_an_unmasked_exit_status() {
         "ℹ tests 0\nℹ pass 0\n",
     ] {
         let report = objective_test_report_with_output("node --test", output);
-        assert!(
-            !objective_validation_report(&report).unwrap().passed,
-            "{output}"
-        );
+        let validation = objective_validation_report(&report).unwrap();
+        assert!(!validation.passed, "{output}");
+        assert_eq!(validation.status, ObjectiveValidationStatus::Unknown);
     }
     for command in [
         "node script.js --test",

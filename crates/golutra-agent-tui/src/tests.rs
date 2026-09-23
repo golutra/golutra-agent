@@ -5242,7 +5242,7 @@ fn provider_footer_adds_configured_reasoning_effort() {
 }
 
 #[test]
-fn transcript_role_markers_follow_codex_symbols() {
+fn transcript_role_markers_are_stable() {
     let app = TuiApp::new(
         ThreadId::new(),
         SessionId::new(),
@@ -7108,6 +7108,40 @@ fn normal_transcript_keeps_only_user_visible_runtime_milestones() {
 }
 
 #[test]
+fn normal_transcript_hides_verification_governance() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        Some(TaskId::new()),
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.projection = Some(UserProjection {
+        session_id: app.session_id,
+        task_id: app.task_id,
+        status: golutra_agent_core::TaskStatus::Partial,
+        visible_steps: Vec::new(),
+        pending_approval: None,
+        final_message: Some("done".to_owned()),
+        residual_risks: vec!["verification evidence is insufficient".to_owned()],
+    });
+
+    let items = rendered_transcript_operation_projections(&app)
+        .into_iter()
+        .map(|projection| projection.item(false))
+        .collect::<Vec<_>>();
+    assert!(items.iter().any(|item| item.title == "Golutra"));
+    assert!(items.iter().all(|item| {
+        !item.title.starts_with("Result ·")
+            && !item.title.contains("Residual risks")
+            && !item.body.iter().any(|line| {
+                line.contains("verification evidence is insufficient") || line.starts_with("next:")
+            })
+    }));
+}
+
+#[test]
 fn developer_panel_exposes_governance_without_leaking_into_normal_view() {
     let session_id = SessionId::new();
     let task_id = TaskId::new();
@@ -7787,7 +7821,10 @@ fn provider_failure_is_shown_once_and_survives_history_replay() {
         assert!(text.contains("Hi!"), "{text}");
         assert!(text.contains("Request ID: req-fixture"));
         assert!(text.contains("HTTP response: 200"));
-        assert!(text.contains("uncommitted file changes need review"));
+        assert!(
+            !text.contains("uncommitted file changes need review"),
+            "verification risks belong in /debug, not the user transcript"
+        );
         assert!(!text.contains("verification evidence is insufficient"));
         assert!(!items.iter().any(|item| item.title == "Task Completed"));
     }
@@ -7811,11 +7848,14 @@ fn provider_failure_is_shown_once_and_survives_history_replay() {
     );
     app.projection.as_mut().unwrap().visible_steps.clear();
     assert!(
-        projection_overlay_items(app.projection.as_ref().unwrap())[0]
-            .body
-            .iter()
-            .any(|risk| risk == "verification evidence is insufficient"),
-        "unexplained risks remain visible"
+        transcript_items(&app).iter().all(|item| {
+            item.title != "Residual risks"
+                && !item
+                    .body
+                    .iter()
+                    .any(|line| line.contains("verification evidence is insufficient"))
+        }),
+        "verification risks belong in /debug, not the user transcript"
     );
     app.events
         .retain(|event| event.event_type != RuntimeEventType::LoopDecided);
@@ -7823,8 +7863,197 @@ fn provider_failure_is_shown_once_and_survives_history_replay() {
         transcript_items(&app).iter().any(|item| item
             .body
             .iter()
-            .any(|line| line.contains("provider call failed:"))),
-        "paged-out failure must not hide risk evidence"
+            .any(|line| line.contains("400错误，请稍后再试"))),
+        "paged-out provider failure must remain visible"
+    );
+    assert_eq!(
+        transcript_items(&app)
+            .iter()
+            .filter(|item| item.title == "Task failed")
+            .count(),
+        2,
+        "each failed task keeps one diagnostic"
+    );
+}
+
+#[test]
+fn provider_retry_does_not_become_a_task_failure_before_or_after_recovery() {
+    let session = SessionId::new();
+    let task = TaskId::new();
+    let mut events = vec![transcript_event(
+        1,
+        session,
+        task,
+        RuntimeEventType::ProviderFailed,
+        json!({"error":"connection failed"}),
+    )];
+    assert!(
+        event_transcript_items(&events).is_empty(),
+        "request failure alone is not a task terminal"
+    );
+    events.push(transcript_event(
+        2,
+        session,
+        task,
+        RuntimeEventType::RetryScheduled,
+        json!({"recovery":{"reset_stream":true}}),
+    ));
+    events.push(transcript_event(
+        3,
+        session,
+        task,
+        RuntimeEventType::AssistantMessage,
+        json!({"content":"已恢复并完成。"}),
+    ));
+    events.push(transcript_event(
+        4,
+        session,
+        task,
+        RuntimeEventType::LoopDecided,
+        json!({"summary":"no errors; failed check was corrected", "record":{"action":"complete"}}),
+    ));
+    events.push(transcript_event(
+        5,
+        session,
+        task,
+        RuntimeEventType::TaskCompleted,
+        json!({"status":"completed","summary":"runtime task finished"}),
+    ));
+    let items = event_transcript_items(&events);
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(items[0].body, vec!["已恢复并完成。"]);
+}
+
+#[test]
+fn later_task_failure_does_not_reuse_a_recovered_provider_error() {
+    let session = SessionId::new();
+    let task = TaskId::new();
+    let events = vec![
+        transcript_event(
+            1,
+            session,
+            task,
+            RuntimeEventType::ProviderFailed,
+            json!({"error":"obsolete outage"}),
+        ),
+        transcript_event(
+            2,
+            session,
+            task,
+            RuntimeEventType::ProviderCompleted,
+            json!({}),
+        ),
+        transcript_event(
+            3,
+            session,
+            task,
+            RuntimeEventType::TaskCompleted,
+            json!({"status":"failed","error":"store write failed"}),
+        ),
+        transcript_event(
+            4,
+            session,
+            TaskId::new(),
+            RuntimeEventType::AssistantMessage,
+            json!({"content":"next task"}),
+        ),
+    ];
+    let items = event_transcript_items(&events);
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].body, vec!["store write failed"]);
+    assert_eq!(items[1].body, vec!["next task"]);
+}
+
+#[test]
+fn partial_completion_governance_is_hidden_in_events_and_projection_replay() {
+    let session = SessionId::new();
+    let task = TaskId::new();
+    let events = vec![transcript_event(
+        1,
+        session,
+        task,
+        RuntimeEventType::TaskCompleted,
+        json!({"status":"partial", "summary":"verification evidence is insufficient"}),
+    )];
+    assert!(event_transcript_items(&events).is_empty());
+    let projection = UserProjection {
+        session_id: session,
+        task_id: Some(task),
+        status: golutra_agent_core::TaskStatus::Partial,
+        visible_steps: vec![VisibleStep {
+            label: "TaskCompleted".to_owned(),
+            status: "Partial".to_owned(),
+            summary: "verification evidence is insufficient".to_owned(),
+        }],
+        pending_approval: None,
+        final_message: Some("完成。".to_owned()),
+        residual_risks: vec!["missing checks".to_owned()],
+    };
+    let items = projection_items(&projection);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].body, vec!["完成。"]);
+}
+
+#[test]
+fn terminal_failure_is_deduplicated_when_events_arrive_out_of_order() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let error = "provider failed after the terminal marker";
+    let events = vec![
+        transcript_event(
+            1,
+            session_id,
+            task_id,
+            RuntimeEventType::TaskCompleted,
+            json!({
+                "status": golutra_agent_core::TaskStatus::Failed,
+                "summary": "runtime task finished with Failed"
+            }),
+        ),
+        transcript_event(
+            2,
+            session_id,
+            task_id,
+            RuntimeEventType::ProviderFailed,
+            json!({"error": error}),
+        ),
+        transcript_event(
+            3,
+            session_id,
+            task_id,
+            RuntimeEventType::LoopDecided,
+            json!({"summary": error, "error": error}),
+        ),
+    ];
+
+    let items = event_transcript_items(&events);
+    let first_anchor = event_operation_entries(&events[..1])[0].id;
+    assert_eq!(
+        event_operation_entries(&events)[0].id,
+        first_anchor,
+        "late diagnostics must not create a second scrollback identity"
+    );
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| item.title == "Task failed")
+            .count(),
+        1
+    );
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| item.title == "Task Completed")
+            .count(),
+        0
+    );
+    assert_eq!(
+        items
+            .iter()
+            .flat_map(|item| &item.body)
+            .filter(|line| line.contains(error))
+            .count(),
+        1
     );
 }
 

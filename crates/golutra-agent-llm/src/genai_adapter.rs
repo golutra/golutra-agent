@@ -136,14 +136,12 @@ impl GenaiProviderAdapter {
                 credential.clone(),
             )
         });
+        let client = genai_client_for_base_url(web_config, &config.base_url);
         Self {
             config,
             credential,
             cache_profile,
-            client: Client::builder()
-                .with_web_config(web_config)
-                .build()
-                .expect("static genai client configuration is valid"),
+            client,
             responses,
         }
     }
@@ -449,6 +447,25 @@ impl GenaiProviderAdapter {
             .map(|name| (name.to_owned(), affinity_id.clone()))
             .collect::<Vec<_>>();
         Headers::from(headers)
+    }
+}
+
+/// 本地端点直连，外部端点沿用代理；两条路径共享相同的流式传输配置。
+pub(crate) fn genai_client_for_base_url(web_config: WebConfig, base_url: &str) -> Client {
+    if super::endpoint_is_loopback(base_url) {
+        let client = web_config
+            .apply_to_builder(reqwest13::Client::builder().no_proxy())
+            .build()
+            .expect("static genai client configuration is valid");
+        Client::builder()
+            .with_reqwest(client)
+            .build()
+            .expect("static genai client configuration is valid")
+    } else {
+        Client::builder()
+            .with_web_config(web_config)
+            .build()
+            .expect("static genai client configuration is valid")
     }
 }
 

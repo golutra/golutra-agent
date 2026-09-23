@@ -315,6 +315,9 @@ impl ModelInputEnvelope {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextCompactionRecord {
     pub turn_id: TurnId,
+    /// 同一次压缩的生命周期标识；用于把开始、结果和 artifact 关联起来。
+    #[serde(default)]
+    pub compaction_id: String,
     pub mode: String,
     pub strategy: String,
     #[serde(default)]
@@ -465,7 +468,7 @@ impl ContextWindowManager {
 
     /// Like [`required_compaction_limit_with_estimates`], but uses a trusted
     /// provider input count for the already-observed message prefix. This
-    /// mirrors Pi's usage baseline while retaining a conservative local
+    /// records a conservative local
     /// estimate for messages appended after that request.
     #[must_use]
     pub fn required_compaction_limit_with_observed_prefix(
@@ -790,6 +793,7 @@ impl ContextWindowManager {
         let checksum = serialized_digest(&replacement_messages);
         Ok(Some(ContextCompactionRecord {
             turn_id,
+            compaction_id: String::new(),
             mode: "automatic".to_owned(),
             // 压缩上限就是当前 provider budget；保留真实的策略名，避免
             // 已不存在的 active-working-set 分支污染评估和回放指标。

@@ -159,7 +159,7 @@ where
     }));
 }
 
-/// Provider input reported for the last successful request. As in Pi, this is
+/// Provider input reported for the last successful request. This is
 /// a checkpoint for the message prefix; only messages appended afterwards are
 /// estimated locally. Any tool or provider-route change invalidates it.
 #[derive(Debug, Clone)]
@@ -2003,7 +2003,9 @@ where
                 // 只在预算边界压缩；所有丢失历史的路径共用模型摘要，facts 仅为
                 // 摘要不可用时的退路。压缩目标留有余量，避免后续每轮重新摘要。
                 if plan.budget_snapshot.planned_input_tokens > compaction_limit {
+                    let compaction_id = uuid::Uuid::now_v7().to_string();
                     trace(AgentLoopTraceEvent::ContextCompactionStarted {
+                        compaction_id: compaction_id.clone(),
                         original_input_tokens: plan.budget_snapshot.planned_input_tokens,
                         budget_limit: compaction_limit,
                     });
@@ -2013,6 +2015,7 @@ where
                         observed_prefix,
                     ) {
                         Ok(Some(mut record)) => {
+                            record.compaction_id = compaction_id.clone();
                             if record.supports_model_summary()
                                 && primary_contract.native_protocol != "in_memory"
                                 && let Some(summary) = self
@@ -2032,6 +2035,13 @@ where
                             }
                             // 取消不能以备用摘要的形式提交历史边界。
                             if control.cancellation.is_cancelled() {
+                                trace(AgentLoopTraceEvent::ContextCompactionFailed {
+                                    compaction_id,
+                                    planned_input_tokens: plan.budget_snapshot.planned_input_tokens,
+                                    budget_limit: compaction_limit,
+                                    reason: "compaction cancelled before history replacement"
+                                        .to_owned(),
+                                });
                                 return Err(AgentLoopError::Cancelled);
                             }
                             message_token_total = plan.replace_messages(
@@ -2048,9 +2058,19 @@ where
                             seen_read_facts.clear();
                             trace(AgentLoopTraceEvent::ContextAutoCompacted(record));
                         }
-                        Ok(None) => {}
+                        Ok(None) => {
+                            // 超预算但没有可替换历史时，开始事件必须有终态；否则 resume
+                            // 只能看到一个悬挂的 compaction attempt。
+                            trace(AgentLoopTraceEvent::ContextCompactionFailed {
+                                compaction_id,
+                                planned_input_tokens: plan.budget_snapshot.planned_input_tokens,
+                                budget_limit: compaction_limit,
+                                reason: "no compactable context was available".to_owned(),
+                            });
+                        }
                         Err(error) => {
                             trace(AgentLoopTraceEvent::ContextCompactionFailed {
+                                compaction_id,
                                 planned_input_tokens: plan.budget_snapshot.planned_input_tokens,
                                 budget_limit: compaction_limit,
                                 reason: error.to_string(),
@@ -2370,6 +2390,7 @@ where
                             );
                             trace(AgentLoopTraceEvent::RetryScheduled {
                                 attempt: empty_response_count,
+                                after_request_id: Some(completed_request.request_id),
                                 reason: "provider returned an empty response".to_owned(),
                             });
                             append_plan_message(
@@ -3833,10 +3854,18 @@ where
                     {
                         continue;
                     }
+                    let check_prefix = match validation.status {
+                        objective_evidence::ObjectiveValidationStatus::Passed => "objective",
+                        objective_evidence::ObjectiveValidationStatus::Failed => "objective",
+                        objective_evidence::ObjectiveValidationStatus::Unknown => {
+                            "objective:unknown"
+                        }
+                    };
                     command_checks.push(VerificationCheck {
                         kind: VerificationCheckKind::ObjectiveValidation,
                         name: format!(
-                            "objective:{}:{}:identity:{}",
+                            "{}:{}:{}:identity:{}",
+                            check_prefix,
                             validation.kind.label(),
                             report.envelope.tool_name,
                             validation.identity
@@ -4055,7 +4084,12 @@ where
                         limit.saturating_sub(turn_state.correction_attempt.saturating_add(1))
                     }),
                 );
-                if correction_progress.permits_retry(&correction, &verification, &tool_reports) {
+                if correction_progress.permits_retry(
+                    &correction,
+                    &verification,
+                    &tool_reports,
+                    last_assistant_message.as_deref(),
+                ) {
                     trace(AgentLoopTraceEvent::VerificationCompleted {
                         record: verification.clone(),
                         terminal: false,
@@ -4961,9 +4995,9 @@ fn delivery_path_was_changed(
 
 #[cfg(test)]
 use objective_evidence::{
-    ObjectiveValidationKind, is_objective_validation_command, line_reports_executed_tests,
-    objective_validation_command_identity, objective_validation_command_kind,
-    shell_command_is_read_only,
+    ObjectiveValidationKind, ObjectiveValidationStatus, is_objective_validation_command,
+    line_reports_executed_tests, objective_validation_command_identity,
+    objective_validation_command_kind, shell_command_is_read_only,
 };
 use objective_evidence::{
     ObjectiveValidationOutcome, attach_prepared_objective_validation,
@@ -5253,7 +5287,7 @@ fn tool_profile_rejection_reason(
     registry: &ToolRegistry,
 ) -> Option<&'static str> {
     if !is_pi_plus_tool(&request.tool_name) {
-        return Some("tool is not part of the active Pi-plus provider surface");
+        return Some("tool is not part of the active provider surface");
     }
     if !tool_allowed_for_profile(&request.tool_name, profile, registry) {
         if matches!(profile, AgentToolProfile::None) {

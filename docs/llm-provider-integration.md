@@ -13,42 +13,6 @@
 
 首次 provider onboarding、resume、多 session 和多工作区的完整 UX 见 `onboarding-session-workspace-design.md`。
 
-## qwen-code 调研结论
-
-参考项目：[Qwen Code](https://github.com/QwenLM/qwen-code)。
-
-可吸收的设计点：
-
-- `ProviderConfig` 是声明式 provider 注册表，描述 provider 如何展示、使用什么协议、有哪些 base URL 选项、使用哪个 envKey、安装哪些模型，以及是否允许用户编辑模型列表。
-- API key、OAuth、订阅套餐、自定义 endpoint 都不是独立配置架构；它们最终都收敛成一个 provider install plan，再统一写配置。
-- `modelProviders` 保存模型目录和 envKey 引用，真正的 key 优先从环境变量读取；把 key 直接写入 settings 只作为低优先级兼容路径。
-- 自定义 provider 的 envKey 要由协议和 baseUrl 派生，并带 hash 后缀，避免不同 endpoint 折叠到同一个环境变量名。
-- provider 模型配置是原子包。选中 provider model 后，它的 baseUrl、envKey、generation config 应整体生效，不能被低优先级配置半覆盖。
-- qwen-code 的 `generationConfig.extra_body` 是配置容器；OpenAI-compatible provider 的 `buildRequest()` 会把其中字段展开到最终 HTTP JSON 顶层。Golutra 直接构造 wire body，因此不能把 `extra_body` 容器原样发送。
-- 运行中凭据请求要用统一结构表达 `bearer`、`basic`、`header`、`query`、`multi-header`，UI 只负责采集和取消，不持久化业务状态。
-- 安装 provider 时要能 rollback settings、process env 和 runtime model registry，避免 auth refresh 失败后留下半更新状态。
-- qwen-code desktop 的 credential manager 把 `CredentialId`、`StoredCredential` 和 backend 分离，并按 credential id 合并并发 refresh；OAuth browser flow 使用 PKCE、state、loopback callback 和 refresh-token rotation。Golutra 应复用这些边界，不复制 TypeScript/Electron 实现。
-
-Golutra 不直接复制 qwen-code 的配置文件形状。Golutra 的核心仍是 Rust runtime、event log 和 `ProviderContract`，qwen-code 只作为 provider 接入与用户认证 UX 的参考。
-
-## Codex 调研结论
-
-参考项目：[OpenAI Codex](https://github.com/openai/codex)。
-
-- Codex 在 `codex-rs/login/src/auth/storage.rs` 用统一 `AuthStorageBackend` 隔离 file、keyring、auto 和 ephemeral storage；keyring account 包含 canonical `CODEX_HOME` hash，避免替代 home 读到真实用户凭据。
-- `AuthCredentialsStoreMode` 明确区分 file/keyring/auto/ephemeral，OAuth token 的存储选择不进入 model provider adapter。
-- browser/device login、token exchange、refresh 和 storage 归 login/auth 层；core runtime 消费已解析 auth，不自行读取 auth 文件。
-- Golutra 采纳 storage trait、home 隔离和 auth service 分层，并按当前产品决策使用显式 disk backend：交互式本地 secret 默认进入 owner-only `$GOLUTRA_AGENT_HOME/credentials.json`，CI/headless 环境可使用 env ref；不访问 OS keychain。
-
-## opencode 调研结论
-
-参考项目：[OpenCode](https://github.com/anomalyco/opencode)。
-
-- opencode 的 OAuth 不是从任意 endpoint 猜测授权地址，而是 provider auth plugin 注册认证方法和 request loader：OpenAI 使用 browser PKCE 和私有 headless device-auth，xAI 同时提供 browser/device，GitHub Copilot 使用 device flow，GitLab/Poe 等可由外部 plugin 扩展。
-- 授权成功不等于 provider 可用。OpenAI ChatGPT subscription token 必须改走 Codex Responses SSE endpoint并携带 `ChatGPT-Account-Id`；GitHub Copilot 请求必须增加 GitHub API version、intent、initiator 等 header。Golutra 因此把 OAuth method 与固定 runtime adapter 一起注册。
-- `/connect` 动态展示当前 provider 的 auth methods。Golutra 对应为 TUI `/auth` 的认证方式选择和 CLI `provider auth-methods`，Custom Provider 仍只展示 API key/env ref，除非用户显式提供受审计 descriptor。
-- opencode 默认把 token 明文放在 owner-only `auth.json`。Golutra采用相同的本地文件威胁模型，但把 secret 独立放在 `$GOLUTRA_AGENT_HOME/credentials.json`，`provider.json` 仍只暴露非敏感 account id、expiry 和 SecretRef。
-
 ## 当前状态
 
 截至 2026-09-02：
@@ -56,11 +20,11 @@ Golutra 不直接复制 qwen-code 的配置文件形状。Golutra 的核心仍�
 - `golutra-agent-llm` 已有 `MockProvider`、独立 OpenAI-compatible live adapter、基于固定 `rust-genai 0.7.0-beta.18` 的 `GenaiProviderAdapter`，以及显式使用其 `OpenAIResp` adapter 的 Responses 薄适配。
 - 默认 provider 是 mock。
 - CLI 已支持 `golutra-agent provider login`、`set-key`、`oauth-login`、`logout` 和 `use`；`provider login` 可填写 `--enable-thinking`、`--reasoning-effort low|medium|high|xhigh|max|ultra`、`--context-window-size <n>`、`--max-tokens <n>`。TUI 首次进入会检查 provider onboarding 状态。Responses / Chat Completions 按原值发送显式 effort，需上游模型支持；其他原生适配器暂不支持 `ultra`，不会静默降档。
-- 如果全局用户配置没有 active provider profile，TUI 会打开 provider setup；用户可以先选 Golutra API、Third-party Providers、Custom Provider 或 mock，再按 qwen-code 风格选择协议、base URL、凭据存储、推荐或自定义 model 和高级生成配置，最后在 review 页确认脱敏 install plan 后保存。交互输入的 API key 默认进入 `$GOLUTRA_AGENT_HOME/credentials.json`，也可只保存已有 envKey 引用。
+- 如果全局用户配置没有 active provider profile，TUI 会打开 provider setup；用户可以先选 Golutra API、Third-party Providers、Custom Provider 或 mock，再选择协议、base URL、凭据存储、推荐或自定义 model 和高级生成配置，最后在 review 页确认脱敏 install plan 后保存。交互输入的 API key 默认进入 `$GOLUTRA_AGENT_HOME/credentials.json`，也可只保存已有 envKey 引用。
 - 高级配置默认选中第一项 `Continue`，Enter 直接进入确认页。需要修改时上下选择其他项：Thinking / Reasoning effort 可用左右键或 Enter 切换；Context window / Max output tokens / Custom headers 按 Enter 进入编辑，支持光标移动、删除、粘贴及 Ctrl+U 清空，Enter 或 Esc 保留草稿并返回选项列表。编辑时 `j/k` 正常输入，不触发导航；再次选中 Continue 才会校验配置并进入确认页，最终仍在确认页保存。
 - Golutra API 与 Custom Provider 都在填好 URL 和凭据后立即进入模型页：默认选中第一项空白 `Custom model`，可直接输入或粘贴模型 ID，Enter 继续，不等待网络。后台按所选协议读取规范化基址的 `GET /models`，返回的模型按上游顺序去重并追加到手填项下方；不自动切换选择，不覆盖正在输入的内容。上下键可选择获取到的模型。OpenAI Chat/Responses 使用 Bearer 认证及 `data[].id`；Anthropic 使用 `x-api-key`、`anthropic-version` 及 `data[].id`；Gemini 使用 `x-goog-api-key` 及 `models[].name`，去掉 `models/` 前缀。当前读取单次目录响应，不追踪分页；Vertex AI、rust-genai 没有此处可直接使用的统一目录协议，保留手动输入。第三方预设仍使用内置推荐列表。
 - 模型发现最多等待 10 秒，失败、空列表或不支持目录查询均不影响手填和继续。环境变量模式仅从当前进程环境读取 Key，不把值写回向导或配置。返回改 Key、关闭向导或继续下一步会取消未完成的查询，旧结果不会覆盖当前输入；从高级配置返回模型页复用已获取列表。目录查询不代表模型一定支持当前协议或推理能力。Review 确认保存仍只落盘，不发起联网验证。
-- Custom Provider 的 API key envKey 已按 qwen-code 规则由 `(protocol, baseUrl)` 派生：`GOLUTRA_AGENT_CUSTOM_PROVIDER_API_KEY_{PROTOCOL}_{NORMALIZED_BASE_URL}_{12_HEX_HASH}`。同一个 endpoint 的尾随 `/` 不会生成不同 key，不同协议或不同 endpoint 不会共享固定 `GOLUTRA_AGENT_PROVIDER_API_KEY`。
+- Custom Provider 的 API key envKey 已按统一规则由 `(protocol, baseUrl)` 派生：`GOLUTRA_AGENT_CUSTOM_PROVIDER_API_KEY_{PROTOCOL}_{NORMALIZED_BASE_URL}_{12_HEX_HASH}`。同一个 endpoint 的尾随 `/` 不会生成不同 key，不同协议或不同 endpoint 不会共享固定 `GOLUTRA_AGENT_PROVIDER_API_KEY`。
 - 真实联网调用必须显式选择协议并配置凭据。推荐设置：
   - `GOLUTRA_AGENT_PROVIDER_PROTOCOL=openai-compatible`
   - `GOLUTRA_AGENT_PROVIDER_API_KEY`
@@ -75,10 +39,10 @@ Golutra 不直接复制 qwen-code 的配置文件形状。Golutra 的核心仍�
 - provider protocol catalog 已注册且可执行 `mock`、`openai-compatible`、`openai-responses`、`anthropic`、`gemini`、`vertex-ai` 和 `genai`。
 - `anthropic` 强制使用 Anthropic Messages wire，`gemini` 使用 generateContent，`vertex-ai` 使用 Vertex generateContent 和 bearer/OAuth token，`genai` 根据 model namespace 选择 rust-genai adapter；它们统一映射 tool round-trip、usage、reasoning effort、finish reason 和脱敏错误。
 - live HTTP 调用使用 10 秒 connect timeout；`GenaiProviderAdapter` 和 Responses adapter 的粗粒度请求上限为 3600 秒，独立 OpenAI-compatible client 使用 300 秒 read-idle 上限，活动流仍由 `ProviderSession` 的事件 deadline 收口。OpenAI-compatible 已使用 SSE 增量读取并按顺序产生 text/tool/usage stream event，truncated/malformed stream 显式失败。SSE 与 genai captured raw metadata 都执行 16 MiB 响应边界，assistant message、tool id/name/arguments 另有更小字段上限。
-- CLI/env base URL 会做 P0 规范化：例如 `api.golutra.cn` 会解析成 `https://api.golutra.cn/v1`。TUI provider setup 为了对齐 qwen-code 的交互校验，要求用户输入 `http://` 或 `https://` 开头的 endpoint；Golutra 官方 preset 默认填入 `https://api.golutra.cn/v1`。
+- CLI/env base URL 会做 P0 规范化：例如 `api.golutra.cn` 会解析成 `https://api.golutra.cn/v1`。TUI provider setup 要求用户输入 `http://` 或 `https://` 开头的 endpoint；Golutra 官方 preset 默认填入 `https://api.golutra.cn/v1`。
 - CLI 已提供 `golutra-agent provider protocols`、`golutra-agent provider current` 和 `golutra-agent provider probe`，输出只包含协议目录、脱敏配置与 probe 结果，不输出 API key。
 - provider/auth 配置持久化到 `$GOLUTRA_AGENT_HOME/provider.json` v2；workspace `.golutra-agent` 不再作为 provider 配置来源。v2 使用原子写和 owner-only 权限，只保存 `credential_ref`、OAuth descriptor 与非敏感 provider metadata，不保存 API key 或 token。交互 secret 进入独立的 owner-only `$GOLUTRA_AGENT_HOME/credentials.json`，CI/headless 配置可保存只读 env ref；v1 `env` map 会在 provider settings lock 内一次性迁移到 disk SecretStore，迁移失败会恢复 secret 并保留原配置。
-- 高级生成配置跟随 active profile 保存为 `generation_config`，运行时序列化到 `GOLUTRA_AGENT_PROVIDER_GENERATION_CONFIG`。对齐 qwen-code provider 展开语义后，OpenAI-compatible adapter 会在最终 Chat Completions JSON 顶层下发 `enable_thinking`、`reasoning_effort` 和 `max_tokens`；`context_window_size` 不写入 provider 请求体，但会收紧 `ContextBuilder` 的 context window、reserved output 和输入预算。
+- 高级生成配置跟随 active profile 保存为 `generation_config`，运行时序列化到 `GOLUTRA_AGENT_PROVIDER_GENERATION_CONFIG`。OpenAI-compatible adapter 会在最终 Chat Completions JSON 顶层下发 `enable_thinking`、`reasoning_effort` 和 `max_tokens`；`context_window_size` 不写入 provider 请求体，但会收紧 `ContextBuilder` 的 context window、reserved output 和输入预算。
 - `provider current`、运行时 resolver 与 `provider probe` 在没有任何配置时都一致解析为 deterministic mock；显式 live 配置损坏或缺失仍返回错误，不静默 fallback。
 - live 模式下配置缺失会显式失败，不再静默回退到 mock。
 - env 入口继续作为非交互配置协议，并已由 SecretRef 层作为只读 credential source 使用；明文值不会复制进 provider 配置。`golutra-agent-auth` 已实现 browser PKCE、RFC 8628 device flow、OpenAI headless device-auth、token refresh/revoke/logout，LLM adapter 在 401 时只强制刷新并重试一次。受审计 catalog 已内置 OpenAI ChatGPT browser/headless、xAI browser/device 和 GitHub Copilot device；自定义 OAuth 仍要求显式 descriptor，不会从任意 OpenAI-compatible base URL 自动推断授权端点。
@@ -109,7 +73,7 @@ Golutra 不直接复制 qwen-code 的配置文件形状。Golutra 的核心仍�
 | 协议/路由 | 请求字段 | 亲和 header | 默认行为 |
 | --- | --- | --- | --- |
 | 通用 `openai-responses` | 默认只发 `prompt_cache_key`；显式 `Long` 且声明长期能力时才发 `prompt_cache_retention` | `session_id`、`x-client-request-id` | 上游默认短期窗口 |
-| ChatGPT/Codex Responses | `prompt_cache_key`；不假定长期 retention 或 `cache_control` | `session-id`、`x-client-request-id` | Codex preset |
+| ChatGPT Responses | `prompt_cache_key`；不假定长期 retention 或 `cache_control` | `session-id`、`x-client-request-id` | ChatGPT preset |
 | `anthropic` | 仅按声明发送 `cache_control`（5m/1h） | 默认无；明确声明后才发送 `x-session-affinity` | Anthropic preset |
 | 已登记的 OpenAI-compatible（如 `golutra-agent`） | 默认只发 key；显式 `Long` 时按声明发送 retention | 按显式声明发送 | 上游默认短期窗口 |
 | 未登记的 OpenAI-compatible | 不发送缓存字段或亲和 header | 无 | 保守 disabled |
@@ -182,7 +146,7 @@ Golutra 第一阶段按协议能力分类，不按品牌分叉 runtime：
 | provider | 推荐协议 | 备注 |
 | --- | --- | --- |
 | OpenAI API key | `openai-compatible` | `OPENAI_*` env 可作为 fallback |
-| OpenAI ChatGPT OAuth | `openai-responses` | 固定走 ChatGPT Codex endpoint，不与 API key adapter 混用 |
+| OpenAI ChatGPT OAuth | `openai-responses` | 固定走 ChatGPT backend endpoint，不与 API key adapter 混用 |
 | xAI | `openai-compatible` | 支持 API key，以及受审计的 browser/device OAuth |
 | GitHub Copilot | `openai-compatible` | 只展示 GitHub device OAuth，并增加 Copilot 专用 header |
 | OpenRouter | `openai-compatible` | 设置自定义 baseUrl 和 model |
@@ -263,7 +227,7 @@ GOLUTRA_AGENT_CUSTOM_PROVIDER_API_KEY_{PROTOCOL}_{NORMALIZED_BASE_URL}_{SHA256(p
 | 优先级 | 来源 | 说明 |
 | --- | --- | --- |
 | 1 | 命令行显式参数 | `--provider`、`--model`、`--base-url`、`--api-key-env`、临时 API key |
-| 2 | 用户配置 | `$GOLUTRA_AGENT_HOME/provider.json`，Codex 风格全局 provider/auth 配置 |
+| 2 | 用户配置 | `$GOLUTRA_AGENT_HOME/provider.json`，全局 provider/auth 配置 |
 | 3 | 环境变量 | `GOLUTRA_AGENT_PROVIDER_*`、`OPENAI_API_KEY` 等 |
 | 4 | 内置默认 | mock provider |
 
@@ -423,7 +387,7 @@ refresh 规则：
 - provider 返回新 refresh token 时先覆盖安全存储中的完整 token set，再发布新的内存 access token；若未返回新 refresh token则保留已轮换记录。`invalid_grant` 会删除失效 token set并转为 `reauth_required`。
 - `/auth logout` 在 provider 支持时先 revoke，再删除 disk credential 和 profile ref；revoke 失败也不能在本地继续保留可用凭据，错误以脱敏诊断返回。
 
-内置 OAuth catalog 当前包含：OpenAI ChatGPT browser PKCE/headless device-auth、xAI browser PKCE/device code、GitHub Copilot device code。OpenAI headless 按 opencode 的私有 user-code -> poll authorization-code -> PKCE token exchange协议实现，不伪装成 RFC 8628。Vertex AI 优先复用 Google Application Default Credentials 或显式官方 descriptor；OpenAI-compatible、Anthropic 和 Gemini API key 模式不因为共用 HTTP adapter而自动获得 OAuth 选项。DigitalOcean implicit flow 未内置，因为 fragment token flow 不符合当前安全存储/授权码边界；GitLab/Poe 等继续通过 descriptor/registry 扩展，不伪装成通用 OAuth。
+内置 OAuth catalog 当前包含：OpenAI ChatGPT browser PKCE/headless device-auth、xAI browser PKCE/device code、GitHub Copilot device code。OpenAI headless 使用 user-code、授权码轮询、PKCE token exchange，并明确区分该流程与 RFC 8628。Vertex AI 优先复用 Google Application Default Credentials 或显式官方 descriptor；OpenAI-compatible、Anthropic 和 Gemini API key 模式不因为共用 HTTP adapter 而自动获得 OAuth 选项。DigitalOcean implicit flow 未内置，因为 fragment token flow 不符合当前安全存储/授权码边界；GitLab/Poe 等继续通过 descriptor/registry 扩展，不伪装成通用 OAuth。
 
 ## 用户体验
 
@@ -463,7 +427,7 @@ golutra-agent provider use custom
 首次进入策略：
 
 - `golutra tui`：如果没有 ready live provider，打开 provider setup，并提供 Continue with mock。Web 首次 provider setup 不在当前范围。
-- `golutra tui` 当前已实现 qwen-code 风格 provider 分组和 API key setup；流程为 group -> provider preset/protocol -> baseUrl -> credential storage -> API key/envKey -> model -> advanced -> review -> install。交互 key 默认写 `$GOLUTRA_AGENT_HOME/credentials.json` 并保存 SecretRef，用户也可选择只读 env ref；workspace `.golutra-agent` 不参与 provider/auth 配置。
+- `golutra tui` 当前已实现 provider 分组和 API key setup；流程为 group -> provider preset/protocol -> baseUrl -> credential storage -> API key/envKey -> model -> advanced -> review -> install。交互 key 默认写 `$GOLUTRA_AGENT_HOME/credentials.json` 并保存 SecretRef，用户也可选择只读 env ref；workspace `.golutra-agent` 不参与 provider/auth 配置。
 - `golutra-agent chat`：默认 mock；如果用户显式设置 live protocol 但缺 key/model，返回 missing env 错误。
 - `golutra-agent provider login`：强制进入 provider setup。
 - CI / 非 TTY：永远不弹交互 UI，只输出结构化错误。
@@ -563,7 +527,7 @@ probe 结果进入 capability matrix，但不能把一次 probe 成功当作永�
 
 ### P1 provider catalog
 
-- 新增 Codex 风格全局 provider/auth config 文件。
+- 新增全局 provider/auth config 文件。
 - 实现 `provider list/current/use/probe/login/set-key`。
 - 引入 `ProviderCatalog`、`ProviderSelection`、`ResolvedProviderConfig`。
 - 引入 `ProviderInstallPlan`，确保 settings/env/runtime reload/probe 失败时可 rollback。

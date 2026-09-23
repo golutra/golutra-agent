@@ -25,6 +25,13 @@ pub(super) enum ObjectiveValidationKind {
     FileState,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ObjectiveValidationStatus {
+    Passed,
+    Failed,
+    Unknown,
+}
+
 impl ObjectiveValidationKind {
     pub(super) const fn label(self) -> &'static str {
         match self {
@@ -50,6 +57,7 @@ const PREPARED_OBJECTIVE_VALIDATION_FACT: &str = "runtime_objective_validation";
 pub(super) struct ObjectiveValidationOutcome {
     pub(super) kind: ObjectiveValidationKind,
     pub(super) identity: String,
+    pub(super) status: ObjectiveValidationStatus,
     pub(super) passed: bool,
     pub(super) message: String,
 }
@@ -61,6 +69,11 @@ pub(super) fn objective_validation_report(
         return Some(ObjectiveValidationOutcome {
             kind: ObjectiveValidationKind::Test,
             identity: "external-verifier".to_owned(),
+            status: if report.envelope.status == ToolResultStatus::Ok {
+                ObjectiveValidationStatus::Passed
+            } else {
+                ObjectiveValidationStatus::Failed
+            },
             passed: report.envelope.status == ToolResultStatus::Ok,
             message: report.envelope.summary.clone(),
         });
@@ -78,8 +91,14 @@ pub(super) fn objective_validation_report(
         let identity =
             validation_identity_in_workdir(objective_validation_command_identity(command)?, report);
         let exited_cleanly = shell_report_exited_cleanly(report);
-        let passed = exited_cleanly
-            && (kind != ObjectiveValidationKind::Test || test_report_executed_tests(report));
+        let status = if !exited_cleanly {
+            ObjectiveValidationStatus::Failed
+        } else if kind == ObjectiveValidationKind::Test && !test_report_executed_tests(report) {
+            ObjectiveValidationStatus::Unknown
+        } else {
+            ObjectiveValidationStatus::Passed
+        };
+        let passed = status == ObjectiveValidationStatus::Passed;
         let message = match (kind, exited_cleanly, passed) {
             (_, false, _) => "validation command did not exit successfully".to_owned(),
             (ObjectiveValidationKind::Test, true, false) => {
@@ -97,6 +116,7 @@ pub(super) fn objective_validation_report(
         return Some(ObjectiveValidationOutcome {
             kind,
             identity,
+            status,
             passed,
             message,
         });
@@ -142,7 +162,14 @@ fn prepared_objective_validation_report(
     let exited_cleanly = shell_report_exited_cleanly(report);
     let executed_tests =
         kind != ObjectiveValidationKind::Test || test_report_executed_tests(report);
-    let passed = exited_cleanly && executed_tests;
+    let status = if !exited_cleanly {
+        ObjectiveValidationStatus::Failed
+    } else if kind == ObjectiveValidationKind::Test && !executed_tests {
+        ObjectiveValidationStatus::Unknown
+    } else {
+        ObjectiveValidationStatus::Passed
+    };
+    let passed = status == ObjectiveValidationStatus::Passed;
     let message = if !exited_cleanly {
         "validation command did not exit successfully".to_owned()
     } else if kind == ObjectiveValidationKind::Test && !executed_tests {
@@ -157,6 +184,7 @@ fn prepared_objective_validation_report(
     Some(ObjectiveValidationOutcome {
         kind,
         identity,
+        status,
         passed,
         message,
     })
@@ -252,6 +280,11 @@ pub(super) fn explicitly_requested_inspection_validation(
     Some(ObjectiveValidationOutcome {
         kind: ObjectiveValidationKind::Diagnostic,
         identity: format!("inspection:{:x}", Sha256::digest(relative_lower.as_bytes())),
+        status: if passed {
+            ObjectiveValidationStatus::Passed
+        } else {
+            ObjectiveValidationStatus::Failed
+        },
         passed,
         message: if passed {
             format!("explicitly requested workspace input was inspected: {relative}")

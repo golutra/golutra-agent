@@ -49,6 +49,8 @@ The existing `RetryScheduled` runtime event carries an additive `recovery` paylo
 | `transport` | `streaming` or `buffered` |
 | `reason`, `error_metadata` | Redacted error details and available HTTP/provider evidence |
 
+空响应触发的同一 turn 续写也会在 `RetryScheduled.after_request_id` 中保存上一条完整 provider 请求身份。它与新用户 turn、provider fallback 或新的 task 分开，便于 resume/replay 区分“同一逻辑任务继续”与“重新开始”。
+
 Clients consuming deltas must honor `reset_stream`; concatenating all deltas across attempts is not a valid final response. `ProviderCompleted`/`AssistantMessage` remain authoritative completed output. Raw recovery events remain queryable for diagnostics even though they are quiet in the transcript. These events are required observations so recorder backpressure cannot silently drop an attempt boundary.
 
 ## Validation
@@ -73,4 +75,4 @@ This keeps the endpoint unavailable for two actual hours, restores a local HTTP/
 
 ## Design reference
 
-The local Codex checkout at `fc269b66` separates unbounded typed connection recovery from bounded stream failures (`core/src/responses_retry.rs`), enables it by default (`features/src/lib.rs`) and updates the status row (`tui/src/chatwidget/streaming.rs`). Golutra uses its own existing full-response tool execution boundary, event journal, budgets and recovery machinery instead of importing Codex's entire session architecture.
+Connection recovery separates typed connection failures from bounded stream failures. The runtime keeps tool execution behind the complete-response boundary, records every retry in the event journal, and preserves cancellation, budgets and recovery state across reconnects.

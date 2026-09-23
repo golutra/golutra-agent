@@ -49,6 +49,7 @@
 
 - `summary_attempts`：准备并执行的逻辑摘要请求次数，通常为 0、1 或 2；不等同于底层 HTTP 连接重试次数。
 - `summary_failure`：最终降级原因；模型摘要成功时为 null。每次失败的 provider 结束原因和真实错误仍保留在相应事件中。
+- `compaction_id`：本次压缩 attempt 的身份；`CompactionStarted`、`CompactionFailed`、`CompactionCompleted` 以及 baseline artifact 使用同一值，resume 或审计不需要按相邻事件猜测生命周期。
 
 ## 验证边界
 
