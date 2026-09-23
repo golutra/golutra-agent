@@ -448,9 +448,12 @@ fn with_suspended_terminal<T>(operation: impl FnOnce() -> io::Result<T>) -> io::
 }
 
 fn suspend_terminal() -> io::Result<()> {
-    disable_raw_mode()?;
     let alternate_screen = ALTERNATE_SCREEN_ACTIVE.load(Ordering::Relaxed);
-    if let Err(error) = suspend_terminal_output(&mut io::stdout(), alternate_screen) {
+    // Windows mouse cleanup restores its saved raw console mode. Disable raw
+    // mode last so an external editor receives cooked input during suspension.
+    let result = suspend_terminal_output(&mut io::stdout(), alternate_screen)
+        .and_then(|()| disable_raw_mode());
+    if let Err(error) = result {
         let output_restore = resume_terminal_output(
             &mut io::stdout(),
             alternate_screen,
@@ -458,7 +461,7 @@ fn suspend_terminal() -> io::Result<()> {
         );
         let raw_restore = enable_raw_mode();
         return Err(combine_terminal_errors(
-            "suspend terminal output",
+            "suspend terminal",
             error,
             [
                 ("restore terminal output", output_restore),

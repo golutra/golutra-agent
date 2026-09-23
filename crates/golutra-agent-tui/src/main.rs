@@ -6739,6 +6739,15 @@ type InteractiveTerminal =
 fn setup_terminal(viewport_height: u16) -> miette::Result<InteractiveTerminal> {
     enable_raw_mode().map_err(|error| miette::miette!("{error}"))?;
     let mut stdout = io::stdout();
+    // Crossterm 0.28 only records the Windows mouse-mode baseline on enable.
+    // Record it while raw mode is active, before any disable or setup rollback.
+    #[cfg(windows)]
+    if let Err(error) = execute!(stdout, event::EnableMouseCapture) {
+        let restore = disable_raw_mode();
+        return Err(miette::miette!(
+            "initialize mouse capture: {error}; raw-mode restore: {restore:?}"
+        ));
+    }
     if let Err(error) = execute!(
         stdout,
         event::DisableMouseCapture,
@@ -6764,7 +6773,6 @@ fn setup_terminal(viewport_height: u16) -> miette::Result<InteractiveTerminal> {
 
 fn restore_terminal(output: &mut impl io::Write, use_alternate_screen: bool) -> miette::Result<()> {
     let mut failures = Vec::new();
-    record_terminal_failure(&mut failures, "disable raw mode", disable_raw_mode());
     record_terminal_failure(
         &mut failures,
         "disable bracketed paste",
@@ -6775,6 +6783,9 @@ fn restore_terminal(output: &mut impl io::Write, use_alternate_screen: bool) -> 
         "disable mouse capture",
         execute!(output, event::DisableMouseCapture),
     );
+    // Mouse cleanup restores a raw-mode baseline on Windows, so cooked input
+    // must be restored afterwards for the parent shell.
+    record_terminal_failure(&mut failures, "disable raw mode", disable_raw_mode());
     record_terminal_failure(
         &mut failures,
         "restore cursor style",
