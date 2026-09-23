@@ -235,6 +235,8 @@ impl AuthDialogState {
             AuthDialogStep::AuthMethod
         } else if provider.protocol_options.len() > 1 {
             AuthDialogStep::Protocol
+        } else if provider.source == AuthProviderSource::Official {
+            AuthDialogStep::ApiKey
         } else {
             AuthDialogStep::BaseUrl
         };
@@ -472,7 +474,16 @@ impl AuthDialogState {
                 Some(AuthProviderSource::ThirdParty) => AuthDialogStep::ThirdPartyChoice,
                 _ => AuthDialogStep::GroupChoice,
             },
-            AuthDialogStep::ApiKey | AuthDialogStep::EnvKey => AuthDialogStep::BaseUrl,
+            AuthDialogStep::ApiKey | AuthDialogStep::EnvKey => {
+                if self
+                    .provider
+                    .is_some_and(|provider| provider.source == AuthProviderSource::Official)
+                {
+                    AuthDialogStep::GroupChoice
+                } else {
+                    AuthDialogStep::BaseUrl
+                }
+            }
             AuthDialogStep::Model => {
                 // 退回凭据页即使随后再次进入，也不能接受旧 Key 发起的目录请求。
                 self.model_discovery = ModelDiscoveryState::Idle;
@@ -568,7 +579,7 @@ pub(crate) const OFFICIAL_PROVIDER_PRESET: AuthProviderPreset = AuthProviderPres
     detail: "Official OpenAI-compatible endpoint",
     source: AuthProviderSource::Official,
     protocol_options: OPENAI_PROTOCOL_ONLY,
-    base_url: Some("https://api.golutra.cn/v1"),
+    base_url: Some("https://api.golutra.cn"),
     model: None,
     recommended_models: &[],
     oauth_provider_id: None,

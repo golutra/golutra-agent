@@ -10599,6 +10599,64 @@ async fn active_task_blocks_session_switching_commands() {
 }
 
 #[tokio::test]
+async fn auth_dialog_official_skips_address_and_returns_to_provider_choice() {
+    let _guard = env_lock_guard().await;
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "missing provider".to_owned(),
+        Some(AuthDialogState::new()),
+    );
+    for environment in [false, true] {
+        handle_auth_dialog_key(
+            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
+            &mut app,
+            &transport,
+        )
+        .await
+        .expect("select official provider");
+        let dialog = app.auth_dialog.as_mut().expect("dialog");
+        assert_eq!(dialog.step, AuthDialogStep::ApiKey);
+        assert_eq!(dialog.base_url, "https://api.golutra.cn");
+        assert!(dialog.api_key.is_empty());
+        assert!(dialog.api_key_env.is_empty());
+        dialog.api_key = "test-official-key".to_owned();
+        dialog.model = "explicit-model".to_owned();
+        let review = build_auth_review(dialog).expect("offline review");
+        assert_eq!(review.base_url, "https://api.golutra.cn/v1");
+        assert_eq!(dialog.base_url, "https://api.golutra.cn");
+        assert!(app.auth_model_discovery.is_none());
+        if environment {
+            handle_auth_dialog_key(
+                KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+                &mut app,
+                &transport,
+            )
+            .await
+            .expect("switch to environment credential");
+            assert_eq!(
+                app.auth_dialog.as_ref().unwrap().step,
+                AuthDialogStep::EnvKey
+            );
+        }
+        handle_auth_dialog_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut app,
+            &transport,
+        )
+        .await
+        .expect("return to provider choice");
+        assert_eq!(
+            app.auth_dialog.as_ref().unwrap().step,
+            AuthDialogStep::GroupChoice
+        );
+    }
+}
+
+#[tokio::test]
 async fn auth_dialog_defaults_to_key_and_toggles_environment_reference() {
     use secrecy::ExposeSecret;
 
@@ -10613,7 +10671,8 @@ async fn auth_dialog_defaults_to_key_and_toggles_environment_reference() {
     );
     {
         let dialog = app.auth_dialog.as_mut().expect("dialog");
-        dialog.select_provider(OFFICIAL_PROVIDER_PRESET);
+        dialog.select_provider(CUSTOM_PROVIDER_PRESET);
+        dialog.base_url = "https://api.example.com".to_owned();
         dialog.credential_store = AuthCredentialStore::Disk;
         dialog.step = AuthDialogStep::BaseUrl;
     }
