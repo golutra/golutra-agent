@@ -37,6 +37,12 @@ personal credentials or network access.
 
 ## Change Workflow
 
+The canonical repository is `https://github.com/golutra/golutra-agent`.
+The maintainer account `seekskyworld` may commit and push directly to `main`;
+these pushes skip CI jobs. Administrators can bypass branch protection, while
+pull requests and pushes from other accounts retain their checks. Tagged releases
+still run the release workflow and its platform acceptance before publication.
+
 1. Fork the repository and create a focused branch from `main`.
 2. Describe the intended behavior and the affected boundary before making a
    cross-cutting change.

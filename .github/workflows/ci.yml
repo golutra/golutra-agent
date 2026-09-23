@@ -14,7 +14,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # 维护者直接推送 main 时跳过 CI；PR 和其他账号的推送继续执行检查。
   rust:
+    if: github.event_name != 'push' || github.actor != 'seekskyworld'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -62,6 +64,7 @@ jobs:
             sdk/python/src/golutra_agent_sdk/generated.py)"
 
   tui-driver-process:
+    if: github.event_name != 'push' || github.actor != 'seekskyworld'
     name: TUI Driver process (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -77,6 +80,7 @@ jobs:
         run: cargo test --locked -p golutra-agent-tui --test tui_driver_process -- --test-threads=1
 
   tui-pty-acceptance:
+    if: github.event_name != 'push' || github.actor != 'seekskyworld'
     name: TUI PTY acceptance (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -92,6 +96,7 @@ jobs:
         run: cargo test --locked -p golutra-agent-tui --test pty_acceptance -- --test-threads=1
 
   portable-check:
+    if: github.event_name != 'push' || github.actor != 'seekskyworld'
     strategy:
       fail-fast: false
       matrix:
