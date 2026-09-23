@@ -44,11 +44,10 @@
 18. `research-self-evolving-agent-systems.md`：自修改 agent、防过拟合和发布完整性的一手资料研究。
 19. `extensions-sdk-delivery.md`：Plugin/MCP、IPC、TypeScript/Python SDK 和安装交付。
 20. `tui-driver.md`：agent 可控的原生离屏 TUI、NDJSON/Unix socket 协议、快照和安全边界。
-21. `framework-comparison.md`：六个外部 agent 项目对 Golutra 的影响。
-22. `runtime-entrypoints.md`：exec、App Server、Python/TypeScript SDK、MCP 和 Remote TUI 的进程模型、协议边界和验收方式。
-23. `runtime-stability.md`：长任务执行、provider/process 监督、崩溃恢复、任务对账和 restart soak 验收。
-24. `external-verification.md`：调用方声明的客观验证器、证据链和自动修复驱动。
-25. [tui-rendering.md](tui-rendering.md)：终端历史、流式显示、输入区锚点、工具卡片与真实 PTY 验收。
+21. `runtime-entrypoints.md`：exec、App Server、Python/TypeScript SDK、MCP 和 Remote TUI 的进程模型、协议边界和验收方式。
+22. `runtime-stability.md`：长任务执行、provider/process 监督、崩溃恢复、任务对账和 restart soak 验收。
+23. `external-verification.md`：调用方声明的客观验证器、证据链和自动修复驱动。
+24. [tui-rendering.md](tui-rendering.md)：终端历史、流式显示、输入区锚点、工具卡片与真实 PTY 验收。
 
 ## 文档分工
 
@@ -74,7 +73,6 @@
 | `research-self-evolving-agent-systems.md` | 自修改系统与反过拟合一手资料研究 |
 | `extensions-sdk-delivery.md` | Plugin/MCP、transport、SDK 和交付 |
 | `tui-driver.md` | 原生 TUI Driver、离屏快照、NDJSON/Unix socket 和进程级验收 |
-| `framework-comparison.md` | 外部项目调研结论 |
 | `runtime-entrypoints.md` | 五类运行入口、共享 Runtime 分层、进程模型和跨进程验收 |
 | `runtime-stability.md` | 长任务稳定性不变量、故障分类、恢复对账和 soak 验收 |
 | `external-verification.md` | 外部验证契约、证据链、审批边界和 benchmark 驱动 |

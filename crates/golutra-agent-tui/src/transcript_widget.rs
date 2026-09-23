@@ -263,7 +263,7 @@ fn with_session_banner(
 }
 
 pub(crate) fn transcript_top_padding(app: &TuiApp, layout: &TranscriptLayout, area: Rect) -> u16 {
-    // 对照 Codex：不要把 live transcript 垫到 viewport 底部。
+    // live transcript 不垫到 viewport 底部，避免新内容改变历史锚点。
     // history 开启时再垫，会在上方 scrollback 和 › /status 之间留出一块空洞。
     let _ = (app, layout, area);
     0
@@ -569,7 +569,7 @@ fn render_item_rows(
             .flat_map(|value| value.split('\n').map(detail_line).collect::<Vec<_>>())
             .collect(),
     };
-    // 对照 Codex：已推进上方 scrollback 的流式前缀不再画进 live 区。
+    // 已推进上方 scrollback 的流式前缀不再画进 live 区。
     if skip_lines > 0 && matches!(item.role, TranscriptRole::Assistant) {
         let keep_from = skip_lines.min(body_lines.len());
         if keep_from > 0 {
@@ -654,7 +654,7 @@ pub(crate) fn role_marker(app: &TuiApp, role: &TranscriptRole) -> &'static str {
         TranscriptRole::User if app.preferences.screen_reader => "> ",
         TranscriptRole::User => "› ",
         TranscriptRole::CommandResult if app.preferences.screen_reader => "* ",
-        // 对照 Claude Code：slash 结果缩进在命令行下面，用 ⎿ 标明成功或取消。
+        // slash 结果缩进在命令行下面，用 ⎿ 标明成功或取消。
         TranscriptRole::CommandResult => "  ⎿  ",
         TranscriptRole::Assistant
         | TranscriptRole::Status

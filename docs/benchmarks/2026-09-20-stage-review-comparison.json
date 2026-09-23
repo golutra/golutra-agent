@@ -769,7 +769,7 @@
   ],
   "limitations": [
     "macOS arm64; one Responses upstream/model.",
-    "No Codex rerun and not a multi-hour coding test.",
+    "No external product rerun and not a multi-hour coding test.",
     "Derived-change runtime correction is not included in either binary."
   ]
 }

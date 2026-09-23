@@ -570,15 +570,17 @@ fn estimate_observation_bytes(observation: &RuntimeObservation) -> usize {
             trimmed_contributors,
         )),
         RuntimeObservation::ContextCompactionStarted {
+            compaction_id,
             original_input_tokens,
             budget_limit,
-        } => structured_bytes(&(original_input_tokens, budget_limit)),
+        } => structured_bytes(&(compaction_id, original_input_tokens, budget_limit)),
         RuntimeObservation::ContextAutoCompacted(record) => structured_bytes(record),
         RuntimeObservation::ContextCompactionFailed {
+            compaction_id,
             planned_input_tokens,
             budget_limit,
             reason,
-        } => structured_bytes(&(planned_input_tokens, budget_limit, reason)),
+        } => structured_bytes(&(compaction_id, planned_input_tokens, budget_limit, reason)),
         RuntimeObservation::ContextSnapshot(snapshot) => structured_bytes(snapshot),
         RuntimeObservation::ContextSnapshotCaptured { snapshot, request } => {
             structured_bytes(&(snapshot, request))
@@ -643,9 +645,11 @@ fn estimate_observation_bytes(observation: &RuntimeObservation) -> usize {
         RuntimeObservation::UserQuestionRequested(request) => structured_bytes(request),
         RuntimeObservation::UserQuestionResolved(resolution) => structured_bytes(resolution),
         RuntimeObservation::ProviderRecovery { recovery, .. } => structured_bytes(recovery),
-        RuntimeObservation::RetryScheduled { attempt, reason } => {
-            structured_bytes(&(attempt, reason))
-        }
+        RuntimeObservation::RetryScheduled {
+            attempt,
+            after_request_id,
+            reason,
+        } => structured_bytes(&(attempt, after_request_id, reason)),
         RuntimeObservation::ProviderFallback {
             from_provider,
             to_provider,

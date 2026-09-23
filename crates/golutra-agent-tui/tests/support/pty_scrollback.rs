@@ -399,6 +399,25 @@ fn partial_stream_failure_is_visible_once_with_diagnostics_in_real_pty() {
         1,
         "no replay after partial output"
     );
+    assert!(!text.contains("Residual risks"), "{text}");
+    assert!(!text.contains("Result ·"), "{text}");
+    assert!(!text.contains("VerificationCompleted"), "{text}");
+    submit(&mut pty, &mut parser, "/debug");
+    wait_for_visible(&mut pty, &mut parser, "Alt+D events");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        parser.process(&pty.collect_for(Duration::from_millis(50)));
+        let debug = all_terminal_rows(&mut parser);
+        if debug.contains("VerificationCompleted") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "verification missing from /debug: {debug}"
+        );
+    }
+    submit(&mut pty, &mut parser, "/quit");
+    assert!(pty.wait().1.success());
 }
 
 #[test]
@@ -1351,6 +1370,18 @@ fn inline_scrollback_preserves_long_cjk_responses_prompts_and_status() {
     restored.process(&resumed.collect_for(Duration::from_millis(500)));
     expected.retain(|needle| needle != "• Status");
     assert_once_in_order(&all_terminal_rows(&mut restored), &expected);
+    let text = all_terminal_rows(&mut restored);
+    for hidden in [
+        "Residual risks",
+        "Result ·",
+        "verification evidence is insufficient",
+        "next: resolve",
+    ] {
+        assert!(
+            !text.contains(hidden),
+            "resumed transcript contains {hidden}: {text}"
+        );
+    }
     submit(&mut resumed, &mut restored, "/quit");
     assert!(resumed.wait().1.success());
 }

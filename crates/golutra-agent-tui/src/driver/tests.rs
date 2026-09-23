@@ -333,6 +333,8 @@ fn driver_error_codes_are_stable_and_messages_are_bounded() {
 #[test]
 fn driver_rejects_session_switching_slash_commands() {
     for command in [
+        "/handoff",
+        "/handoff continue parser work",
         "/new",
         "/resume",
         "/resume 019f79f6-c084-7210-a891-a12832a20f14",

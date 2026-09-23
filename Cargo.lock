@@ -841,12 +841,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
-name = "downcast"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1435fa1053d8b2fbbe9be7e97eca7f33d37b28409959813daefc1446a14247f1"
-
-[[package]]
 name = "downcast-rs"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1046,15 +1040,6 @@ checksum = "e076045bb43dac435333ed5f04caf35c7463631d0dae2deb2638d94dd0a5b872"
 dependencies = [
  "lazy_static",
  "num",
-]
-
-[[package]]
-name = "fragile"
-version = "2.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8878864ba14bb86e818a412bfd6f18f9eabd4ec0f008a28e8f7eb61db532fcf9"
-dependencies = [
- "futures-core",
 ]
 
 [[package]]
@@ -1274,7 +1259,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-app-server"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "async-stream",
  "axum",
@@ -1305,7 +1290,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-auth"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1327,7 +1312,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-cli"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "chrono",
  "clap",
@@ -1355,7 +1340,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-client"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1396,7 +1381,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-code-intelligence"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "chrono",
  "fs2",
@@ -1415,7 +1400,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-config"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "fs2",
  "golutra-agent-auth",
@@ -1431,7 +1416,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-context"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "chrono",
  "golutra-agent-core",
@@ -1444,7 +1429,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-core"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "chrono",
  "schemars 1.2.1",
@@ -1456,7 +1441,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-eval"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "chrono",
  "fs2",
@@ -1473,7 +1458,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-eval-model"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "chrono",
  "golutra-agent-core",
@@ -1485,7 +1470,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-eval-worker"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "chrono",
  "clap",
@@ -1500,14 +1485,14 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-event"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "golutra-agent-protocol",
 ]
 
 [[package]]
 name = "golutra-agent-evolution"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "chrono",
  "fs2",
@@ -1524,7 +1509,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-file-search"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "golutra-agent-core",
  "golutra-agent-policy",
@@ -1539,7 +1524,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-governor"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "golutra-agent-core",
  "schemars 1.2.1",
@@ -1548,7 +1533,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-llm"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1571,7 +1556,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-mcp"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "async-trait",
  "golutra-agent-core",
@@ -1589,7 +1574,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-memory"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "chrono",
  "fs2",
@@ -1604,7 +1589,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-plugin"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "chrono",
  "fs2",
@@ -1621,7 +1606,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-policy"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "golutra-agent-core",
  "shlex 1.3.0",
@@ -1633,7 +1618,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-project-service"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1651,7 +1636,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-protocol"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "chrono",
  "golutra-agent-core",
@@ -1664,7 +1649,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-protocol-fixtures"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "chrono",
  "golutra-agent-core",
@@ -1680,7 +1665,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-release"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "chrono",
  "fs2",
@@ -1699,7 +1684,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-runtime"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1732,7 +1717,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-sandbox"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -1742,7 +1727,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-store"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "chrono",
  "fs2",
@@ -1761,7 +1746,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-supervisor"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1787,7 +1772,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-test-client"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "chrono",
  "golutra-agent-client",
@@ -1801,7 +1786,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-tools"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1826,7 +1811,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-tui"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -1856,7 +1841,6 @@ dependencies = [
  "supports-color",
  "syntect",
  "tempfile",
- "termbg",
  "tokio",
  "tokio-util",
  "unicode-segmentation",
@@ -1867,7 +1851,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-verify"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "chrono",
  "golutra-agent-core",
@@ -1875,7 +1859,7 @@ dependencies = [
 
 [[package]]
 name = "golutra-agent-vis"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "chrono",
  "clap",
@@ -2635,32 +2619,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mockall"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39a6bfcc6c8c7eed5ee98b9c3e33adc726054389233e201c95dab2d41a3839d2"
-dependencies = [
- "cfg-if",
- "downcast",
- "fragile",
- "mockall_derive",
- "predicates",
- "predicates-tree",
-]
-
-[[package]]
-name = "mockall_derive"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25ca3004c2efe9011bd4e461bd8256445052b9615405b4f7ea43fc8ca5c20898"
-dependencies = [
- "cfg-if",
- "proc-macro2",
- "quote",
- "syn 2.0.118",
-]
-
-[[package]]
 name = "ndk-context"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2812,15 +2770,6 @@ checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
  "libm",
-]
-
-[[package]]
-name = "num_threads"
-version = "0.1.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c7398b9c8b70908f6371f47ed36737907c87c52af34c268fed0bf0ceb92ead9"
-dependencies = [
- "libc",
 ]
 
 [[package]]
@@ -3058,32 +3007,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85eae3c4ed2f50dcfe72643da4befc30deadb458a9b590d720cde2f2b1e97da9"
 dependencies = [
  "zerocopy",
-]
-
-[[package]]
-name = "predicates"
-version = "3.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ada8f2932f28a27ee7b70dd6c1c39ea0675c55a36879ab92f3a715eaa1e63cfe"
-dependencies = [
- "anstyle",
- "predicates-core",
-]
-
-[[package]]
-name = "predicates-core"
-version = "1.0.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cad38746f3166b4031b1a0d39ad9f954dd291e7854fcc0eed52ee41a0b50d144"
-
-[[package]]
-name = "predicates-tree"
-version = "1.0.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0de1b847b39c8131db0467e9df1ff60e6d0562ab8e9a16e568ad0fdb372e2f2"
-dependencies = [
- "predicates-core",
- "termtree",
 ]
 
 [[package]]
@@ -4039,17 +3962,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
 
 [[package]]
-name = "simplelog"
-version = "0.12.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16257adbfaef1ee58b1363bdc0664c9b8e1e30aed86049635fb5f147d065a9c0"
-dependencies = [
- "log",
- "termcolor",
- "time",
-]
-
-[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4492,30 +4404,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "termbg"
-version = "0.6.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8bf44577a1adf3dfd7fec3b8763074467e27b2ad35ff9157bc3f0a51bb0a3dd4"
-dependencies = [
- "crossterm",
- "log",
- "mockall",
- "scopeguard",
- "simplelog",
- "thiserror 2.0.18",
- "winapi",
-]
-
-[[package]]
-name = "termcolor"
-version = "1.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
-dependencies = [
- "winapi-util",
-]
-
-[[package]]
 name = "terminal_size"
 version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4524,12 +4412,6 @@ dependencies = [
  "rustix 1.1.4",
  "windows-sys 0.61.2",
 ]
-
-[[package]]
-name = "termtree"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f50febec83f5ee1df3015341d8bd429f2d1cc62bcba7ea2076759d315084683"
 
 [[package]]
 name = "textwrap"
@@ -4588,9 +4470,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "18dfaaeddcb932337b5e7866ee7d0ce9b76d2fd092997146f187ec09b4558a50"
 dependencies = [
  "deranged",
- "libc",
  "num-conv",
- "num_threads",
  "powerfmt",
  "serde_core",
  "time-core",

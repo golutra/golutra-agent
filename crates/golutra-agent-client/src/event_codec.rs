@@ -577,7 +577,8 @@ pub(crate) fn observation_descriptor(observation: &RuntimeObservation) -> Observ
         RuntimeObservation::ContextCompactionStarted { .. } => (
             RuntimeEventType::CompactionStarted,
             RuntimeEventSource::Runtime,
-            ObservationIntegrityClass::Supporting,
+            // 成功/失败事件通过 compaction_id 关联；开始边界丢失后不能可靠重建一次压缩尝试。
+            ObservationIntegrityClass::Required,
         ),
         RuntimeObservation::ContextAutoCompacted(_) => (
             RuntimeEventType::CompactionCompleted,
@@ -810,6 +811,7 @@ pub(crate) fn trace_event_payload(
             }),
         )),
         AgentLoopTraceEvent::ContextCompactionStarted {
+            compaction_id,
             original_input_tokens,
             budget_limit,
         } => Some((
@@ -818,6 +820,7 @@ pub(crate) fn trace_event_payload(
             json!({
                 "summary": "automatic context compaction started",
                 "mode": "automatic",
+                "compaction_id": compaction_id,
                 "original_input_tokens": original_input_tokens,
                 "budget_limit": budget_limit,
             }),
@@ -828,7 +831,10 @@ pub(crate) fn trace_event_payload(
             json!({
                 "summary": "automatic context compaction completed",
                 "mode": record.mode,
+                "compaction_id": record.compaction_id,
                 "strategy": record.strategy,
+                "summary_attempts": record.summary_attempts,
+                "summary_failure": record.summary_failure,
                 "content": record.summary,
                 "original_message_count": record.original_message_count,
                 "replacement_message_count": record.replacement_message_count,
@@ -842,6 +848,7 @@ pub(crate) fn trace_event_payload(
             }),
         )),
         AgentLoopTraceEvent::ContextCompactionFailed {
+            compaction_id,
             planned_input_tokens,
             budget_limit,
             reason,
@@ -851,6 +858,7 @@ pub(crate) fn trace_event_payload(
             json!({
                 "summary": "automatic context compaction failed",
                 "mode": "automatic",
+                "compaction_id": compaction_id,
                 "planned_input_tokens": planned_input_tokens,
                 "budget_limit": budget_limit,
                 "reason": reason,
@@ -1124,12 +1132,17 @@ pub(crate) fn trace_event_payload(
                 "resolution": resolution,
             }),
         )),
-        AgentLoopTraceEvent::RetryScheduled { attempt, reason } => Some((
+        AgentLoopTraceEvent::RetryScheduled {
+            attempt,
+            after_request_id,
+            reason,
+        } => Some((
             RuntimeEventType::RetryScheduled,
             RuntimeEventSource::Runtime,
             json!({
                 "summary": format!("provider retry attempt {attempt}"),
                 "attempt": attempt,
+                "after_request_id": after_request_id,
                 "reason": reason,
             }),
         )),

@@ -135,6 +135,10 @@ fn recovery_reminder_never_evicts_history_or_exceeds_its_budget() {
     add_recovery_reminder(&mut request, Duration::from_secs(120), 1024);
     add_recovery_reminder(&mut request, Duration::from_secs(600), 1024);
     assert_eq!(request.messages.len(), 1);
+    assert_eq!(
+        request.messages[0].role,
+        golutra_agent_llm::ProviderRole::User
+    );
 }
 
 #[tokio::test(start_paused = true)]

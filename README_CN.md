@@ -164,7 +164,7 @@ cargo run -p golutra-agent-tui -- --yolo
 - 安全策略：[SECURITY.md](SECURITY.md)
 - 变更记录：[CHANGELOG.md](CHANGELOG.md)
 
-项目当前处于 `0.3.5` 早期阶段，协议和运行时边界仍可能演进。欢迎提交代码、
+项目当前处于 `0.3.6` 早期阶段，协议和运行时边界仍可能演进。欢迎提交代码、
 测试、文档和可复现的 issue；涉及凭据、沙箱、网络或数据泄露的问题请按安全策略
 私下报告。
 

@@ -461,9 +461,10 @@ fn add_recovery_reminder(request: &mut ProviderRequest, waited: Duration, input_
     {
         return;
     }
-    // 仅在长等待后追加一次；保留完整工具配对及原有前缀，返回的 completed_request 包含该提示。
+    // 动态提示使用 user 段，避免 genai 把末尾 system 消息提升到静态前缀。
+    // 仅在长等待后追加一次；保留完整工具配对，返回的 completed_request 包含该提示。
     let reminder = golutra_agent_llm::ProviderMessage {
-        role: golutra_agent_llm::ProviderRole::System,
+        role: golutra_agent_llm::ProviderRole::User,
         content: REMINDER.to_owned(),
         tool_call_id: None,
         tool_name: None,

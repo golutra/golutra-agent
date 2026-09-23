@@ -56,6 +56,11 @@ impl RunObservation {
                 let check = objective_validation_report(report)?;
                 let current = validation_is_current(report, reports);
                 Some(json!({"kind":check.kind.label(), "passed":check.passed,
+                "status": match check.status {
+                    super::objective_evidence::ObjectiveValidationStatus::Passed => "passed",
+                    super::objective_evidence::ObjectiveValidationStatus::Unknown => "unknown",
+                    super::objective_evidence::ObjectiveValidationStatus::Failed => "failed",
+                },
                 "current":current, "tool_call_id":report.envelope.tool_call_id}))
             })
             .take(8)

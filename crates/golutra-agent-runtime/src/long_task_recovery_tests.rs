@@ -146,7 +146,7 @@ async fn offline_semantic_compaction_retains_the_local_summary_and_recent_contex
             metadata: Default::default(),
         })
         .collect::<Vec<_>>();
-    let record = ContextWindowManager::new(512)
+    let mut record = ContextWindowManager::new(512)
         .compact_if_needed(task.turn_id, 0, &messages, &[], 0)
         .unwrap()
         .unwrap();
@@ -162,7 +162,7 @@ async fn offline_semantic_compaction_retains_the_local_summary_and_recent_contex
             &task,
             &cache,
             task.turn_id,
-            &record,
+            &mut record,
             None,
             &mut control,
             &mut |event| events.push(event),

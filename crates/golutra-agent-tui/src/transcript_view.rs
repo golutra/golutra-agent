@@ -4,11 +4,13 @@ use std::collections::{HashMap, HashSet};
 
 use golutra_agent_core::{
     EventId, FileChangeKind, FileChangeSummary, TaskId, TaskStatus, ToolResultStatus, TurnId,
-    UserStep, UserStepKind, VerificationIndependence, VerificationRecord, VerificationResult,
-    VerificationSource,
+    UserStep, UserStepKind,
 };
 use golutra_agent_protocol::{RuntimeEvent, RuntimeEventType, UserProjection, VisibleStep};
 use serde_json::Value;
+
+#[path = "transcript_terminal.rs"]
+mod terminal;
 
 use super::{
     BodyViewMode, PaneScrollState, TranscriptLayoutCache, TranscriptPresentation,
@@ -25,7 +27,7 @@ pub(crate) enum TranscriptRole {
     Warning,
     Error,
     System,
-    // 对照 Claude Code：slash 命令结果画在 › /resume 下面，用 ⎿ 收口成功或取消。
+    // slash 命令结果画在 › /resume 下面，用 ⎿ 收口成功或取消。
     CommandResult,
 }
 
@@ -237,25 +239,15 @@ impl TranscriptState {
         }
     }
 
-    /// 只快进连续的同回合正文 delta；工具、重试、最终修订和历史裁剪均回退完整投影。
+    /// 非展示事件保留投影；同回合正文只追加尾部，语义边界和裁剪则完整重建。
     pub(crate) fn invalidate_for_event(&mut self, event: &RuntimeEvent, event_count: usize) {
         let mut cache = self.frame_operations.get_mut().take();
         self.invalidate_visual_layout();
         if let Some(cached) = cache.as_mut()
-            && event.event_type == RuntimeEventType::ProviderStreamed
-            && event.turn_id.is_some()
-            && cached.stream_turn == event.turn_id
             && cached.event_count + 1 == event_count
             && cached.anchors == self.history.command_anchors
-            && let Some(record) = cached.entries.last_mut()
-            && !record.stable
-            && record.turn_id == event.turn_id
-            && record.projection.is_assistant_message()
-            && let Some(body) = record.projection.item_mut().body.first_mut()
+            && cached.advance(event)
         {
-            if let Some(delta) = provider_stream_text_delta(event) {
-                body.push_str(delta);
-            }
             cached.event_count = event_count;
             cached.revision = self.revision;
             *self.frame_operations.get_mut() = cache;
@@ -475,7 +467,7 @@ pub(crate) fn transcript_items(app: &TuiApp) -> Vec<TranscriptItem> {
 }
 
 pub(crate) fn transcript_operation_projections(app: &TuiApp) -> Vec<OperationProjection> {
-    transcript_operation_projections_after(app, None, false)
+    transcript_operation_projections_after(app, None)
 }
 
 pub(crate) fn rendered_transcript_operation_projections(app: &TuiApp) -> Vec<OperationProjection> {
@@ -483,13 +475,12 @@ pub(crate) fn rendered_transcript_operation_projections(app: &TuiApp) -> Vec<Ope
         && !app.transcript.fullscreen
         && app.transcript.search.is_none())
     .then_some(&app.transcript.history.committed_event_ids);
-    transcript_operation_projections_after(app, committed, true)
+    transcript_operation_projections_after(app, committed)
 }
 
 fn transcript_operation_projections_after(
     app: &TuiApp,
     committed_event_ids: Option<&HashSet<EventId>>,
-    include_result_card: bool,
 ) -> Vec<OperationProjection> {
     if app.auth_dialog.is_some() {
         return Vec::new();
@@ -518,152 +509,16 @@ fn transcript_operation_projections_after(
     ));
     items.extend(app.command_messages.iter().cloned().map(notice_projection));
     if let Some(projection) = &app.projection {
-        if has_event_items {
-            // 分页历史不一定包含投影中的失败步骤；仅去重当前事件窗口实际展示的错误。
-            let failures = app
-                .events
-                .iter()
-                .filter(|event| {
-                    event.task_id == projection.task_id
-                        && event.event_type == RuntimeEventType::LoopDecided
-                        && status_event_transcript_item(event).is_some()
-                })
-                .filter_map(event_summary)
-                .collect::<Vec<_>>();
-            items.extend(
-                risk_overlay_items(projection, &failures)
-                    .into_iter()
-                    .map(notice_projection),
-            );
-        } else {
+        // 主 transcript 只承载对话和执行过程；验证结论与残余风险由 /debug 面板统一展示。
+        if !has_event_items {
             items.extend(
                 projection_items(projection)
                     .into_iter()
                     .map(plain_projection),
             );
         }
-        if include_result_card && let Some(result_card) = result_card_projection(app) {
-            items.push(result_card);
-        }
     }
     items
-}
-
-fn result_card_projection(app: &TuiApp) -> Option<OperationProjection> {
-    let projection = app.projection.as_ref()?;
-    if !projection.status.is_terminal() {
-        return None;
-    }
-    let verification = app
-        .developer_projection
-        .as_ref()
-        .filter(|debug| {
-            debug
-                .task_id
-                .is_none_or(|task_id| Some(task_id) == projection.task_id)
-        })
-        .and_then(|debug| debug.verification.clone())
-        .or_else(|| latest_verification(&app.events, projection.task_id));
-    let independently_verified = verification.as_ref().is_some_and(is_independently_verified);
-    let state = if independently_verified {
-        "Verified"
-    } else if projection.status == TaskStatus::Partial
-        || verification
-            .as_ref()
-            .is_some_and(|record| record.result == VerificationResult::Partial)
-    {
-        "Partial"
-    } else {
-        // Completed / Failed / Blocked 都不再打 Result 卡；失败原因已在工具行或助手回复里。
-        return None;
-    };
-    let role = match state {
-        "Verified" => TranscriptRole::Success,
-        "Failed" => TranscriptRole::Error,
-        _ => TranscriptRole::Warning,
-    };
-    let mut detail_body = Vec::new();
-    let files_summary = if let Some(changes) = app.change_projection.summary() {
-        let stats = match (changes.added_lines, changes.removed_lines) {
-            (Some(added), Some(removed)) => format!(" (+{added} -{removed})"),
-            _ => String::new(),
-        };
-        detail_body.extend(
-            changes
-                .files
-                .iter()
-                .take(3)
-                .map(|change| format!("  {}", change.path)),
-        );
-        if changes.files.len() > 3 {
-            detail_body.push(format!("  … {} more files", changes.files.len() - 3));
-        }
-        format!("files changed: {}{stats}", changes.file_count)
-    } else {
-        "files changed: 0".to_owned()
-    };
-    let checks_summary = if let Some(record) = &verification {
-        let passed = record.checks.iter().filter(|check| check.passed).count();
-        detail_body.extend(
-            record
-                .residual_risks
-                .iter()
-                .take(3)
-                .map(|risk| format!("risk: {risk}")),
-        );
-        format!("checks: {passed}/{} passed", record.checks.len())
-    } else {
-        "checks: no independent verification record".to_owned()
-    };
-    let next_action = match state {
-        "Verified" => "next: review the verified diff or continue with a follow-up".to_owned(),
-        "Failed" => "next: inspect the failure, then use /retry [model]".to_owned(),
-        "Partial" => "next: resolve residual risks, then retry or verify again".to_owned(),
-        _ => "next: inspect the diff or use /retry [model] for an independent run".to_owned(),
-    };
-    let mut body = vec![format!("{files_summary} · {checks_summary}"), next_action];
-    if app.transcript.details_expanded {
-        body.splice(1..1, detail_body);
-    }
-    Some(notice_projection(TranscriptItem {
-        role,
-        title: format!("Result · {state}"),
-        body,
-    }))
-}
-
-fn latest_verification(
-    events: &[RuntimeEvent],
-    task_id: Option<TaskId>,
-) -> Option<VerificationRecord> {
-    events
-        .iter()
-        .rev()
-        .filter(|event| {
-            event.event_type == RuntimeEventType::VerificationCompleted
-                && task_id.is_none_or(|task_id| event.task_id == Some(task_id))
-        })
-        .find_map(|event| {
-            event
-                .payload
-                .get("record")
-                .cloned()
-                .or_else(|| Some(event.payload.clone()))
-                .and_then(|value| serde_json::from_value::<VerificationRecord>(value).ok())
-                .filter(|record| task_id.is_none_or(|task_id| record.task_id == task_id))
-        })
-}
-
-fn is_independently_verified(record: &VerificationRecord) -> bool {
-    record.result == VerificationResult::Pass
-        && matches!(
-            record.source,
-            VerificationSource::ExternalVerifier | VerificationSource::Mixed
-        )
-        && record.independence == VerificationIndependence::Independent
-        && !record.checks.is_empty()
-        && record.checks.iter().all(|check| check.passed)
-        && !record.evidence_refs.is_empty()
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -811,9 +666,43 @@ pub(crate) fn event_operation_entries(events: &[RuntimeEvent]) -> Vec<EventOpera
 struct HistoryProjectionCache {
     revision: u64,
     event_count: usize,
-    stream_turn: Option<TurnId>,
     anchors: HashSet<EventId>,
     entries: Vec<EventOperationEntry>,
+}
+
+impl HistoryProjectionCache {
+    fn advance(&mut self, event: &RuntimeEvent) -> bool {
+        // 只白名单放行纯观察事件，避免新增事件类型悄悄绕过语义重建。
+        if matches!(
+            event.event_type,
+            RuntimeEventType::TokenUsageRecorded
+                | RuntimeEventType::ContextBuilt
+                | RuntimeEventType::VerificationCompleted
+                | RuntimeEventType::EvaluationCompleted
+                | RuntimeEventType::PostTaskReviewed
+        ) {
+            let _timing = super::ui_timing::span("projection_unchanged");
+            return true;
+        }
+        if event.event_type != RuntimeEventType::ProviderStreamed || event.turn_id.is_none() {
+            return false;
+        }
+        let Some(record) = self.entries.last_mut().filter(|record| {
+            !record.stable
+                && record.task_id == event.task_id
+                && record.turn_id == event.turn_id
+                && record.projection.is_assistant_message()
+        }) else {
+            return false;
+        };
+        let _timing = super::ui_timing::span("projection_append");
+        if let Some(delta) = provider_stream_text_delta(event)
+            && let Some(body) = record.projection.item_mut().body.first_mut()
+        {
+            body.push_str(delta);
+        }
+        true
+    }
 }
 
 pub(crate) fn history_event_operations(app: &TuiApp) -> Vec<EventOperationEntry> {
@@ -825,6 +714,7 @@ pub(crate) fn history_event_operations(app: &TuiApp) -> Vec<EventOperationEntry>
     {
         return cache.entries.clone();
     }
+    let _rebuild_timing = super::ui_timing::span("projection_rebuild");
     let entries = event_operation_entries_with_boundary(
         &app.events,
         &app.transcript.history.committed_event_ids,
@@ -841,11 +731,6 @@ pub(crate) fn history_event_operations(app: &TuiApp) -> Vec<EventOperationEntry>
         *app.transcript.frame_operations.borrow_mut() = Some(HistoryProjectionCache {
             revision: app.transcript.revision,
             event_count: app.events.len(),
-            stream_turn: app
-                .events
-                .last()
-                .filter(|event| event.event_type == RuntimeEventType::ProviderStreamed)
-                .and_then(|event| event.turn_id),
             anchors: app.transcript.history.command_anchors.clone(),
             entries: entries.clone(),
         });
@@ -869,8 +754,7 @@ fn event_operation_entries_with_boundary(
     let mut subagent_updates = HashMap::new();
     let mut turns_with_user_steps = HashSet::<TurnId>::new();
     let mut covered_user_step_tools = HashSet::<OperationId>::new();
-    let mut provider_failures = HashMap::new();
-    let mut reported_failures = HashSet::new();
+    let mut terminal_notices = terminal::notices(&typed_events);
     for event in typed_events {
         if event.event_type.is_task_terminal() {
             for record in &mut items {
@@ -901,11 +785,7 @@ fn event_operation_entries_with_boundary(
                 }
             }
             RuntimeEventType::ProviderTransportFallback => {}
-            RuntimeEventType::ProviderFailed => {
-                if let Some(task_id) = event.task_id {
-                    provider_failures.insert(task_id, event);
-                }
-            }
+            RuntimeEventType::ProviderFailed => {}
             RuntimeEventType::TaskCreated => {
                 let is_new_turn = event
                     .turn_id
@@ -1167,33 +1047,15 @@ fn event_operation_entries_with_boundary(
                 );
             }
             _ => {
-                // 同一任务的执行错误已展示后，终态仅确认状态，不再输出重复系统卡。
-                if event.event_type == RuntimeEventType::TaskCompleted
-                    && event_task_status(event) == Some(TaskStatus::Failed)
-                    && event
-                        .task_id
-                        .is_some_and(|id| reported_failures.contains(&id))
+                let item = if event.task_id.is_some()
+                    && (event.event_type.is_task_terminal()
+                        || event.event_type == RuntimeEventType::LoopDecided)
                 {
-                    continue;
-                }
-                if let Some(mut item) = status_event_transcript_item(event) {
-                    if event.event_type == RuntimeEventType::LoopDecided {
-                        item.title = "Task failed".to_owned();
-                        item.role = TranscriptRole::Error;
-                        if let Some(task_id) = event.task_id {
-                            reported_failures.insert(task_id);
-                            if let Some(failure) = provider_failures.get(&task_id)
-                                && let Some(error) =
-                                    failure.payload.get("error").and_then(Value::as_str)
-                                && failure.turn_id == event.turn_id
-                                && failure_event_error(event)
-                                    .is_some_and(|detail| detail.contains(error))
-                            {
-                                item.body = vec![visible_failure_detail(error).to_owned()];
-                                item.body.extend(provider_failure_details(failure));
-                            }
-                        }
-                    }
+                    terminal_notices.remove(&event.id)
+                } else {
+                    status_event_transcript_item(event)
+                };
+                if let Some(item) = item {
                     items.push(EventOperationEntry::new(
                         event,
                         notice_projection(item),
@@ -2619,26 +2481,28 @@ pub(crate) fn status_event_transcript_item(event: &RuntimeEvent) -> Option<Trans
         return tool_event_transcript_item(event);
     }
     if event.event_type == RuntimeEventType::TaskCompleted
-        && event_task_status(event) == Some(TaskStatus::Completed)
+        && let Some(status) = event_task_status(event)
     {
-        return None;
+        return terminal::status_item(
+            status,
+            failure_event_error(event).unwrap_or("Task finished"),
+        );
     }
     let title = event_status_title(event.event_type)?;
     let summary = event_summary(event)?;
-    if event.event_type == RuntimeEventType::LoopDecided
-        && !summary.contains("failed")
-        && !summary.contains("error")
-    {
-        return None;
+    if event.event_type == RuntimeEventType::LoopDecided {
+        return terminal::loop_failed(event).then(|| TranscriptItem {
+            role: TranscriptRole::Error,
+            title: "Task failed".to_owned(),
+            body: vec![
+                visible_failure_detail(failure_event_error(event).unwrap_or(&summary)).to_owned(),
+            ],
+        });
     }
     Some(TranscriptItem {
         role: TranscriptRole::Status,
         title: title.to_owned(),
-        body: vec![if event.event_type == RuntimeEventType::LoopDecided {
-            visible_failure_detail(failure_event_error(event).unwrap_or(&summary)).to_owned()
-        } else {
-            summary
-        }],
+        body: vec![summary],
     })
 }
 
@@ -2878,53 +2742,7 @@ pub(crate) fn projection_items(projection: &UserProjection) -> Vec<TranscriptIte
             body: vec![final_message.to_owned()],
         });
     }
-    items.extend(projection_overlay_items(projection));
     items
-}
-
-pub(crate) fn projection_overlay_items(projection: &UserProjection) -> Vec<TranscriptItem> {
-    let failures = projection
-        .visible_steps
-        .iter()
-        .filter(|step| step.label == "LoopDecided" && significant_step(step))
-        .map(|step| step.summary.clone())
-        .collect::<Vec<_>>();
-    risk_overlay_items(projection, &failures)
-}
-
-fn risk_overlay_items(projection: &UserProjection, failures: &[String]) -> Vec<TranscriptItem> {
-    let mut items = Vec::new();
-    let risks = projection
-        .residual_risks
-        .iter()
-        .filter(|risk| {
-            let risk = execution_error_detail(risk);
-            let duplicate = failures
-                .iter()
-                .any(|failure| execution_error_detail(failure) == risk);
-            let derivative = risk == "verification evidence is insufficient"
-                && failures
-                    .iter()
-                    .any(|failure| failure.contains("provider call failed:"));
-            !duplicate && !derivative
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if !risks.is_empty() {
-        items.push(TranscriptItem {
-            role: TranscriptRole::Status,
-            title: "Residual risks".to_owned(),
-            body: risks,
-        });
-    }
-    items
-}
-
-fn execution_error_detail(mut text: &str) -> &str {
-    while let Some(detail) = text.strip_prefix("runtime task execution failed: ") {
-        text = detail;
-    }
-    text
 }
 
 // Failure summaries are intentionally compact. The error field keeps the
@@ -2991,12 +2809,20 @@ fn provider_failure_details(event: &RuntimeEvent) -> Vec<String> {
 
 pub(crate) fn significant_step(step: &VisibleStep) -> bool {
     matches!(step.label.as_str(), "ToolCompleted" | "CommandRejected")
-        || (step.label == "TaskCompleted" && step.status != "Completed")
+        || (step.label == "TaskCompleted"
+            && !matches!(step.status.as_str(), "Completed" | "Partial"))
         || (step.label == "LoopDecided"
-            && (step.summary.contains("failed") || step.summary.contains("error")))
+            && step.summary.starts_with("runtime task execution failed:"))
 }
 
 pub(crate) fn step_item(step: &VisibleStep) -> TranscriptItem {
+    if step.label == "TaskCompleted"
+        && let Ok(status) =
+            serde_json::from_value::<TaskStatus>(Value::String(step.status.to_ascii_lowercase()))
+        && let Some(item) = terminal::status_item(status, &step.summary)
+    {
+        return item;
+    }
     if step.label == "LoopDecided" && significant_step(step) {
         return TranscriptItem {
             role: TranscriptRole::Error,
@@ -3035,9 +2861,7 @@ pub(crate) fn readable_step_label(label: &str) -> String {
 mod tests {
     use chrono::Utc;
     use golutra_agent_core::{
-        EventId, EvidenceId, SessionId, TaskId, ToolCallId, UserStep, UserStepId, UserStepKind,
-        UserStepTool, VerificationCheck, VerificationCheckKind, VerificationId,
-        VerificationIndependence, VerificationSource,
+        EventId, SessionId, TaskId, ToolCallId, UserStep, UserStepId, UserStepKind, UserStepTool,
     };
     use golutra_agent_protocol::RuntimeEventSource;
     use serde_json::json;
@@ -3082,6 +2906,46 @@ mod tests {
     }
 
     #[test]
+    fn tool_projection_keeps_full_details_out_of_the_default_summary() {
+        let projection = OperationProjection::ToolActivity {
+            id: OperationId("tool-1".to_owned()),
+            item: TranscriptItem {
+                role: TranscriptRole::Success,
+                title: "ran".to_owned(),
+                body: Vec::new(),
+            },
+            details: vec![
+                "python3 - <<'PY'".to_owned(),
+                "Arguments".to_owned(),
+                "{\"secret\":\"never-in-summary\"}".to_owned(),
+                "Output".to_owned(),
+                "hello".to_owned(),
+                "second line".to_owned(),
+            ],
+        };
+
+        let summary = projection.item(false);
+        assert!(summary.body.iter().any(|line| line.contains("python3")));
+        assert!(summary.body.iter().any(|line| line.contains("hello")));
+        assert!(!summary.body.iter().any(|line| line == "Arguments"));
+        assert!(
+            !summary
+                .body
+                .iter()
+                .any(|line| line.contains("never-in-summary"))
+        );
+
+        let details = projection.item(true);
+        assert!(details.body.iter().any(|line| line == "Arguments"));
+        assert!(
+            details
+                .body
+                .iter()
+                .any(|line| line.contains("never-in-summary"))
+        );
+    }
+
+    #[test]
     fn provider_recovery_events_have_distinct_user_facing_labels() {
         assert_eq!(
             event_status_title(RuntimeEventType::ProviderFallback),
@@ -3098,98 +2962,6 @@ mod tests {
         assert_eq!(
             event_status_title(RuntimeEventType::TaskUncertain),
             Some("Task Uncertain / reconciliation required")
-        );
-    }
-
-    fn verification_for(task_id: TaskId) -> VerificationRecord {
-        VerificationRecord {
-            verification_id: VerificationId::new(),
-            task_id,
-            objective: "verify the change".to_owned(),
-            completion_criteria: vec!["the check passes".to_owned()],
-            checks: vec![VerificationCheck {
-                kind: VerificationCheckKind::ObjectiveValidation,
-                name: "objective:check".to_owned(),
-                command: Some("cargo test".to_owned()),
-                passed: true,
-                evidence_refs: vec![EvidenceId::new()],
-                message: "passed".to_owned(),
-            }],
-            evidence_refs: vec![EvidenceId::new()],
-            result: VerificationResult::Pass,
-            policy_status: "allowed".to_owned(),
-            residual_risks: Vec::new(),
-            plan_id: None,
-            assertions: Vec::new(),
-            source: VerificationSource::ExternalVerifier,
-            independence: VerificationIndependence::Independent,
-            environment_digest: None,
-        }
-    }
-
-    #[test]
-    fn result_card_requires_verification_for_the_current_task() {
-        let current_task = TaskId::new();
-        let old_task = TaskId::new();
-        let mut app = TuiApp::new(
-            golutra_agent_core::ThreadId::new(),
-            SessionId::new(),
-            Some(current_task),
-            false,
-            "ready (mock)".to_owned(),
-            None,
-        );
-        app.projection = Some(UserProjection {
-            session_id: app.session_id,
-            task_id: Some(current_task),
-            status: TaskStatus::Completed,
-            visible_steps: Vec::new(),
-            pending_approval: None,
-            final_message: Some("done".to_owned()),
-            residual_risks: Vec::new(),
-        });
-        let mut event = RuntimeEvent {
-            schema_version: golutra_agent_core::RUNTIME_EVENT_SCHEMA_VERSION,
-            causal_context: Default::default(),
-            causal_links: Vec::new(),
-            id: EventId::new(),
-            sequence_no: 1,
-            session_id: app.session_id,
-            turn_id: None,
-            task_id: Some(old_task),
-            parent_event_id: None,
-            event_type: RuntimeEventType::VerificationCompleted,
-            timestamp: Utc::now(),
-            source: RuntimeEventSource::Verifier,
-            payload: json!({"record": verification_for(old_task)}),
-            payload_ref: None,
-            durable: true,
-        };
-        app.events.push(event.clone());
-        assert!(
-            result_card_projection(&app).is_none(),
-            "successful unverified tasks should not show a result card"
-        );
-
-        event.task_id = Some(current_task);
-        event.payload = json!({"record": verification_for(current_task)});
-        app.events = vec![event];
-        let OperationProjection::Notice { item } =
-            result_card_projection(&app).expect("verified result card")
-        else {
-            panic!("result card must be a notice");
-        };
-        assert_eq!(item.title, "Result · Verified");
-        assert!(
-            !item.title.contains("Unverified"),
-            "unverified wording must not appear on the verified card"
-        );
-
-        app.events.clear();
-        app.projection.as_mut().expect("projection").status = TaskStatus::Failed;
-        assert!(
-            result_card_projection(&app).is_none(),
-            "failed tasks should not show a result card in the user transcript"
         );
     }
 
@@ -3268,6 +3040,79 @@ mod tests {
         assert_eq!(
             history_event_operations(&app),
             event_operation_entries(&app.events)
+        );
+    }
+
+    #[test]
+    fn long_stream_reuses_projection_between_observation_events_and_matches_replay() {
+        let turn = TurnId::new();
+        let mut app = fullscreen_app();
+        app.transcript.frame_cache_enabled = true;
+        for sequence in 1..=200 {
+            let mut event = tool_event_on_turn(
+                sequence,
+                Some(TurnId::new()),
+                RuntimeEventType::AssistantMessage,
+                json!({"content": format!("历史段落 {sequence}。\n\n```rust\nlet n = {sequence};\n```\n")}),
+            );
+            event.session_id = app.session_id;
+            event.task_id = None;
+            app.apply_runtime_event(event);
+        }
+        let mut expected = String::new();
+        for index in 0..1200 {
+            let (kind, payload) = if index % 3 == 1 {
+                (
+                    RuntimeEventType::TokenUsageRecorded,
+                    json!({"input_tokens": index}),
+                )
+            } else if index % 3 == 2 {
+                (
+                    RuntimeEventType::VerificationCompleted,
+                    json!({"summary":"internal checks"}),
+                )
+            } else {
+                let delta = "流式中文 👩‍💻 é\n";
+                expected.push_str(delta);
+                (
+                    RuntimeEventType::ProviderStreamed,
+                    json!({"delta":{"kind":"text_delta","text":delta}}),
+                )
+            };
+            let mut event = tool_event_on_turn(index + 201, Some(turn), kind, payload);
+            event.session_id = app.session_id;
+            event.task_id = None;
+            app.apply_runtime_event(event);
+            if index > 0 {
+                assert!(
+                    app.transcript.frame_operations.borrow().is_some(),
+                    "cache invalidated at {index}"
+                );
+            }
+            if index == 0 || index % 100 == 0 || index == 1199 {
+                assert_eq!(
+                    history_event_operations(&app),
+                    event_operation_entries(&app.events)
+                );
+            }
+        }
+        let entries = history_event_operations(&app);
+        assert_eq!(entries.len(), 201);
+        assert_eq!(
+            entries.last().unwrap().projection.item(false).body,
+            vec![expected]
+        );
+        let mut foreign = tool_event_on_turn(
+            1401,
+            Some(turn),
+            RuntimeEventType::ProviderStreamed,
+            json!({"delta":{"kind":"text_delta","text":"different task"}}),
+        );
+        foreign.session_id = app.session_id;
+        app.apply_runtime_event(foreign);
+        assert!(
+            app.transcript.frame_operations.borrow().is_none(),
+            "task boundary must rebuild"
         );
     }
 
@@ -3824,7 +3669,7 @@ mod tests {
     }
 
     #[test]
-    fn file_tool_events_have_a_compact_codex_style_change_summary() {
+    fn file_tool_events_have_a_compact_change_summary() {
         let event = RuntimeEvent {
             schema_version: golutra_agent_core::RUNTIME_EVENT_SCHEMA_VERSION,
             causal_context: Default::default(),
@@ -4785,7 +4630,7 @@ mod tests {
     }
 
     #[test]
-    fn background_session_and_subagent_follow_codex_titles() {
+    fn background_session_and_subagent_follow_stable_titles() {
         let waited = event_operation_projections(&[tool_event(
             1,
             RuntimeEventType::ToolCompleted,

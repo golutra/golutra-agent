@@ -181,7 +181,7 @@ fn yolo_parses_for_embedded_daemon_connect_and_resume_exec() {
 }
 
 #[test]
-fn approval_mode_accepts_codex_style_aliases() {
+fn approval_mode_accepts_compatibility_aliases() {
     for (value, expected) in [
         ("on-request", ExecApprovalModeArg::Prompt),
         ("granular", ExecApprovalModeArg::Prompt),

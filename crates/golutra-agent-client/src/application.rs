@@ -314,6 +314,14 @@ impl RuntimeSessionService {
         self.host.fork_thread(thread_id, from_turn_id).await
     }
 
+    pub async fn handoff_thread(
+        &self,
+        thread_id: ThreadId,
+        request: crate::HandoffRequest,
+    ) -> Result<crate::HandoffResult, ClientError> {
+        self.host.handoff_thread(thread_id, request).await
+    }
+
     pub async fn export_thread_rollout(
         &self,
         thread_id: ThreadId,

@@ -2,6 +2,66 @@
 use super::*;
 use crate::correction_feedback::model_instruction;
 
+#[test]
+fn correction_actions_follow_failure_types_and_latest_results() {
+    let (mut record, _) = fixture(1);
+    record.assertions.clear();
+    record.residual_risks.clear();
+    record.checks[0].kind = VerificationCheckKind::Schema;
+    let action = correction_envelope(&record, 1, None).requested_action;
+    assert!(action.contains("Correct the final response"));
+    assert!(!action.contains("rerun"));
+
+    let mut validation = record.checks[0].clone();
+    validation.kind = VerificationCheckKind::ObjectiveValidation;
+    record.checks.push(validation.clone());
+    let action = correction_envelope(&record, 1, None).requested_action;
+    assert!(action.contains("Correct the final response"));
+    assert!(action.contains("rerun only the affected checks"));
+
+    validation.passed = true;
+    record.checks.push(validation);
+    assert!(
+        !correction_envelope(&record, 1, None)
+            .requested_action
+            .contains("rerun")
+    );
+
+    record.checks[0].kind = VerificationCheckKind::Policy;
+    let action = correction_envelope(&record, 1, None).requested_action;
+    assert!(action.contains("permission boundary"));
+    assert!(!action.contains("rerun"));
+}
+
+#[test]
+fn missing_evidence_requests_validation_without_claiming_tests_failed() {
+    let (mut record, _) = fixture(0);
+    record.assertions.clear();
+    record.residual_risks = vec!["behavioral changes were not objectively validated".into()];
+    let action = correction_envelope(&record, 1, None).requested_action;
+    assert!(action.contains("missing relevant validation evidence"));
+    assert!(!action.contains("tests failed"));
+    assert!(!action.contains("rerun"));
+}
+
+#[test]
+fn unknown_validation_is_evidence_gap_not_a_failed_test() {
+    let (mut record, _) = fixture(0);
+    record.assertions.clear();
+    record.residual_risks.clear();
+    record.checks = vec![VerificationCheck {
+        kind: VerificationCheckKind::ObjectiveValidation,
+        name: "objective:unknown:test:shell:identity:x".into(),
+        command: Some("custom-test-runner".into()),
+        passed: false,
+        evidence_refs: Vec::new(),
+        message: "test command exited successfully but no executed test was observed".into(),
+    }];
+    let action = correction_envelope(&record, 1, None).requested_action;
+    assert!(action.contains("missing relevant validation evidence"));
+    assert!(!action.contains("reported delivery or validation issue"));
+}
+
 fn fixture(count: usize) -> (VerificationRecord, Vec<ToolExecutionReport>) {
     let reports = (0..count)
         .map(|index| {
@@ -114,4 +174,32 @@ fn correction_feedback_keeps_failure_at_end_of_a_long_verifier_log() {
     assert!(content.contains("actual=17 expected=23"), "{content}");
     assert!(content.contains("Build started"));
     assert!(content.contains("omitted"));
+}
+
+#[test]
+fn missing_validation_feedback_does_not_recycle_historical_tool_errors() {
+    let (mut record, reports) = fixture(1);
+    record.checks[0].kind = VerificationCheckKind::ToolExecution;
+    record.residual_risks = vec!["task contract requires objective validation".into()];
+    let content = model_instruction(&correction_envelope(&record, 1, None), &record, &reports);
+    assert!(content.contains("No objective validation result was recognized"));
+    assert!(content.contains("without piping"));
+    assert!(!content.contains("case_0"));
+    assert!(!content.contains("tool_call_id"));
+}
+
+#[test]
+fn feedback_keeps_distinct_delivery_paths_and_omits_superseded_checks() {
+    let (mut record, reports) = fixture(3);
+    for (index, check) in record.checks.iter_mut().enumerate() {
+        check.name = "objective:content:write_file".into();
+        check.command = Some(format!("file-{index}.txt"));
+    }
+    let mut recovered = record.checks[0].clone();
+    recovered.passed = true;
+    record.checks.push(recovered);
+    let content = model_instruction(&correction_envelope(&record, 1, None), &record, &reports);
+    assert!(!content.contains("case_0"));
+    assert!(content.contains("case_1"));
+    assert!(content.contains("case_2"));
 }

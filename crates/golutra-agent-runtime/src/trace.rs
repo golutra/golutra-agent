@@ -33,11 +33,13 @@ pub enum AgentLoopTraceEvent {
         trimmed_contributors: Vec<String>,
     },
     ContextCompactionStarted {
+        compaction_id: String,
         original_input_tokens: u64,
         budget_limit: u64,
     },
     ContextAutoCompacted(ContextCompactionRecord),
     ContextCompactionFailed {
+        compaction_id: String,
         planned_input_tokens: u64,
         budget_limit: u64,
         reason: String,
@@ -103,6 +105,8 @@ pub enum AgentLoopTraceEvent {
     UserQuestionResolved(UserQuestionResolution),
     RetryScheduled {
         attempt: u32,
+        /// 空响应续写所依附的上一条完整 provider 请求；普通内部重试没有此字段。
+        after_request_id: Option<ProviderRequestId>,
         reason: String,
     },
     ProviderRecovery {

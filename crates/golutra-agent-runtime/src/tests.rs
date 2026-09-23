@@ -21,6 +21,10 @@ mod long_task_recovery_tests;
 #[path = "response_control_tests.rs"]
 mod response_control_tests;
 
+#[path = "compaction_summary_tests.rs"]
+mod compaction_summary_tests;
+#[path = "completion_boundary_tests.rs"]
+mod completion_boundary_tests;
 #[path = "correction_feedback_tests.rs"]
 mod correction_feedback_tests;
 #[path = "long_task_compaction_tests.rs"]
@@ -34,12 +38,12 @@ mod validation_shell_tests;
 
 use golutra_agent_context::{
     ContextBudgetPolicy, ContextBuilder, ContextContributor, ContextMessageSource,
-    ContextWindowManager, estimate_message_tokens, estimate_tokens,
+    ContextWindowManager, context_snapshot_from_request, estimate_message_tokens, estimate_tokens,
     parse_compaction_summary_envelope,
 };
 use golutra_agent_core::{
-    Actor, ActorKind, BudgetOverflowAction, BusyPolicy, PolicyBlockDisposition, TaskStatus,
-    ToolCallId, WorkspaceId,
+    Actor, ActorKind, BudgetOverflowAction, BusyPolicy, PolicyBlockDisposition, PromptCachePolicy,
+    TaskStatus, ToolCallId, WorkspaceId,
 };
 use golutra_agent_governor::GovernorLimits;
 use golutra_agent_llm::{
@@ -1195,7 +1199,9 @@ impl LlmProvider for ActiveWorkingSetProvider {
     async fn complete(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
         let is_summary = request.messages.first().is_some_and(|message| {
             message.role == ProviderRole::System
-                && message.content == COMPACTION_SUMMARY_SYSTEM_PROMPT
+                && message
+                    .content
+                    .starts_with("You are a context summarization assistant")
         });
         let content = if is_summary {
             self.summary_calls.fetch_add(1, Ordering::SeqCst);
@@ -3919,7 +3925,7 @@ async fn semantic_compaction_records_usage_without_exposing_summary_stream() {
             &task,
             &cache_scope,
             task.turn_id,
-            &record,
+            &mut record,
             None,
             &mut control,
             &mut |event| trace.push(event),
@@ -3982,7 +3988,7 @@ fn compaction_summary_request_is_structured_tool_free_and_output_bounded() {
 
     let session_id = SessionId::new();
     let contract = MockProvider::text_response("unused").contract();
-    let request = compaction_summary_request(
+    let mut request = compaction_summary_request(
         TaskId::new(),
         TurnId::new(),
         &contract,
@@ -3995,7 +4001,7 @@ fn compaction_summary_request_is_structured_tool_free_and_output_bounded() {
     let source: serde_json::Value =
         serde_json::from_str(&request.messages[1].content).expect("summary source JSON");
     let snapshot =
-        compaction_summary_context_snapshot(&ContextBuilder::default(), session_id, &request)
+        compaction_summary_context_snapshot(&ContextBuilder::default(), session_id, &mut request)
             .expect("summary context snapshot");
 
     assert!(request.tools.is_empty());
@@ -4004,7 +4010,7 @@ fn compaction_summary_request_is_structured_tool_free_and_output_bounded() {
         request.cache_scope.as_ref().expect("cache scope").key(),
         format!("{session_id}:compaction")
     );
-    assert_eq!(request.max_output_tokens, Some(512));
+    assert_eq!(request.max_output_tokens, Some(1_024));
     assert_eq!(source["previous_summary"], "existing checkpoint");
     assert_eq!(source["history"][0]["role"], "user");
     assert_eq!(source["history"][1]["role"], "assistant");
@@ -4015,7 +4021,7 @@ fn compaction_summary_request_is_structured_tool_free_and_output_bounded() {
     assert!(request.messages[0].content.contains("## Remaining Work"));
     assert_eq!(snapshot.session_id, session_id);
     assert_eq!(snapshot.provider_request_id, request.request_id);
-    assert_eq!(snapshot.budget_snapshot.max_output, 512);
+    assert_eq!(snapshot.budget_snapshot.max_output, 1_024);
     assert_eq!(
         snapshot.budget_snapshot.budget_policy,
         "auxiliary_compaction_summary"
@@ -4028,7 +4034,7 @@ fn compaction_summary_request_is_structured_tool_free_and_output_bounded() {
         action_if_exceeded: BudgetOverflowAction::Compact,
     });
     assert!(
-        compaction_summary_context_snapshot(&tiny_context, session_id, &request).is_none(),
+        compaction_summary_context_snapshot(&tiny_context, session_id, &mut request).is_none(),
         "an oversized summary request must use the local fallback"
     );
 }
@@ -5661,7 +5667,7 @@ async fn correction_without_material_progress_is_advised_checkpointed_and_stoppe
 }
 
 #[tokio::test]
-async fn assistant_only_corrections_do_not_reset_the_material_progress_budget() {
+async fn assistant_only_corrections_stop_before_repeating_identical_verification() {
     let workspace = tempdir().expect("workspace");
     let calls = Arc::new(AtomicUsize::new(0));
     let provider = AssistantOnlyCorrectionProvider {
@@ -5706,23 +5712,22 @@ async fn assistant_only_corrections_do_not_reset_the_material_progress_budget() 
         .await
         .expect("bounded correction outcome");
 
-    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
     assert_ne!(outcome.loop_decision.action, LoopAction::StopSuccess);
     assert!(trace.iter().any(|event| matches!(
         event,
         AgentLoopTraceEvent::LoopGuardTriggered {
             trigger: golutra_agent_core::LoopGuardTrigger::NoProgress,
             reason,
-        } if reason.contains("verification correction")
+        } if reason.contains("automatic correction stopped")
     )));
-    assert!(trace.iter().any(|event| matches!(
-        event,
-        AgentLoopTraceEvent::StepCompleted(completion)
-            if completion.should_stop
-                && completion.made_progress
-                && !completion.made_material_progress
-                && completion.correction_no_progress_steps == 2
-    )));
+    assert_eq!(
+        trace
+            .iter()
+            .filter(|event| matches!(event, AgentLoopTraceEvent::CorrectionIssued(_)))
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -6959,7 +6964,7 @@ fn coding_profile_keeps_builtin_coding_capabilities_and_hides_undeclared_extensi
             AgentToolProfile::Full,
             executor.registry(),
         ),
-        Some("tool is not part of the active Pi-plus provider surface")
+        Some("tool is not part of the active provider surface")
     );
     assert_eq!(
         tool_profile_rejection_reason(

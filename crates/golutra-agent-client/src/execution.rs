@@ -1,7 +1,7 @@
 //! Context construction, task supervision, AgentLoop, and provider auth lifecycles.
 
 use super::*;
-use golutra_agent_context::{estimate_tokens, fit_compaction_context_content};
+use golutra_agent_context::{compaction_context_content, estimate_tokens};
 use golutra_agent_llm::{
     LlmProvider, PromptCacheScope, ProviderMessage, ProviderRequest, ProviderRole,
 };
@@ -16,10 +16,8 @@ const MEMORY_CANDIDATE_MAX: usize = 64;
 // 上限不是预留配额，未命中或未用完的 token 会全部回流给活动历史。
 const MAX_MEMORY_CONTEXT_TOKENS: u64 = 1_024;
 const MAX_SKILL_CONTEXT_TOKENS: u64 = 1_024;
-// compaction 保存旧事实，最近尾部保存当前工作状态；绝对边界避免随大窗口膨胀，
-// 同时让 summary 未用额度继续留给最近历史。
+// 最近尾部保存当前工作状态；完整摘要的保存上限由共用压缩策略负责。
 const MIN_RECENT_HISTORY_TOKENS: u64 = 1_024;
-const MAX_WORKING_SUMMARY_TOKENS: u64 = 2_048;
 const ACTIVE_PATH_COMPACTION_MAX_DEPTH: u32 = 65_536;
 const MAX_RESUME_PROVIDER_REQUEST_BYTES: u64 = 16 * 1024 * 1024;
 pub(super) const MAX_RESUME_PROVIDER_MESSAGES: usize = 16_384;
@@ -541,10 +539,7 @@ impl RuntimeHost {
             source_refs: vec![format!("workspace:{}", workspace_root.display())],
         });
         let project_instructions = self.cached_project_instruction_bundle(&workspace_root);
-        let skill_context =
-            self.active_skill_context_with_budget(&objective, MAX_SKILL_CONTEXT_TOKENS);
-
-        // 四路来源互不依赖且只读取已有状态，并行加载可把首次 provider 请求
+        // 三路来源互不依赖且只读取已有状态，并行加载可把首次 provider 请求
         // 的准备时间收敛到最慢一路；MemoryRetrieved 仍在选择完成后有序落库。
         let memory_store = self.storage.memory_store.clone();
         let memory_query = objective.clone();
@@ -557,8 +552,8 @@ impl RuntimeHost {
             .map_err(ClientError::from)
         };
         let history = self.cached_history_events(session_id);
-        let (project_instructions, skill_context, memories, history) =
-            tokio::join!(project_instructions, skill_context, memories, history);
+        let (project_instructions, memories, history) =
+            tokio::join!(project_instructions, memories, history);
         let history = history?;
         if let Some(project_instructions) = project_instructions? {
             contributors.push(ContextContributor {
@@ -632,11 +627,13 @@ impl RuntimeHost {
             remaining_budget = remaining_budget.saturating_sub(memory_tokens);
         }
 
-        let skill_context = skill_context?
-            .map(|content| {
-                truncate_to_token_budget(&content, optional_budget.min(MAX_SKILL_CONTEXT_TOKENS))
-            })
-            .filter(|content| !content.is_empty());
+        // 实际剩余额度决定整份技能选择；先按最大额度渲染再截取会丢失末尾限制。
+        let skill_context = self
+            .active_skill_context_with_budget(
+                &objective_contributor.content,
+                optional_budget.min(MAX_SKILL_CONTEXT_TOKENS),
+            )
+            .await?;
         if let Some(skill_context) = skill_context.as_ref() {
             let skill_tokens = estimate_tokens(skill_context);
             remaining_budget = remaining_budget.saturating_sub(skill_tokens);
@@ -691,7 +688,7 @@ impl RuntimeHost {
                 name: "project_skills".to_owned(),
                 role: ProviderRole::User,
                 content: skill_context,
-                token_budget_hint: 1_024,
+                token_budget_hint: 0,
                 source_refs: vec!["runtime:active_skills".to_owned()],
             });
         }
@@ -860,14 +857,10 @@ impl RuntimeHost {
                 })
                 .collect::<Vec<_>>()
         });
-        let recent_reserve = recent_history_reserve.min(token_budget);
-        let summary_budget = token_budget
-            .saturating_sub(recent_reserve)
-            .min(MAX_WORKING_SUMMARY_TOKENS);
         let mut contributors = Vec::new();
         let mut summary_tokens = 0;
         if let Some((sequence_no, summary)) = compaction
-            && let Some(content) = fit_compaction_context_content(&summary, summary_budget)
+            && let Some(content) = compaction_context_content(&summary)
         {
             summary_tokens = estimate_tokens(&content);
             contributors.push(ContextContributor {
@@ -878,7 +871,11 @@ impl RuntimeHost {
                 source_refs: vec![format!("event-sequence:{sequence_no}")],
             });
         }
-        let history_budget = token_budget.saturating_sub(summary_tokens);
+        // 保存后的交接摘要不能在跨回合加载时再次截断。窗口变小时保留完整摘要
+        // 和最近保留额，让 runtime 对完整输入执行同一套压缩/失败策略。
+        let history_budget = token_budget
+            .saturating_sub(summary_tokens)
+            .max(recent_history_reserve.min(token_budget));
         let history = if let Some(facts) = history_facts {
             history_contributors_from_cached_facts(facts, history_budget)
         } else {

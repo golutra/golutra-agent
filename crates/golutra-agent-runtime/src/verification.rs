@@ -35,17 +35,25 @@ impl RuntimeVerificationService {
         contract: &TaskContract,
     ) -> VerificationPlan {
         let mut plan = self.runner.plan(input);
-        let objective_validation_observed = input
-            .command_checks
-            .iter()
-            .any(|check| check.kind == VerificationCheckKind::ObjectiveValidation);
-        if !contract.require_objective_validation && !objective_validation_observed {
-            plan.assertions.retain(|assertion| {
-                !matches!(
-                    assertion.criterion_id.as_str(),
-                    "workspace_validation" | "tests_or_diagnostics" | "effect_validation"
-                )
-            });
+        let tests_or_diagnostics_observed = input.command_checks.iter().any(|check| {
+            check.kind == VerificationCheckKind::ObjectiveValidation
+                && (check.name.starts_with("objective:test:")
+                    || check.name.starts_with("objective:diagnostic:"))
+        });
+        let content_validation_observed = input.command_checks.iter().any(|check| {
+            check.kind == VerificationCheckKind::ObjectiveValidation
+                && check.name.starts_with("objective:content:")
+        });
+        if !contract.require_objective_validation {
+            // 路径或文件内容验收不隐含“再补一套测试”；仅保留实际观察到的对应验收义务。
+            plan.assertions
+                .retain(|assertion| match assertion.criterion_id.as_str() {
+                    "workspace_validation" => {
+                        tests_or_diagnostics_observed || content_validation_observed
+                    }
+                    "tests_or_diagnostics" | "effect_validation" => tests_or_diagnostics_observed,
+                    _ => true,
+                });
         }
         plan
     }

@@ -358,6 +358,7 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/{session_id}/thread", get(thread_for_session))
         .route("/threads/{thread_id}/resume", post(resume_thread))
         .route("/threads/{thread_id}/fork", post(fork_thread))
+        .route("/threads/{thread_id}/handoff", post(handoff_thread))
         .route(
             "/threads/{thread_id}/rollout/export",
             post(export_thread_rollout),
@@ -1045,6 +1046,20 @@ async fn fork_thread(
 #[derive(Debug, Deserialize)]
 struct ForkThreadRequest {
     from_turn_id: Option<golutra_agent_core::TurnId>,
+}
+
+async fn handoff_thread(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(thread_id): AxumPath<String>,
+    Json(request): Json<golutra_agent_client::HandoffRequest>,
+) -> Result<Json<golutra_agent_client::HandoffResult>, AppError> {
+    let transport = state.attached_transport(&headers).await?;
+    Ok(Json(
+        transport
+            .handoff_thread(parse_thread_id(&thread_id)?, request)
+            .await?,
+    ))
 }
 
 async fn export_thread_rollout(
@@ -2161,6 +2176,115 @@ mod tests {
         )
         .expect("trace page");
         assert_eq!(http_trace, embedded_trace);
+    }
+
+    #[tokio::test]
+    async fn handoff_http_creation_is_authenticated_idempotent_and_does_not_start_a_turn() {
+        use golutra_agent_client::{HandoffRequest, HandoffResult, RuntimeClient};
+        let (state, attachment_id, session_id, transport) =
+            state_with_attachment_and_transport().await;
+        let source = transport.default_thread_id();
+        transport
+            .send_command(SessionCommand {
+                command_id: CommandId::new(),
+                session_id: Some(session_id),
+                kind: SessionCommandKind::Create,
+                idempotency_key: Uuid::now_v7().to_string(),
+                actor: Actor {
+                    kind: ActorKind::Api,
+                    id: "handoff-test".into(),
+                },
+                payload: json!({"_thread_id": source}),
+                timestamp: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let app = router(state);
+        let path = format!("/threads/{source}/handoff");
+        let request = HandoffRequest::Create {
+            thread_id: ThreadId::new(),
+            session_id: SessionId::new(),
+            draft: "Goal: finish tests\nValidation: pending".into(),
+        };
+        let body = serde_json::to_vec(&request).unwrap();
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(&path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    authorized_request(
+                        Request::builder()
+                            .method("POST")
+                            .uri(&path)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .header(APP_SERVER_ATTACHMENT_HEADER, &attachment_id),
+                    )
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let result: HandoffResult =
+                serde_json::from_slice(&to_bytes(response.into_body(), 256 * 1024).await.unwrap())
+                    .unwrap();
+            let HandoffResult::Created { thread } = result else {
+                panic!("created");
+            };
+            assert_eq!(thread.parent_thread_id, Some(source));
+            let events = transport
+                .replay_events(EventFilter {
+                    session_id: thread.session_id,
+                    task_id: None,
+                    after_sequence_no: None,
+                })
+                .await
+                .unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["event_type"], "session_created");
+        }
+        let operation_id = Uuid::now_v7();
+        for request in [
+            HandoffRequest::Cancel { operation_id },
+            HandoffRequest::Prepare {
+                operation_id,
+                goal: None,
+                provider: Value::Null,
+            },
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    authorized_request(
+                        Request::builder()
+                            .method("POST")
+                            .uri(&path)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .header(APP_SERVER_ATTACHMENT_HEADER, &attachment_id),
+                    )
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let result: HandoffResult =
+                serde_json::from_slice(&to_bytes(response.into_body(), 256 * 1024).await.unwrap())
+                    .unwrap();
+            assert!(matches!(result, HandoffResult::Cancelled));
+        }
     }
 
     #[tokio::test]

@@ -110,7 +110,7 @@ Use `isolation: "worktree"` on spawn for a separate Git checkout of the parent's
 
 Worktrees are retained under the runtime workspace state directory for review and same-child resume. Results expose `child_workspace_path` and `child_isolation`. No changes are automatically merged, discarded or committed. Resume keeps the original checkout; a missing or replaced checkout fails explicitly instead of silently switching back to the parent directory. Review and integrate changes explicitly, then remove the known checkout with Git when it is no longer needed.
 
-## Batch findings and comparison
+## Batch findings
 
 Batch waits preserve the terminal execution they actually observed, even if a
 concurrent caller resumes that child before the remaining children finish.
@@ -120,19 +120,11 @@ accounting metadata stays in durable envelopes rather than occupying each child'
 answer budget. Large findings still require explicit pagination; necessary status
 queries, reads and verification remain available.
 
-The [2026-09-16 comparison](benchmarks/subagents-20260916.md) records matched
-Golutra/Codex lifecycle, long-fork, cancellation, coding and ten-child tests,
-including failures and evaluator corrections. The reusable harness is
-`scripts/compare_subagents.py`; run performance samples sequentially, with a new
-private output directory, to avoid mixing resource contention into latency.
+## Validation
 
-## Validation (2026-09-15)
+An opt-in real-provider functional check uses isolated credentials/workspace: two background children, one explicit fork, bounded waits and a same-child resume. It verifies durable child execution records and returned sentinel facts, reports parent and whole-task usage separately, and retains owner-only evidence.
 
-The local reference review used Codex's shared agent control and multi-agent handlers, plus `claude-code-main`'s AgentTool/LocalAgentTask implementation. The latter is an unofficial source snapshot, not a guarantee about the current proprietary Claude Code release. Golutra keeps one lifecycle tool, durable events and strict execution outcomes; it does not copy synthetic tool-result placeholders or silently fall back from a missing worktree.
-
-`scripts/smoke_subagents.py --output /tmp/golutra-agent-subagents.json` runs an opt-in real-provider functional check with isolated credentials/workspace: two background children, one explicit fork, bounded waits and a same-child resume. It verifies durable child execution records and returned sentinel facts, reports parent and whole-task usage separately, and retains owner-only CLI evidence beside the report. A single smoke does not establish performance superiority over Codex or Claude Code.
-
-The real-provider acceptance passed two overlapping background children, explicit fork findings, same-child resume and three unique execution-bound completion notices. The final run took 30.02 seconds, with 7 tools and 34,349 provider tokens across parent and children. The [acceptance report](benchmarks/subagents-20260915.md) retains all five attempts, including the preceding failures and the fixes they motivated. These are functional smoke measurements, not a statistical performance comparison.
+The real-provider acceptance passed two overlapping background children, explicit fork findings, same-child resume and three unique execution-bound completion notices. The final run took 30.02 seconds, with 7 tools and 34,349 provider tokens across parent and children. The acceptance log retains all attempts, including preceding failures and the fixes they motivated. These are functional smoke measurements, not a statistical performance claim.
 
 Deterministic coverage includes configurable default-ten admission and slot reuse, cross-turn limits, fork ownership/checksum/current child tool contracts, current execution result attribution, notification recovery/deduplication, failed-request usage remaining unknown, worktree retention and missing/replaced checkout errors. It also retains English/Chinese contract tests, strict validation, unverified findings, read-only admission, bounded non-destructive waits, Unicode pagination, cancellation and cross-parent rejection. The final checkpoint subset passed 20 tests, the client suite passed 412, and the scripts passed 90 (including 6 acceptance-evaluator regressions). TypeScript/Python SDK checks and real local PTY tests are part of the regression gates; Windows was not exercised on this host.
 

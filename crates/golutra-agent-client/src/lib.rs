@@ -16,8 +16,8 @@ pub(crate) use golutra_agent_context::estimate_message_tokens;
 #[cfg(test)]
 pub(crate) use golutra_agent_context::estimate_tokens;
 use golutra_agent_context::{
-    CompactionSourceRange, ContextContributor, compaction_source_checksum,
-    compaction_summary_envelope, deterministic_compaction_fallback,
+    CompactionSourceRange, ContextContributor, DEFAULT_COMPACTION_SUMMARY_TOKENS,
+    compaction_source_checksum, compaction_summary_envelope, deterministic_compaction_fallback,
     parse_compaction_summary_envelope,
 };
 use golutra_agent_core::{
@@ -53,11 +53,11 @@ use golutra_agent_protocol::{
 use golutra_agent_runtime::{
     AgentExecutionControl, AgentExecutionHandle, AgentGovernorUsage, AgentHarness, AgentLoopError,
     AgentLoopTraceEvent, AgentReplayContext, AgentTaskRequest, BeforeSideEffectRecorder,
-    ConfiguredAgentRun, ConfiguredPendingAgentTurn, PendingAgentTurn, PendingTurnExecutionOptions,
-    RuntimeLaneError, RuntimeLaneManager, RuntimeObservation, RuntimeObservationSink,
-    RuntimeVerificationService, WorkspaceCheckpointManager,
+    CompactionSummaryPlan, ConfiguredAgentRun, ConfiguredPendingAgentTurn, PendingAgentTurn,
+    PendingTurnExecutionOptions, RuntimeLaneError, RuntimeLaneManager, RuntimeObservation,
+    RuntimeObservationSink, RuntimeVerificationService, SummaryFailure, WorkspaceCheckpointManager,
     agent_execution_channel_with_cancellation, auxiliary_provider_usage_record,
-    compaction_summary_context_snapshot, compaction_summary_request, is_active_status,
+    compaction_summary_request, is_active_status,
 };
 use golutra_agent_store::{
     CommandClaim, RuntimeRepositories, RuntimeStore, StoreError, ThreadRecord,
@@ -149,6 +149,9 @@ mod application;
 mod causal_recorder;
 mod change_tracker;
 mod command;
+mod compaction_summary;
+mod handoff;
+pub use handoff::{HandoffRequest, HandoffResult};
 mod context;
 mod debug_export;
 mod delegation;
@@ -199,7 +202,7 @@ pub(crate) use context::{
     load_project_instruction_bundle, memory_context_with_budget, model_prompt_from_payload,
     preview_from_payload, project_instruction_fingerprint, prompt_from_payload,
     select_memories_for_context_with_budget, system_prompt, task_contract_from_payload,
-    title_from_payload, truncate_to_token_budget,
+    title_from_payload,
 };
 pub use debug_export::{
     DebugExportCoordinator, DebugExportManifest, DebugExportReceipt, DebugExportRequest,
@@ -431,6 +434,7 @@ struct RuntimeHostExecutionState {
     causal_ledger: Mutex<causal_recorder::CausalLedger>,
     command_mutex: Mutex<()>,
     task_controls: Mutex<HashMap<SessionId, HostedTaskControl>>,
+    handoff_operations: StdMutex<HashMap<(ThreadId, Uuid), (Instant, CancellationToken)>>,
     context_resources: StdMutex<ContextResourceCache>,
     provider_route_cache: Arc<StdMutex<ProviderRouteCache>>,
     delegation_admissions: Mutex<HashMap<SessionId, delegation::DelegationAdmission>>,
@@ -1833,6 +1837,7 @@ impl RuntimeHost {
                 causal_ledger: Mutex::new(causal_recorder::CausalLedger::default()),
                 command_mutex: Mutex::new(()),
                 task_controls: Mutex::new(HashMap::new()),
+                handoff_operations: StdMutex::new(HashMap::new()),
                 context_resources: StdMutex::new(ContextResourceCache::default()),
                 provider_route_cache: Arc::new(StdMutex::new(ProviderRouteCache::default())),
                 delegation_admissions: Mutex::new(HashMap::new()),

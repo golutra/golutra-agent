@@ -436,35 +436,15 @@ fn criterion_assertion_kind(task_class: TaskClass, criterion: &str) -> Verificat
         return VerificationAssertionKind::AssistantResponse;
     }
     let lower = criterion.to_ascii_lowercase();
-    if ["test", "fixture"]
-        .iter()
-        .any(|marker| lower.contains(marker))
-        || ["测试", "用例"]
-            .iter()
-            .any(|marker| criterion.contains(marker))
-    {
+    if criterion_requests_test(&lower, criterion) {
         return VerificationAssertionKind::Test;
     }
-    if [
-        "check",
-        "build",
-        "compile",
-        "lint",
-        "typecheck",
-        "diagnostic",
-        "schema",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
-        || ["检查", "构建", "编译", "诊断", "协议"]
-            .iter()
-            .any(|marker| criterion.contains(marker))
-    {
+    if criterion_requests_diagnostic(&lower, criterion) {
         return VerificationAssertionKind::Diagnostic;
     }
     if ["content", "contains", "equals", "match"]
         .iter()
-        .any(|marker| lower.contains(marker))
+        .any(|marker| contains_word(&lower, marker))
         || ["内容", "包含", "等于", "匹配"]
             .iter()
             .any(|marker| criterion.contains(marker))
@@ -473,7 +453,7 @@ fn criterion_assertion_kind(task_class: TaskClass, criterion: &str) -> Verificat
     }
     if ["file", "path", "diff", "write", "edit", "create"]
         .iter()
-        .any(|marker| lower.contains(marker))
+        .any(|marker| contains_word(&lower, marker))
         || ["文件", "路径", "差异", "写入", "修改", "创建"]
             .iter()
             .any(|marker| criterion.contains(marker))
@@ -481,6 +461,70 @@ fn criterion_assertion_kind(task_class: TaskClass, criterion: &str) -> Verificat
         return VerificationAssertionKind::FileState;
     }
     VerificationAssertionKind::Delivery
+}
+
+fn contains_word(text: &str, word: &str) -> bool {
+    text.split_whitespace().any(|token| {
+        token.trim_matches(|character: char| !character.is_ascii_alphanumeric()) == word
+    })
+}
+
+fn criterion_requests_test(lower: &str, original: &str) -> bool {
+    [
+        "tests pass",
+        "tests passed",
+        "test passes",
+        "test passed",
+        "run tests",
+        "run the tests",
+        "test suite",
+        "test command",
+        "test result",
+        "fixture passes",
+        "fixture passed",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase))
+        || [
+            "测试通过",
+            "测试成功",
+            "运行测试",
+            "测试命令",
+            "用例通过",
+            "用例成功",
+        ]
+        .iter()
+        .any(|phrase| original.contains(phrase))
+}
+
+fn criterion_requests_diagnostic(lower: &str, original: &str) -> bool {
+    [
+        "check passes",
+        "check passed",
+        "run the check",
+        "run checks",
+        "build passes",
+        "build passed",
+        "compile succeeds",
+        "compiles successfully",
+        "lint passes",
+        "typecheck passes",
+        "diagnostic passes",
+        "schema validates",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase))
+        || [
+            "检查通过",
+            "检查成功",
+            "运行检查",
+            "构建通过",
+            "编译通过",
+            "诊断通过",
+            "协议通过",
+        ]
+        .iter()
+        .any(|phrase| original.contains(phrase))
 }
 
 fn assertion(
@@ -593,6 +637,9 @@ fn assertion_status(
             let checks = authoritative_objective_checks(
                 matching_checks(&[VerificationCheckKind::ObjectiveValidation])
                     .into_iter()
+                    // 退出码为 0 但没有任何测试执行证据属于未知，不是测试失败。
+                    // 从失败集合排除后，终态只要求补证据，不会反复修复未经证明的候选。
+                    .filter(|check| !is_unknown_objective_check(check))
                     .filter(|check| {
                         check.name == "objective:test:external_verifier"
                             || (assertion.criterion_id == "tests_or_diagnostics"
@@ -735,6 +782,11 @@ fn assertion_status(
             refs,
         ),
     }
+}
+
+fn is_unknown_objective_check(check: &VerificationCheck) -> bool {
+    check.kind == VerificationCheckKind::ObjectiveValidation
+        && check.name.starts_with("objective:unknown:")
 }
 
 fn latest_distinct_checks(checks: Vec<&VerificationCheck>) -> Vec<&VerificationCheck> {
@@ -927,6 +979,26 @@ fn residual_risks(result: VerificationResult) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_criteria_do_not_turn_a_test_filename_into_a_test_obligation() {
+        assert_eq!(
+            criterion_assertion_kind(TaskClass::WorkspaceChange, "create test.md"),
+            VerificationAssertionKind::FileState
+        );
+        assert_eq!(
+            criterion_assertion_kind(TaskClass::WorkspaceChange, "run tests and ensure they pass"),
+            VerificationAssertionKind::Test
+        );
+        assert_eq!(
+            criterion_assertion_kind(TaskClass::WorkspaceChange, "创建 test.md 文件"),
+            VerificationAssertionKind::FileState
+        );
+        assert_eq!(
+            criterion_assertion_kind(TaskClass::WorkspaceChange, "create schema.md"),
+            VerificationAssertionKind::FileState
+        );
+    }
 
     #[test]
     fn code_task_without_evidence_fails() {

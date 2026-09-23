@@ -69,6 +69,7 @@ static TUI_ACTOR_ID: LazyLock<String> = LazyLock::new(|| {
         Uuid::now_v7()
     )
 });
+mod handoff;
 const TUI_HISTORY_PAGE_SIZE: u32 = 256;
 // 仅回收已写入终端的活动窗口；完整加载和未归档历史不受此软预算限制。
 const TUI_EVENT_HISTORY_LIMIT: usize = 32_768;
@@ -319,6 +320,7 @@ struct DriverArgs {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OverlaySurface {
+    Handoff,
     Help,
     Auth,
     Approval,
@@ -355,6 +357,7 @@ struct TranscriptProjectionAnchor {
 
 #[derive(Debug)]
 struct TuiApp {
+    handoff: Option<handoff::HandoffFlow>,
     thread_id: ThreadId,
     session_id: SessionId,
     task_id: Option<TaskId>,
@@ -512,6 +515,7 @@ impl TuiApp {
     }
 
     pub(crate) async fn shutdown_pending_operations(&mut self) {
+        self.shutdown_handoff().await;
         self.history_reload = None;
         if let Some(pending) = self.auth_model_discovery.take() {
             pending.task.abort();
@@ -574,6 +578,11 @@ fn bound_event_payload(event: &mut RuntimeEvent) {
     // permanently truncated assistant response.
     if let Some(object) = event.payload.as_object() {
         let mut preserved = serde_json::Map::new();
+        if event.event_type == RuntimeEventType::SessionCreated
+            && let Some(draft) = object.get("handoff_draft").and_then(Value::as_str)
+        {
+            preserved.insert("handoff_draft".to_owned(), json!(draft));
+        }
         if let Some(content) = object.get("content").and_then(Value::as_str) {
             preserved.insert("content".to_owned(), Value::String(content.to_owned()));
         }
@@ -648,7 +657,9 @@ async fn load_runtime_refresh_snapshot(
 
 impl TuiApp {
     fn overlay_surface_without_help(&self) -> Option<OverlaySurface> {
-        if self.auth_dialog.is_some() {
+        if self.handoff.is_some() {
+            Some(OverlaySurface::Handoff)
+        } else if self.auth_dialog.is_some() {
             Some(OverlaySurface::Auth)
         } else if self.approval_dialog.is_some() {
             Some(OverlaySurface::Approval)
@@ -717,6 +728,7 @@ impl TuiApp {
             editing_queued_turn: None,
             pending_recovery: None,
             export_flow: None,
+            handoff: None,
             export_operation: None,
             auth_dialog,
             auth_operation: None,
@@ -945,6 +957,7 @@ impl TuiApp {
             Some(OverlaySurface::Settings) => "settings",
             Some(OverlaySurface::Export) => "session export",
             Some(OverlaySurface::Help) => "help",
+            Some(OverlaySurface::Handoff) => "handoff",
             None if self.transcript.search.is_some() => "transcript search",
             None if self.history_search.is_some() => "prompt history search",
             None if self.debug_mode => "developer runtime",
@@ -1173,7 +1186,9 @@ impl TuiApp {
     async fn load_recent_history(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
         // 会话恢复和首次附着都要把可回放的完整历史灌进 transcript。
         // 只读最近一页会让 --resume / /resume 后终端只剩尾部几轮。
-        self.load_session_history(transport).await
+        self.load_session_history(transport).await?;
+        self.restore_handoff_draft();
+        Ok(())
     }
 
     async fn load_session_history(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
@@ -2995,6 +3010,7 @@ impl TuiApp {
                     .await?;
                 self.last_control_ack = Some(ack);
             }
+            SlashCommand::Handoff { goal } => self.start_handoff(transport, goal),
             SlashCommand::Queue => self.open_queue_picker(),
             SlashCommand::Attach { path } => self.add_attachment(&path),
             SlashCommand::Detach => self.clear_attachments(),
@@ -3132,7 +3148,7 @@ impl TuiApp {
         }
 
         if items.is_empty() {
-            // 对照 Claude Code：没有可恢复会话时，在 › /resume 下面给出结果，不打开空 picker。
+            // 没有可恢复会话时，在 › /resume 下面给出结果，不打开空 picker。
             self.push_command_result("No sessions in this cwd yet");
             return Ok(());
         }
@@ -3307,6 +3323,7 @@ impl TuiApp {
     }
 
     fn start_new_session(&mut self) {
+        self.handoff = None;
         self.thread_id = ThreadId::new();
         self.session_id = SessionId::new();
         self.begin_history_replay();
@@ -3387,7 +3404,7 @@ impl TuiApp {
         thread_id: ThreadId,
     ) -> miette::Result<()> {
         self.resume_thread(transport, thread_id).await?;
-        // 对照 Claude Code：slash / picker 成功后新会话留下 › /resume 和结果行。
+        // slash / picker 成功后新会话留下 › /resume 和结果行。
         // retry fork 走 resume_thread，不能把 /resume 记进新会话。
         self.record_slash_command("/resume");
         self.push_command_result(format!("Resumed {}", short_id(&self.thread_id.to_string())));
@@ -3529,13 +3546,14 @@ impl TuiApp {
                     flow.picker.move_selection(direction);
                 }
             }
+            Some(OverlaySurface::Handoff) => {}
             None => {}
         }
     }
 
     fn close_resume_picker(&mut self) {
         self.resume_picker = None;
-        // 对照 Claude Code：取消 picker 后留下 › /resume，下面再跟 ⎿ Resume cancelled。
+        // 取消 picker 后留下 › /resume，下面再跟 ⎿ Resume cancelled。
         // 提交时已经 reset 过 composer；这里再清一次，避免退出全屏后把 › /re 叠在分隔线上。
         self.input.reset();
         self.push_command_result("Resume cancelled");
@@ -4735,7 +4753,7 @@ fn sync_overlay_screen(
 fn overlay_uses_native_mouse(app: &TuiApp) -> bool {
     matches!(
         app.overlay_surface(),
-        Some(OverlaySurface::Auth | OverlaySurface::Settings)
+        Some(OverlaySurface::Auth | OverlaySurface::Settings | OverlaySurface::Handoff)
     ) || (app.auth_operation.is_some() && app.overlay_surface().is_none())
 }
 
@@ -4926,6 +4944,10 @@ async fn handle_key(
             return Ok(());
         }
         Some(OverlaySurface::Export) => return handle_export_key(key, app, transport).await,
+        Some(OverlaySurface::Handoff) => {
+            handoff::handle_key(key, app, transport);
+            return Ok(());
+        }
         None => {}
     }
     if app.history_search.is_some() {
@@ -5776,6 +5798,10 @@ fn handle_paste(pasted: &str, app: &mut TuiApp) {
             if let Some(input) = app.export_input_mut() {
                 input.insert_str(&single_line);
             }
+            return;
+        }
+        Some(OverlaySurface::Handoff) => {
+            handoff::paste(app, &normalized);
             return;
         }
         None => {}

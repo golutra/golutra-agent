@@ -88,6 +88,23 @@ fn validation_after_edits_is_required_but_documentation_does_not_expire_code_tes
 }
 
 #[test]
+fn direct_file_validation_survives_an_unrelated_source_edit() {
+    let previous = objective_test_report_with_output("test -f generated/report.json", "");
+    let mut unrelated = objective_test_report("write_file", None);
+    unrelated.changed_files = vec![PathBuf::from("src/other.rs")];
+    assert!(validation_is_current(
+        &previous,
+        &[previous.clone(), unrelated]
+    ));
+    let mut target = objective_test_report("write_file", None);
+    target.changed_files = vec![PathBuf::from("generated/report.json")];
+    assert!(!validation_is_current(
+        &previous,
+        &[previous.clone(), target]
+    ));
+}
+
+#[test]
 fn passing_python_tests_do_not_expire_previous_checks_by_writing_bytecode_cache() {
     let previous = objective_test_report_with_output(
         "python3 -m unittest test_existing",
@@ -976,6 +993,64 @@ async fn default_open_plain_conversation_uses_one_provider_request() {
         .unwrap();
     assert_eq!(result.loop_decision.action, LoopAction::StopSuccess);
     assert_eq!(calls, 1);
+}
+
+#[tokio::test]
+async fn response_schema_repair_finishes_without_tools_or_workspace_changes() {
+    struct RepairProvider(std::sync::Mutex<Vec<ProviderRequest>>);
+    #[async_trait]
+    impl LlmProvider for RepairProvider {
+        fn contract(&self) -> golutra_agent_core::ProviderContract {
+            MockProvider::text_response("").contract()
+        }
+        async fn complete(&self, req: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
+            let first = {
+                let mut requests = self.0.lock().unwrap();
+                let first = requests.is_empty();
+                requests.push(req.clone());
+                first
+            };
+            if !first {
+                let feedback = &req.messages.last().unwrap().content;
+                assert!(
+                    feedback.contains("Correct the final response"),
+                    "{feedback}"
+                );
+                assert!(!feedback.contains("rerun"), "{feedback}");
+            }
+            MockProvider::text_response(if first { "not JSON" } else { "{\"result\":42}" })
+                .complete(req)
+                .await
+        }
+    }
+    let root = tempdir().unwrap();
+    let harness = AgentHarness::new(
+        RepairProvider(std::sync::Mutex::new(Vec::new())),
+        ContextBuilder::default(),
+        BasicToolExecutor::new(WorkspacePolicy::new(root.path()).unwrap()),
+    );
+    let mut req = request();
+    req.objective = "Return result 42 as JSON".into();
+    req.output_schema = Some(json!({"type":"object", "required":["result"],
+        "properties":{"result":{"type":"integer"}}, "additionalProperties":false}));
+    let run = ConfiguredAgentRun::new(req).with_task_contract(TaskContract {
+        max_correction_rounds: Some(2),
+        ..TaskContract::open(Vec::new())
+    });
+    let (_handle, control) = agent_execution_channel(1);
+    let mut calls = 0;
+    let outcome = harness
+        .execute_configured(run, control, |event| {
+            if matches!(event, AgentLoopTraceEvent::ProviderCompleted { .. }) {
+                calls += 1;
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(outcome.loop_decision.action, LoopAction::StopSuccess);
+    assert_eq!(calls, 2);
+    assert!(outcome.tool_reports.is_empty());
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
 }
 
 #[test]

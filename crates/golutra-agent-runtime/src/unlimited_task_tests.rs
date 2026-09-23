@@ -7,11 +7,11 @@ struct LongReadProvider(AtomicUsize);
 #[async_trait]
 impl LlmProvider for LongReadProvider {
     async fn complete(&self, request: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
-        if request
-            .messages
-            .first()
-            .is_some_and(|message| message.content == COMPACTION_SUMMARY_SYSTEM_PROMPT)
-        {
+        if request.messages.first().is_some_and(|message| {
+            message
+                .content
+                .starts_with("You are a context summarization assistant")
+        }) {
             return MockProvider::text_response(
                 "Repeatedly inspected input.txt. Continue the same task.",
             )

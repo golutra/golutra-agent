@@ -184,7 +184,7 @@ async fn differing_nonterminal_text_continues_beyond_old_limit() {
 }
 
 #[tokio::test]
-async fn incomplete_auxiliary_summary_is_not_installed_or_continued() {
+async fn incomplete_auxiliary_summary_retries_once_without_installing_partial_text() {
     struct SummaryProvider;
     #[async_trait]
     impl LlmProvider for SummaryProvider {
@@ -222,7 +222,7 @@ async fn incomplete_auxiliary_summary_is_not_installed_or_continued() {
             metadata: Default::default(),
         })
         .collect::<Vec<_>>();
-    let record = ContextWindowManager::new(512)
+    let mut record = ContextWindowManager::new(512)
         .compact_if_needed(task.turn_id, 0, &messages, &[], 0)
         .unwrap()
         .unwrap();
@@ -233,7 +233,7 @@ async fn incomplete_auxiliary_summary_is_not_installed_or_continued() {
             &task,
             &PromptCacheScope::session(task.session_id, None),
             task.turn_id,
-            &record,
+            &mut record,
             None,
             &mut control,
             &mut |e| trace.push(e),
@@ -241,18 +241,23 @@ async fn incomplete_auxiliary_summary_is_not_installed_or_continued() {
         )
         .await;
     assert!(result.is_none());
+    assert_eq!(record.summary_attempts, 2);
+    assert_eq!(
+        record.summary_failure,
+        Some(SummaryFailure::OutputTruncated.to_string())
+    );
     assert_eq!(
         trace
             .iter()
             .filter(|e| matches!(e, AgentLoopTraceEvent::ProviderStarted { .. }))
             .count(),
-        1
+        2
     );
     assert_eq!(
         trace
             .iter()
             .filter(|e| matches!(e, AgentLoopTraceEvent::TokenUsageRecorded(_)))
             .count(),
-        1
+        2
     );
 }

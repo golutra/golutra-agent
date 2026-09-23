@@ -117,7 +117,10 @@ async fn truncated_provider_response_body_is_retryable() {
             .await
             .expect("truncated response");
     });
-    let response = reqwest::Client::new()
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("client")
         .get(format!("http://{address}"))
         .send()
         .await
@@ -131,6 +134,27 @@ async fn truncated_provider_response_body_is_retryable() {
         matches!(error, ProviderError::Unavailable { .. }),
         "{error:?}"
     );
+}
+
+#[test]
+fn only_loopback_provider_endpoints_bypass_the_proxy() {
+    for endpoint in [
+        "http://127.0.0.1:8000",
+        "http://127.0.0.2",
+        "https://localhost/v1",
+        "http://[::1]:8000",
+    ] {
+        assert!(endpoint_is_loopback(endpoint), "{endpoint}");
+    }
+    for endpoint in [
+        "https://api.example.com",
+        "http://192.168.1.1",
+        "http://localhost.example.com",
+        "http://[2001:db8::1]",
+        "invalid",
+    ] {
+        assert!(!endpoint_is_loopback(endpoint), "{endpoint}");
+    }
 }
 
 #[tokio::test]

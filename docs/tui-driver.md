@@ -62,6 +62,8 @@ Driver 默认连接用户级 `golutra-agent-app-server`。`--embedded` 创建仅
 
 全局 `--task-id <uuid>` 是可选的严格过滤。该 task 必须已有事件并属于所选 session，否则启动失败并返回 `task_not_found`。Driver 不会把其他 workspace 或其他 session 的 task 静默映射到当前视图。
 
+`/handoff [目标]` 需要切换会话，因此 Driver 同样返回 `session_binding_immutable`。交互式 TUI 的交接流程见 [handoff.md](handoff.md)。
+
 绑定在 Driver 生命周期内不可变。`input_slash`、composer 键盘路径、session picker 的键盘/鼠标确认，以及 `/n`、`/r` 等候选补全路径中的 `/new`、`/resume`、`/fork` 均返回 `session_binding_immutable`；调用方必须为目标 session 启动另一个 Driver。显式 `--task-id` 用于只读观察，prompt、takeover、abort、abort-before-close，以及 approval、question、auth、queue 的键盘/鼠标 Runtime 控制均返回 `task_binding_read_only`，避免历史 task Driver 操作同 session 的其他 active task。顶层 help 或 search 仍可关闭和导航，不会因其下方存在 active task 或 approval 而被误判为控制操作。`/status`、`/debug`、`/threads`、`/export`、`/clear`、`/quit` 等只读或本地 UI 命令仍可使用。
 
 同一 active session 可以被多个 daemon Driver 观察，但只有 active controller 能提交输入。observer 的 prompt 会被 runtime busy policy 拒绝；显式 `takeover` 成功后才可控制该 lane。

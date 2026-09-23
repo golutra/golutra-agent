@@ -7,10 +7,51 @@
 use std::collections::BTreeMap;
 
 use golutra_agent_core::{
-    BudgetState, LoopAction, LoopDecision, LoopDecisionId, PolicyId, TaskId, ToolResultStatus,
-    TurnId, VerificationRecord, VerificationResult, semantic_tool_failure_family,
+    BudgetState, LoopAction, LoopDecision, LoopDecisionId, PolicyId, TaskContract, TaskId,
+    ToolResultStatus, TurnId, VerificationAssertionStatus, VerificationCheckKind,
+    VerificationRecord, VerificationRequirement, VerificationResult, semantic_tool_failure_family,
 };
 use golutra_agent_tools::ToolExecutionReport;
+
+/// 普通任务可以在证据不充分时结束；验证记录保持 Partial，不能作为已验证交付使用。
+/// 仅放行缺少可选验证的变更，显式合同、已观察到的验收失败与权限边界仍有效。
+pub(crate) fn accepts_best_effort_completion(
+    contract: &TaskContract,
+    verification: &VerificationRecord,
+) -> bool {
+    contract.verification == VerificationRequirement::BestEffort
+        && !contract.require_objective_validation
+        && verification.result == VerificationResult::Partial
+        && verification.policy_status == "task_contract_satisfied"
+        && verification
+            .assertions
+            .iter()
+            .filter(|a| a.blocking)
+            .all(|a| {
+                matches!(
+                    a.status,
+                    VerificationAssertionStatus::Pass | VerificationAssertionStatus::NotApplicable
+                )
+            })
+        && verification
+            .checks
+            .iter()
+            .any(|c| c.kind == VerificationCheckKind::WorkspaceChange && c.passed)
+        && !verification
+            .checks
+            .iter()
+            .any(|c| c.kind == VerificationCheckKind::ObjectiveValidation)
+        && verification
+            .checks
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.kind,
+                    VerificationCheckKind::Schema | VerificationCheckKind::Policy
+                )
+            })
+            .all(|c| c.passed)
+}
 
 pub(crate) fn loop_decision(
     task_id: TaskId,
@@ -85,14 +126,25 @@ fn evidence_backed_failure_message(
     let failed_check = verification
         .checks
         .iter()
-        .find(|check| !check.passed)
+        .rev()
+        .find(|check| !check.passed && check.kind != VerificationCheckKind::ToolExecution)
         .map(|check| check.message.trim())
         .filter(|message| !message.is_empty())
         .or_else(|| verification.residual_risks.first().map(String::as_str))
         .unwrap_or("completion criteria were not proven");
     let failed_reports = tool_reports
         .iter()
-        .filter(|report| report.envelope.status != ToolResultStatus::Ok)
+        .filter(|report| {
+            report.envelope.status != ToolResultStatus::Ok
+                && verification.checks.iter().any(|check| {
+                    !check.passed
+                        && check.kind != VerificationCheckKind::ToolExecution
+                        && check
+                            .evidence_refs
+                            .iter()
+                            .any(|id| report.envelope.evidence_refs.contains(id))
+                })
+        })
         .collect::<Vec<_>>();
     let mut families = BTreeMap::<String, usize>::new();
     for report in &failed_reports {

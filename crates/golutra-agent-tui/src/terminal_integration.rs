@@ -345,7 +345,7 @@ pub(crate) fn restored_inline_viewport(saved: Option<Rect>, size: Size) -> Rect 
     Rect::new(0, saved.y.min(max_y), width, height)
 }
 
-/// ANSI cannot selectively replace application-owned scrollback. As in Codex, purge it
+/// ANSI cannot selectively replace application-owned scrollback. Purge it
 /// before replaying source-backed history; otherwise stale wrapped rows survive above the screen.
 pub(crate) fn rebuild_inline_history_terminal(
     terminal: &mut InteractiveTerminal,

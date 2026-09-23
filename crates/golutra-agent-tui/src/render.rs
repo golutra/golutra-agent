@@ -211,6 +211,7 @@ fn bottom_pane_height_parts(app: &TuiApp, width: u16, include_popups: bool) -> u
 pub(crate) fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
     if let Some(surface) = app.overlay_surface() {
         match surface {
+            OverlaySurface::Handoff => handoff::draw(frame, area, app),
             OverlaySurface::Help => draw_help_dialog(
                 frame,
                 area,
@@ -2705,6 +2706,7 @@ pub(crate) fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
     let palette = app.palette();
     let surface = app.overlay_surface();
     let overlay_help = match surface {
+        Some(OverlaySurface::Handoff) => Some("Enter newline   Ctrl+S create session   Esc cancel"),
         Some(OverlaySurface::Help) => {
             Some("1-5 topic   Tab switch   Up/Down scroll   F1 or Esc close")
         }
@@ -2811,6 +2813,10 @@ pub(crate) fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
             Span::styled(composer_prefix, Style::default().fg(palette.accent)),
             Span::styled("Export session history", composer_style(app)),
         ])]
+    } else if surface == Some(OverlaySurface::Handoff) {
+        vec![Line::from(
+            "Review the handoff; creating a session does not send the prompt",
+        )]
     } else if let Some(search) = &app.transcript.search {
         vec![Line::from(vec![
             Span::styled("Find: ", Style::default().fg(palette.warning)),
@@ -3518,6 +3524,7 @@ pub(crate) fn status_chip(app: &TuiApp) -> &'static str {
             OverlaySurface::Dashboard => "dashboard",
             OverlaySurface::Settings => "settings",
             OverlaySurface::Export => "export",
+            OverlaySurface::Handoff => "handoff",
         };
     }
     match app.projection.as_ref().map(|projection| projection.status) {

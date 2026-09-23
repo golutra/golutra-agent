@@ -62,7 +62,7 @@ impl CanonicalFactRecorder {
         coalescing: CoalescingSummary,
     ) -> Result<(), ClientError> {
         self.host
-            .record_trace_observation(&self.task, observation, coalescing)
+            .record_trace_observation(&self.task, observation, coalescing, None)
             .await
     }
 
@@ -92,8 +92,15 @@ impl RuntimeHost {
         task: &HostedAgentTask,
         trace_event: RuntimeObservation,
     ) -> Result<(), ClientError> {
-        self.record_trace_observation(task, trace_event, CoalescingSummary::default())
-            .await
+        self.record_trace_observation(
+            task,
+            trace_event,
+            CoalescingSummary::default(),
+            task.payload
+                .get("_auxiliary_operation")
+                .and_then(Value::as_str),
+        )
+        .await
     }
 
     async fn record_trace_observation(
@@ -101,6 +108,7 @@ impl RuntimeHost {
         task: &HostedAgentTask,
         trace_event: RuntimeObservation,
         coalescing: CoalescingSummary,
+        auxiliary_operation: Option<&str>,
     ) -> Result<(), ClientError> {
         let (trace_event, context_artifacts) = match trace_event {
             AgentLoopTraceEvent::ContextSnapshotCaptured {
@@ -238,6 +246,15 @@ impl RuntimeHost {
             }
             if let Some(turn_id) = event_turn_id {
                 event.turn_id = Some(turn_id);
+            }
+            // 独立交接只记录 session 级审计，不让辅助 provider 事件改写 active_task_id。
+            // 原 task/turn 仍留在 payload 和工件中用于溯源；标记仅由辅助请求构造器设置。
+            if let Some(operation) = auxiliary_operation {
+                event.payload["auxiliary_operation"] = json!(operation);
+                event.payload["source_task_id"] = json!(task.task_id);
+                event.payload["source_turn_id"] = json!(task.turn_id);
+                event.task_id = None;
+                event.turn_id = None;
             }
             for (mut artifact, bytes, payload_key) in context_artifacts {
                 artifact.provenance_refs.push(event.id);
