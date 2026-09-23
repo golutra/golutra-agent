@@ -37,7 +37,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.3.6"
+version = "0.3.7"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/golutra/golutra-agent"
@@ -102,11 +102,11 @@ unicode-width = "0.1.14"
 webbrowser = "1.0"
 walkdir = "2.5"
 
-golutra-agent-release = { path = "crates/golutra-agent-release", version = "0.3.6" }
-golutra-agent-supervisor = { path = "crates/golutra-agent-supervisor", version = "0.3.6" }
+golutra-agent-release = { path = "crates/golutra-agent-release", version = "0.3.7" }
+golutra-agent-supervisor = { path = "crates/golutra-agent-supervisor", version = "0.3.7" }
 
-golutra-agent-core = { path = "crates/golutra-agent-core", version = "0.3.6" }
-golutra-agent-protocol = { path = "crates/golutra-agent-protocol", version = "0.3.6" }
-golutra-agent-protocol-fixtures = { path = "crates/golutra-agent-protocol-fixtures", version = "0.3.6" }
-golutra-agent-project-service = { path = "crates/golutra-agent-project-service", version = "0.3.6" }
-golutra-agent-sandbox = { path = "crates/golutra-agent-sandbox", version = "0.3.6" }
+golutra-agent-core = { path = "crates/golutra-agent-core", version = "0.3.7" }
+golutra-agent-protocol = { path = "crates/golutra-agent-protocol", version = "0.3.7" }
+golutra-agent-protocol-fixtures = { path = "crates/golutra-agent-protocol-fixtures", version = "0.3.7" }
+golutra-agent-project-service = { path = "crates/golutra-agent-project-service", version = "0.3.7" }
+golutra-agent-sandbox = { path = "crates/golutra-agent-sandbox", version = "0.3.7" }

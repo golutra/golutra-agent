@@ -6,6 +6,28 @@ follow [Semantic Versioning](https://semver.org/) where applicable.
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-09-23
+
+### Fixed
+
+- Initialize the Windows console mouse-mode baseline during terminal setup,
+  and restore cooked input after mouse cleanup when exiting or suspending the
+  TUI so the parent shell and external editor receive the intended input mode.
+
+### Changed
+
+- Selecting Golutra API opens credential entry directly with the built-in
+  `https://api.golutra.cn` address. Review and saving resolve the protocol path;
+  Esc from either credential screen returns to provider selection.
+- Preserve the complete development commit history on the canonical repository.
+- Maintainer pushes to `main` skip CI jobs; tagged releases retain platform
+  builds and acceptance before publishing.
+
+### Distribution
+
+- Align workspace crates, npm packages, native desktop archives and SDK metadata
+  at 0.3.7. No user-data format changes are included.
+
 ## [0.3.6] - 2026-09-23
 
 ### Fixed
@@ -275,7 +297,8 @@ This is the initial public development baseline. See the repository history
 and [architecture documentation](docs/ARCHITECTURE.md) for the implementation
 details and current compatibility boundaries.
 
-[unreleased]: https://github.com/golutra/golutra-agent/compare/v0.3.6...HEAD
+[unreleased]: https://github.com/golutra/golutra-agent/compare/v0.3.7...HEAD
+[0.3.7]: https://github.com/golutra/golutra-agent/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/golutra/golutra-agent/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/golutra/golutra-agent/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/golutra/golutra-agent/compare/v0.3.3...v0.3.4

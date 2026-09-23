@@ -15,10 +15,10 @@ categories.workspace = true
 [dependencies]
 chrono.workspace = true
 clap.workspace = true
-golutra-agent-client = { path = "../golutra-agent-client", version = "0.3.6" }
+golutra-agent-client = { path = "../golutra-agent-client", version = "0.3.7" }
 golutra-agent-core.workspace = true
 golutra-agent-protocol.workspace = true
-golutra-agent-tools = { path = "../golutra-agent-tools", version = "0.3.6" }
+golutra-agent-tools = { path = "../golutra-agent-tools", version = "0.3.7" }
 miette.workspace = true
 schemars.workspace = true
 serde.workspace = true

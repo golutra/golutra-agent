@@ -14,8 +14,8 @@ categories.workspace = true
 
 [dependencies]
 fs2.workspace = true
-golutra-agent-auth = { path = "../golutra-agent-auth", version = "0.3.6" }
-golutra-agent-llm = { path = "../golutra-agent-llm", version = "0.3.6" }
+golutra-agent-auth = { path = "../golutra-agent-auth", version = "0.3.7" }
+golutra-agent-llm = { path = "../golutra-agent-llm", version = "0.3.7" }
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true

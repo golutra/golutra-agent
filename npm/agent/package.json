@@ -1,6 +1,6 @@
 {
   "name": "@golutra/agent",
-  "version": "0.3.6",
+  "version": "0.3.7",
   "description": "Simple local coding agent with background work and full observability",
   "license": "Apache-2.0",
   "bin": {
