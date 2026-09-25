@@ -1271,6 +1271,7 @@ fn turn_picker_visual_layout(
     let width = area.width.max(1);
     let mut lines = Vec::new();
     let mut ranges = Vec::with_capacity(picker.items.len());
+    let mut visual_rows = 0_usize;
     for (index, item) in picker.items.iter().enumerate() {
         let selected = index == picker.selected;
         let style = Style::default()
@@ -1284,10 +1285,7 @@ fn turn_picker_visual_layout(
             } else {
                 Modifier::empty()
             });
-        let start = lines
-            .iter()
-            .map(|line: &Line<'static>| turn_picker_line_count(line, width))
-            .sum::<usize>();
+        let start = visual_rows;
         lines.push(Line::from(vec![
             Span::styled(
                 selection_marker(app, selected),
@@ -1308,10 +1306,11 @@ fn turn_picker_visual_layout(
             Span::styled(item.metadata.clone(), Style::default().fg(palette.muted)),
         ]));
         lines.push(Line::default());
-        let end = lines
-            .iter()
-            .map(|line: &Line<'static>| turn_picker_line_count(line, width))
-            .sum::<usize>();
+        let end = start
+            .saturating_add(turn_picker_line_count(&lines[lines.len() - 3], width))
+            .saturating_add(turn_picker_line_count(&lines[lines.len() - 2], width))
+            .saturating_add(turn_picker_line_count(&lines[lines.len() - 1], width));
+        visual_rows = end;
         ranges.push((start, end));
     }
     TurnPickerVisualLayout { lines, ranges }
