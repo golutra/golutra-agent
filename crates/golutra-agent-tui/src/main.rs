@@ -436,6 +436,8 @@ struct TuiApp {
     history_has_more_before: bool,
     history_load_requested: bool,
     quit_shortcut_expires_at: Option<Instant>,
+    /// 双击 Esc 只在短窗口内组成会话恢复快捷键，单击仍保留原有取消语义。
+    last_escape_at: Option<Instant>,
     should_quit: bool,
     last_prompt_ack: Option<CommandAck>,
     last_control_ack: Option<CommandAck>,
@@ -786,6 +788,7 @@ impl TuiApp {
             history_has_more_before: false,
             history_load_requested: false,
             quit_shortcut_expires_at: None,
+            last_escape_at: None,
             should_quit: false,
             last_prompt_ack: None,
             last_control_ack: None,
@@ -3166,6 +3169,26 @@ impl TuiApp {
         Ok(())
     }
 
+    async fn open_previous_session_picker(
+        &mut self,
+        transport: &RuntimeTransport,
+    ) -> miette::Result<()> {
+        self.open_resume_picker(transport).await?;
+        let current_thread = self.thread_id;
+        let Some(picker) = &mut self.resume_picker else {
+            return Ok(());
+        };
+        // 会话列表按最近更新时间排序；跳过当前线程后首项就是最近的上一会话。
+        picker.selected = picker
+            .items
+            .iter()
+            .position(|item| item.thread_id != current_thread)
+            .unwrap_or(0);
+        self.status_message =
+            "previous session selected; press Enter to continue, Esc to close".to_owned();
+        Ok(())
+    }
+
     async fn open_export_flow(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
         let threads = transport
             .list_threads(50)
@@ -4894,6 +4917,13 @@ async fn handle_key(
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return Ok(());
     }
+    // 按住 Esc 产生的终端 Repeat 事件不能被误认为第二次独立按键。
+    if key.kind == KeyEventKind::Repeat && key.code == KeyCode::Esc {
+        return Ok(());
+    }
+    if key.code != KeyCode::Esc || app.overlay_surface().is_some() {
+        app.last_escape_at = None;
+    }
     if app.tool_detail.is_some() {
         tool_detail::handle_tool_detail_key(key, app);
         return Ok(());
@@ -5263,6 +5293,23 @@ async fn handle_composer_escape(
     app: &mut TuiApp,
     transport: &RuntimeTransport,
 ) -> miette::Result<()> {
+    let now = Instant::now();
+    let can_resume_previous =
+        app.editing_queued_turn.is_none() && !has_active_task(app) && app.input.is_empty();
+    if can_resume_previous
+        && app
+            .last_escape_at
+            .take()
+            .is_some_and(|previous| now.duration_since(previous) <= Duration::from_millis(500))
+    {
+        app.open_previous_session_picker(transport).await?;
+        return Ok(());
+    }
+    if can_resume_previous {
+        app.last_escape_at = Some(now);
+    } else {
+        app.last_escape_at = None;
+    }
     if app.editing_queued_turn.take().is_some() {
         app.input.reset();
         app.attachments.clear();
@@ -5285,7 +5332,8 @@ async fn handle_composer_escape(
         app.prompt_history.reset_navigation();
         app.status_message = "input cleared".to_owned();
     } else {
-        app.status_message = "press Ctrl+C twice to quit".to_owned();
+        app.status_message =
+            "press Esc again to choose a previous session, or Ctrl+C twice to quit".to_owned();
     }
     Ok(())
 }
