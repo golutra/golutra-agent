@@ -11185,6 +11185,20 @@ fn resume_picker_offset_keeps_selected_item_visible() {
 }
 
 #[test]
+fn turn_picker_scroll_tracks_variable_height_blocks() {
+    let ranges = [(0, 3), (3, 9), (9, 12)];
+    assert_eq!(turn_picker_scroll_offset(&ranges, 0, 4), 0);
+    assert_eq!(turn_picker_scroll_offset(&ranges, 1, 4), 3);
+    assert_eq!(turn_picker_scroll_offset(&ranges, 2, 4), 8);
+}
+
+#[test]
+fn turn_picker_scroll_starts_long_block_at_its_first_line() {
+    let ranges = [(0, 2), (2, 12)];
+    assert_eq!(turn_picker_scroll_offset(&ranges, 1, 4), 2);
+}
+
+#[test]
 fn only_visible_provider_deltas_use_the_immediate_frame_lane() {
     assert!(provider_stream_event_is_meaningful(&json!({
         "delta": {"kind": "text_delta", "text": "首字"}

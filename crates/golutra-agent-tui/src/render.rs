@@ -1236,61 +1236,114 @@ pub(crate) fn draw_turn_picker(
     picker: &TurnPickerState,
     app: &TuiApp,
 ) {
-    let palette = app.palette();
-    let visible_count = resume_picker_page_size(area);
-    let offset = resume_picker_offset(picker.selected, visible_count, picker.items.len());
-    let items = picker
-        .items
-        .iter()
-        .enumerate()
-        .skip(offset)
-        .take(visible_count)
-        .map(|(index, item)| {
-            let selected = index == picker.selected;
-            ListItem::new(vec![
-                Line::from(vec![
-                    Span::styled(
-                        selection_marker(app, selected),
-                        Style::default().fg(if selected {
-                            palette.accent
-                        } else {
-                            palette.muted
-                        }),
-                    ),
-                    Span::styled(
-                        format!("{} ", index + 1),
-                        Style::default().fg(palette.muted),
-                    ),
-                    Span::styled(
-                        item.prompt.clone(),
-                        Style::default()
-                            .fg(if selected {
-                                palette.text
-                            } else {
-                                palette.subtle
-                            })
-                            .add_modifier(if selected {
-                                Modifier::BOLD
-                            } else {
-                                Modifier::empty()
-                            }),
-                    ),
-                ]),
-                Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled(item.metadata.clone(), Style::default().fg(palette.muted)),
-                ]),
-            ])
-        })
-        .collect::<Vec<_>>();
-    frame.render_widget(
-        List::new(items).block(
-            Block::default()
-                .title("Previous user turns")
-                .borders(Borders::TOP),
-        ),
-        area,
+    let layout = turn_picker_visual_layout(area, picker, app);
+    let block = Block::default()
+        .title("Previous user turns · Enter fork · Esc close")
+        .borders(Borders::TOP);
+    let content_area = block.inner(area);
+    let scroll = turn_picker_scroll_offset(
+        &layout.ranges,
+        picker.selected,
+        usize::from(content_area.height),
     );
+    frame.render_widget(block, area);
+    frame.render_widget(
+        Paragraph::new(layout.lines)
+            .wrap(Wrap { trim: false })
+            .scroll((ratatui_vertical_scroll(scroll, content_area.height), 0)),
+        content_area,
+    );
+}
+
+#[derive(Debug, Clone)]
+struct TurnPickerVisualLayout {
+    lines: Vec<Line<'static>>,
+    ranges: Vec<(usize, usize)>,
+}
+
+/// 按实际换行后的高度构造历史 turn 预览，滚动和鼠标命中都复用同一份区块边界。
+fn turn_picker_visual_layout(
+    area: Rect,
+    picker: &TurnPickerState,
+    app: &TuiApp,
+) -> TurnPickerVisualLayout {
+    let palette = app.palette();
+    let width = area.width.max(1);
+    let mut lines = Vec::new();
+    let mut ranges = Vec::with_capacity(picker.items.len());
+    for (index, item) in picker.items.iter().enumerate() {
+        let selected = index == picker.selected;
+        let style = Style::default()
+            .fg(if selected {
+                palette.text
+            } else {
+                palette.subtle
+            })
+            .add_modifier(if selected {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            });
+        let start = lines
+            .iter()
+            .map(|line: &Line<'static>| turn_picker_line_count(line, width))
+            .sum::<usize>();
+        lines.push(Line::from(vec![
+            Span::styled(
+                selection_marker(app, selected),
+                Style::default().fg(if selected {
+                    palette.accent
+                } else {
+                    palette.muted
+                }),
+            ),
+            Span::styled(
+                format!("{} ", index + 1),
+                Style::default().fg(palette.muted),
+            ),
+            Span::styled(item.prompt.clone(), style),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(item.metadata.clone(), Style::default().fg(palette.muted)),
+        ]));
+        lines.push(Line::default());
+        let end = lines
+            .iter()
+            .map(|line: &Line<'static>| turn_picker_line_count(line, width))
+            .sum::<usize>();
+        ranges.push((start, end));
+    }
+    TurnPickerVisualLayout { lines, ranges }
+}
+
+fn turn_picker_line_count(line: &Line<'static>, width: u16) -> usize {
+    Paragraph::new(line.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(width)
+        .max(1)
+}
+
+/// 让当前选中的 turn 完整进入可视区域；超长 turn 至少从其首行开始展示。
+pub(crate) fn turn_picker_scroll_offset(
+    ranges: &[(usize, usize)],
+    selected: usize,
+    visible_rows: usize,
+) -> usize {
+    if ranges.is_empty() || visible_rows == 0 {
+        return 0;
+    }
+    let (start, end) = ranges[selected.min(ranges.len().saturating_sub(1))];
+    let total_rows = ranges.last().map(|(_, end)| *end).unwrap_or(0);
+    let max_scroll = total_rows.saturating_sub(visible_rows);
+    let offset = if end.saturating_sub(start) > visible_rows {
+        start
+    } else if end > visible_rows {
+        end.saturating_sub(visible_rows)
+    } else {
+        0
+    };
+    offset.min(max_scroll)
 }
 
 pub(crate) fn draw_queue_picker(
@@ -2587,7 +2640,7 @@ pub(crate) fn overlay_mouse_regions(area: Rect, app: &TuiApp) -> Vec<OverlayMous
     if surface == Some(OverlaySurface::TurnPicker)
         && let Some(picker) = &app.turn_picker
     {
-        return turn_mouse_regions(area, picker);
+        return turn_mouse_regions(area, picker, app);
     }
     if surface == Some(OverlaySurface::Queue)
         && let Some(picker) = &app.queue_picker
@@ -2720,17 +2773,25 @@ fn resume_mouse_regions(area: Rect, picker: &ResumePickerState) -> Vec<OverlayMo
     regions
 }
 
-fn turn_mouse_regions(area: Rect, picker: &TurnPickerState) -> Vec<OverlayMouseRegion> {
-    let visible_count = resume_picker_page_size(area);
-    let offset = resume_picker_offset(picker.selected, visible_count, picker.items.len());
-    (offset..picker.items.len().min(offset.saturating_add(visible_count)))
-        .filter_map(|index| {
-            content_mouse_region(area, index.saturating_sub(offset), 2).map(|area| {
-                OverlayMouseRegion {
+fn turn_mouse_regions(
+    area: Rect,
+    picker: &TurnPickerState,
+    app: &TuiApp,
+) -> Vec<OverlayMouseRegion> {
+    let layout = turn_picker_visual_layout(area, picker, app);
+    let visible_rows = usize::from(area.height.saturating_sub(1));
+    let scroll = turn_picker_scroll_offset(&layout.ranges, picker.selected, visible_rows);
+    layout
+        .ranges
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (start, end))| {
+            scrolled_content_mouse_region(area, *start, end.saturating_sub(*start), scroll).map(
+                |area| OverlayMouseRegion {
                     press: UiMousePress::Turn(index),
                     area,
-                }
-            })
+                },
+            )
         })
         .collect()
 }
