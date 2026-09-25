@@ -9,6 +9,7 @@ use golutra_agent_protocol::{
     SessionCommandKind,
 };
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -46,6 +47,19 @@ pub(crate) struct HistoricalTurnItem {
     pub(crate) turn_id: TurnId,
     pub(crate) prompt: String,
     pub(crate) metadata: String,
+    pub(crate) preview: Vec<HistoricalTurnPreview>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct HistoricalTurnPreview {
+    pub(crate) kind: HistoricalTurnPreviewKind,
+    pub(crate) text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HistoricalTurnPreviewKind {
+    Assistant,
+    Tool,
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +124,37 @@ pub(crate) fn historical_turn_items(events: &[RuntimeEvent]) -> Vec<HistoricalTu
     let mut items = Vec::<(u64, HistoricalTurnItem)>::new();
     let mut ordered = events.iter().collect::<Vec<_>>();
     ordered.sort_by_key(|event| event.sequence_no);
+    let mut previews = HashMap::<TurnId, Vec<HistoricalTurnPreview>>::new();
+    for event in &ordered {
+        let Some(turn_id) = event.turn_id else {
+            continue;
+        };
+        let (kind, text) = match event.event_type {
+            RuntimeEventType::AssistantMessage => (
+                HistoricalTurnPreviewKind::Assistant,
+                event.payload.get("content").and_then(Value::as_str),
+            ),
+            RuntimeEventType::ToolCompleted => (
+                HistoricalTurnPreviewKind::Tool,
+                event
+                    .payload
+                    .pointer("/envelope/summary")
+                    .and_then(Value::as_str)
+                    .or_else(|| event.payload.get("summary").and_then(Value::as_str)),
+            ),
+            _ => (HistoricalTurnPreviewKind::Assistant, None),
+        };
+        let Some(text) = text.map(str::trim).filter(|text| !text.is_empty()) else {
+            continue;
+        };
+        previews
+            .entry(turn_id)
+            .or_default()
+            .push(HistoricalTurnPreview {
+                kind,
+                text: text.to_owned(),
+            });
+    }
     for event in ordered {
         if !matches!(
             event.event_type,
@@ -140,6 +185,7 @@ pub(crate) fn historical_turn_items(events: &[RuntimeEvent]) -> Vec<HistoricalTu
                 super::short_id(&turn_id.to_string()),
                 event.sequence_no
             ),
+            preview: previews.get(&turn_id).cloned().unwrap_or_default(),
         };
         if let Some((sequence, existing)) = items
             .iter_mut()

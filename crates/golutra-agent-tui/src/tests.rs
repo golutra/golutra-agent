@@ -998,17 +998,26 @@ fn historical_turn_items_deduplicate_turn_updates_and_ignore_missing_ids() {
         json!({"payload": {"prompt": "updated"}}),
     );
     updated.turn_id = Some(turn);
-    let missing_id = transcript_event(
+    let mut assistant = transcript_event(
         3,
+        session_id,
+        task_id,
+        RuntimeEventType::AssistantMessage,
+        json!({"content": "assistant preview"}),
+    );
+    assistant.turn_id = Some(turn);
+    let missing_id = transcript_event(
+        4,
         session_id,
         task_id,
         RuntimeEventType::TaskCreated,
         json!({"payload": {"prompt": "cannot fork"}}),
     );
-    let items = historical_turn_items(&[initial, updated, missing_id]);
+    let items = historical_turn_items(&[initial, updated, assistant, missing_id]);
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].turn_id, turn);
     assert_eq!(items[0].prompt, "updated");
+    assert_eq!(items[0].preview[0].text, "assistant preview");
 }
 
 #[tokio::test]

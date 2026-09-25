@@ -1286,6 +1286,7 @@ fn turn_picker_visual_layout(
                 Modifier::empty()
             });
         let start = visual_rows;
+        let block_line_start = lines.len();
         lines.push(Line::from(vec![
             Span::styled(
                 selection_marker(app, selected),
@@ -1305,11 +1306,31 @@ fn turn_picker_visual_layout(
             Span::raw("    "),
             Span::styled(item.metadata.clone(), Style::default().fg(palette.muted)),
         ]));
+        for preview in &item.preview {
+            let (marker, color) = match preview.kind {
+                HistoricalTurnPreviewKind::Assistant => ("    • ", palette.subtle),
+                HistoricalTurnPreviewKind::Tool => ("    · ", palette.muted),
+            };
+            for (line_index, text) in preview.text.lines().enumerate() {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        if line_index == 0 { marker } else { "       " },
+                        Style::default().fg(color),
+                    ),
+                    Span::styled(
+                        super::tool_detail_data::terminal_text(text),
+                        Style::default().fg(color),
+                    ),
+                ]));
+            }
+        }
         lines.push(Line::default());
-        let end = start
-            .saturating_add(turn_picker_line_count(&lines[lines.len() - 3], width))
-            .saturating_add(turn_picker_line_count(&lines[lines.len() - 2], width))
-            .saturating_add(turn_picker_line_count(&lines[lines.len() - 1], width));
+        let end = start.saturating_add(
+            lines[block_line_start..]
+                .iter()
+                .map(|line| turn_picker_line_count(line, width))
+                .sum(),
+        );
         visual_rows = end;
         ranges.push((start, end));
     }
