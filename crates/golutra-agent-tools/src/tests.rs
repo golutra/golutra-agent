@@ -3688,9 +3688,12 @@ fn shell_request_read_only_fast_path_is_conservative() {
     assert!(shell_request_is_strictly_read_only(
         &json!({"command": "cat README.md", "background": true})
     ));
+    assert!(shell_request_is_strictly_read_only(
+        &json!({"command": "printf ok | tr o O"})
+    ));
     for arguments in [
         json!({"command": "bash -lc 'cat README.md'"}),
-        json!({"command": "printf ok | tr o O"}),
+        json!({"command": "printf ok | tee result.txt"}),
         json!({"command": "find . -exec cat {} +"}),
         json!({"command": "sort -o result.txt"}),
     ] {
@@ -3702,8 +3705,15 @@ fn shell_request_read_only_fast_path_is_conservative() {
 async fn strict_read_only_shell_skips_workspace_snapshot_and_reports_zero_changes() {
     let workspace = tempdir().expect("workspace");
     fs::write(workspace.path().join("README.md"), "read-only\n").expect("fixture");
-    let executor = executor(workspace.path());
-    let request = request("shell", json!({"command": "cat README.md"}));
+    let executor = BasicToolExecutor::new(
+        WorkspacePolicy::new(workspace.path())
+            .unwrap()
+            .with_unrestricted_access(true),
+    );
+    let request = request(
+        "shell",
+        json!({"command": "pwd && cat README.md | head -1"}),
+    );
     let policy = executor.evaluate(&request).expect("policy evaluates");
     let preparation = executor
         .prepare_side_effect_snapshot(&request)
@@ -3734,6 +3744,27 @@ async fn strict_read_only_shell_skips_workspace_snapshot_and_reports_zero_change
     assert!(report.before_images.is_empty());
     assert!(report.after_images.is_empty());
     assert!(report.changed_files.is_empty());
+    let timings = &report.envelope.structured_facts["timings"];
+    assert_eq!(timings["workspace_before_ms"], 0);
+    assert_eq!(timings["workspace_after_ms"], 0);
+    assert!(timings["launch_ms"].is_u64());
+    assert!(timings["invocation_ms"].as_u64().unwrap() >= timings["process_ms"].as_u64().unwrap());
+}
+
+#[test]
+fn secret_redaction_keeps_task_identifiers_but_removes_real_keys() {
+    let references =
+        "task-workspace automation-generated-task-01a0d401-a6e0-7271-a4d2-7b1cb68d59e7";
+    assert_eq!(redact_sensitive_text(references).0, references);
+    let secret = "sk-1234567890abcdefghijklmnop";
+    for text in [
+        secret.to_owned(),
+        format!("({secret})"),
+        format!("key={secret}"),
+        format!("密钥{secret}"),
+    ] {
+        assert!(!redact_sensitive_text(&text).0.contains(secret));
+    }
 }
 
 #[tokio::test]

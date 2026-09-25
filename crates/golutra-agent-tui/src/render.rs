@@ -765,6 +765,15 @@ pub(crate) fn auth_model_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
 }
 
 pub(crate) fn auth_advanced_config_lines(dialog: &AuthDialogState) -> Vec<Line<'static>> {
+    if matches!(dialog.protocol_detection, ModelDiscoveryState::Loading(_)) {
+        return vec![
+            Line::from("Detecting provider protocol…"),
+            Line::from(
+                "Sending a short test request; project files and conversation history are not included.",
+            ),
+            Line::from("Esc cancel"),
+        ];
+    }
     let mut lines = vec![
         Line::from(vec![Span::styled(
             auth_step_title(dialog),
@@ -776,7 +785,11 @@ pub(crate) fn auth_advanced_config_lines(dialog: &AuthDialogState) -> Vec<Line<'
         auth_option_line(
             0,
             "Continue",
-            "Review provider setup",
+            if dialog.automatic_protocol {
+                "Detect protocol, then review setup"
+            } else {
+                "Review provider setup"
+            },
             dialog.advanced_selected == 0,
         ),
         auth_option_line(
@@ -828,15 +841,24 @@ pub(crate) fn auth_advanced_config_lines(dialog: &AuthDialogState) -> Vec<Line<'
             Style::default().fg(Color::DarkGray),
         )),
     ];
+    if dialog.automatic_protocol
+        && matches!(dialog.protocol_detection, ModelDiscoveryState::Failed(_))
+    {
+        lines.push(Line::from(
+            "Select Continue to retry; Ctrl+P to choose a protocol and save without detection.",
+        ));
+    }
     push_auth_error(&mut lines, dialog.error.as_deref());
     lines
 }
 
 fn auth_advanced_help(dialog: &AuthDialogState) -> &'static str {
-    if dialog.advanced_input.is_some() {
+    if matches!(dialog.protocol_detection, ModelDiscoveryState::Loading(_)) {
+        "Detecting protocol   Esc cancel"
+    } else if dialog.advanced_input.is_some() {
         "Enter/Esc keep edit   Left/Right cursor   Ctrl+U clear"
     } else {
-        "Up/Down select   Enter change/continue   Left/Right adjust   Esc back"
+        "Up/Down select   Enter change/continue   Ctrl+P select protocol   Esc back"
     }
 }
 
@@ -2719,9 +2741,11 @@ pub(crate) fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
                     "Provider setup   Enter save   Esc back   Ctrl+C twice quit"
                 }
                 Some(AuthDialogStep::ApiKey) => {
-                    "Enter continue   Ctrl+E use environment variable   Esc back"
+                    "Enter continue   Ctrl+E use environment variable   Ctrl+P select protocol   Esc back"
                 }
-                Some(AuthDialogStep::EnvKey) => "Enter continue   Ctrl+E use API key   Esc back",
+                Some(AuthDialogStep::EnvKey) => {
+                    "Enter continue   Ctrl+E use API key   Ctrl+P select protocol   Esc back"
+                }
                 Some(AuthDialogStep::AdvancedConfig) => {
                     auth_advanced_help(app.auth_dialog.as_ref().expect("auth dialog"))
                 }

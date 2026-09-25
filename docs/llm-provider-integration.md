@@ -13,6 +13,12 @@
 
 首次 provider onboarding、resume、多 session 和多工作区的完整 UX 见 `onboarding-session-workspace-design.md`。
 
+官方 `/auth` 与 Custom Provider 共用协议顺序列表：Responses、Anthropic、Gemini、Chat Completions、Vertex AI、rust-genai。官方入口默认自动探测，使用 `https://api.golutra.cn` 并跳过地址输入和手动协议页。填写凭据、模型及高级设置后，Continue 使用独立的短文本请求按该列表顺序探测，成功才进入确认页；确认页仍离线保存。Ctrl+P 可改为手动选择协议，Custom Provider 默认手动选择，列表首项为 Responses。
+
+探测复用实际流式适配器，不发送项目文件、历史或工具定义；模型目录可读、HTTP 200 或空响应不等于探测成功。单项超时 20 秒、总超时 60 秒，Esc 取消，过期结果不能覆盖新草稿。只有明确的接口不支持错误才尝试下一项；认证失败、限流、网络故障、请求拒绝和服务错误保留原错。Vertex AI 需要项目地址与 OAuth，rust-genai 是路由适配器，两者保留手动入口，不纳入普通 API Key 的自动探测。探测仅验证基本文本调用，不保证所有工具或生成参数组合均可用；已有配置不会被自动迁移，正常任务失败也不会触发跨协议重放。
+
+同一向导内缓存最近一次成功结果：返回高级设置再 Continue 时，地址、有效 Key、模型、生成参数及解析后的自定义 header 均未变化则直接进入确认页。指纹只在内存比较，不落盘或输出；更换提供商或关闭向导即清除，失败和取消不缓存。环境引用按当前值比较，探测期间变化的配置不能接受迟到结果。超时仅表示协议尚未确认，不表示不兼容；Continue 可重试，Ctrl+P 可手动选择协议并离线确认保存。
+
 ## 当前状态
 
 截至 2026-09-02：
@@ -21,7 +27,7 @@
 - 默认 provider 是 mock。
 - CLI 已支持 `golutra-agent provider login`、`set-key`、`oauth-login`、`logout` 和 `use`；`provider login` 可填写 `--enable-thinking`、`--reasoning-effort low|medium|high|xhigh|max|ultra`、`--context-window-size <n>`、`--max-tokens <n>`。TUI 首次进入会检查 provider onboarding 状态。Responses / Chat Completions 按原值发送显式 effort，需上游模型支持；其他原生适配器暂不支持 `ultra`，不会静默降档。
 - 如果全局用户配置没有 active provider profile，TUI 会打开 provider setup；用户可以先选 Golutra API、Third-party Providers、Custom Provider 或 mock，再选择协议、base URL、凭据存储、推荐或自定义 model 和高级生成配置，最后在 review 页确认脱敏 install plan 后保存。交互输入的 API key 默认进入 `$GOLUTRA_AGENT_HOME/credentials.json`，也可只保存已有 envKey 引用。
-- 高级配置默认选中第一项 `Continue`，Enter 直接进入确认页。需要修改时上下选择其他项：Thinking / Reasoning effort 可用左右键或 Enter 切换；Context window / Max output tokens / Custom headers 按 Enter 进入编辑，支持光标移动、删除、粘贴及 Ctrl+U 清空，Enter 或 Esc 保留草稿并返回选项列表。编辑时 `j/k` 正常输入，不触发导航；再次选中 Continue 才会校验配置并进入确认页，最终仍在确认页保存。
+- 高级配置默认选中第一项 `Continue`，Enter 校验配置后进入确认页；官方自动模式会先探测协议。需要修改时上下选择其他项：Thinking / Reasoning effort 可用左右键或 Enter 切换；Context window / Max output tokens / Custom headers 按 Enter 进入编辑，支持光标移动、删除、粘贴及 Ctrl+U 清空，Enter 或 Esc 保留草稿并返回选项列表。编辑时 `j/k` 正常输入，不触发导航；再次选中 Continue 才会校验配置，最终仍在确认页保存。
 - Golutra API 使用内置 URL，Custom Provider 填写 URL；两者在填好凭据后立即进入模型页：默认选中第一项空白 `Custom model`，可直接输入或粘贴模型 ID，Enter 继续，不等待网络。后台按所选协议读取规范化基址的 `GET /models`，返回的模型按上游顺序去重并追加到手填项下方；不自动切换选择，不覆盖正在输入的内容。上下键可选择获取到的模型。OpenAI Chat/Responses 使用 Bearer 认证及 `data[].id`；Anthropic 使用 `x-api-key`、`anthropic-version` 及 `data[].id`；Gemini 使用 `x-goog-api-key` 及 `models[].name`，去掉 `models/` 前缀。当前读取单次目录响应，不追踪分页；Vertex AI、rust-genai 没有此处可直接使用的统一目录协议，保留手动输入。第三方预设仍使用内置推荐列表。
 - 模型发现最多等待 10 秒，失败、空列表或不支持目录查询均不影响手填和继续。环境变量模式仅从当前进程环境读取 Key，不把值写回向导或配置。返回改 Key、关闭向导或继续下一步会取消未完成的查询，旧结果不会覆盖当前输入；从高级配置返回模型页复用已获取列表。目录查询不代表模型一定支持当前协议或推理能力。Review 确认保存仍只落盘，不发起联网验证。
 - Custom Provider 的 API key envKey 已按统一规则由 `(protocol, baseUrl)` 派生：`GOLUTRA_AGENT_CUSTOM_PROVIDER_API_KEY_{PROTOCOL}_{NORMALIZED_BASE_URL}_{12_HEX_HASH}`。同一个 endpoint 的尾随 `/` 不会生成不同 key，不同协议或不同 endpoint 不会共享固定 `GOLUTRA_AGENT_PROVIDER_API_KEY`。
@@ -39,13 +45,13 @@
 - provider protocol catalog 已注册且可执行 `mock`、`openai-compatible`、`openai-responses`、`anthropic`、`gemini`、`vertex-ai` 和 `genai`。
 - `anthropic` 强制使用 Anthropic Messages wire，`gemini` 使用 generateContent，`vertex-ai` 使用 Vertex generateContent 和 bearer/OAuth token，`genai` 根据 model namespace 选择 rust-genai adapter；它们统一映射 tool round-trip、usage、reasoning effort、finish reason 和脱敏错误。
 - live HTTP 调用使用 10 秒 connect timeout；`GenaiProviderAdapter` 和 Responses adapter 的粗粒度请求上限为 3600 秒，独立 OpenAI-compatible client 使用 300 秒 read-idle 上限，活动流仍由 `ProviderSession` 的事件 deadline 收口。OpenAI-compatible 已使用 SSE 增量读取并按顺序产生 text/tool/usage stream event，truncated/malformed stream 显式失败。SSE 与 genai captured raw metadata 都执行 16 MiB 响应边界，assistant message、tool id/name/arguments 另有更小字段上限。
-- CLI/env 与 TUI base URL 共用协议规范化：裸域名默认补 HTTPS，OpenAI Chat/Responses、Anthropic 补 `/v1`，Gemini 补 `/v1beta`，保留显式路径。Golutra 官方 preset 内置 `https://api.golutra.cn` 并跳过地址输入页，直接填写凭据；确认和保存时补齐当前协议的路径。官方预设当前使用 OpenAI Chat Completions，不自动推断模型协议。
+- CLI/env 与 TUI base URL 共用协议规范化：裸域名默认补 HTTPS，OpenAI Chat/Responses、Anthropic 补 `/v1`，Gemini 补 `/v1beta`，保留显式路径。Golutra 官方 preset 内置 `https://api.golutra.cn` 并跳过地址输入页，直接填写凭据；自动探测按共享列表优先尝试 Responses，确认和保存时补齐选定协议的路径。手动选择 Vertex AI 或 rust-genai 时保留地址输入页以支持特殊端点。
 - CLI 已提供 `golutra-agent provider protocols`、`golutra-agent provider current` 和 `golutra-agent provider probe`，输出只包含协议目录、脱敏配置与 probe 结果，不输出 API key。
 - provider/auth 配置持久化到 `$GOLUTRA_AGENT_HOME/provider.json` v2；workspace `.golutra-agent` 不再作为 provider 配置来源。v2 使用原子写和 owner-only 权限，只保存 `credential_ref`、OAuth descriptor 与非敏感 provider metadata，不保存 API key 或 token。交互 secret 进入独立的 owner-only `$GOLUTRA_AGENT_HOME/credentials.json`，CI/headless 配置可保存只读 env ref；v1 `env` map 会在 provider settings lock 内一次性迁移到 disk SecretStore，迁移失败会恢复 secret 并保留原配置。
 - 高级生成配置跟随 active profile 保存为 `generation_config`，运行时序列化到 `GOLUTRA_AGENT_PROVIDER_GENERATION_CONFIG`。OpenAI-compatible adapter 会在最终 Chat Completions JSON 顶层下发 `enable_thinking`、`reasoning_effort` 和 `max_tokens`；`context_window_size` 不写入 provider 请求体，但会收紧 `ContextBuilder` 的 context window、reserved output 和输入预算。
 - `provider current`、运行时 resolver 与 `provider probe` 在没有任何配置时都一致解析为 deterministic mock；显式 live 配置损坏或缺失仍返回错误，不静默 fallback。
 - live 模式下配置缺失会显式失败，不再静默回退到 mock。
-- env 入口继续作为非交互配置协议，并已由 SecretRef 层作为只读 credential source 使用；明文值不会复制进 provider 配置。`golutra-agent-auth` 已实现 browser PKCE、RFC 8628 device flow、OpenAI headless device-auth、token refresh/revoke/logout，LLM adapter 在 401 时只强制刷新并重试一次。受审计 catalog 已内置 OpenAI ChatGPT browser/headless、xAI browser/device 和 GitHub Copilot device；自定义 OAuth 仍要求显式 descriptor，不会从任意 OpenAI-compatible base URL 自动推断授权端点。
+- env 入口继续作为非交互配置协议，并已由 SecretRef 层作为只读 credential source 使用；明文值不会复制进 provider 配置。`golutra-agent-auth` 已实现 browser PKCE、RFC 8628 device flow、OpenAI headless device-auth、token refresh/revoke/logout。LLM adapter 遇到 401 时，仅对支持刷新的凭据刷新并重试一次；固定 API Key 和磁盘 Key 直接保留首次认证错误。受审计 catalog 已内置 OpenAI ChatGPT browser/headless、xAI browser/device 和 GitHub Copilot device；自定义 OAuth 仍要求显式 descriptor，不会从任意 OpenAI-compatible base URL 自动推断授权端点。
 - OpenAI ChatGPT OAuth 使用 `openai-responses` 薄适配：固定 `rust-genai::OpenAIResp` 后发往 Responses SSE endpoint，不按模型名重新推断协议；account id 优先从 token response 的 `id_token` 安全提取，调用时携带 `ChatGPT-Account-Id`/`session-id`，并在 `store=false` 的多轮工具调用中保留/回送 encrypted reasoning item。流建立阶段的 401 只允许在首个业务事件前刷新重建一次。GitHub Copilot adapter 增加其要求的 API version、intent、initiator 和 User-Agent header。
 - 已提交六组 provider golden fixture，通过本地 HTTP 捕获实际 adapter wire，覆盖完整 message/tool result 序列化、Responses SSE/reasoning replay、文本和 tool-call 响应、usage/finish reason、auth header 与 401。`just provider-live-smoke` 只读取专用 `GOLUTRA_AGENT_LIVE_*` 环境变量，不读取正常用户凭据，变量不全时安全跳过。
 - provider capability 已有 declared/discovered 两级来源。OpenAI-compatible probe 从 `/models` 的 supported parameters、context window、max output 和 input modalities 更新 streaming/tools/JSON Schema/reasoning/vision；无法发现的字段保留 declared/unknown，不伪造能力。

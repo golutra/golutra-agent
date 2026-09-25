@@ -3,7 +3,7 @@
 use super::*;
 
 #[derive(Clone, Copy, Debug)]
-enum Wire {
+pub(super) enum Wire {
     Chat,
     Anthropic,
     Gemini,
@@ -199,7 +199,7 @@ fn event(kind: &str, data: Value) -> String {
     format!("event: {kind}\ndata: {data}\n\n")
 }
 
-fn stream(wire: Wire, reason: Option<&str>, tool: bool, terminal: bool) -> String {
+pub(super) fn stream(wire: Wire, reason: Option<&str>, tool: bool, terminal: bool) -> String {
     let value = body(wire, reason, tool);
     match wire {
         Wire::Chat => {

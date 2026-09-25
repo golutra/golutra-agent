@@ -35,7 +35,7 @@ impl ProviderTransport {
 pub struct ProviderSessionPolicy {
     /// 普通流错误的重试额度；已确认的连接故障另行等待，仍受任务截止时间约束。
     pub max_stream_retries: u32,
-    /// 非流式请求的普通瞬态错误额度，不包含连接等待。
+    /// 请求重试的兼容上限；两种传输共享两项上限的较大值，不包含连接等待。
     pub max_request_retries: u32,
     /// Maximum time without a stream event before the attempt is considered lost.
     pub stream_idle_timeout: Duration,
@@ -232,41 +232,44 @@ where
         E: FnMut(ProviderSessionEvent) + Send,
     {
         let mut retries = RetryState::default();
+        let total_retries = self
+            .policy
+            .max_stream_retries
+            .max(self.policy.max_request_retries);
         let error = loop {
             if self.allow_connection_wait {
                 add_recovery_reminder(request, retries.waited, self.input_budget);
             }
+            let started = Instant::now();
             match self
                 .complete_stream_attempt(provider, request.clone(), cancellation, on_event)
                 .await
             {
                 Ok(response) => return Ok(response),
-                Err(failure) => {
+                Err(mut failure) => {
+                    if failure.error == ProviderError::Cancelled {
+                        return Err(ProviderError::Cancelled);
+                    }
+                    retries.record_failure(&failure.error, started.elapsed());
+                    failure.error = retries.with_failures(failure.error);
+                    let can_fallback = self.policy.enable_transport_fallback
+                        && provider.supports_buffered_transport()
+                        && provider_retry::transport_fallback_eligible(&failure.error);
+                    // 换传输也是一次重试，预留额度，不能切换后再重置计数。
+                    let stream_retries = if can_fallback {
+                        self.policy
+                            .max_stream_retries
+                            .min(total_retries.saturating_sub(1))
+                    } else {
+                        self.policy.max_stream_retries
+                    };
                     let Some((delay, recovery)) = retries.schedule(
                         &failure.error,
-                        self.policy.max_stream_retries,
+                        stream_retries,
                         self.allow_connection_wait,
                         request.request_id.0.as_u128() as u64,
                         failure.preview_seen,
                     ) else {
-                        // 换传输之前也必须结束旧预览，不能将 buffered 结果接到半句话后。
-                        if failure.preview_seen
-                            && self.policy.enable_transport_fallback
-                            && provider.supports_buffered_transport()
-                            && provider_retry::is_retryable(&failure.error)
-                        {
-                            on_event(ProviderSessionEvent::Recovery(ProviderRecovery {
-                                phase: RecoveryPhase::Retrying,
-                                attempt: 0,
-                                delay_ms: 0,
-                                waited_ms: duration_ms(retries.waited),
-                                network: false,
-                                reset_stream: true,
-                                reason: "switching to buffered transport".to_owned(),
-                                transport: ProviderTransport::Buffered,
-                                error_metadata: failure.error.metadata().cloned(),
-                            }));
-                        }
                         break failure.error;
                     };
                     if !wait_for_recovery(delay, recovery, &mut retries, cancellation, on_event)
@@ -279,8 +282,21 @@ where
         };
         if self.policy.enable_transport_fallback
             && provider.supports_buffered_transport()
-            && provider_retry::is_retryable(&error)
+            && provider_retry::transport_fallback_eligible(&error)
         {
+            retries.switch_to_buffered();
+            let Some((delay, recovery)) = retries.schedule(
+                &error,
+                total_retries,
+                false,
+                request.request_id.0.as_u128() as u64,
+                true,
+            ) else {
+                return Err(retries.with_failures(error));
+            };
+            if !wait_for_recovery(delay, recovery, &mut retries, cancellation, on_event).await {
+                return Err(ProviderError::Cancelled);
+            }
             let provider_id = provider.contract().provider_id;
             on_event(ProviderSessionEvent::TransportFallback {
                 provider_id,
@@ -292,7 +308,7 @@ where
                 .complete_buffered(provider, request, cancellation, on_event, &mut retries)
                 .await;
         }
-        Err(error)
+        Err(retries.with_failures(error))
     }
 
     async fn complete_stream_attempt<E>(
@@ -364,7 +380,10 @@ where
                                 "provider stream idle for {} ms",
                                 self.policy.stream_idle_timeout.as_millis()
                             ),
-                        },
+                        }.with_metadata(golutra_agent_llm::ProviderErrorMetadata {
+                            stream_interrupted: true,
+                            ..Default::default()
+                        }),
                         preview_seen,
                     });
                 }
@@ -383,12 +402,11 @@ where
     where
         E: FnMut(ProviderSessionEvent) + Send,
     {
-        // 传输降级有独立的普通重试额度；累计等待时间仍属于同一逻辑请求。
-        retries.reset_transport_budget();
         loop {
             if self.allow_connection_wait {
                 add_recovery_reminder(request, retries.waited, self.input_budget);
             }
+            let started = Instant::now();
             let result = self
                 .complete_buffered_attempt(provider, request.clone(), cancellation)
                 .await;
@@ -398,14 +416,21 @@ where
                     return Ok(response);
                 }
                 Err(error) => {
+                    if error == ProviderError::Cancelled {
+                        return Err(error);
+                    }
+                    retries.record_failure(&error, started.elapsed());
+                    let error = retries.with_failures(error);
                     let Some((delay, recovery)) = retries.schedule(
                         &error,
-                        self.policy.max_request_retries,
+                        self.policy
+                            .max_request_retries
+                            .max(self.policy.max_stream_retries),
                         self.allow_connection_wait,
                         request.request_id.0.as_u128() as u64,
                         false,
                     ) else {
-                        return Err(error);
+                        return Err(retries.with_failures(error));
                     };
                     if !wait_for_recovery(delay, recovery, retries, cancellation, on_event).await {
                         return Err(ProviderError::Cancelled);
@@ -738,7 +763,11 @@ mod tests {
             if call < self.failures_before_success {
                 return Err(ProviderError::Unavailable {
                     message: "connection reset by fixture".to_owned(),
-                });
+                }
+                .with_metadata(golutra_agent_llm::ProviderErrorMetadata {
+                    stream_interrupted: true,
+                    ..Default::default()
+                }));
             }
             self.success.complete_stream(request, on_event).await
         }
@@ -930,10 +959,12 @@ mod tests {
             .await
             .expect_err("idle timeout");
 
-        assert!(matches!(
-            error,
-            ProviderSessionError::Provider(ProviderError::Timeout { .. })
-        ));
+        let ProviderSessionError::Provider(error) = error else {
+            panic!("provider error");
+        };
+        assert!(error.to_string().contains("provider stream idle"));
+        assert_eq!(error.metadata().unwrap().attempts.len(), 1);
+        assert!(error.metadata().unwrap().stream_interrupted);
         assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 1);
     }
 
@@ -1039,7 +1070,7 @@ mod tests {
         let provider = FlakyStreamProvider::new(usize::MAX);
         let policy = ProviderSessionPolicy {
             max_stream_retries: 0,
-            max_request_retries: 0,
+            max_request_retries: 1,
             enable_transport_fallback: true,
             stream_idle_timeout: Duration::from_secs(1),
             request_timeout: Duration::from_secs(1),

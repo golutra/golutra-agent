@@ -363,6 +363,74 @@ fn history_projection_event(
     }
 }
 
+#[test]
+fn resume_snapshot_appends_confirmed_tail_but_rebuilds_across_tool_boundaries() {
+    let old_task = TaskId::new();
+    let current_task = TaskId::new();
+    let turn = TurnId::new();
+    let mut current = history_projection_event(
+        4,
+        turn,
+        RuntimeEventType::TaskCreated,
+        json!({"prompt":"continue"}),
+    );
+    current.task_id = Some(current_task);
+    let tail = vec![
+        history_projection_event(
+            1,
+            turn,
+            RuntimeEventType::ProviderCompleted,
+            json!({"tool_call_count":0}),
+        ),
+        history_projection_event(
+            2,
+            turn,
+            RuntimeEventType::AssistantMessage,
+            json!({"content":"work finished"}),
+        ),
+        current,
+    ];
+    let messages =
+        crate::execution::resume_confirmed_tail(vec![replay_user("do work")], &tail, current_task)
+            .unwrap();
+    let messages =
+        crate::execution::resume_provider_messages(messages, old_task, current_task, "continue")
+            .unwrap();
+    assert_eq!(
+        messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        vec!["do work", "work finished", "continue"]
+    );
+    assert_eq!(messages[1].role, ProviderRole::Assistant);
+    for (event_type, payload) in [
+        (RuntimeEventType::ToolCompleted, json!({})),
+        (RuntimeEventType::CompactionCompleted, json!({})),
+        (
+            RuntimeEventType::ProviderCompleted,
+            json!({"tool_call_count":1}),
+        ),
+    ] {
+        let mut unsafe_tail = tail.clone();
+        unsafe_tail.push(history_projection_event(5, turn, event_type, payload));
+        assert!(
+            crate::execution::resume_confirmed_tail(vec![], &unsafe_tail, current_task).is_none()
+        );
+    }
+}
+
+#[test]
+fn environment_date_is_stable_within_day_and_refreshes_across_midnight() {
+    let now = chrono::DateTime::parse_from_rfc3339("2026-09-24T23:59:58+08:00").unwrap();
+    let render = |now| crate::context::environment_context_at(Path::new("/tmp/work"), now);
+    let prompt = render(now);
+    assert!(prompt.contains("<current_date>2026-09-24</current_date>"));
+    assert!(prompt.contains("<timezone>+08:00</timezone>"));
+    assert_eq!(prompt, render(now + chrono::Duration::seconds(1)));
+    assert!(render(now + chrono::Duration::seconds(2)).contains("2026-09-25"));
+}
+
 fn test_compaction_summary(summary: &str) -> String {
     compaction_summary_envelope(
         summary,
@@ -6997,6 +7065,84 @@ async fn first_prompt_sets_thread_title_from_prompt() {
 
     assert_eq!(thread.title, "write file chain.txt with content ok");
     assert_eq!(thread.preview, "write file chain.txt with content ok");
+}
+
+#[tokio::test]
+async fn next_request_after_restart_contains_the_previous_confirmed_answer() {
+    let workspace = tempdir().unwrap();
+    let _provider = IsolatedGlobalMockProvider::install().await;
+    let transport = EmbeddedTransport::for_cwd(workspace.path()).await.unwrap();
+    let session = transport.default_session_id();
+    transport
+        .send_command(bounded_mock_command(session, json!({"prompt":"hello"})))
+        .await
+        .unwrap();
+    let events = wait_for_task_completed_count(&transport, session, 1).await;
+    let answer = events
+        .iter()
+        .rev()
+        .find(|event| event.event_type == RuntimeEventType::AssistantMessage)
+        .unwrap()
+        .payload["content"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    transport.close().await.unwrap();
+    drop(transport);
+
+    let reopened = EmbeddedTransport::for_cwd(workspace.path()).await.unwrap();
+    reopened
+        .send_command(bounded_mock_command(
+            session,
+            json!({"prompt":"what did you just answer?"}),
+        ))
+        .await
+        .unwrap();
+    wait_for_task_completed_count(&reopened, session, 2).await;
+    let snapshot = reopened
+        .host
+        .storage
+        .store
+        .load_latest_context_snapshot(session)
+        .await
+        .unwrap()
+        .unwrap();
+    let artifact = reopened
+        .host
+        .storage
+        .repositories
+        .artifacts
+        .get(snapshot.restricted_request_artifact_ref.unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let bytes = reopened
+        .host
+        .storage
+        .store
+        .load_artifact_bytes_bounded(&artifact, 32 * 1024 * 1024)
+        .await
+        .unwrap()
+        .unwrap();
+    let request: golutra_agent_llm::ProviderRequest = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        request
+            .messages
+            .iter()
+            .filter(|message| message.role == ProviderRole::Assistant && message.content == answer)
+            .count(),
+        1
+    );
+    assert_eq!(
+        request
+            .messages
+            .iter()
+            .filter(|message| message.role == ProviderRole::User
+                && message.content == "what did you just answer?")
+            .count(),
+        1
+    );
+    reopened.close().await.unwrap();
 }
 
 #[tokio::test]

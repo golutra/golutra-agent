@@ -1046,7 +1046,12 @@ pub(crate) fn trace_event_payload(
                     "response_http_status": metadata.response_http_status,
                     "http_status": metadata.http_status,
                     "provider_code": metadata.provider_code,
+                    "error_type": metadata.error_type,
+                    "error_detail": metadata.error_detail,
+                    "attempts": metadata.attempts,
+                    "stream_interrupted": metadata.stream_interrupted,
                     "request_id": metadata.request_id,
+                    "upstream_response_id": metadata.upstream_response_id,
                     "retry_after_ms": metadata.retry_after.map(|delay| delay.as_millis()),
                 })),
             }),
@@ -1478,6 +1483,7 @@ mod tests {
                 provider_code: Some("invalid_request".to_owned()),
                 request_id: Some("fixture-400".to_owned()),
                 retry_after: None,
+                ..Default::default()
             }),
         })
         .expect("provider failure payload");

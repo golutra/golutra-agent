@@ -164,12 +164,20 @@ impl RuntimeHost {
             return Ok(None);
         }
 
-        let replay_messages = resume_provider_messages(
-            previous.messages,
-            previous.task_id,
-            current_task_id,
-            objective,
-        );
+        let Some(tail) = self
+            .storage
+            .store
+            .load_context_tail(session_id, previous.request_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(messages) = resume_confirmed_tail(previous.messages, &tail, current_task_id)
+        else {
+            return Ok(None);
+        };
+        let replay_messages =
+            resume_provider_messages(messages, previous.task_id, current_task_id, objective);
         Ok(Some(match replay_messages {
             Some(messages) => {
                 let mut replay = AgentReplayContext::for_resume(messages, previous.tools);
@@ -342,8 +350,45 @@ impl RuntimeHost {
     }
 }
 
-/// 恢复完整 provider transcript 并追加当前目标。上下文预算和语义压缩统一由
-/// runtime 处理；这里改写旧消息会破坏稳定前缀，也会丢失模型摘要所需的来源。
+/// 请求快照不包含它生成的答案；从持久事件补全已确认尾部，复杂边界回退普通历史重建。
+pub(crate) fn resume_confirmed_tail(
+    mut messages: Vec<ProviderMessage>,
+    tail: &[RuntimeEvent],
+    current_task_id: TaskId,
+) -> Option<Vec<ProviderMessage>> {
+    // 涉及工具、排队输入或压缩时使用现有历史重建，不能拼出半组调用或重复用户输入。
+    if tail.iter().any(|event| {
+        matches!(
+            event.event_type,
+            RuntimeEventType::ToolCompleted
+                | RuntimeEventType::CompactionCompleted
+                | RuntimeEventType::TurnQueued
+                | RuntimeEventType::TurnUpdated
+                | RuntimeEventType::TurnCancelled
+        ) || event.event_type == RuntimeEventType::ProviderCompleted
+            && event.payload["tool_call_count"].as_u64().unwrap_or(0) > 0
+    }) {
+        return None;
+    }
+    for event in tail.iter().filter(|event| {
+        !(event.task_id == Some(current_task_id)
+            && event.event_type == RuntimeEventType::TaskCreated)
+    }) {
+        if let Some(contributor) = crate::context::conversation_history_contributor(event) {
+            messages.push(ProviderMessage {
+                role: contributor.role,
+                content: contributor.content,
+                tool_call_id: None,
+                tool_name: None,
+                tool_calls: Vec::new(),
+                metadata: Default::default(),
+            });
+        }
+    }
+    Some(messages)
+}
+
+/// 保留历史来源并追加当前目标，预算和语义压缩由 runtime 统一处理。
 pub(crate) fn resume_provider_messages(
     mut messages: Vec<ProviderMessage>,
     previous_task_id: TaskId,

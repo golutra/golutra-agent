@@ -1045,9 +1045,19 @@ pub(crate) fn system_prompt() -> String {
 }
 
 pub(crate) fn environment_context_prompt(workspace_root: &Path) -> String {
+    environment_context_at(workspace_root, chrono::Local::now().fixed_offset())
+}
+
+pub(crate) fn environment_context_at(
+    workspace_root: &Path,
+    now: chrono::DateTime<chrono::FixedOffset>,
+) -> String {
+    // 日期按构建请求时刷新；不放秒级时间，避免稳定前缀随每次工具循环变化。
     format!(
-        "<environment_context>\n  <cwd>{}</cwd>\n</environment_context>",
-        xml_escape(&workspace_root.to_string_lossy())
+        "<environment_context>\n  <cwd>{}</cwd>\n  <current_date>{}</current_date>\n  <timezone>{}</timezone>\n</environment_context>",
+        xml_escape(&workspace_root.to_string_lossy()),
+        now.format("%Y-%m-%d"),
+        now.format("%:z")
     )
 }
 

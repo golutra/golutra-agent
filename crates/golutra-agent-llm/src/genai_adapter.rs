@@ -26,9 +26,8 @@ use super::{
     ProviderStreamEvent, ProviderToolCall, ProviderUsage, RESERVED_AFFINITY_HEADERS, UsageSource,
     cache_capabilities_from_reader, configured_or_first_env, custom_headers_from_reader,
     env_mapping, first_env, generation_config_from_reader, missing_env_error,
-    protocol_capabilities, provider_tool_schema_for_contract, request_id_from_headers,
-    retry_after_from_headers, sanitize_provider_error, selected_protocol_from_reader,
-    validate_provider_base_url_for_model,
+    protocol_capabilities, provider_tool_schema_for_contract, sanitize_provider_error,
+    selected_protocol_from_reader, validate_provider_base_url_for_model,
 };
 
 #[derive(Clone, PartialEq, Eq)]
@@ -312,7 +311,11 @@ impl GenaiProviderAdapter {
             .await;
         match response {
             Ok(response) => provider_response_from_genai(response),
-            Err(error) if !force_refresh && genai_error_requires_auth_refresh(&error) => {
+            Err(error)
+                if !force_refresh
+                    && self.credential.supports_refresh()
+                    && genai_error_requires_auth_refresh(&error) =>
+            {
                 let api_key = self
                     .credential
                     .credential(true)
@@ -340,6 +343,7 @@ impl GenaiProviderAdapter {
         // Keep the shaped request and options stable across a credential
         // refresh. This is especially valuable for long tool schemas.
         let chat_request = genai_chat_request(request, self.config.protocol)?;
+        let errors = Arc::new(crate::stream_error::StreamErrorCapture::default());
         let options = genai_chat_options(
             &self.config.generation_config,
             request.max_output_tokens,
@@ -348,7 +352,8 @@ impl GenaiProviderAdapter {
             request.cache_policy,
             self.cache_profile,
         )?
-        .with_extra_headers(self.affinity_headers(request));
+        .with_extra_headers(self.affinity_headers(request))
+        .with_raw_frame_sink_arc(errors.clone());
         let mut force_refresh = false;
         let response = loop {
             let api_key = self
@@ -366,7 +371,11 @@ impl GenaiProviderAdapter {
                 .await
             {
                 Ok(response) => break response,
-                Err(error) if !force_refresh && genai_error_requires_auth_refresh(&error) => {
+                Err(error)
+                    if !force_refresh
+                        && self.credential.supports_refresh()
+                        && genai_error_requires_auth_refresh(&error) =>
+                {
                     force_refresh = true;
                 }
                 Err(error) => return Err(map_genai_error(error)),
@@ -379,6 +388,9 @@ impl GenaiProviderAdapter {
         let mut observed_tool_ids = HashSet::new();
         let mut observed_id_bytes = 0_usize;
         while let Some(event) = stream.next().await {
+            if let Some(error) = errors.error() {
+                return Err(error);
+            }
             match event.map_err(map_genai_error)? {
                 ChatStreamEvent::Start
                 | ChatStreamEvent::ThoughtSignatureChunk(_)
@@ -427,8 +439,14 @@ impl GenaiProviderAdapter {
                 }
             }
         }
-        let end = stream_end.ok_or_else(|| ProviderError::Unavailable {
-            message: "native provider stream ended before a terminal event".to_owned(),
+        if let Some(error) = errors.error() {
+            return Err(error);
+        }
+        let end = stream_end.ok_or_else(|| {
+            ProviderError::Unavailable {
+                message: "native provider stream ended before a terminal event".to_owned(),
+            }
+            .with_stream_interrupted()
         })?;
         let response = provider_response_from_genai_stream(end, &model_id)?;
         super::response_contract::ensure_tools_captured(
@@ -1062,9 +1080,13 @@ fn non_negative_u64(value: Option<i32>) -> Option<u64> {
 }
 
 pub(crate) fn map_genai_error(error: genai::Error) -> ProviderError {
+    if let genai::Error::ChatResponse { body, .. } = &error {
+        return super::provider_error_from_value(body, Some(200), &Default::default());
+    }
     let message = sanitize_provider_error(&error.to_string());
     let status = genai_error_http_status(&error);
-    let metadata = genai_error_metadata(&error);
+    let mut metadata = genai_error_metadata(&error);
+    metadata.stream_interrupted = super::transport_error::genai_stream_interrupted(&error);
     let mapped = if status == Some(429) {
         ProviderError::RateLimited { message }
     } else if status.is_some_and(|status| (500..600).contains(&status)) {
@@ -1083,20 +1105,7 @@ pub(crate) fn map_genai_error(error: genai::Error) -> ProviderError {
             _ if message.to_ascii_lowercase().contains("timed out") => {
                 ProviderError::Timeout { message }
             }
-            _ if [
-                "stream",
-                "connection",
-                "connect",
-                "disconnect",
-                "reset",
-                "transport",
-                "broken pipe",
-            ]
-            .iter()
-            .any(|marker| message.to_ascii_lowercase().contains(marker)) =>
-            {
-                ProviderError::Unavailable { message }
-            }
+            _ if metadata.stream_interrupted => ProviderError::Unavailable { message },
             _ => ProviderError::Failed { message },
         }
     };
@@ -1137,6 +1146,17 @@ pub(crate) fn genai_error_http_status(error: &genai::Error) -> Option<u16> {
 /// 从 rust-genai 的错误包装层提取所有失败请求的脱敏元数据。
 pub(crate) fn genai_error_metadata(error: &genai::Error) -> ProviderErrorMetadata {
     match error {
+        genai::Error::ChatResponse { body, .. } => {
+            super::provider_error_metadata(Some(200), &Default::default(), Some(body))
+        }
+        genai::Error::HttpError { status, body, .. } => {
+            let value = serde_json::from_str::<Value>(body).ok();
+            super::provider_error_metadata(
+                Some(status.as_u16()),
+                &Default::default(),
+                value.as_ref(),
+            )
+        }
         genai::Error::WebStream { error, .. } => error
             .downcast_ref::<genai::Error>()
             .map(genai_error_metadata)
@@ -1163,14 +1183,13 @@ fn webc_error_http_status(error: &genai::webc::Error) -> Option<u16> {
 fn webc_error_metadata(error: &genai::webc::Error) -> ProviderErrorMetadata {
     match error {
         genai::webc::Error::ResponseFailedStatus {
-            status, headers, ..
-        } => ProviderErrorMetadata {
-            response_http_status: Some(status.as_u16()),
-            http_status: Some(status.as_u16()),
-            retry_after: retry_after_from_headers(headers),
-            request_id: request_id_from_headers(headers),
-            ..ProviderErrorMetadata::default()
-        },
+            status,
+            headers,
+            body,
+        } => {
+            let value = serde_json::from_str::<Value>(body).ok();
+            super::provider_error_metadata(Some(status.as_u16()), headers, value.as_ref())
+        }
         genai::webc::Error::Reqwest(error) => ProviderErrorMetadata {
             response_http_status: error.status().map(|status| status.as_u16()),
             http_status: error.status().map(|status| status.as_u16()),
@@ -1229,10 +1248,12 @@ mod tests {
             model_iden: ModelIden::new(AdapterKind::OpenAIResp, "gpt-test"),
             body: json!({"error": {"message": "stream unavailable"}}),
         };
-        assert!(matches!(
-            map_genai_error(response_error),
-            ProviderError::Malformed { .. }
-        ));
+        let mapped = map_genai_error(response_error);
+        assert_eq!(mapped.metadata().unwrap().response_http_status, Some(200));
+        assert!(!mapped.metadata().unwrap().stream_interrupted);
+        assert!(
+            matches!(mapped, ProviderError::WithMetadata { error, .. } if matches!(*error, ProviderError::Failed { .. }))
+        );
     }
 
     #[test]
@@ -1428,11 +1449,8 @@ mod tests {
             mapped,
             ProviderError::WithMetadata {
                 error,
-                metadata: ProviderErrorMetadata {
-                    http_status: Some(502),
-                    ..
-                }
-            } if matches!(*error, ProviderError::Unavailable { .. })
+                metadata,
+            } if metadata.http_status == Some(502) && matches!(*error, ProviderError::Unavailable { .. })
         ));
     }
 

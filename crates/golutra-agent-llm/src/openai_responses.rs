@@ -200,7 +200,7 @@ impl OpenAiResponsesProvider {
 
     pub async fn probe(&self) -> Result<ProviderProbeResult, ProviderError> {
         let mut response = self.send_probe(false).await?;
-        if response.status().as_u16() == 401 {
+        if response.status().as_u16() == 401 && self.credential.supports_refresh() {
             response = self.send_probe(true).await?;
         }
         let status = response.status();
@@ -449,7 +449,9 @@ impl OpenAiResponsesProvider {
             {
                 Ok(response) => response,
                 Err(error)
-                    if !force_refresh && genai_stream_error_requires_auth_refresh(&error) =>
+                    if !force_refresh
+                        && self.credential.supports_refresh()
+                        && genai_stream_error_requires_auth_refresh(&error) =>
                 {
                     force_refresh = true;
                     credential_refresh_attempted = true;
@@ -478,6 +480,7 @@ impl OpenAiResponsesProvider {
                     Ok(event) => event,
                     Err(error)
                         if !force_refresh
+                            && self.credential.supports_refresh()
                             && !business_event_seen
                             && genai_stream_error_requires_auth_refresh(&error) =>
                     {
@@ -485,7 +488,9 @@ impl OpenAiResponsesProvider {
                         break;
                     }
                     Err(error) => {
-                        return Err(map_responses_genai_error(error));
+                        return Err(terminal
+                            .error()
+                            .unwrap_or_else(|| map_responses_genai_error(error)));
                     }
                 };
                 match event {
@@ -567,10 +572,14 @@ impl OpenAiResponsesProvider {
                 credential_refresh_attempted = true;
                 continue;
             }
+            if let Some(error) = terminal.error() {
+                return Err(error);
+            }
             let Some(end) = stream_end else {
                 return Err(ProviderError::Unavailable {
                     message: "responses stream ended before a terminal event".to_owned(),
-                });
+                }
+                .with_stream_interrupted());
             };
             let diagnostics = ProviderTransportDiagnostics {
                 transport: "responses_sse".to_owned(),
@@ -718,8 +727,11 @@ fn responses_provider_response(
         .captured_response_id
         .as_deref()
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| ProviderError::Unavailable {
-            message: "responses stream ended before response.completed".to_owned(),
+        .ok_or_else(|| {
+            ProviderError::Unavailable {
+                message: "responses stream ended before response.completed".to_owned(),
+            }
+            .with_stream_interrupted()
         })?
         .to_owned();
     if response_id.len() > MAX_PROVIDER_TOOL_CALL_ID_BYTES {
@@ -826,7 +838,7 @@ fn map_responses_genai_error(error: genai::Error) -> ProviderError {
         None if matches!(error, genai::Error::StreamParse { .. }) => {
             ProviderError::Malformed { message }
         }
-        None => map_genai_error(error),
+        None => return map_genai_error(error),
     };
     mapped.with_metadata(ProviderErrorMetadata {
         http_status: status.or(metadata.http_status),

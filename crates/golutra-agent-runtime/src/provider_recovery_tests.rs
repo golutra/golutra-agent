@@ -305,6 +305,93 @@ async fn auxiliary_summary_requests_keep_bounded_connection_retries() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn transport_switch_shares_budget_and_retains_first_and_last_errors() {
+    let mut provider = FaultProvider::offline(usize::MAX);
+    provider.error = ProviderError::Unavailable {
+        message: "stream truncated".into(),
+    }
+    .with_metadata(ProviderErrorMetadata {
+        stream_interrupted: true,
+        response_http_status: Some(200),
+        ..Default::default()
+    });
+    let mut events = Vec::new();
+    let error = ProviderSession::new(&provider, None, ProviderSessionPolicy::default())
+        .complete(
+            super::tests::request(),
+            &CancellationToken::new(),
+            &mut |event| events.push(event),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+    let ProviderSessionError::Provider(error) = error else {
+        panic!("provider error");
+    };
+    let attempts = &error.metadata().unwrap().attempts;
+    assert_eq!(attempts.len(), 3);
+    assert_eq!(attempts[0].transport, "streaming");
+    assert_eq!(attempts[2].transport, "buffered");
+    assert_eq!(attempts[2].attempt, 3);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ProviderSessionEvent::TransportFallback { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn zero_retry_budget_disables_transport_switch() {
+    let mut provider = FaultProvider::offline(usize::MAX);
+    provider.error = ProviderError::Unavailable {
+        message: "truncated".into(),
+    }
+    .with_metadata(ProviderErrorMetadata {
+        stream_interrupted: true,
+        ..Default::default()
+    });
+    let policy = ProviderSessionPolicy {
+        max_stream_retries: 0,
+        max_request_retries: 0,
+        ..Default::default()
+    };
+    assert!(
+        ProviderSession::new(&provider, None, policy)
+            .complete(
+                super::tests::request(),
+                &CancellationToken::new(),
+                &mut |_| {}
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn attempt_history_is_bounded_and_preserves_the_initial_cause() {
+    let mut retries = RetryState::default();
+    for index in 1..=20 {
+        retries.record_failure(
+            &ProviderError::Unavailable {
+                message: format!("failure {index}"),
+            },
+            Duration::from_millis(index),
+        );
+    }
+    let error = retries.with_failures(ProviderError::Unavailable {
+        message: "last".into(),
+    });
+    let attempts = &error.metadata().unwrap().attempts;
+    assert_eq!(attempts.len(), 8);
+    assert_eq!(attempts[0].attempt, 1);
+    assert_eq!(attempts[1].attempt, 14);
+    assert_eq!(attempts[7].attempt, 20);
+}
+
+#[tokio::test(start_paused = true)]
 async fn an_http_failure_never_enters_unbounded_connection_wait() {
     let mut provider = FaultProvider::offline(usize::MAX);
     provider.error = provider.error.with_metadata(ProviderErrorMetadata {
@@ -324,7 +411,12 @@ async fn an_http_failure_never_enters_unbounded_connection_wait() {
             .is_err()
     );
     assert!(started.elapsed() < Duration::from_secs(2));
-    assert_eq!(provider.calls.load(Ordering::SeqCst), 6);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, ProviderSessionEvent::TransportFallback { .. }))
+    );
     assert!(events.iter().all(|event| !matches!(
         event,
         ProviderSessionEvent::Recovery(ProviderRecovery { network: true, .. })
@@ -347,6 +439,20 @@ fn http_provider(address: std::net::SocketAddr) -> golutra_agent_llm::OpenAiComp
 }
 
 async fn serve_response(listener: &tokio::net::TcpListener, complete: bool) {
+    let body = if complete {
+        "data: {\"choices\":[{\"delta\":{\"content\":\"恢复后的完整中文。\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+    } else {
+        "data: {\"choices\":[{\"delta\":{\"content\":\"中断的半句\"},\"finish_reason\":null}]}\n\n"
+    };
+    serve_provider_reply(listener, 200, "text/event-stream", body).await;
+}
+
+async fn serve_provider_reply(
+    listener: &tokio::net::TcpListener,
+    status: u16,
+    content_type: &str,
+    body: &str,
+) -> serde_json::Value {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let (mut socket, _) = listener.accept().await.unwrap();
     let mut header = Vec::new();
@@ -367,17 +473,77 @@ async fn serve_response(listener: &tokio::net::TcpListener, complete: bool) {
     let mut request = vec![0; length];
     socket.read_exact(&mut request).await.unwrap();
     assert!(header.starts_with("POST /v1/chat/completions"));
-    let body = if complete {
-        "data: {\"choices\":[{\"delta\":{\"content\":\"恢复后的完整中文。\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
-    } else {
-        "data: {\"choices\":[{\"delta\":{\"content\":\"中断的半句\"},\"finish_reason\":null}]}\n\n"
-    };
-    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+    socket.write_all(format!("HTTP/1.1 {status} Fixture\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
     // 分段写入包含中文的 UTF-8 流，接收端必须保持事件顺序。
     for chunk in body.as_bytes().chunks(7) {
         socket.write_all(chunk).await.unwrap();
         tokio::task::yield_now().await;
     }
+    serde_json::from_slice(&request).unwrap()
+}
+
+#[tokio::test]
+async fn real_sse_business_error_followed_by_502_keeps_cause_without_buffered_replay() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let provider = http_provider(listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let initial = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"checking\"},\"finish_reason\":null}]}\n\n",
+            "event: error\ndata: {\"error\":{\"type\":\"upstream_error\",\"message\":\"400错误，请稍后再试\",\"request_id\":\"first-cause\"}}\n\n"
+        );
+        assert_eq!(
+            serve_provider_reply(&listener, 200, "text/event-stream", initial).await["stream"],
+            true
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                serve_provider_reply(
+                    &listener,
+                    502,
+                    "application/json",
+                    "{\"error\":{\"message\":\"bad gateway\",\"request_id\":\"last-cause\"}}"
+                )
+                .await["stream"],
+                true
+            );
+        }
+    });
+    let mut events = Vec::new();
+    let error = ProviderSession::new(&provider, None, ProviderSessionPolicy::default())
+        .with_deadline(Some(Instant::now() + Duration::from_secs(15)))
+        .complete(
+            super::tests::request(),
+            &CancellationToken::new(),
+            &mut |event| events.push(event),
+        )
+        .await
+        .unwrap_err();
+    let ProviderSessionError::Provider(error) = error else {
+        panic!("provider error");
+    };
+    let metadata = error.metadata().unwrap();
+    assert_eq!(metadata.http_status, Some(502));
+    assert_eq!(metadata.attempts.len(), 3);
+    assert_eq!(metadata.attempts[0].response_http_status, Some(200));
+    assert_eq!(metadata.attempts[0].http_status, None);
+    assert_eq!(
+        metadata.attempts[0].error_type.as_deref(),
+        Some("upstream_error")
+    );
+    assert_eq!(
+        metadata.attempts[0].request_id.as_deref(),
+        Some("first-cause")
+    );
+    assert_eq!(
+        metadata.attempts[2].request_id.as_deref(),
+        Some("last-cause")
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, ProviderSessionEvent::TransportFallback { .. }))
+    );
+    server.await.unwrap();
 }
 
 #[tokio::test]

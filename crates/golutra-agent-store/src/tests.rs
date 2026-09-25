@@ -667,6 +667,160 @@ async fn appends_events_and_reduces_state() {
 }
 
 #[tokio::test]
+async fn late_task_telemetry_preserves_session_and_entity_statuses() {
+    let store = RuntimeStore::in_memory().await.unwrap();
+    let session_id = SessionId::new();
+    let old_task = TaskId::new();
+    let current_task = TaskId::new();
+    let old_turn = TurnId::new();
+    let current_turn = TurnId::new();
+    let mut events = Vec::new();
+    for (task_id, turn_id, event_type, payload) in [
+        (old_task, old_turn, RuntimeEventType::TaskCreated, json!({})),
+        (
+            old_task,
+            old_turn,
+            RuntimeEventType::TaskCompleted,
+            json!({"status":"completed"}),
+        ),
+        (
+            current_task,
+            current_turn,
+            RuntimeEventType::TaskCreated,
+            json!({}),
+        ),
+        (
+            current_task,
+            current_turn,
+            RuntimeEventType::TaskCompleted,
+            json!({"status":"failed"}),
+        ),
+        (
+            old_task,
+            old_turn,
+            RuntimeEventType::ProcessUpdated,
+            json!({"process_id":"late-process"}),
+        ),
+        (
+            old_task,
+            old_turn,
+            RuntimeEventType::VerificationCompleted,
+            json!({}),
+        ),
+    ] {
+        let event = RuntimeEvent {
+            schema_version: golutra_agent_core::RUNTIME_EVENT_SCHEMA_VERSION,
+            causal_context: Default::default(),
+            causal_links: vec![],
+            id: EventId::new(),
+            sequence_no: events.len() as u64 + 1,
+            session_id,
+            task_id: Some(task_id),
+            turn_id: Some(turn_id),
+            parent_event_id: None,
+            event_type,
+            timestamp: Utc::now(),
+            source: RuntimeEventSource::Runtime,
+            payload,
+            payload_ref: None,
+            durable: true,
+        };
+        store.append_event(&event).await.unwrap();
+        events.push(event);
+    }
+    let live = store.query_state(session_id, None).await.unwrap();
+    let replay = RuntimeStore::reduce_state(session_id, &events);
+    assert_eq!(live, replay);
+    assert_eq!(live.active_task_id, Some(current_task));
+    assert_eq!(live.task_status, TaskStatus::Failed);
+    assert_eq!(
+        store
+            .query_state(session_id, Some(old_task))
+            .await
+            .unwrap()
+            .task_status,
+        TaskStatus::Completed
+    );
+    for (table, column, id, expected) in [
+        ("tasks", "task_id", old_task.to_string(), "completed"),
+        ("tasks", "task_id", current_task.to_string(), "failed"),
+        ("turns", "turn_id", old_turn.to_string(), "completed"),
+        ("turns", "turn_id", current_turn.to_string(), "failed"),
+    ] {
+        let status: String =
+            sqlx::query_scalar(&format!("SELECT status FROM {table} WHERE {column} = ?"))
+                .bind(id)
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(status, expected);
+    }
+}
+
+#[tokio::test]
+async fn context_tail_starts_at_matching_snapshot_and_keeps_confirmed_answer() {
+    let store = RuntimeStore::in_memory().await.unwrap();
+    let session_id = SessionId::new();
+    let request_id = golutra_agent_core::ProviderRequestId::new();
+    assert!(
+        store
+            .load_context_tail(session_id, request_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    for (index, (event_type, payload)) in [
+        (
+            RuntimeEventType::AssistantMessage,
+            json!({"content":"already in snapshot"}),
+        ),
+        (
+            RuntimeEventType::ContextSnapshotCreated,
+            json!({"snapshot":{"provider_request_id":request_id}}),
+        ),
+        (
+            RuntimeEventType::ProviderStreamed,
+            json!({"delta":{"text":"unconfirmed"}}),
+        ),
+        (
+            RuntimeEventType::AssistantMessage,
+            json!({"content":"confirmed answer"}),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        store
+            .append_event(&RuntimeEvent {
+                schema_version: golutra_agent_core::RUNTIME_EVENT_SCHEMA_VERSION,
+                causal_context: Default::default(),
+                causal_links: vec![],
+                id: EventId::new(),
+                sequence_no: index as u64 + 1,
+                session_id,
+                task_id: None,
+                turn_id: None,
+                parent_event_id: None,
+                event_type,
+                timestamp: Utc::now(),
+                source: RuntimeEventSource::Runtime,
+                payload,
+                payload_ref: None,
+                durable: true,
+            })
+            .await
+            .unwrap();
+    }
+    let tail = store
+        .load_context_tail(session_id, request_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tail.len(), 1);
+    assert_eq!(tail[0].payload["content"], "confirmed answer");
+}
+
+#[tokio::test]
 async fn assistant_message_becomes_user_projection_final_message() {
     let store = RuntimeStore::in_memory().await.expect("store opens");
     let session_id = SessionId::new();

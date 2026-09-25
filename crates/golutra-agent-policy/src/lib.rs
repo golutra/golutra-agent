@@ -919,6 +919,8 @@ pub fn shell_command_is_strictly_read_only(parts: &[String]) -> bool {
 
     let arguments = &parts[1..];
     match program.as_str() {
+        // GNU/BSD date 的设时参数不兼容，仅无参数和单个输出格式可证明只读。
+        "date" => arguments.is_empty() || arguments.len() == 1 && arguments[0].starts_with('+'),
         "cat" | "cut" | "du" | "file" | "grep" | "head" | "ls" | "printf" | "pwd" | "readlink"
         | "sort" | "strings" | "tail" | "tr" | "uniq" | "wc" => {
             simple_read_command_is_safe(program, arguments)
@@ -926,6 +928,52 @@ pub fn shell_command_is_strictly_read_only(parts: &[String]) -> bool {
         "rg" => ripgrep_read_command_is_safe(arguments),
         "find" => find_read_command_is_safe(arguments),
         "git" => git_read_command_is_safe(arguments),
+        _ => false,
+    }
+}
+
+/// 判断普通只读命令组成的列表或管道；不执行展开，也不改变权限审批。
+/// 脚本、重定向、后台执行和动态替换无法静态证明只读，继续走有界变更观测。
+#[must_use]
+pub fn shell_script_is_strictly_read_only(script: &str) -> bool {
+    if script.trim().is_empty() || script.len() > 16 * 1024 {
+        return false;
+    }
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_bash::LANGUAGE.into())
+        .is_err()
+    {
+        return false;
+    }
+    let Some(tree) = parser.parse(script, None) else {
+        return false;
+    };
+    !tree.root_node().has_error() && read_only_shell_node(tree.root_node(), script.as_bytes(), 0)
+}
+
+fn read_only_shell_node(node: tree_sitter::Node<'_>, source: &[u8], depth: usize) -> bool {
+    // 限制分析工作量；过深语法只影响快路径，不拒绝命令执行。
+    if depth > 32 {
+        return false;
+    }
+    match node.kind() {
+        "program" | "list" | "pipeline" => {
+            let mut cursor = node.walk();
+            node.children(&mut cursor).all(|child| {
+                if child.is_named() {
+                    read_only_shell_node(child, source, depth + 1)
+                } else {
+                    matches!(child.kind(), ";" | "&&" | "||" | "|")
+                }
+            })
+        }
+        "command" => node.utf8_text(source).ok().is_some_and(|command| {
+            !contains_shell_metacharacter(command)
+                && shlex::split(command)
+                    .is_some_and(|parts| shell_command_is_strictly_read_only(&parts))
+        }),
+        "comment" => true,
         _ => false,
     }
 }
@@ -2060,6 +2108,8 @@ mod tests {
         let parse = |command: &str| parse_shell_command(command).expect("argv");
         for command in [
             "cat README.md",
+            "date",
+            "date '+%Y-%m-%d %H:%M'",
             "rg --line-number token src",
             "find . -name '*.rs' -print",
             "git diff --stat",
@@ -2074,6 +2124,9 @@ mod tests {
 
         for command in [
             "git status --short",
+            "date -s tomorrow",
+            "date 092423152026",
+            "date --set=tomorrow",
             "git diff --ext-diff",
             "git diff -oout.patch",
             "git show --output=out.patch",
@@ -2091,6 +2144,36 @@ mod tests {
                 !shell_command_is_strictly_read_only(&parse(command)),
                 "expected conservative serial command: {command}"
             );
+        }
+    }
+
+    #[test]
+    fn read_only_shell_lists_validate_every_command_and_expansion() {
+        for command in [
+            "pwd && ls -la",
+            "git branch --show-current; git log --oneline -8; git diff --stat",
+            "rg pattern src | head -20",
+            "cat missing.txt || printf 'not found\\n'",
+            "printf '%s' 'literal $(not executed)' && ls",
+            "pwd\n# comment\nls",
+        ] {
+            assert!(shell_script_is_strictly_read_only(command), "{command}");
+        }
+        for command in [
+            "ls && touch new.txt",
+            "ls; rm file",
+            "cat README.md > copy.md",
+            "cat <(touch file)",
+            "printf '%s' \"$(touch file)\"",
+            "ls | tee output.txt",
+            "pwd &",
+            "git status && git diff --output=patch.txt",
+            "bash -lc 'ls && pwd'",
+            "find . -exec touch file ';'",
+            "for f in a b; do cat \"$f\"; done",
+            "ls &&",
+        ] {
+            assert!(!shell_script_is_strictly_read_only(command), "{command}");
         }
     }
 

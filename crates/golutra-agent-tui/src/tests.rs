@@ -10599,7 +10599,7 @@ async fn active_task_blocks_session_switching_commands() {
 }
 
 #[tokio::test]
-async fn auth_dialog_official_skips_address_and_returns_to_provider_choice() {
+async fn auth_dialog_official_selects_protocol_skips_address_and_preserves_back_navigation() {
     let _guard = env_lock_guard().await;
     let transport = RuntimeTransport::in_memory().await.expect("transport");
     let mut app = TuiApp::new(
@@ -10618,8 +10618,36 @@ async fn auth_dialog_official_skips_address_and_returns_to_provider_choice() {
         )
         .await
         .expect("select official provider");
+        assert_eq!(
+            app.auth_dialog.as_ref().unwrap().step,
+            AuthDialogStep::ApiKey
+        );
+        assert!(app.auth_dialog.as_ref().unwrap().automatic_protocol);
+        handle_auth_dialog_key(
+            KeyEvent::new(KeyCode::Char('P'), KeyModifiers::CONTROL),
+            &mut app,
+            &transport,
+        )
+        .await
+        .expect("choose protocol manually");
+        assert_eq!(
+            app.auth_dialog.as_ref().unwrap().step,
+            AuthDialogStep::Protocol
+        );
+        assert_eq!(
+            app.auth_dialog.as_ref().unwrap().selected_protocol(),
+            ProviderProtocol::OpenAiResponses
+        );
+        handle_auth_dialog_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut app,
+            &transport,
+        )
+        .await
+        .expect("select responses protocol");
         let dialog = app.auth_dialog.as_mut().expect("dialog");
         assert_eq!(dialog.step, AuthDialogStep::ApiKey);
+        assert_eq!(dialog.protocol, ProviderProtocol::OpenAiResponses);
         assert_eq!(dialog.base_url, "https://api.golutra.cn");
         assert!(dialog.api_key.is_empty());
         assert!(dialog.api_key_env.is_empty());
@@ -10648,11 +10676,88 @@ async fn auth_dialog_official_skips_address_and_returns_to_provider_choice() {
             &transport,
         )
         .await
+        .expect("return to protocol choice");
+        assert_eq!(
+            app.auth_dialog.as_ref().unwrap().step,
+            AuthDialogStep::Protocol
+        );
+        handle_auth_dialog_key(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut app,
+            &transport,
+        )
+        .await
         .expect("return to provider choice");
         assert_eq!(
             app.auth_dialog.as_ref().unwrap().step,
             AuthDialogStep::GroupChoice
         );
+    }
+}
+
+#[tokio::test]
+async fn official_auth_review_preserves_each_selected_protocol_without_network() {
+    let _guard = env_lock_guard().await;
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    let protocols = [
+        ProviderProtocol::OpenAiResponses,
+        ProviderProtocol::Anthropic,
+        ProviderProtocol::Gemini,
+        ProviderProtocol::OpenAiCompatible,
+        ProviderProtocol::VertexAi,
+        ProviderProtocol::Genai,
+    ];
+    for (index, protocol) in protocols.into_iter().enumerate() {
+        let mut dialog = AuthDialogState::new();
+        dialog.select_provider(OFFICIAL_PROVIDER_PRESET);
+        dialog.step = AuthDialogStep::Protocol;
+        dialog.selected = index;
+        let mut app = TuiApp::new(
+            ThreadId::new(),
+            SessionId::new(),
+            None,
+            false,
+            "missing provider".to_owned(),
+            Some(dialog),
+        );
+        advance_auth_dialog(&mut app, &transport)
+            .await
+            .expect("select protocol");
+        assert!(app.auth_model_discovery.is_none());
+        let needs_address = matches!(
+            protocol,
+            ProviderProtocol::VertexAi | ProviderProtocol::Genai
+        );
+        if needs_address {
+            let dialog = app.auth_dialog.as_mut().unwrap();
+            assert_eq!(dialog.step, AuthDialogStep::BaseUrl);
+            dialog.base_url = if protocol == ProviderProtocol::VertexAi {
+                "https://vertex.example/v1/projects/project/locations/us-central1".to_owned()
+            } else {
+                "https://api.golutra.cn/v1".to_owned()
+            };
+            advance_auth_dialog(&mut app, &transport).await.unwrap();
+        }
+        let dialog = app.auth_dialog.as_mut().unwrap();
+        assert_eq!(dialog.step, AuthDialogStep::ApiKey);
+        assert_eq!(dialog.protocol, protocol);
+        if !needs_address {
+            assert_eq!(dialog.base_url, "https://api.golutra.cn");
+        }
+        dialog.api_key = "test-official-key".to_owned();
+        dialog.model = "gpt-test".to_owned();
+        let review = build_auth_review(dialog).expect("offline review");
+        let plan: serde_json::Value = serde_json::from_str(&review.preview_json).unwrap();
+        assert_eq!(review.protocol, protocol.id());
+        assert_eq!(plan["profile"]["protocol"], protocol.id());
+        assert_eq!(auth_login(dialog).unwrap().protocol, protocol);
+        dialog.go_back();
+        if needs_address {
+            assert_eq!(dialog.step, AuthDialogStep::BaseUrl);
+            dialog.go_back();
+        }
+        assert_eq!(dialog.step, AuthDialogStep::Protocol);
+        assert_eq!(dialog.selected_protocol(), protocol);
     }
 }
 

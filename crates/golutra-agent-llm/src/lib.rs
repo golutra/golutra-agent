@@ -27,13 +27,16 @@ use thiserror::Error;
 mod genai_adapter;
 mod model_catalog;
 mod openai_responses;
+mod protocol_detection;
 mod provider_config;
 mod response_contract;
+mod stream_error;
 mod transport_error;
 
 pub use genai_adapter::{GenaiProviderAdapter, GenaiProviderConfig};
 pub use model_catalog::{discover_provider_models, discover_provider_models_with_client_builder};
 pub use openai_responses::{OpenAiResponsesProvider, OpenAiResponsesProviderConfig};
+pub use protocol_detection::detect_provider_protocol;
 pub(crate) use provider_config::{
     apply_generation_config_to_openai_body, cache_capabilities_from_reader,
     configured_or_first_env, custom_headers_from_reader, env_mapping, first_env,
@@ -428,8 +431,29 @@ pub struct ProviderErrorMetadata {
     pub response_http_status: Option<u16>,
     pub http_status: Option<u16>,
     pub provider_code: Option<String>,
+    pub error_type: Option<String>,
+    pub error_detail: Option<String>,
+    /// 由适配器确认的流传输故障；服务端业务错误不能仅凭正文关键词设置此字段。
+    pub stream_interrupted: bool,
     pub retry_after: Option<Duration>,
     pub request_id: Option<String>,
+    /// 上游流内响应身份，与 HTTP Request ID 分开；SDK 未暴露响应头时仍可追踪。
+    pub upstream_response_id: Option<String>,
+    pub attempts: Vec<ProviderAttemptError>,
+}
+
+/// 有界的尝试错误链；保留第一因及最近失败，不保存请求正文或认证信息。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProviderAttemptError {
+    pub attempt: u32,
+    pub transport: String,
+    pub elapsed_ms: u64,
+    pub message: String,
+    pub response_http_status: Option<u16>,
+    pub http_status: Option<u16>,
+    pub error_type: Option<String>,
+    pub request_id: Option<String>,
+    pub upstream_response_id: Option<String>,
 }
 
 impl ProviderErrorMetadata {
@@ -438,8 +462,13 @@ impl ProviderErrorMetadata {
         self.response_http_status.is_none()
             && self.http_status.is_none()
             && self.provider_code.is_none()
+            && self.error_type.is_none()
+            && self.error_detail.is_none()
+            && !self.stream_interrupted
+            && self.attempts.is_empty()
             && self.retry_after.is_none()
             && self.request_id.is_none()
+            && self.upstream_response_id.is_none()
     }
 }
 
@@ -466,19 +495,30 @@ pub enum ProviderError {
     #[error("{error}")]
     WithMetadata {
         error: Box<ProviderError>,
-        metadata: ProviderErrorMetadata,
+        metadata: Box<ProviderErrorMetadata>,
     },
 }
 
 impl ProviderError {
+    pub(crate) fn with_stream_interrupted(self) -> Self {
+        let mut metadata = self.metadata().cloned().unwrap_or_default();
+        metadata.stream_interrupted = true;
+        self.with_metadata(metadata)
+    }
+
     #[must_use]
     pub fn with_metadata(self, metadata: ProviderErrorMetadata) -> Self {
         if metadata.is_empty() {
             self
         } else {
+            // 新元数据已由调用方合并，替换包装而非叠加，保持重试错误链深度固定。
+            let error = match self {
+                Self::WithMetadata { error, .. } => error,
+                error => Box::new(error),
+            };
             Self::WithMetadata {
-                error: Box::new(self),
-                metadata,
+                error,
+                metadata: Box::new(metadata),
             }
         }
     }
@@ -1631,7 +1671,7 @@ impl OpenAiCompatibleProvider {
             .send()
             .await
             .map_err(provider_transport_error)?;
-        if response.status().as_u16() != 401 {
+        if response.status().as_u16() != 401 || !self.credential.supports_refresh() {
             return Ok(response);
         }
         let token = self
@@ -1672,7 +1712,7 @@ impl OpenAiCompatibleProvider {
             .send()
             .await
             .map_err(provider_transport_error)?;
-        if response.status().as_u16() != 401 {
+        if response.status().as_u16() != 401 || !self.credential.supports_refresh() {
             return Ok(response);
         }
         let token = self
@@ -2992,14 +3032,18 @@ async fn provider_response_from_openai_stream(
 
     while let Some(event) = stream.next().await {
         let event = event.map_err(|error| {
-            ProviderError::Unavailable {
-                message: sanitize_provider_error(&error.to_string()),
-            }
-            .with_metadata(provider_error_metadata(
+            let message = sanitize_provider_error(&error.to_string());
+            let interrupted = matches!(&error, eventsource_stream::EventStreamError::Transport(source)
+                if !transport_error::has_permanent_transport_cause(source));
+            let mapped = if interrupted { ProviderError::Unavailable { message } }
+                else { ProviderError::Malformed { message } };
+            let mut metadata = provider_error_metadata(
                 Some(response_status),
                 &response_headers,
                 None,
-            ))
+            );
+            metadata.stream_interrupted = interrupted;
+            mapped.with_metadata(metadata)
         })?;
         parsed_bytes = parsed_bytes.saturating_add(event.data.len());
         if parsed_bytes > MAX_PROVIDER_RESPONSE_BYTES {
@@ -3133,7 +3177,8 @@ async fn provider_response_from_openai_stream(
             Some(response_status),
             &response_headers,
             None,
-        )));
+        ))
+        .with_stream_interrupted());
     }
 
     let tool_calls = tool_calls
@@ -3549,8 +3594,11 @@ fn provider_error_metadata(
         response_http_status: status,
         http_status: status.filter(|status| *status >= 400).or(payload_status),
         provider_code: value.and_then(provider_error_code),
+        error_type: value.and_then(provider_error_type),
+        error_detail: value.map(provider_error_message),
         retry_after: payload_retry_after.or_else(|| retry_after_from_headers(headers)),
         request_id: payload_request_id.or_else(|| request_id_from_headers(headers)),
+        ..ProviderErrorMetadata::default()
     }
 }
 
@@ -3561,6 +3609,33 @@ fn provider_error_kind(status: Option<u16>, value: &Value) -> ProviderError {
         Some(status) if (500..600).contains(&status) => ProviderError::Unavailable { message },
         Some(_) => ProviderError::Failed { message },
         None => {
+            let code = provider_error_code(value)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let kind = provider_error_type(value)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            // 明确的业务分类优先于正文措辞，不能因参数错误提到 upstream 就当作服务故障。
+            if [code.as_str(), kind.as_str()].iter().any(|marker| {
+                matches!(
+                    *marker,
+                    "invalid_request"
+                        | "invalid_prompt"
+                        | "bio_policy"
+                        | "misalignment_policy_violation"
+                        | "cyber_policy_violation"
+                        | "invalid_request_error"
+                        | "invalid_argument"
+                        | "authentication_error"
+                        | "unauthenticated"
+                        | "permission_error"
+                        | "permission_denied"
+                        | "not_found"
+                        | "not_found_error"
+                )
+            }) {
+                return ProviderError::Failed { message };
+            }
             // 网关常用 code/type 表达瞬态错误，不能只依赖 HTTP status 或 message。
             let marker_text = format!(
                 "{} {} {}",

@@ -605,6 +605,38 @@ struct ProjectionIndexes {
     pending_user_turns: HashMap<TurnId, TranscriptItem>,
     streamed_assistant_items: HashMap<TurnId, usize>,
     active_tools: HashMap<OperationId, usize>,
+    recovering_requests: HashSet<(Option<TurnId>, Option<String>)>,
+}
+
+fn recovery_request_key(event: &RuntimeEvent) -> (Option<TurnId>, Option<String>) {
+    (
+        event.turn_id,
+        event
+            .payload
+            .get("provider_request_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    )
+}
+
+fn update_recovering_requests(
+    requests: &mut HashSet<(Option<TurnId>, Option<String>)>,
+    event: &RuntimeEvent,
+) {
+    if event.event_type == RuntimeEventType::RetryScheduled
+        && event.payload["recovery"]["reset_stream"].as_bool() == Some(true)
+    {
+        requests.insert(recovery_request_key(event));
+    } else if matches!(
+        event.event_type,
+        RuntimeEventType::ProviderCompleted | RuntimeEventType::ProviderFailed
+    ) {
+        requests.remove(&recovery_request_key(event));
+    } else if event.event_type == RuntimeEventType::AssistantMessage
+        || event.event_type.is_task_terminal()
+    {
+        requests.retain(|(turn, _)| *turn != event.turn_id);
+    }
 }
 
 fn user_step_projection(step: &UserStep) -> Option<OperationProjection> {
@@ -668,10 +700,18 @@ struct HistoryProjectionCache {
     event_count: usize,
     anchors: HashSet<EventId>,
     entries: Vec<EventOperationEntry>,
+    recovering_requests: HashSet<(Option<TurnId>, Option<String>)>,
 }
 
 impl HistoryProjectionCache {
     fn advance(&mut self, event: &RuntimeEvent) -> bool {
+        if event.event_type == RuntimeEventType::ProviderStreamed
+            && self
+                .recovering_requests
+                .contains(&recovery_request_key(event))
+        {
+            return true;
+        }
         // 只白名单放行纯观察事件，避免新增事件类型悄悄绕过语义重建。
         if matches!(
             event.event_type,
@@ -728,11 +768,16 @@ pub(crate) fn history_event_operations(app: &TuiApp) -> Vec<EventOperationEntry>
             .collect(),
     );
     if app.transcript.frame_cache_enabled {
+        let mut recovering_requests = HashSet::new();
+        for event in &app.events {
+            update_recovering_requests(&mut recovering_requests, event);
+        }
         *app.transcript.frame_operations.borrow_mut() = Some(HistoryProjectionCache {
             revision: app.transcript.revision,
             event_count: app.events.len(),
             anchors: app.transcript.history.command_anchors.clone(),
             entries: entries.clone(),
+            recovering_requests,
         });
     }
     entries
@@ -756,6 +801,7 @@ fn event_operation_entries_with_boundary(
     let mut covered_user_step_tools = HashSet::<OperationId>::new();
     let mut terminal_notices = terminal::notices(&typed_events);
     for event in typed_events {
+        update_recovering_requests(&mut indexes.recovering_requests, event);
         if event.event_type.is_task_terminal() {
             for record in &mut items {
                 if event.task_id.is_some() && record.task_id == event.task_id
@@ -775,7 +821,7 @@ fn event_operation_entries_with_boundary(
                         .and_then(|id| indexes.streamed_assistant_items.remove(&id))
                     && let Some(record) = items.get_mut(index)
                 {
-                    // 已进入终端滚动历史的片段不能撤回，明确标记中断并让新尝试另起一条。
+                    // 已归档片段不可撤回；只标记一次，恢复期间的重复预览留在观测记录。
                     record
                         .projection
                         .item_mut()
@@ -785,6 +831,7 @@ fn event_operation_entries_with_boundary(
                 }
             }
             RuntimeEventType::ProviderTransportFallback => {}
+            RuntimeEventType::ProviderCompleted => {}
             RuntimeEventType::ProviderFailed => {}
             RuntimeEventType::TaskCreated => {
                 let is_new_turn = event
@@ -838,6 +885,12 @@ fn event_operation_entries_with_boundary(
                 }
             }
             RuntimeEventType::ProviderStreamed => {
+                if indexes
+                    .recovering_requests
+                    .contains(&recovery_request_key(event))
+                {
+                    continue;
+                }
                 let Some(delta) = provider_stream_text_delta(event) else {
                     continue;
                 };
@@ -4109,6 +4162,49 @@ mod tests {
             RuntimeEventType::ProviderStreamed,
             json!({"delta": {"kind": "text_delta", "text": text}}),
         )
+    }
+
+    #[test]
+    fn repeated_retry_previews_are_hidden_until_confirmed_and_new_requests_stream_normally() {
+        let turn = TurnId::new();
+        let mut events = vec![assistant_delta(1, turn, "first partial")];
+        events[0].payload["provider_request_id"] = json!("request-one");
+        for index in 0..3 {
+            events.push(tool_event_on_turn(
+                2 + index * 2,
+                Some(turn),
+                RuntimeEventType::RetryScheduled,
+                json!({"provider_request_id":"request-one", "recovery":{"reset_stream":true}}),
+            ));
+            let mut preview = assistant_delta(3 + index * 2, turn, "repeated partial");
+            preview.payload["provider_request_id"] = json!("request-one");
+            events.push(preview);
+        }
+        let pending = event_operation_projections(&events);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].item(false).body,
+            vec!["first partial", "[Response interrupted; retrying]"]
+        );
+        events.push(tool_event_on_turn(
+            8,
+            Some(turn),
+            RuntimeEventType::ProviderCompleted,
+            json!({"provider_request_id":"request-one"}),
+        ));
+        events.push(tool_event_on_turn(
+            9,
+            Some(turn),
+            RuntimeEventType::AssistantMessage,
+            json!({"content":"complete answer"}),
+        ));
+        let mut next = assistant_delta(10, turn, "next request");
+        next.payload["provider_request_id"] = json!("request-two");
+        events.push(next);
+        let replayed = event_operation_projections(&events);
+        assert_eq!(replayed.len(), 3);
+        assert_eq!(replayed[1].item(false).body, vec!["complete answer"]);
+        assert_eq!(replayed[2].item(false).body, vec!["next request"]);
     }
 
     #[test]

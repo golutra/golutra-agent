@@ -20,32 +20,7 @@ pub(crate) fn is_retryable(error: &ProviderError) -> bool {
         | ProviderError::Unavailable { .. }
         | ProviderError::RateLimited { .. }
         | ProviderError::Timeout { .. } => true,
-        ProviderError::Failed { message } => {
-            let message = message.to_ascii_lowercase();
-            [
-                "stream",
-                "connection",
-                "connect",
-                "disconnect",
-                "reset",
-                "transport",
-                "broken pipe",
-                "bad gateway",
-                "gateway timeout",
-                "service unavailable",
-                "temporarily unavailable",
-                "server error",
-                "server_error",
-                "internal error",
-                "internal_error",
-                "overloaded",
-                "502",
-                "503",
-                "504",
-            ]
-            .iter()
-            .any(|marker| message.contains(marker))
-        }
+        ProviderError::Failed { .. } => false,
         ProviderError::WithMetadata { error, .. } => is_retryable(error),
         ProviderError::Cancelled
         | ProviderError::NotConfigured { .. }
@@ -71,6 +46,14 @@ pub(crate) fn fallback_eligible(error: &ProviderError) -> bool {
         | ProviderError::NotConfigured { .. }
         | ProviderError::Malformed { .. } => false,
     }
+}
+
+/// 只有适配器确认流传输不完整时才换传输；HTTP/SSE 业务错误沿原传输有限重试。
+pub(crate) fn transport_fallback_eligible(error: &ProviderError) -> bool {
+    is_retryable(error)
+        && error
+            .metadata()
+            .is_some_and(|metadata| metadata.stream_interrupted)
 }
 
 pub(crate) fn backoff(attempt: u32) -> Duration {

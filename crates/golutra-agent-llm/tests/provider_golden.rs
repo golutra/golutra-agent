@@ -108,6 +108,9 @@ async fn built_in_shell_contract_survives_all_protocol_wire_adapters() {
 #[path = "provider_golden/terminal_contract.rs"]
 mod terminal_contract;
 
+#[path = "provider_golden/protocol_detection.rs"]
+mod protocol_detection;
+
 #[derive(Debug, Clone, Copy)]
 struct ProtocolCase {
     protocol: ProviderProtocol,
@@ -330,6 +333,87 @@ async fn native_provider_tool_calls_match_goldens() {
 }
 
 #[tokio::test]
+async fn native_stream_errors_preserve_business_metadata_without_transport_fallback_flag() {
+    let error_stream = concat!(
+        "event: error\n",
+        "data: {\"type\":\"error\",\"request_id\":\"fixture-business-error\",\"error\":{\"status\":400,\"type\":\"invalid_request_error\",\"message\":\"invalid stream parameter sk-1234567890abcdefghijk\"}}\n\n",
+    );
+    for case in cases() {
+        let (base_url, _captured) =
+            spawn_provider_sequence(vec![TestProviderResponse::sse(200, error_stream)]).await;
+        let error = provider(case, base_url)
+            .complete_stream(simple_request(case.model), &mut |_| {})
+            .await
+            .unwrap_err();
+        let metadata = error
+            .metadata()
+            .unwrap_or_else(|| panic!("{}: {error:?}", case.protocol.id()));
+        assert_eq!(
+            metadata.response_http_status,
+            Some(200),
+            "{}",
+            case.protocol.id()
+        );
+        assert_eq!(metadata.http_status, Some(400), "{}", case.protocol.id());
+        assert_eq!(
+            metadata.error_type.as_deref(),
+            Some("invalid_request_error")
+        );
+        assert_eq!(
+            metadata.request_id.as_deref(),
+            Some("fixture-business-error")
+        );
+        assert!(!metadata.stream_interrupted);
+        assert!(!error.to_string().contains("sk-1234567890abcdefghijk"));
+        assert!(
+            !serde_json::to_string(metadata)
+                .unwrap()
+                .contains("sk-1234567890abcdefghijk")
+        );
+    }
+}
+
+#[tokio::test]
+async fn responses_stream_failure_preserves_first_business_error() {
+    let (base_url, _captured) = spawn_provider_sequence(vec![TestProviderResponse::sse(200,
+        "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"status\":503,\"type\":\"overloaded_error\",\"message\":\"temporarily unavailable\"}}}\n\n")]).await;
+    let error = openai_responses_provider(base_url)
+        .complete_stream(simple_request("gpt-golden"), &mut |_| {})
+        .await
+        .unwrap_err();
+    let metadata = error.metadata().unwrap();
+    assert_eq!(metadata.response_http_status, Some(200));
+    assert_eq!(metadata.http_status, Some(503));
+    assert_eq!(metadata.error_type.as_deref(), Some("overloaded_error"));
+    assert!(!metadata.stream_interrupted);
+}
+
+#[tokio::test]
+async fn responses_rejection_keeps_created_response_identity_and_is_permanent() {
+    let body = concat!(
+        "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_diagnostic\",\"status\":\"in_progress\"}}\n\n",
+        "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"invalid_prompt\",\"message\":\"upstream rejected this request\"}}}\n\n",
+    );
+    let (base_url, _) = spawn_provider_sequence(vec![TestProviderResponse::sse(200, body)]).await;
+    let error = openai_responses_provider(base_url)
+        .complete_stream(simple_request("gpt-golden"), &mut |_| {})
+        .await
+        .unwrap_err();
+    let metadata = error.metadata().unwrap();
+    assert_eq!(
+        metadata.upstream_response_id.as_deref(),
+        Some("resp_diagnostic")
+    );
+    assert_eq!(metadata.provider_code.as_deref(), Some("invalid_prompt"));
+    assert!(metadata.request_id.is_none());
+    assert!(!metadata.stream_interrupted);
+    assert!(
+        matches!(error, golutra_agent_llm::ProviderError::WithMetadata { error, .. }
+        if matches!(*error, golutra_agent_llm::ProviderError::Failed { .. }))
+    );
+}
+
+#[tokio::test]
 async fn native_provider_errors_match_goldens() {
     for case in cases() {
         let (base_url, _captured) = spawn_provider(401, case.error_response_fixture).await;
@@ -529,6 +613,8 @@ async fn openai_compatible_sse_error_status_is_classified_as_retryable() {
         .expect_err("SSE error event");
 
     assert_eq!(error.http_status(), Some(502));
+    assert_eq!(error.metadata().unwrap().response_http_status, Some(200));
+    assert!(!error.metadata().unwrap().stream_interrupted);
     assert_eq!(error.retry_after(), Some(std::time::Duration::from_secs(1)));
     assert_eq!(
         error
@@ -935,7 +1021,8 @@ async fn openai_responses_provider_matches_sse_goldens_and_auth_headers() {
         .complete(simple_request("gpt-golden"))
         .await
         .expect_err("Responses SSE error");
-    assert!(matches!(error, ProviderError::Malformed { .. }));
+    assert!(!error.metadata().unwrap().stream_interrupted);
+    assert_eq!(error.metadata().unwrap().response_http_status, Some(200));
     assert!(error.to_string().contains("golden responses failure"));
 }
 
@@ -1246,7 +1333,7 @@ async fn openai_responses_rejects_stream_without_completed_response_id() {
         .await
         .expect_err("truncated Responses stream");
 
-    assert!(matches!(error, ProviderError::Unavailable { .. }));
+    assert!(error.metadata().unwrap().stream_interrupted);
     assert!(error.to_string().contains("response.completed"));
 }
 

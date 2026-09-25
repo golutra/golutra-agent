@@ -145,6 +145,8 @@ impl TerminationIntent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProcessSnapshot {
+    pub(crate) workspace_before_ms: u64,
+    pub(crate) workspace_after_ms: Option<u64>,
     pub(crate) process_id: String,
     pub(crate) command: String,
     pub(crate) workdir: PathBuf,
@@ -404,6 +406,7 @@ impl OutputJournal {
 }
 
 struct ManagedProcess {
+    workspace_before_ms: u64,
     id: String,
     session_id: SessionId,
     request_identity: ProcessRequestIdentity,
@@ -1032,6 +1035,7 @@ impl ProcessSupervisor {
             request_identity,
             command_display: request.command_display,
             started_at: Instant::now(),
+            workspace_before_ms: request.workspace_before.capture_ms,
             workspace_overlap: AtomicBool::new(false),
             authoritative_pid,
             pid_lifecycle,
@@ -1981,6 +1985,8 @@ async fn snapshot_page(entry: &ManagedProcess, cursor: u64, limit: usize) -> Pro
             },
         );
     ProcessSnapshot {
+        workspace_before_ms: entry.workspace_before_ms,
+        workspace_after_ms: state.workspace_scan.as_ref().map(|scan| scan.duration_ms),
         process_id: entry.id.clone(),
         command: entry.command_display.clone(),
         workdir: entry.request_identity.cwd.clone(),

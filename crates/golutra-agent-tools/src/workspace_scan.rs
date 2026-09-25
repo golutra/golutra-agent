@@ -1,4 +1,4 @@
-//! Bounded before/after workspace sampling for opaque process tools.
+//! 为不透明进程提供有界变更采样；不完整采样保留未知状态，不阻塞普通命令做全盘快照。
 
 use std::{
     collections::BTreeMap,
@@ -15,14 +15,16 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use walkdir::{DirEntry, WalkDir};
 
-use super::{FileBeforeImage, MAX_WORKSPACE_SNAPSHOT_CONTENT_BYTES};
+use super::FileBeforeImage;
 
 const MAX_TRACKED_FILES: usize = 5_000;
 const MAX_TRACKED_FILE_BYTES: u64 = 2 * 1024 * 1024;
-const MAX_HASHED_FILE_BYTES: u64 = 1024 * 1024 * 1024;
-const MAX_HASHED_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_HASHED_FILE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_HASHED_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
+// 普通过程采样只保留少量可恢复内容；定向文件编辑仍使用完整 before-image 合同。
+const MAX_SAMPLED_CONTENT_BYTES: usize = 2 * 1024 * 1024;
 const HASH_BUFFER_BYTES: usize = 1024 * 1024;
-const MAX_SCAN_DURATION: Duration = Duration::from_secs(30);
+pub(crate) const MAX_SCAN_DURATION: Duration = Duration::from_millis(250);
 const MAX_CONCURRENT_SCANS: usize = 2;
 static SCAN_PERMITS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_SCANS)));
@@ -51,6 +53,7 @@ struct BoundedReadError {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct WorkspaceSnapshot {
+    pub(crate) capture_ms: u64,
     files: BTreeMap<PathBuf, FileSample>,
     scan_complete: bool,
     checkpoint_complete: bool,
@@ -76,6 +79,7 @@ impl WorkspaceSnapshot {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct WorkspaceMutationScan {
+    pub(crate) duration_ms: u64,
     pub(crate) changed_files: Vec<PathBuf>,
     pub(crate) before_images: Vec<FileBeforeImage>,
     pub(crate) after_images: Vec<FileBeforeImage>,
@@ -85,7 +89,10 @@ pub(crate) struct WorkspaceMutationScan {
 }
 
 pub(crate) async fn capture(root: &Path) -> WorkspaceSnapshot {
-    capture_with_budget(root, MAX_SCAN_DURATION).await
+    let started = Instant::now();
+    let mut snapshot = capture_with_budget(root, MAX_SCAN_DURATION).await;
+    snapshot.capture_ms = super::elapsed_millis(started);
+    snapshot
 }
 
 async fn capture_with_budget(root: &Path, budget: Duration) -> WorkspaceSnapshot {
@@ -114,8 +121,11 @@ async fn capture_with_budget(root: &Path, budget: Duration) -> WorkspaceSnapshot
 }
 
 pub(crate) async fn compare(root: &Path, before: WorkspaceSnapshot) -> WorkspaceMutationScan {
+    let started = Instant::now();
     let after = capture(root).await;
-    compare_snapshots(before, after)
+    let mut scan = compare_snapshots(before, after);
+    scan.duration_ms = super::elapsed_millis(started);
+    scan
 }
 
 pub(crate) fn read_regular_file_bounded(
@@ -237,7 +247,7 @@ fn capture_blocking(
         }
         let file_bytes = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
         let retain_content = metadata.len() <= MAX_TRACKED_FILE_BYTES
-            && retained_bytes.saturating_add(file_bytes) <= MAX_WORKSPACE_SNAPSHOT_CONTENT_BYTES;
+            && retained_bytes.saturating_add(file_bytes) <= MAX_SAMPLED_CONTENT_BYTES;
         if !retain_content {
             snapshot.checkpoint_complete = false;
         }
@@ -255,8 +265,7 @@ fn capture_blocking(
             continue;
         };
         let retain_limit = retain_content.then(|| {
-            let retained_remaining =
-                MAX_WORKSPACE_SNAPSHOT_CONTENT_BYTES.saturating_sub(retained_bytes);
+            let retained_remaining = MAX_SAMPLED_CONTENT_BYTES.saturating_sub(retained_bytes);
             MAX_TRACKED_FILE_BYTES.min(u64::try_from(retained_remaining).unwrap_or(u64::MAX))
         });
         let sampled = match read_bounded_with_control(
@@ -374,6 +383,10 @@ fn compare_snapshots(before: WorkspaceSnapshot, after: WorkspaceSnapshot) -> Wor
     for path in paths {
         let old = before.files.get(&path);
         let new = after.files.get(&path);
+        // 未采样不等于不存在，不能把预算截断投影成新增/删除或可恢复的缺失文件。
+        if old.is_none() && !before.scan_complete || new.is_none() && !after.scan_complete {
+            continue;
+        }
         if samples_match(old, new) {
             continue;
         }
@@ -839,6 +852,60 @@ mod tests {
                 .iter()
                 .find(|image| image.path.ends_with("added.txt"))
                 .is_some_and(|image| image.content.is_none())
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_samples_do_not_invent_file_creation_or_deletion() {
+        let workspace = tempdir().unwrap();
+        let path = workspace.path().join("still-present.txt");
+        fs::write(&path, "unchanged").unwrap();
+        let complete = capture(workspace.path()).await;
+        let missing_sample = WorkspaceSnapshot::default();
+        for scan in [
+            compare_snapshots(complete.clone(), missing_sample.clone()),
+            compare_snapshots(missing_sample, complete),
+        ] {
+            assert!(!scan.complete);
+            assert!(scan.changed_files.is_empty());
+            assert!(scan.before_images.is_empty());
+            assert!(scan.after_images.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn exhausted_scan_budget_preserves_unknown_state() {
+        let workspace = tempdir().expect("workspace");
+        fs::write(workspace.path().join("source.txt"), "before").unwrap();
+        let before = capture_with_budget(workspace.path(), Duration::ZERO).await;
+        assert!(!before.is_complete());
+        fs::write(workspace.path().join("source.txt"), "after").unwrap();
+        let after = capture(workspace.path()).await;
+        let scan = compare_snapshots(before, after);
+        assert!(!scan.complete);
+        assert!(!scan.only_derived_changes);
+    }
+
+    #[tokio::test]
+    async fn oversized_files_do_not_hide_small_file_changes() {
+        let workspace = tempdir().expect("workspace");
+        let large = workspace.path().join("archive.bin");
+        fs::File::create(&large)
+            .unwrap()
+            .set_len(MAX_HASHED_FILE_BYTES + 1)
+            .unwrap();
+        let small = workspace.path().join("source.txt");
+        fs::write(&small, "before").unwrap();
+        let before = capture(workspace.path()).await;
+        assert!(!before.is_complete());
+        fs::write(&small, "after").unwrap();
+        let scan = compare(workspace.path(), before).await;
+        assert!(!scan.complete);
+        assert!(scan.changed_files.contains(&small));
+        assert!(
+            scan.before_images.iter().any(|image| {
+                image.path == small && image.content.as_deref() == Some(b"before")
+            })
         );
     }
 

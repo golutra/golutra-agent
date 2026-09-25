@@ -192,6 +192,7 @@ impl TuiRuntimeController {
         let details_changed = super::tool_detail::poll_data(app, &self.transport).await;
         app.poll_auth_operation(&self.transport).await;
         changed |= app.poll_auth_model_discovery().await;
+        changed |= app.poll_auth_protocol_detection().await;
         app.poll_export_operation().await;
         let recovered = app.poll_pending_recovery(&self.transport).await?;
         Ok(changed
@@ -256,6 +257,7 @@ impl TuiRuntimeController {
         let details_changed = super::tool_detail::poll_data(app, &self.transport).await;
         app.poll_auth_operation(&self.transport).await;
         changed |= app.poll_auth_model_discovery().await;
+        changed |= app.poll_auth_protocol_detection().await;
         app.poll_export_operation().await;
         let recovered = app.poll_pending_recovery(&self.transport).await?;
         Ok(changed

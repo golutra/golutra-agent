@@ -8,6 +8,22 @@ use tokio::{
 
 use super::*;
 
+#[test]
+fn typed_request_error_takes_precedence_over_transient_words_in_its_message() {
+    let error = provider_error_from_value(
+        &json!({"error": {
+            "type":"invalid_request_error", "message":"invalid upstream stream parameter",
+        }}),
+        Some(200),
+        &Default::default(),
+    );
+    assert_eq!(error.metadata().unwrap().http_status, None);
+    assert!(!error.metadata().unwrap().stream_interrupted);
+    assert!(
+        matches!(error, ProviderError::WithMetadata { error, .. } if matches!(*error, ProviderError::Failed { .. }))
+    );
+}
+
 #[tokio::test]
 async fn mock_provider_can_emit_a_deterministic_failure() {
     let provider = MockProvider::failure("forced failure");

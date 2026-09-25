@@ -890,6 +890,37 @@ impl RuntimeStore {
         Ok(events)
     }
 
+    /// 返回请求快照之后的已确认事实；缺少边界时由调用方重建普通历史。
+    pub async fn load_context_tail(
+        &self,
+        session_id: SessionId,
+        request_id: golutra_agent_core::ProviderRequestId,
+    ) -> StoreResult<Option<Vec<RuntimeEvent>>> {
+        let anchor: Option<i64> = sqlx::query_scalar(
+            "SELECT sequence_no FROM runtime_events WHERE session_id = ? AND event_type = 'ContextSnapshotCreated' AND json_extract(payload_json, '$.snapshot.provider_request_id') = ? ORDER BY sequence_no DESC LIMIT 1",
+        )
+        .bind(session_id.to_string())
+        .bind(request_id.to_string())
+        .fetch_optional(&self.pool).await?;
+        let Some(anchor) = anchor else {
+            return Ok(None);
+        };
+        let rows = sqlx::query(
+            "SELECT event_json FROM runtime_events WHERE session_id = ? AND sequence_no > ? AND event_type IN ('AssistantMessage', 'ProviderCompleted', 'ToolCompleted', 'TaskCreated', 'TurnQueued', 'TurnUpdated', 'TurnCancelled', 'TaskCompleted', 'TaskAborted', 'TaskInterrupted', 'TaskUncertain', 'CompactionCompleted', 'SubagentUpdated', 'CandidateReady', 'VerificationReady') ORDER BY sequence_no LIMIT 4097",
+        )
+        .bind(session_id.to_string()).bind(anchor).fetch_all(&self.pool).await?;
+        if rows.len() > 4096 {
+            return Ok(None);
+        }
+        rows.into_iter()
+            .map(|row| {
+                let json: String = row.try_get("event_json")?;
+                Ok(serde_json::from_str(&json)?)
+            })
+            .collect::<StoreResult<Vec<_>>>()
+            .map(Some)
+    }
+
     pub fn reduce_state(session_id: SessionId, events: &[RuntimeEvent]) -> StateProjection {
         let mut projection = initial_projection(session_id);
 
@@ -3262,6 +3293,16 @@ async fn persist_runtime_indexes(
     .execute(&mut **transaction)
     .await?;
     if let Some(task_id) = event.task_id {
+        let task_status = if projection.active_task_id == Some(task_id) {
+            status.clone()
+        } else {
+            let previous: Option<String> =
+                sqlx::query_scalar("SELECT status FROM tasks WHERE task_id = ?")
+                    .bind(task_id.to_string())
+                    .fetch_optional(&mut **transaction)
+                    .await?;
+            indexed_status_after_event(previous, event)?
+        };
         sqlx::query(
             r#"
             INSERT INTO tasks (task_id, session_id, status, last_sequence_no, created_at, updated_at)
@@ -3274,7 +3315,7 @@ async fn persist_runtime_indexes(
         )
         .bind(task_id.to_string())
         .bind(event.session_id.to_string())
-        .bind(&status)
+        .bind(&task_status)
         .bind(i64::try_from(projection.last_sequence_no).unwrap_or(i64::MAX))
         .bind(&timestamp)
         .bind(&timestamp)
@@ -3282,6 +3323,12 @@ async fn persist_runtime_indexes(
         .await?;
     }
     if let Some(turn_id) = event.turn_id {
+        let previous: Option<String> =
+            sqlx::query_scalar("SELECT status FROM turns WHERE turn_id = ?")
+                .bind(turn_id.to_string())
+                .fetch_optional(&mut **transaction)
+                .await?;
+        let turn_status = indexed_status_after_event(previous, event)?;
         sqlx::query(
             r#"
             INSERT INTO turns (turn_id, session_id, task_id, status, last_sequence_no, created_at, updated_at)
@@ -3295,7 +3342,7 @@ async fn persist_runtime_indexes(
         .bind(turn_id.to_string())
         .bind(event.session_id.to_string())
         .bind(event.task_id.map(|id| id.to_string()))
-        .bind(&status)
+        .bind(&turn_status)
         .bind(i64::try_from(projection.last_sequence_no).unwrap_or(i64::MAX))
         .bind(&timestamp)
         .bind(&timestamp)
@@ -3303,6 +3350,22 @@ async fn persist_runtime_indexes(
         .await?;
     }
     Ok(())
+}
+
+// 索引归约使用该实体自己的上次状态，不能复制会话中另一个任务的状态。
+fn indexed_status_after_event(
+    previous: Option<String>,
+    event: &RuntimeEvent,
+) -> StoreResult<String> {
+    let previous = previous
+        .map(|status| serde_json::from_value(serde_json::Value::String(status)))
+        .transpose()?
+        .unwrap_or(golutra_agent_core::TaskStatus::Idle);
+    let status = golutra_agent_protocol::task_status_after_event(previous, event);
+    Ok(serde_json::to_value(status)?
+        .as_str()
+        .unwrap_or("idle")
+        .to_owned())
 }
 
 /// Encode a filesystem path for SQLx without treating Windows verbatim prefixes

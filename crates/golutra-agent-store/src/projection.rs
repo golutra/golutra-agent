@@ -25,7 +25,27 @@ pub(crate) fn initial_projection(session_id: SessionId) -> StateProjection {
 pub(crate) fn apply_event_to_state(projection: &mut StateProjection, event: &RuntimeEvent) {
     projection.last_sequence_no = projection.last_sequence_no.max(event.sequence_no);
     if let Some(task_id) = event.task_id {
-        projection.active_task_id = Some(task_id);
+        // 事件归属不等于活动任务切换；旧进程和后台诊断可以在下一任务启动后落盘。
+        if projection.active_task_id.is_none()
+            || matches!(
+                event.event_type,
+                RuntimeEventType::TaskCreated
+                    | RuntimeEventType::TaskResumed
+                    | RuntimeEventType::TurnStarted
+            )
+        {
+            if projection.active_task_id != Some(task_id) {
+                projection.runtime_lane = None;
+                projection.pending_approval = None;
+                projection.final_message = None;
+                projection.last_loop_decision = None;
+                projection.last_verification = None;
+            }
+            projection.active_task_id = Some(task_id);
+        }
+        if projection.active_task_id != Some(task_id) {
+            return;
+        }
     }
     apply_event_to_projection(projection, event);
 }

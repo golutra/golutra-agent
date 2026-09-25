@@ -29,7 +29,7 @@ pub(crate) fn diagnose_task(
     let primary_episode = episodes
         .iter()
         .filter(|episode| episode.status == FailureEpisodeStatus::Active)
-        .max_by_key(|episode| episode_priority(episode))?;
+        .max_by_key(|episode| episode_priority(episode, events))?;
     let primary_episode_id = primary_episode.episode_id.clone();
     let primary_signal_kind = primary_episode.primary_signal.kind;
     let trigger = events
@@ -72,7 +72,7 @@ pub(crate) fn diagnose_task(
         confidence,
         code_targets: targets,
         regression_commands: commands,
-        analyzer_version: "golutra-agent-failure-diagnosis-v4".to_owned(),
+        analyzer_version: "golutra-agent-failure-diagnosis-v5".to_owned(),
         failure_episode_id: Some(primary_episode_id.clone()),
         revision: u32::try_from(
             events
@@ -654,9 +654,23 @@ fn push_episode_signal(episode: &mut FailureEpisode, signal: FailureSignalRef) {
     }
 }
 
-fn episode_priority(episode: &FailureEpisode) -> u8 {
+fn episode_priority(episode: &FailureEpisode, events: &[RuntimeEvent]) -> u8 {
     if !episode.external_assertion_failures.is_empty() {
         4
+    } else if !episode.self_check_failures.is_empty()
+        && episode.self_check_failures.iter().all(|signal| {
+            events.iter().any(|event| {
+                event.id == signal.event_ref
+                    && event
+                        .payload
+                        .pointer("/record/policy_status")
+                        .and_then(Value::as_str)
+                        == Some("runtime_failed")
+            })
+        })
+    {
+        // runtime_failed 是执行失败的派生验证，不能盖住尚未恢复的原始错误。
+        0
     } else if !episode.self_check_failures.is_empty() {
         3
     } else if episode
@@ -1669,6 +1683,31 @@ mod tests {
             payload_ref: None,
             durable: true,
         }
+    }
+
+    #[test]
+    fn derived_runtime_verification_does_not_hide_unresolved_provider_failure() {
+        let task = TaskId::new();
+        let events = vec![
+            event(
+                1,
+                task,
+                RuntimeEventType::ProviderFailed,
+                json!({"error":"upstream failure"}),
+            ),
+            event(
+                2,
+                task,
+                RuntimeEventType::VerificationCompleted,
+                json!({"record":{"result":"fail", "policy_status":"runtime_failed"}}),
+            ),
+        ];
+        let analysis = diagnose_task(task, &events, None).unwrap();
+        assert_eq!(analysis.diagnosis.trigger_event_refs, vec![events[0].id]);
+        let mut genuine_check = events.clone();
+        genuine_check[1].payload["record"]["policy_status"] = json!("verified");
+        let analysis = diagnose_task(task, &genuine_check, None).unwrap();
+        assert_eq!(analysis.diagnosis.trigger_event_refs, vec![events[1].id]);
     }
 
     #[test]

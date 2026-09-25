@@ -491,6 +491,12 @@ impl SecretStore for MemorySecretStore {
 pub trait CredentialProvider: Send + Sync {
     async fn credential(&self, force_refresh: bool) -> Result<SecretString, AuthError>;
 
+    /// 是否有刷新机制；静态 Key 无法刷新，不应重复请求并掩盖第一次 401。
+    /// 默认保留自定义凭据提供方既有的刷新契约。
+    fn supports_refresh(&self) -> bool {
+        true
+    }
+
     async fn metadata(&self) -> Result<CredentialMetadata, AuthError> {
         Ok(CredentialMetadata::default())
     }
@@ -530,6 +536,10 @@ impl FixedCredentialProvider {
 
 #[async_trait]
 impl CredentialProvider for FixedCredentialProvider {
+    fn supports_refresh(&self) -> bool {
+        false
+    }
+
     async fn credential(&self, _force_refresh: bool) -> Result<SecretString, AuthError> {
         Ok(self.secret.clone())
     }
@@ -564,6 +574,10 @@ impl StoredCredentialProvider {
 
 #[async_trait]
 impl CredentialProvider for StoredCredentialProvider {
+    fn supports_refresh(&self) -> bool {
+        false
+    }
+
     async fn credential(&self, _force_refresh: bool) -> Result<SecretString, AuthError> {
         let store = Arc::clone(&self.store);
         let reference = self.reference.clone();

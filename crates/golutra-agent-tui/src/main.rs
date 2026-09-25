@@ -388,6 +388,7 @@ struct TuiApp {
     auth_dialog: Option<AuthDialogState>,
     auth_operation: Option<PendingAuthOperation>,
     auth_model_discovery: Option<PendingModelDiscovery>,
+    auth_protocol_detection: Option<PendingProtocolDetection>,
     input: ComposerInput,
     prompt_history: PromptHistory,
     history_search: Option<HistorySearchState>,
@@ -516,6 +517,7 @@ impl TuiApp {
 
     pub(crate) async fn shutdown_pending_operations(&mut self) {
         self.shutdown_handoff().await;
+        self.cancel_auth_protocol_detection();
         self.history_reload = None;
         if let Some(pending) = self.auth_model_discovery.take() {
             pending.task.abort();
@@ -533,6 +535,9 @@ impl TuiApp {
 
 impl Drop for TuiApp {
     fn drop(&mut self) {
+        if let Some(pending) = self.auth_protocol_detection.as_ref() {
+            pending.task.abort();
+        }
         if let Some(pending) = self.auth_model_discovery.as_ref() {
             pending.task.abort();
         }
@@ -733,6 +738,7 @@ impl TuiApp {
             auth_dialog,
             auth_operation: None,
             auth_model_discovery: None,
+            auth_protocol_detection: None,
             input: ComposerInput::default(),
             prompt_history: PromptHistory::default(),
             history_search: None,
@@ -5738,6 +5744,9 @@ async fn handle_export_key(
 }
 
 fn handle_paste(pasted: &str, app: &mut TuiApp) {
+    if app.auth_protocol_detection.is_some() {
+        return;
+    }
     if app.developer_detail.is_some() {
         return;
     }

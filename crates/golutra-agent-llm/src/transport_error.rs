@@ -2,6 +2,35 @@
 
 use std::error::Error;
 
+pub(crate) fn genai_stream_interrupted(error: &genai::Error) -> bool {
+    let genai::Error::WebStream { error, .. } = error else {
+        return false;
+    };
+    if has_permanent_transport_cause(error.as_ref()) {
+        return false;
+    }
+    if let Some(error) = error.downcast_ref::<genai::Error>() {
+        return genai_stream_interrupted(error);
+    }
+    if let Some(genai::webc::Error::Reqwest(error)) = error.downcast_ref::<genai::webc::Error>() {
+        return error.status().is_none() && (error.is_body() || error.is_timeout());
+    }
+    error
+        .downcast_ref::<reqwest13::Error>()
+        .is_some_and(|error| error.status().is_none() && (error.is_body() || error.is_timeout()))
+        || error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+            error.status().is_none() && (error.is_body() || error.is_timeout())
+        })
+        || error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+            )
+        })
+}
+
 pub(crate) fn has_permanent_transport_cause(error: &(dyn Error + 'static)) -> bool {
     let mut current = Some(error);
     while let Some(error) = current {

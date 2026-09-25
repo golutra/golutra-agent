@@ -7,6 +7,29 @@ pub(crate) async fn handle_auth_dialog_key(
     app: &mut TuiApp,
     transport: &RuntimeTransport,
 ) -> miette::Result<()> {
+    if app.auth_protocol_detection.is_some() {
+        if key.code == KeyCode::Esc {
+            app.cancel_auth_protocol_detection();
+        }
+        return Ok(());
+    }
+    if matches!(key.code, KeyCode::Char('p' | 'P')) && key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        app.cancel_auth_model_discovery();
+        if let Some(dialog) = &mut app.auth_dialog
+            && dialog.protocol_options().len() > 1
+        {
+            dialog.step = AuthDialogStep::Protocol;
+            dialog.selected = dialog
+                .protocol_options()
+                .iter()
+                .position(|p| *p == dialog.protocol)
+                .unwrap_or(0);
+            dialog.review = None;
+            dialog.error = None;
+        }
+        return Ok(());
+    }
     if let Some(dialog) = app.auth_dialog.as_mut()
         && dialog.step == AuthDialogStep::AdvancedConfig
         && dialog.advanced_input.is_some()
@@ -273,6 +296,7 @@ pub(crate) async fn advance_auth_dialog(
             }
             AuthDialogStep::Protocol => {
                 dialog.protocol = dialog.selected_protocol();
+                dialog.automatic_protocol = false;
                 if dialog.base_url.is_empty()
                     && dialog
                         .provider
@@ -281,7 +305,22 @@ pub(crate) async fn advance_auth_dialog(
                     dialog.base_url =
                         AuthDialogState::default_base_url_for_protocol(dialog.protocol).to_owned();
                 }
-                dialog.step = AuthDialogStep::BaseUrl;
+                // 普通官方 API 复用固定地址；项目端点和原生路由需要显式配置地址。
+                dialog.step = if dialog
+                    .provider
+                    .is_some_and(|provider| provider.source == AuthProviderSource::Official)
+                    && !matches!(
+                        dialog.protocol,
+                        ProviderProtocol::VertexAi | ProviderProtocol::Genai
+                    ) {
+                    if dialog.credential_store == AuthCredentialStore::Environment {
+                        AuthDialogStep::EnvKey
+                    } else {
+                        AuthDialogStep::ApiKey
+                    }
+                } else {
+                    AuthDialogStep::BaseUrl
+                };
                 dialog.selected = 0;
                 dialog.error = None;
                 AuthAdvanceAction::None
@@ -363,17 +402,29 @@ pub(crate) async fn advance_auth_dialog(
                 AuthAdvanceAction::None
             }
             AuthDialogStep::AdvancedConfig => {
-                match validate_generation_config(dialog).and_then(|_| build_auth_review(dialog)) {
-                    Ok(review) => {
-                        dialog.review = Some(review);
-                        dialog.step = AuthDialogStep::Review;
-                        dialog.error = None;
+                if dialog.automatic_protocol {
+                    // 先校验本地草稿，独立探测完成后再构建离线确认页。
+                    match auth_login(dialog) {
+                        Ok(_) => AuthAdvanceAction::DetectProtocol,
+                        Err(error) => {
+                            dialog.error = Some(error);
+                            AuthAdvanceAction::None
+                        }
                     }
-                    Err(error) => {
-                        dialog.error = Some(error);
+                } else {
+                    match validate_generation_config(dialog).and_then(|_| build_auth_review(dialog))
+                    {
+                        Ok(review) => {
+                            dialog.review = Some(review);
+                            dialog.step = AuthDialogStep::Review;
+                            dialog.error = None;
+                        }
+                        Err(error) => {
+                            dialog.error = Some(error);
+                        }
                     }
+                    AuthAdvanceAction::None
                 }
-                AuthAdvanceAction::None
             }
             AuthDialogStep::Review => match auth_login(dialog) {
                 Ok(login) => AuthAdvanceAction::SaveOpenAiCompatible(Box::new(login)),
@@ -410,6 +461,7 @@ pub(crate) async fn advance_auth_dialog(
     }
     match action {
         AuthAdvanceAction::None => {}
+        AuthAdvanceAction::DetectProtocol => app.start_auth_protocol_detection()?,
         AuthAdvanceAction::SaveMock => {
             apply_auth_mock()?;
             notify_runtime_provider_configured(transport, app.session_id).await?;

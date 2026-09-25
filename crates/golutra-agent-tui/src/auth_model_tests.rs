@@ -9,6 +9,17 @@ async fn catalog_server() -> (
     oneshot::Sender<&'static str>,
     JoinHandle<()>,
 ) {
+    setup_server("application/json").await
+}
+
+async fn setup_server(
+    content_type: &'static str,
+) -> (
+    String,
+    oneshot::Receiver<String>,
+    oneshot::Sender<&'static str>,
+    JoinHandle<()>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let (request_tx, request_rx) = oneshot::channel();
@@ -25,7 +36,7 @@ async fn catalog_server() -> (
         let _ = request_tx.send(String::from_utf8(request).unwrap());
         if let Ok(body) = response_rx.await {
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
             let _ = socket.write_all(response.as_bytes()).await;
@@ -36,6 +47,311 @@ async fn catalog_server() -> (
 
 fn catalog_app(base: &str) -> TuiApp {
     catalog_app_for(base, OFFICIAL_PROVIDER_PRESET)
+}
+
+fn detection_app(base: &str) -> TuiApp {
+    let mut app = catalog_app(base);
+    let dialog = app.auth_dialog.as_mut().unwrap();
+    dialog.step = AuthDialogStep::AdvancedConfig;
+    dialog.model = "gpt-test".to_owned();
+    app
+}
+
+async fn finish_detection(app: &mut TuiApp) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while app.auth_protocol_detection.is_some() {
+            app.poll_auth_protocol_detection().await;
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn auth_protocol_detection_uses_generation_and_then_opens_offline_review() {
+    let _guard = env_lock_guard().await;
+    let transport = RuntimeTransport::in_memory().await.unwrap();
+    let (base, received, release, server) = setup_server("text/event-stream").await;
+    let mut app = detection_app(&base);
+    advance_auth_dialog(&mut app, &transport).await.unwrap();
+    assert!(app.auth_protocol_detection.is_some());
+    assert!(app.auth_dialog.as_ref().unwrap().review.is_none());
+    let request = tokio::time::timeout(Duration::from_secs(5), received)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(request.starts_with("POST /v1/responses"), "{request}");
+    assert!(
+        auth_advanced_config_lines(app.auth_dialog.as_ref().unwrap())
+            .iter()
+            .any(|line| line.to_string().contains("Detecting provider protocol"))
+    );
+    release
+        .send(include_str!(
+            "../../golutra-agent-llm/tests/fixtures/openai-responses/text-response.sse"
+        ))
+        .unwrap();
+    finish_detection(&mut app).await;
+    server.await.unwrap();
+    let dialog = app.auth_dialog.as_ref().unwrap();
+    assert_eq!(dialog.step, AuthDialogStep::Review, "{:?}", dialog.error);
+    assert_eq!(dialog.review.as_ref().unwrap().protocol, "openai-responses");
+    assert!(app.auth_operation.is_none());
+
+    // 上游已关闭；从确认页返回再继续必须复用成功结果，不发第二次请求。
+    handle_auth_dialog_key(
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .unwrap();
+    advance_auth_dialog(&mut app, &transport).await.unwrap();
+    assert!(app.auth_protocol_detection.is_none());
+    assert_eq!(
+        app.auth_dialog.as_ref().unwrap().step,
+        AuthDialogStep::Review
+    );
+
+    let original = app.auth_dialog.as_ref().unwrap().clone();
+    for field in ["base", "key", "model", "effort", "tokens", "headers"] {
+        let mut changed = original.clone();
+        changed.go_back();
+        match field {
+            "base" => changed.base_url.push_str("/other"),
+            "key" => changed.api_key.push_str("-changed"),
+            "model" => changed.model.push_str("-changed"),
+            "effort" => changed.reasoning_effort = Some(ProviderReasoningEffort::High),
+            "tokens" => changed.max_tokens = "2048".to_owned(),
+            "headers" => changed.custom_headers = "X-Client=changed".to_owned(),
+            _ => unreachable!(),
+        }
+        app.auth_dialog = Some(changed);
+        advance_auth_dialog(&mut app, &transport).await.unwrap();
+        assert!(
+            app.auth_protocol_detection.is_some(),
+            "{field} must invalidate detection"
+        );
+        assert!(
+            app.auth_dialog
+                .as_ref()
+                .unwrap()
+                .successful_protocol_detection
+                .is_none()
+        );
+        app.cancel_auth_protocol_detection();
+    }
+}
+
+#[tokio::test]
+async fn auth_protocol_detection_cache_tracks_environment_key_and_header_values() {
+    let _guard = env_lock_guard().await;
+    let variables = [
+        "GOLUTRA_AGENT_TEST_DETECTION_KEY",
+        "GOLUTRA_AGENT_TEST_DETECTION_HEADER",
+    ];
+    let previous = variables.map(std::env::var_os);
+    for variable in variables {
+        unsafe {
+            std::env::set_var(variable, "initial-test-secret");
+        }
+    }
+    let (base, received, release, server) = setup_server("text/event-stream").await;
+    let transport = RuntimeTransport::in_memory().await.unwrap();
+    let mut app = detection_app(&base);
+    let dialog = app.auth_dialog.as_mut().unwrap();
+    dialog.credential_store = AuthCredentialStore::Environment;
+    dialog.api_key.clear();
+    dialog.api_key_env = variables[0].to_owned();
+    dialog.custom_headers = format!("X-Api-Key=@{}", variables[1]);
+    advance_auth_dialog(&mut app, &transport).await.unwrap();
+    let request = tokio::time::timeout(Duration::from_secs(5), received)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(request.contains("Bearer initial-test-secret"));
+    assert!(
+        request
+            .to_ascii_lowercase()
+            .contains("x-api-key: initial-test-secret")
+    );
+    release
+        .send(include_str!(
+            "../../golutra-agent-llm/tests/fixtures/openai-responses/text-response.sse"
+        ))
+        .unwrap();
+    finish_detection(&mut app).await;
+    server.await.unwrap();
+    let dialog = app.auth_dialog.as_mut().unwrap();
+    assert_eq!(dialog.step, AuthDialogStep::Review, "{:?}", dialog.error);
+    assert!(!format!("{:?}", dialog.successful_protocol_detection).contains("initial-test-secret"));
+    dialog.go_back();
+    advance_auth_dialog(&mut app, &transport).await.unwrap();
+    assert!(app.auth_protocol_detection.is_none());
+    assert_eq!(
+        app.auth_dialog.as_ref().unwrap().step,
+        AuthDialogStep::Review
+    );
+    let cached = app.auth_dialog.as_ref().unwrap().clone();
+    for variable in variables {
+        app.auth_dialog = Some(cached.clone());
+        app.auth_dialog.as_mut().unwrap().go_back();
+        unsafe {
+            std::env::set_var(variable, "replacement-test-secret");
+        }
+        advance_auth_dialog(&mut app, &transport).await.unwrap();
+        assert!(app.auth_protocol_detection.is_some(), "{variable}");
+        // 请求发出后环境又变化，即使迟到结果成功也不能认证新值。
+        let pending = app.auth_protocol_detection.as_mut().unwrap();
+        pending.task.abort();
+        pending.task = tokio::spawn(async { Ok(ProviderProtocol::OpenAiResponses) });
+        unsafe {
+            std::env::set_var(variable, "initial-test-secret");
+        }
+        finish_detection(&mut app).await;
+        let dialog = app.auth_dialog.as_ref().unwrap();
+        assert!(dialog.successful_protocol_detection.is_none());
+        assert!(dialog.review.is_none());
+        assert!(
+            dialog
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("settings changed")
+        );
+    }
+    for (variable, value) in variables.into_iter().zip(previous) {
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(variable, value),
+                None => std::env::remove_var(variable),
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn auth_protocol_detection_failure_allows_retry_and_manual_offline_review() {
+    let _guard = env_lock_guard().await;
+    let transport = RuntimeTransport::in_memory().await.unwrap();
+    let mut app = detection_app("http://127.0.0.1:1");
+    advance_auth_dialog(&mut app, &transport).await.unwrap();
+    let pending = app.auth_protocol_detection.as_mut().unwrap();
+    pending.task.abort();
+    pending.task =
+        tokio::spawn(async { Err("Detection timed out; protocol remains unconfirmed".to_owned()) });
+    finish_detection(&mut app).await;
+    let dialog = app.auth_dialog.as_ref().unwrap();
+    assert!(dialog.successful_protocol_detection.is_none());
+    let text = auth_advanced_config_lines(dialog)
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("unconfirmed"));
+    assert!(text.contains("Continue to retry"));
+    assert!(text.contains("Ctrl+P"));
+    assert!(text.contains("save without detection"));
+    advance_auth_dialog(&mut app, &transport).await.unwrap();
+    assert!(app.auth_protocol_detection.is_some());
+    app.cancel_auth_protocol_detection();
+    let failed = app.auth_dialog.as_ref().unwrap().clone();
+    for environment in [false, true] {
+        app.auth_dialog = Some(failed.clone());
+        if environment {
+            let dialog = app.auth_dialog.as_mut().unwrap();
+            dialog.credential_store = AuthCredentialStore::Environment;
+            dialog.api_key_env = "GOLUTRA_AGENT_TEST_MANUAL_PROTOCOL_KEY".to_owned();
+            dialog.api_key.clear();
+        }
+        handle_auth_dialog_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            &mut app,
+            &transport,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            app.auth_dialog.as_ref().unwrap().step,
+            AuthDialogStep::Protocol
+        );
+        for expected in [
+            if environment {
+                AuthDialogStep::EnvKey
+            } else {
+                AuthDialogStep::ApiKey
+            },
+            AuthDialogStep::Model,
+            AuthDialogStep::AdvancedConfig,
+            AuthDialogStep::Review,
+        ] {
+            advance_auth_dialog(&mut app, &transport).await.unwrap();
+            assert_eq!(app.auth_dialog.as_ref().unwrap().step, expected);
+            assert!(app.auth_protocol_detection.is_none());
+        }
+        assert!(!app.auth_dialog.as_ref().unwrap().automatic_protocol);
+    }
+}
+
+#[tokio::test]
+async fn auth_protocol_detection_cancels_without_applying_old_result_or_editing_draft() {
+    let _guard = env_lock_guard().await;
+    let transport = RuntimeTransport::in_memory().await.unwrap();
+    let (base, received, release, server) = setup_server("text/event-stream").await;
+    let mut app = detection_app(&base);
+    advance_auth_dialog(&mut app, &transport).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), received)
+        .await
+        .unwrap()
+        .unwrap();
+    handle_paste("unexpected", &mut app);
+    handle_auth_dialog_key(
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .unwrap();
+    assert_eq!(app.auth_dialog.as_ref().unwrap().model, "gpt-test");
+    handle_auth_dialog_key(
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .unwrap();
+    assert!(app.auth_protocol_detection.is_none());
+    assert_eq!(
+        app.auth_dialog.as_ref().unwrap().step,
+        AuthDialogStep::AdvancedConfig
+    );
+    let _ = release.send(include_str!(
+        "../../golutra-agent-llm/tests/fixtures/openai-responses/text-response.sse"
+    ));
+    server.await.unwrap();
+    assert!(!app.poll_auth_protocol_detection().await);
+    assert!(app.auth_dialog.as_ref().unwrap().review.is_none());
+}
+
+#[tokio::test]
+async fn auth_protocol_detection_discards_result_after_dialog_replacement() {
+    let mut app = detection_app("http://127.0.0.1:1");
+    let id = Uuid::new_v4();
+    app.auth_dialog.as_mut().unwrap().protocol_detection = ModelDiscoveryState::Loading(id);
+    app.auth_protocol_detection = Some(PendingProtocolDetection {
+        id,
+        fingerprint: ProtocolDetectionFingerprint([0; 32]),
+        task: tokio::spawn(async { Ok(ProviderProtocol::Anthropic) }),
+    });
+    app.auth_dialog = Some(AuthDialogState::new());
+    assert!(app.poll_auth_protocol_detection().await);
+    assert!(app.auth_protocol_detection.is_none());
+    assert_eq!(
+        app.auth_dialog.as_ref().unwrap().step,
+        AuthDialogStep::GroupChoice
+    );
+    assert!(app.auth_dialog.as_ref().unwrap().review.is_none());
 }
 
 fn catalog_app_for(base: &str, provider: AuthProviderPreset) -> TuiApp {
@@ -318,6 +634,8 @@ async fn auth_catalog_manual_continue_cancels_pending_lookup() {
             AuthDialogStep::AdvancedConfig
         );
         assert!(app.auth_model_discovery.is_none());
+        // 手动模式可跳过联网探测；自动模式另有独立探测和取消回归。
+        app.auth_dialog.as_mut().unwrap().automatic_protocol = false;
         advance_auth_dialog(&mut app, &transport).await.unwrap();
         assert_eq!(
             app.auth_dialog.as_ref().unwrap().step,

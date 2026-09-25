@@ -20,6 +20,29 @@ pub(crate) struct PendingModelDiscovery {
     pub(crate) task: JoinHandle<Result<Vec<String>, String>>,
 }
 
+#[derive(Debug)]
+pub(crate) struct PendingProtocolDetection {
+    pub(crate) id: Uuid,
+    pub(crate) fingerprint: ProtocolDetectionFingerprint,
+    pub(crate) task: JoinHandle<Result<ProviderProtocol, String>>,
+}
+
+// 指纹含凭据的摘要，仅用于向导内比较，不落盘或输出到诊断。
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ProtocolDetectionFingerprint(pub(crate) [u8; 32]);
+
+impl std::fmt::Debug for ProtocolDetectionFingerprint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SuccessfulProtocolDetection {
+    pub(crate) fingerprint: ProtocolDetectionFingerprint,
+    pub(crate) protocol: ProviderProtocol,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) enum ModelDiscoveryState {
     #[default]
@@ -58,6 +81,9 @@ pub(crate) struct AuthDialogState {
     pub(crate) manual_scroll: bool,
     pub(crate) provider: Option<AuthProviderPreset>,
     pub(crate) protocol: ProviderProtocol,
+    pub(crate) automatic_protocol: bool,
+    pub(crate) protocol_detection: ModelDiscoveryState,
+    pub(crate) successful_protocol_detection: Option<SuccessfulProtocolDetection>,
     pub(crate) base_url: String,
     pub(crate) model: String,
     pub(crate) models: Vec<String>,
@@ -141,6 +167,7 @@ pub(crate) struct AuthReview {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AuthAdvanceAction {
     None,
+    DetectProtocol,
     SaveMock,
     SaveOpenAiCompatible(Box<OpenAiCompatibleLogin>),
     StartBuiltinOAuth(Box<BuiltinOAuthMethod>),
@@ -167,6 +194,9 @@ impl AuthDialogState {
             manual_scroll: false,
             provider: None,
             protocol: ProviderProtocol::OpenAiCompatible,
+            automatic_protocol: false,
+            protocol_detection: ModelDiscoveryState::Idle,
+            successful_protocol_detection: None,
             base_url: String::new(),
             model: String::new(),
             models: Vec::new(),
@@ -205,6 +235,9 @@ impl AuthDialogState {
 
     pub(crate) fn select_provider(&mut self, provider: AuthProviderPreset) {
         self.provider = Some(provider);
+        self.automatic_protocol = provider.source == AuthProviderSource::Official;
+        self.protocol_detection = ModelDiscoveryState::Idle;
+        self.successful_protocol_detection = None;
         self.protocol = provider
             .protocol_options
             .first()
@@ -233,7 +266,7 @@ impl AuthDialogState {
         self.error = None;
         self.step = if !self.oauth_methods().is_empty() {
             AuthDialogStep::AuthMethod
-        } else if provider.protocol_options.len() > 1 {
+        } else if provider.protocol_options.len() > 1 && !self.automatic_protocol {
             AuthDialogStep::Protocol
         } else if provider.source == AuthProviderSource::Official {
             AuthDialogStep::ApiKey
@@ -468,9 +501,7 @@ impl AuthDialogState {
             },
             AuthDialogStep::BaseUrl => match self.provider.map(|provider| provider.source) {
                 Some(_) if !self.oauth_methods().is_empty() => AuthDialogStep::AuthMethod,
-                Some(AuthProviderSource::Custom) if self.protocol_options().len() > 1 => {
-                    AuthDialogStep::Protocol
-                }
+                Some(_) if self.protocol_options().len() > 1 => AuthDialogStep::Protocol,
                 Some(AuthProviderSource::ThirdParty) => AuthDialogStep::ThirdPartyChoice,
                 _ => AuthDialogStep::GroupChoice,
             },
@@ -478,8 +509,16 @@ impl AuthDialogState {
                 if self
                     .provider
                     .is_some_and(|provider| provider.source == AuthProviderSource::Official)
+                    && !matches!(
+                        self.protocol,
+                        ProviderProtocol::VertexAi | ProviderProtocol::Genai
+                    )
                 {
-                    AuthDialogStep::GroupChoice
+                    if self.protocol_options().len() > 1 && !self.automatic_protocol {
+                        AuthDialogStep::Protocol
+                    } else {
+                        AuthDialogStep::GroupChoice
+                    }
                 } else {
                     AuthDialogStep::BaseUrl
                 }
@@ -497,6 +536,13 @@ impl AuthDialogState {
             AuthDialogStep::Review => AuthDialogStep::AdvancedConfig,
             AuthDialogStep::Protocol => AuthDialogStep::GroupChoice,
         };
+        if self.step == AuthDialogStep::Protocol {
+            self.selected = self
+                .protocol_options()
+                .iter()
+                .position(|protocol| *protocol == self.protocol)
+                .unwrap_or(0);
+        }
     }
 
     pub(crate) fn cycle_advanced_item(&mut self, forward: bool) {
@@ -548,7 +594,7 @@ impl AuthDialogState {
 
 pub(crate) const AUTH_ADVANCED_ITEMS: usize = 6;
 pub(crate) const OPENAI_PROTOCOL_ONLY: &[ProviderProtocol] = &[ProviderProtocol::OpenAiCompatible];
-pub(crate) const CUSTOM_PROTOCOL_OPTIONS: &[ProviderProtocol] = &[
+pub(crate) const AUTH_PROTOCOL_OPTIONS: &[ProviderProtocol] = &[
     ProviderProtocol::OpenAiResponses,
     ProviderProtocol::Anthropic,
     ProviderProtocol::Gemini,
@@ -576,9 +622,9 @@ pub(crate) const CUSTOM_MODELS: &[&str] = &[];
 pub(crate) const OFFICIAL_PROVIDER_PRESET: AuthProviderPreset = AuthProviderPreset {
     profile: "golutra",
     title: "Golutra API",
-    detail: "Official OpenAI-compatible endpoint",
+    detail: "Official API endpoint with automatic protocol detection",
     source: AuthProviderSource::Official,
-    protocol_options: OPENAI_PROTOCOL_ONLY,
+    protocol_options: AUTH_PROTOCOL_OPTIONS,
     base_url: Some("https://api.golutra.cn"),
     model: None,
     recommended_models: &[],
@@ -591,7 +637,7 @@ pub(crate) const CUSTOM_PROVIDER_PRESET: AuthProviderPreset = AuthProviderPreset
     title: "Custom Provider",
     detail: "Manually connect a local server, proxy, or unsupported provider",
     source: AuthProviderSource::Custom,
-    protocol_options: CUSTOM_PROTOCOL_OPTIONS,
+    protocol_options: AUTH_PROTOCOL_OPTIONS,
     base_url: None,
     model: None,
     recommended_models: CUSTOM_MODELS,

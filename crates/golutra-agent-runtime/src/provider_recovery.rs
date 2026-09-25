@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use golutra_agent_llm::{ProviderError, ProviderErrorMetadata};
+use golutra_agent_llm::{ProviderAttemptError, ProviderError, ProviderErrorMetadata};
 use serde::Serialize;
 
 use super::{ProviderTransport, provider_retry};
@@ -35,12 +35,43 @@ pub(super) struct RetryState {
     attempts: u32,
     pub waited: Duration,
     transport: ProviderTransport,
+    failures: Vec<ProviderAttemptError>,
+    failed_attempts: u32,
 }
 
 impl RetryState {
-    pub fn reset_transport_budget(&mut self) {
-        self.ordinary_retries = 0;
+    pub fn switch_to_buffered(&mut self) {
         self.transport = ProviderTransport::Buffered;
+    }
+
+    pub fn record_failure(&mut self, error: &ProviderError, elapsed: Duration) {
+        self.failed_attempts = self.failed_attempts.saturating_add(1);
+        let metadata = error.metadata().cloned().unwrap_or_default();
+        // 保留第一因和最近七次错误；长时间断网不能让诊断记录无限增长。
+        if self.failures.len() == 8 {
+            self.failures.remove(1);
+        }
+        self.failures.push(ProviderAttemptError {
+            attempt: self.failed_attempts,
+            transport: self.transport.label().to_owned(),
+            elapsed_ms: duration_ms(elapsed),
+            message: golutra_agent_tools::redact_sensitive_text(&error.to_string())
+                .0
+                .chars()
+                .take(512)
+                .collect(),
+            response_http_status: metadata.response_http_status,
+            http_status: metadata.http_status,
+            error_type: metadata.error_type,
+            request_id: metadata.request_id,
+            upstream_response_id: metadata.upstream_response_id,
+        });
+    }
+
+    pub fn with_failures(&self, error: ProviderError) -> ProviderError {
+        let mut metadata = error.metadata().cloned().unwrap_or_default();
+        metadata.attempts = self.failures.clone();
+        error.with_metadata(metadata)
     }
 
     pub fn schedule(

@@ -8,7 +8,7 @@ use serde::Deserialize;
 use super::{ProviderError, ProviderFinishReason};
 
 #[derive(Default)]
-pub(super) struct ResponsesTerminal(Mutex<State>);
+pub(super) struct ResponsesTerminal(Mutex<State>, crate::stream_error::StreamErrorCapture);
 
 #[derive(Default)]
 struct State {
@@ -50,6 +50,7 @@ struct Incomplete<'a> {
 impl ChatFrameSink for ResponsesTerminal {
     fn on_frame(&self, _: &FrameCtx, frame: RawFrameRef<'_>) {
         let elapsed_us = frame.elapsed_us;
+        self.1.capture(frame.data);
         // 仅反序列化必要字段；output 等大字段由 serde 跳过，避免长任务重复留存正文。
         let Ok(frame) = serde_json::from_str::<Frame<'_>>(frame.data) else {
             return;
@@ -93,13 +94,20 @@ impl ChatFrameSink for ResponsesTerminal {
 }
 
 impl ResponsesTerminal {
+    pub(super) fn error(&self) -> Option<ProviderError> {
+        self.1.error()
+    }
+
     pub(super) fn finish_reason(&self) -> Result<ProviderFinishReason, ProviderError> {
         self.0
             .lock()
             .ok()
             .and_then(|state| state.reason)
-            .ok_or_else(|| ProviderError::Unavailable {
-                message: "responses stream ended without a valid terminal event".into(),
+            .ok_or_else(|| {
+                ProviderError::Unavailable {
+                    message: "responses stream ended without a valid terminal event".into(),
+                }
+                .with_stream_interrupted()
             })
     }
 

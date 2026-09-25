@@ -12,10 +12,7 @@ use golutra_agent_core::{
     SessionId, SideEffectType, ToolCallId, ToolContract, ToolExecutionMetrics, ToolProgress,
     ToolProgressPhase, ToolResultEnvelope, ToolResultStatus, TurnId,
 };
-use golutra_agent_policy::{
-    WorkspacePolicy, contains_shell_metacharacter, explicit_shell_script,
-    parse_shell_command_with_input, shell_command_is_strictly_read_only,
-};
+use golutra_agent_policy::{WorkspacePolicy, shell_script_is_strictly_read_only};
 use golutra_agent_sandbox::{SystemSandbox, WorkspaceAccess};
 use regex::Regex;
 use serde_json::{Value, json};
@@ -3063,6 +3060,7 @@ impl ToolRuntime {
                 None => workspace_scan::capture(self.policy.workspace_root()).await,
             }
         };
+        let launch_started = Instant::now();
         let wait_ms = request
             .arguments
             .get("yield_time_ms")
@@ -3102,6 +3100,7 @@ impl ToolRuntime {
                 tty,
             )
             .await?;
+        let launch_ms = elapsed_millis(launch_started);
         let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms);
         let mut observed_cursor = 0;
         while !snapshot.state.is_terminal() && tokio::time::Instant::now() < deadline {
@@ -3134,7 +3133,12 @@ impl ToolRuntime {
         }
         snapshot = if !background && snapshot.state.is_terminal() {
             self.process_supervisor
-                .wait_for_scan(request.session_id, &process_id, 0, 30_000)
+                .wait_for_scan(
+                    request.session_id,
+                    &process_id,
+                    0,
+                    workspace_scan::MAX_SCAN_DURATION.as_millis() as u64,
+                )
                 .await?
         } else {
             self.process_supervisor
@@ -3143,6 +3147,9 @@ impl ToolRuntime {
         };
         let session_id = request.session_id;
         let mut report = supervised_process_report(request, policy, snapshot);
+        report.envelope.structured_facts["timings"]["launch_ms"] = json!(launch_ms);
+        report.envelope.structured_facts["timings"]["invocation_ms"] =
+            json!(elapsed_millis(started_at));
         report.envelope.structured_facts["requested_timeout_ms"] = json!(timeout_ms);
         report.envelope.structured_facts["effective_timeout_ms"] = json!(effective_timeout_ms);
         report.envelope.structured_facts["effective_yield_time_ms"] = json!(wait_ms);
@@ -3396,7 +3403,7 @@ impl ToolRuntime {
                     request.session_id,
                     &snapshot.process_id,
                     snapshot.output_start_cursor,
-                    30_000,
+                    workspace_scan::MAX_SCAN_DURATION.as_millis() as u64,
                 )
                 .await?
         } else {
@@ -4921,6 +4928,11 @@ fn supervised_process_report(
             "command": snapshot.command,
             "workdir": snapshot.workdir,
             "elapsed_ms": snapshot.elapsed_ms,
+            "timings": {
+                "workspace_before_ms": snapshot.workspace_before_ms,
+                "process_ms": snapshot.elapsed_ms,
+                "workspace_after_ms": snapshot.workspace_after_ms,
+            },
             "workspace_scan_pending": snapshot.workspace_scan_pending,
             "workspace_overlap": snapshot.workspace_overlap,
             "workspace_change_scope": "shared_workspace_observation",
@@ -6766,13 +6778,7 @@ pub fn shell_request_is_strictly_read_only(arguments: &Value) -> bool {
     let Ok(command) = shell_command_for_request(arguments) else {
         return false;
     };
-    let Some(parsed) = parse_shell_command_with_input(&command) else {
-        return false;
-    };
-    parsed.stdin.is_none()
-        && explicit_shell_script(&parsed.parts).is_none()
-        && !contains_shell_metacharacter(&command)
-        && shell_command_is_strictly_read_only(&parsed.parts)
+    shell_script_is_strictly_read_only(&command)
 }
 
 fn shell_quote_argv_item(argument: &str) -> String {
@@ -6834,7 +6840,7 @@ pub fn redact_sensitive_text(raw_output: &str) -> (String, RedactionStatus) {
         .expect("secret assignment regex is valid")
     });
     static PREFIXED_SECRET: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i)(?:sk-[a-z0-9_-]{9,}|ghp_[a-z0-9_-]{8,}|github_pat_[a-z0-9_-]{8,}|xox[bp]-[a-z0-9_-]{8,})")
+        Regex::new(r"(?i)(?-u:\b)(?:sk-[a-z0-9_-]{9,}|ghp_[a-z0-9_-]{8,}|github_pat_[a-z0-9_-]{8,}|xox[bp]-[a-z0-9_-]{8,})")
             .expect("prefixed secret redaction regex is valid")
     });
 
