@@ -6,6 +6,7 @@ use super::ComposerInput;
 pub(crate) enum UiMousePress {
     Auth(usize),
     Resume(usize),
+    Turn(usize),
     Queue(usize),
     Approval(super::ApprovalChoice),
     QuestionOption { question: usize, option: usize },
@@ -20,6 +21,7 @@ pub(crate) enum UiMousePress {
 pub(crate) enum UiMouseActivation {
     AuthContinue,
     ResumeSession,
+    ForkTurn,
     Approval(super::ApprovalChoice),
     QuestionSubmit,
 }

@@ -884,26 +884,12 @@ async fn q_key_does_not_exit_tui() {
 }
 
 #[tokio::test]
-async fn double_escape_opens_previous_session_picker_with_previous_thread_selected() {
+async fn double_escape_opens_current_session_turn_picker() {
     let transport = RuntimeTransport::in_memory().await.expect("transport");
     let current_session_id = transport.default_session_id();
     let current_thread_id = ThreadId::new();
-    let previous_session_id = SessionId::new();
-    let previous_thread_id = ThreadId::new();
-    for (session_id, thread_id, prompt) in [
-        (current_session_id, current_thread_id, "current session"),
-        (previous_session_id, previous_thread_id, "previous session"),
-    ] {
-        let ack = transport
-            .send_command(session_command(
-                session_id,
-                SessionCommandKind::Create,
-                json!({"_thread_id": thread_id, "prompt": prompt}),
-            ))
-            .await
-            .expect("create session");
-        assert!(ack.accepted);
-    }
+    let first_turn = TurnId::new();
+    let second_turn = TurnId::new();
     let mut app = TuiApp::new(
         current_thread_id,
         current_session_id,
@@ -912,6 +898,23 @@ async fn double_escape_opens_previous_session_picker_with_previous_thread_select
         "ready (mock)".to_owned(),
         None,
     );
+    let mut first = transcript_event(
+        1,
+        current_session_id,
+        TaskId::new(),
+        RuntimeEventType::TaskCreated,
+        json!({"payload": {"prompt": "first prompt"}}),
+    );
+    first.turn_id = Some(first_turn);
+    let mut second = transcript_event(
+        2,
+        current_session_id,
+        TaskId::new(),
+        RuntimeEventType::TaskCreated,
+        json!({"payload": {"prompt": "second prompt"}}),
+    );
+    second.turn_id = Some(second_turn);
+    app.events = vec![first, second];
     let escape = || KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
     handle_key(escape(), &mut app, &transport)
         .await
@@ -921,9 +924,11 @@ async fn double_escape_opens_previous_session_picker_with_previous_thread_select
     handle_key(escape(), &mut app, &transport)
         .await
         .expect("second escape");
-    let picker = app.resume_picker.as_ref().expect("previous session picker");
-    assert_eq!(picker.items[picker.selected].thread_id, previous_thread_id);
-    assert!(app.status_message.contains("press Enter to continue"));
+    let picker = app.turn_picker.as_ref().expect("turn picker");
+    assert!(app.resume_picker.is_none());
+    assert_eq!(picker.items[picker.selected].turn_id, second_turn);
+    assert_eq!(picker.items[picker.selected].prompt, "second prompt");
+    assert!(app.status_message.contains("fork"));
 }
 
 #[tokio::test]
@@ -965,8 +970,45 @@ async fn double_escape_requires_consecutive_empty_composer_input() {
     )
     .await
     .expect("second empty escape");
-    assert!(app.resume_picker.is_none());
-    assert!(app.status_message.contains("No sessions") || app.status_message.contains("Esc again"));
+    assert!(app.turn_picker.is_none());
+    assert!(
+        app.status_message.contains("No previous user turns")
+            || app.status_message.contains("Esc again")
+    );
+}
+
+#[test]
+fn historical_turn_items_deduplicate_turn_updates_and_ignore_missing_ids() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let turn = TurnId::new();
+    let mut initial = transcript_event(
+        1,
+        session_id,
+        task_id,
+        RuntimeEventType::TaskCreated,
+        json!({"payload": {"prompt": "initial"}}),
+    );
+    initial.turn_id = Some(turn);
+    let mut updated = transcript_event(
+        2,
+        session_id,
+        task_id,
+        RuntimeEventType::TurnUpdated,
+        json!({"payload": {"prompt": "updated"}}),
+    );
+    updated.turn_id = Some(turn);
+    let missing_id = transcript_event(
+        3,
+        session_id,
+        task_id,
+        RuntimeEventType::TaskCreated,
+        json!({"payload": {"prompt": "cannot fork"}}),
+    );
+    let items = historical_turn_items(&[initial, updated, missing_id]);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].turn_id, turn);
+    assert_eq!(items[0].prompt, "updated");
 }
 
 #[tokio::test]

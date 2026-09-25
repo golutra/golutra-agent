@@ -4,7 +4,10 @@ use golutra_agent_client::{DebugExportReceipt, RuntimeClient, RuntimeTransport};
 use golutra_agent_core::{
     Actor, ActorKind, CommandId, SessionId, TaskId, TaskStatus, ThreadId, TurnId,
 };
-use golutra_agent_protocol::{RuntimeQuery, RuntimeQueryKind, SessionCommand, SessionCommandKind};
+use golutra_agent_protocol::{
+    RuntimeEvent, RuntimeEventType, RuntimeQuery, RuntimeQueryKind, SessionCommand,
+    SessionCommandKind,
+};
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -36,6 +39,120 @@ pub(crate) struct ResumeThreadItem {
     pub(crate) title: String,
     pub(crate) preview: String,
     pub(crate) metadata: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct HistoricalTurnItem {
+    pub(crate) turn_id: TurnId,
+    pub(crate) prompt: String,
+    pub(crate) metadata: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TurnPickerState {
+    pub(crate) items: Vec<HistoricalTurnItem>,
+    pub(crate) selected: usize,
+}
+
+impl TurnPickerState {
+    pub(crate) fn new(items: Vec<HistoricalTurnItem>) -> Self {
+        Self { items, selected: 0 }
+    }
+
+    pub(crate) fn selected_turn_id(&self) -> Option<TurnId> {
+        self.items.get(self.selected).map(|item| item.turn_id)
+    }
+
+    pub(crate) fn move_selection(&mut self, direction: ResumeSelectionDirection) {
+        if self.items.is_empty() {
+            self.selected = 0;
+            return;
+        }
+        self.selected = match direction {
+            ResumeSelectionDirection::Previous => self.selected.saturating_sub(1),
+            ResumeSelectionDirection::Next => {
+                (self.selected + 1).min(self.items.len().saturating_sub(1))
+            }
+        };
+    }
+
+    pub(crate) fn move_selection_by_page(
+        &mut self,
+        direction: ResumeSelectionDirection,
+        page_size: usize,
+    ) {
+        if self.items.is_empty() {
+            self.selected = 0;
+            return;
+        }
+        let page_size = page_size.max(1);
+        self.selected = match direction {
+            ResumeSelectionDirection::Previous => self.selected.saturating_sub(page_size),
+            ResumeSelectionDirection::Next => self
+                .selected
+                .saturating_add(page_size)
+                .min(self.items.len().saturating_sub(1)),
+        };
+    }
+
+    pub(crate) fn select_first(&mut self) {
+        self.selected = 0;
+    }
+
+    pub(crate) fn select_last(&mut self) {
+        self.selected = self.items.len().saturating_sub(1);
+    }
+}
+
+/// 从持久事件中提取可回退的用户 turn，并按最近使用顺序排列。
+/// 同一个 turn 可能写入多个更新事件，最后一次非空 prompt 才是用户看到的内容。
+pub(crate) fn historical_turn_items(events: &[RuntimeEvent]) -> Vec<HistoricalTurnItem> {
+    let mut items = Vec::<(u64, HistoricalTurnItem)>::new();
+    let mut ordered = events.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|event| event.sequence_no);
+    for event in ordered {
+        if !matches!(
+            event.event_type,
+            RuntimeEventType::TaskCreated
+                | RuntimeEventType::TurnQueued
+                | RuntimeEventType::TurnUpdated
+        ) {
+            continue;
+        }
+        let Some(turn_id) = event.turn_id else {
+            continue;
+        };
+        let Some(prompt) = event
+            .payload
+            .get("payload")
+            .and_then(|payload| payload.get("prompt"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|prompt| !prompt.is_empty())
+        else {
+            continue;
+        };
+        let item = HistoricalTurnItem {
+            turn_id,
+            prompt: prompt.to_owned(),
+            metadata: format!(
+                "turn {} · event #{}",
+                super::short_id(&turn_id.to_string()),
+                event.sequence_no
+            ),
+        };
+        if let Some((sequence, existing)) = items
+            .iter_mut()
+            .find(|(_, existing)| existing.turn_id == turn_id)
+        {
+            *sequence = event.sequence_no;
+            *existing = item;
+        } else {
+            items.push((event.sequence_no, item));
+        }
+    }
+    items.sort_by(|left, right| right.0.cmp(&left.0));
+    items.into_iter().map(|(_, item)| item).collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -296,6 +296,7 @@ fn overlay_region_id(press: UiMousePress) -> String {
     match press {
         UiMousePress::Auth(index) => format!("auth_option_{index}"),
         UiMousePress::Resume(index) => format!("resume_item_{index}"),
+        UiMousePress::Turn(index) => format!("turn_item_{index}"),
         UiMousePress::Queue(index) => format!("queue_item_{index}"),
         UiMousePress::Approval(choice) => format!("approval_{}", region_slug(choice.label())),
         UiMousePress::QuestionOption { question, option } => {

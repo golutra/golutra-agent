@@ -1293,6 +1293,7 @@ fn ensure_driver_binding_allows_key(
         Some(
             OverlaySurface::Help
             | OverlaySurface::Resume
+            | OverlaySurface::TurnPicker
             | OverlaySurface::Dashboard
             | OverlaySurface::Settings
             | OverlaySurface::Handoff
@@ -1335,6 +1336,7 @@ fn ensure_driver_binding_allows_mouse(
             UiMouseActivation::AuthContinue
                 | UiMouseActivation::Approval(_)
                 | UiMouseActivation::QuestionSubmit
+                | UiMouseActivation::ForkTurn
         )
     {
         return ensure_task_binding_accepts_no_control(task_id, "mouse control");
@@ -1357,6 +1359,9 @@ fn ensure_driver_binding_allows_mouse_event(
         Some(UiMousePress::Auth(_)) => Some(UiMouseActivation::AuthContinue),
         Some(UiMousePress::Resume(_)) if app.resume_picker.is_some() => {
             Some(UiMouseActivation::ResumeSession)
+        }
+        Some(UiMousePress::Turn(_)) if app.turn_picker.is_some() => {
+            Some(UiMouseActivation::ForkTurn)
         }
         Some(UiMousePress::Approval(choice)) => Some(UiMouseActivation::Approval(choice)),
         Some(UiMousePress::QuestionSubmit)

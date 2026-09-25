@@ -326,6 +326,7 @@ pub(crate) enum OverlaySurface {
     Approval,
     Question,
     Resume,
+    TurnPicker,
     Queue,
     Dashboard,
     Settings,
@@ -375,6 +376,7 @@ struct TuiApp {
     tool_detail: Option<tool_detail::ToolDetailState>,
     developer_detail: Option<developer_detail::DeveloperDetailState>,
     resume_picker: Option<ResumePickerState>,
+    turn_picker: Option<TurnPickerState>,
     queue_picker: Option<QueuePickerState>,
     approval_dialog: Option<ApprovalDialogState>,
     question_dialog: Option<QuestionDialogState>,
@@ -436,7 +438,7 @@ struct TuiApp {
     history_has_more_before: bool,
     history_load_requested: bool,
     quit_shortcut_expires_at: Option<Instant>,
-    /// 双击 Esc 只在短窗口内组成会话恢复快捷键，单击仍保留原有取消语义。
+    /// 双击 Esc 只在短窗口内组成历史 turn 回退快捷键，单击仍保留原有取消语义。
     last_escape_at: Option<Instant>,
     should_quit: bool,
     last_prompt_ack: Option<CommandAck>,
@@ -674,6 +676,8 @@ impl TuiApp {
             Some(OverlaySurface::Question)
         } else if self.resume_picker.is_some() {
             Some(OverlaySurface::Resume)
+        } else if self.turn_picker.is_some() {
+            Some(OverlaySurface::TurnPicker)
         } else if self.queue_picker.is_some() {
             Some(OverlaySurface::Queue)
         } else if self.dashboard.is_some() {
@@ -726,6 +730,7 @@ impl TuiApp {
             tool_detail: None,
             developer_detail: None,
             resume_picker: None,
+            turn_picker: None,
             queue_picker: None,
             approval_dialog: None,
             question_dialog: None,
@@ -961,6 +966,7 @@ impl TuiApp {
             Some(OverlaySurface::Approval) => "approval",
             Some(OverlaySurface::Question) => "question",
             Some(OverlaySurface::Resume) => "sessions",
+            Some(OverlaySurface::TurnPicker) => "history turns",
             Some(OverlaySurface::Queue) => "queued prompts",
             Some(OverlaySurface::Dashboard) => "runtime dashboard",
             Some(OverlaySurface::Settings) => "settings",
@@ -2839,53 +2845,59 @@ impl TuiApp {
                 thread_id,
                 from_turn_id,
             } => {
-                let thread = transport
-                    .fork_thread(
-                        parse_thread_id(&thread_id)?,
-                        from_turn_id.as_deref().map(parse_turn_id).transpose()?,
-                    )
-                    .await
-                    .map_err(|error| miette::miette!("{error}"))?;
-                self.thread_id = thread.thread_id;
-                self.session_id = thread.session_id;
-                self.begin_history_replay();
-                self.task_id = None;
-                self.projection = None;
-                self.developer_projection = None;
-                self.developer_error = None;
-                self.developer_updated_at = None;
-                self.debug_timeline_cache.get_mut().take();
-                self.replace_event_history(Vec::new(), false);
-                self.activity_projection = ActivityProjection::default();
-                self.invalidate_activity_snapshot();
-                self.change_projection = ChangeProjection::default();
-                self.command_messages.clear();
-                self.transcript.local_entries.clear();
-                self.input.reset();
-                self.mention_completion = None;
-                self.attachments.clear();
-                self.selected_attachment = None;
-                self.export_flow = None;
-                self.reset_slash_selection();
-                self.reset_history_window();
-                self.reset_transcript_view();
-                self.status_message =
-                    format!("forked thread {}", short_id(&thread.thread_id.to_string()));
-                self.push_system_message(
-                    "Thread forked",
-                    vec![
-                        format!("thread {}", thread.thread_id),
-                        format!(
-                            "parent {}",
-                            thread
-                                .parent_thread_id
-                                .map(|id| id.to_string())
-                                .unwrap_or_else(|| "none".to_owned())
-                        ),
-                        format!("session {}", thread.session_id),
-                    ],
-                );
-                self.refresh(transport).await?;
+                let target_thread = parse_thread_id(&thread_id)?;
+                let from_turn = from_turn_id.as_deref().map(parse_turn_id).transpose()?;
+                if target_thread == self.thread_id
+                    && let Some(from_turn) = from_turn
+                {
+                    self.fork_current_thread_from_turn(transport, from_turn)
+                        .await?;
+                } else {
+                    let thread = transport
+                        .fork_thread(target_thread, from_turn)
+                        .await
+                        .map_err(|error| miette::miette!("{error}"))?;
+                    self.thread_id = thread.thread_id;
+                    self.session_id = thread.session_id;
+                    self.begin_history_replay();
+                    self.task_id = None;
+                    self.projection = None;
+                    self.developer_projection = None;
+                    self.developer_error = None;
+                    self.developer_updated_at = None;
+                    self.debug_timeline_cache.get_mut().take();
+                    self.replace_event_history(Vec::new(), false);
+                    self.activity_projection = ActivityProjection::default();
+                    self.invalidate_activity_snapshot();
+                    self.change_projection = ChangeProjection::default();
+                    self.command_messages.clear();
+                    self.transcript.local_entries.clear();
+                    self.input.reset();
+                    self.mention_completion = None;
+                    self.attachments.clear();
+                    self.selected_attachment = None;
+                    self.export_flow = None;
+                    self.reset_slash_selection();
+                    self.reset_history_window();
+                    self.reset_transcript_view();
+                    self.status_message =
+                        format!("forked thread {}", short_id(&thread.thread_id.to_string()));
+                    self.push_system_message(
+                        "Thread forked",
+                        vec![
+                            format!("thread {}", thread.thread_id),
+                            format!(
+                                "parent {}",
+                                thread
+                                    .parent_thread_id
+                                    .map(|id| id.to_string())
+                                    .unwrap_or_else(|| "none".to_owned())
+                            ),
+                            format!("session {}", thread.session_id),
+                        ],
+                    );
+                    self.refresh(transport).await?;
+                }
             }
             SlashCommand::Status => {
                 self.refresh(transport).await?;
@@ -3163,29 +3175,43 @@ impl TuiApp {
         }
 
         self.queue_picker = None;
+        self.turn_picker = None;
         self.editing_queued_turn = None;
         self.resume_picker = Some(ResumePickerState::new(items));
         self.status_message = "select a session to resume".to_owned();
         Ok(())
     }
 
-    async fn open_previous_session_picker(
+    async fn open_current_turn_picker(
         &mut self,
         transport: &RuntimeTransport,
     ) -> miette::Result<()> {
-        self.open_resume_picker(transport).await?;
-        let current_thread = self.thread_id;
-        let Some(picker) = &mut self.resume_picker else {
-            return Ok(());
+        let events = match load_complete_event_history(transport, self.session_id, None).await {
+            Ok(history) if !history.events.is_empty() => history.events,
+            Ok(_) => self.events.clone(),
+            Err(_) if !self.events.is_empty() => self.events.clone(),
+            Err(error) => {
+                return Err(miette::miette!(
+                    "load current session turns failed: {error}"
+                ));
+            }
         };
-        // 会话列表按最近更新时间排序；跳过当前线程后首项就是最近的上一会话。
-        picker.selected = picker
-            .items
-            .iter()
-            .position(|item| item.thread_id != current_thread)
-            .unwrap_or(0);
+        let current_session_events = events
+            .into_iter()
+            .filter(|event| event.session_id == self.session_id)
+            .collect::<Vec<_>>();
+        let items = historical_turn_items(&current_session_events);
+        if items.is_empty() {
+            self.push_command_result("No previous user turns in this session");
+            return Ok(());
+        }
+        self.resume_picker = None;
+        self.turn_picker = None;
+        self.queue_picker = None;
+        self.editing_queued_turn = None;
+        self.turn_picker = Some(TurnPickerState::new(items));
         self.status_message =
-            "previous session selected; press Enter to continue, Esc to close".to_owned();
+            "select a previous user turn; press Enter to fork, Esc to close".to_owned();
         Ok(())
     }
 
@@ -3376,6 +3402,7 @@ impl TuiApp {
         self.reset_slash_selection();
         self.reset_history_window();
         self.resume_picker = None;
+        self.turn_picker = None;
         self.queue_picker = None;
         self.approval_dialog = None;
         self.question_dialog = None;
@@ -3418,6 +3445,7 @@ impl TuiApp {
         self.reset_slash_selection();
         self.reset_history_window();
         self.resume_picker = None;
+        self.turn_picker = None;
         self.queue_picker = None;
         self.approval_dialog = None;
         self.question_dialog = None;
@@ -3449,6 +3477,64 @@ impl TuiApp {
             return Ok(());
         };
         self.resume_thread_from_command(transport, thread_id).await
+    }
+
+    async fn fork_current_thread_from_turn(
+        &mut self,
+        transport: &RuntimeTransport,
+        turn_id: TurnId,
+    ) -> miette::Result<()> {
+        let thread = transport
+            .fork_thread(self.thread_id, Some(turn_id))
+            .await
+            .map_err(|error| miette::miette!("fork from turn failed: {error}"))?;
+        let parent_thread_id = thread.parent_thread_id;
+        self.thread_id = thread.thread_id;
+        self.session_id = thread.session_id;
+        self.begin_history_replay();
+        self.task_id = None;
+        self.projection = None;
+        self.developer_projection = None;
+        self.developer_error = None;
+        self.developer_updated_at = None;
+        self.debug_timeline_cache.get_mut().take();
+        self.replace_event_history(Vec::new(), false);
+        self.activity_projection = ActivityProjection::default();
+        self.invalidate_activity_snapshot();
+        self.change_projection = ChangeProjection::default();
+        self.command_messages.clear();
+        self.transcript.local_entries.clear();
+        self.input.reset();
+        self.mention_completion = None;
+        self.attachments.clear();
+        self.selected_attachment = None;
+        self.export_flow = None;
+        self.reset_slash_selection();
+        self.reset_history_window();
+        self.resume_picker = None;
+        self.turn_picker = None;
+        self.queue_picker = None;
+        self.approval_dialog = None;
+        self.question_dialog = None;
+        self.help_dialog = None;
+        self.dashboard = None;
+        self.editing_queued_turn = None;
+        self.reset_transcript_view();
+        self.status_message = format!("forked from turn {}", short_id(&turn_id.to_string()));
+        self.push_system_message(
+            "Turn forked",
+            vec![
+                format!("thread {}", thread.thread_id),
+                format!(
+                    "parent {}",
+                    parent_thread_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "none".to_owned())
+                ),
+                format!("turn {}", turn_id),
+            ],
+        );
+        self.refresh(transport).await
     }
 
     async fn apply_session_picker_action(
@@ -3551,6 +3637,11 @@ impl TuiApp {
                 .as_mut()
                 .expect("resume surface")
                 .move_selection(direction),
+            Some(OverlaySurface::TurnPicker) => self
+                .turn_picker
+                .as_mut()
+                .expect("turn picker surface")
+                .move_selection(direction),
             Some(OverlaySurface::Queue) => self
                 .queue_picker
                 .as_mut()
@@ -3586,6 +3677,11 @@ impl TuiApp {
         // 提交时已经 reset 过 composer；这里再清一次，避免退出全屏后把 › /re 叠在分隔线上。
         self.input.reset();
         self.push_command_result("Resume cancelled");
+    }
+
+    fn close_turn_picker(&mut self) {
+        self.turn_picker = None;
+        self.status_message = "turn rewind cancelled".to_owned();
     }
 
     fn push_command_result(&mut self, result: impl Into<String>) {
@@ -3632,6 +3728,7 @@ impl TuiApp {
 
     fn open_auth_dialog(&mut self) {
         self.resume_picker = None;
+        self.turn_picker = None;
         self.queue_picker = None;
         self.editing_queued_turn = None;
         self.input.clear();
@@ -4968,6 +5065,9 @@ async fn handle_key(
         Some(OverlaySurface::Resume) => {
             return handle_resume_picker_key(key, app, transport).await;
         }
+        Some(OverlaySurface::TurnPicker) => {
+            return handle_turn_picker_key(key, app, transport).await;
+        }
         Some(OverlaySurface::Queue) => {
             return handle_queue_picker_key(key, app, transport).await;
         }
@@ -5302,7 +5402,7 @@ async fn handle_composer_escape(
             .take()
             .is_some_and(|previous| now.duration_since(previous) <= Duration::from_millis(500))
     {
-        app.open_previous_session_picker(transport).await?;
+        app.open_current_turn_picker(transport).await?;
         return Ok(());
     }
     if can_resume_previous {
@@ -5333,7 +5433,7 @@ async fn handle_composer_escape(
         app.status_message = "input cleared".to_owned();
     } else {
         app.status_message =
-            "press Esc again to choose a previous session, or Ctrl+C twice to quit".to_owned();
+            "press Esc again to choose a previous user turn, or Ctrl+C twice to quit".to_owned();
     }
     Ok(())
 }
@@ -5808,6 +5908,7 @@ fn handle_paste(pasted: &str, app: &mut TuiApp) {
     match app.overlay_surface() {
         Some(OverlaySurface::Help)
         | Some(OverlaySurface::Approval)
+        | Some(OverlaySurface::TurnPicker)
         | Some(OverlaySurface::Queue)
         | Some(OverlaySurface::Dashboard) => return,
         Some(OverlaySurface::Auth) => {
@@ -6296,6 +6397,11 @@ fn handle_mouse(mouse: MouseEvent, app: &mut TuiApp) -> Option<UiMouseActivation
                             return Some(UiMouseActivation::ResumeSession);
                         }
                     }
+                    UiMousePress::Turn(_) => {
+                        if app.turn_picker.is_some() {
+                            return Some(UiMouseActivation::ForkTurn);
+                        }
+                    }
                     UiMousePress::QuestionOption { question, option } => {
                         if let Some(dialog) = &mut app.question_dialog
                             && dialog.focus(question, option)
@@ -6379,6 +6485,11 @@ fn apply_mouse_press(app: &mut TuiApp, press: UiMousePress) {
                 flow.picker.selected = index.min(flow.picker.items.len().saturating_sub(1));
             }
         }
+        UiMousePress::Turn(index) => {
+            if let Some(picker) = &mut app.turn_picker {
+                picker.selected = index.min(picker.items.len().saturating_sub(1));
+            }
+        }
         UiMousePress::Queue(index) => {
             if let Some(picker) = &mut app.queue_picker {
                 picker.selected = index.min(picker.items.len().saturating_sub(1));
@@ -6435,6 +6546,19 @@ async fn execute_mouse_activation(
         }
         UiMouseActivation::ResumeSession => {
             app.resume_selected_thread(transport).await?;
+            return Ok(());
+        }
+        UiMouseActivation::ForkTurn => {
+            let Some(turn_id) = app
+                .turn_picker
+                .as_ref()
+                .and_then(TurnPickerState::selected_turn_id)
+            else {
+                app.status_message = "no historical turn selected".to_owned();
+                return Ok(());
+            };
+            app.fork_current_thread_from_turn(transport, turn_id)
+                .await?;
             return Ok(());
         }
         UiMouseActivation::Approval(choice) => {
@@ -6745,6 +6869,64 @@ async fn handle_resume_picker_key(
                 picker.search.insert_char(character);
                 picker.refresh_search();
             }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn handle_turn_picker_key(
+    key: KeyEvent,
+    app: &mut TuiApp,
+    transport: &RuntimeTransport,
+) -> miette::Result<()> {
+    match key.code {
+        KeyCode::Esc => app.close_turn_picker(),
+        KeyCode::Up | KeyCode::Char('k') if key.code == KeyCode::Up || key.modifiers.is_empty() => {
+            if let Some(picker) = &mut app.turn_picker {
+                picker.move_selection(ResumeSelectionDirection::Previous);
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j')
+            if key.code == KeyCode::Down || key.modifiers.is_empty() =>
+        {
+            if let Some(picker) = &mut app.turn_picker {
+                picker.move_selection(ResumeSelectionDirection::Next);
+            }
+        }
+        KeyCode::PageUp => {
+            let page_size = resume_picker_page_size(app.layout.transcript);
+            if let Some(picker) = &mut app.turn_picker {
+                picker.move_selection_by_page(ResumeSelectionDirection::Previous, page_size);
+            }
+        }
+        KeyCode::PageDown => {
+            let page_size = resume_picker_page_size(app.layout.transcript);
+            if let Some(picker) = &mut app.turn_picker {
+                picker.move_selection_by_page(ResumeSelectionDirection::Next, page_size);
+            }
+        }
+        KeyCode::Home => {
+            if let Some(picker) = &mut app.turn_picker {
+                picker.select_first();
+            }
+        }
+        KeyCode::End => {
+            if let Some(picker) = &mut app.turn_picker {
+                picker.select_last();
+            }
+        }
+        KeyCode::Enter => {
+            let Some(turn_id) = app
+                .turn_picker
+                .as_ref()
+                .and_then(TurnPickerState::selected_turn_id)
+            else {
+                app.status_message = "no historical turn selected".to_owned();
+                return Ok(());
+            };
+            app.fork_current_thread_from_turn(transport, turn_id)
+                .await?;
         }
         _ => {}
     }

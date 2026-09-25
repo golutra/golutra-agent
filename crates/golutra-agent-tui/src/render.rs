@@ -243,6 +243,12 @@ pub(crate) fn draw_transcript(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
                 app.thread_id,
                 app,
             ),
+            OverlaySurface::TurnPicker => draw_turn_picker(
+                frame,
+                area,
+                app.turn_picker.as_ref().expect("turn picker surface"),
+                app,
+            ),
             OverlaySurface::Queue => draw_queue_picker(
                 frame,
                 area,
@@ -1222,6 +1228,69 @@ pub(crate) fn draw_resume_picker(
             area.y,
         ));
     }
+}
+
+pub(crate) fn draw_turn_picker(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    picker: &TurnPickerState,
+    app: &TuiApp,
+) {
+    let palette = app.palette();
+    let visible_count = resume_picker_page_size(area);
+    let offset = resume_picker_offset(picker.selected, visible_count, picker.items.len());
+    let items = picker
+        .items
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(visible_count)
+        .map(|(index, item)| {
+            let selected = index == picker.selected;
+            ListItem::new(vec![
+                Line::from(vec![
+                    Span::styled(
+                        selection_marker(app, selected),
+                        Style::default().fg(if selected {
+                            palette.accent
+                        } else {
+                            palette.muted
+                        }),
+                    ),
+                    Span::styled(
+                        format!("{} ", index + 1),
+                        Style::default().fg(palette.muted),
+                    ),
+                    Span::styled(
+                        item.prompt.clone(),
+                        Style::default()
+                            .fg(if selected {
+                                palette.text
+                            } else {
+                                palette.subtle
+                            })
+                            .add_modifier(if selected {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(item.metadata.clone(), Style::default().fg(palette.muted)),
+                ]),
+            ])
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        List::new(items).block(
+            Block::default()
+                .title("Previous user turns")
+                .borders(Borders::TOP),
+        ),
+        area,
+    );
 }
 
 pub(crate) fn draw_queue_picker(
@@ -2515,6 +2584,11 @@ pub(crate) fn overlay_mouse_regions(area: Rect, app: &TuiApp) -> Vec<OverlayMous
             Vec::new()
         };
     }
+    if surface == Some(OverlaySurface::TurnPicker)
+        && let Some(picker) = &app.turn_picker
+    {
+        return turn_mouse_regions(area, picker);
+    }
     if surface == Some(OverlaySurface::Queue)
         && let Some(picker) = &app.queue_picker
     {
@@ -2646,6 +2720,21 @@ fn resume_mouse_regions(area: Rect, picker: &ResumePickerState) -> Vec<OverlayMo
     regions
 }
 
+fn turn_mouse_regions(area: Rect, picker: &TurnPickerState) -> Vec<OverlayMouseRegion> {
+    let visible_count = resume_picker_page_size(area);
+    let offset = resume_picker_offset(picker.selected, visible_count, picker.items.len());
+    (offset..picker.items.len().min(offset.saturating_add(visible_count)))
+        .filter_map(|index| {
+            content_mouse_region(area, index.saturating_sub(offset), 2).map(|area| {
+                OverlayMouseRegion {
+                    press: UiMousePress::Turn(index),
+                    area,
+                }
+            })
+        })
+        .collect()
+}
+
 fn tab_mouse_regions(area: Rect, tabs: &[(UiMousePress, &'static str)]) -> Vec<OverlayMouseRegion> {
     let mut start = 0_usize;
     tabs.iter()
@@ -2761,6 +2850,9 @@ pub(crate) fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
         Some(OverlaySurface::Resume) => Some(
             "Type filter   Enter resume   Alt+I details   Alt+R rename   Alt+A archive   Alt+D delete",
         ),
+        Some(OverlaySurface::TurnPicker) => {
+            Some("Up/Down select   Enter fork from turn   Esc close")
+        }
         Some(OverlaySurface::Queue) => {
             Some("Enter edit   Delete cancel prompt   Up/Down select   Esc close")
         }
@@ -2816,6 +2908,11 @@ pub(crate) fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
         vec![Line::from(vec![
             Span::styled(composer_prefix, Style::default().fg(palette.accent)),
             Span::styled("Select a session to resume", composer_style(app)),
+        ])]
+    } else if surface == Some(OverlaySurface::TurnPicker) {
+        vec![Line::from(vec![
+            Span::styled(composer_prefix, Style::default().fg(palette.accent)),
+            Span::styled("Select a previous user turn", composer_style(app)),
         ])]
     } else if surface == Some(OverlaySurface::Queue) {
         vec![Line::from(vec![
@@ -3544,6 +3641,7 @@ pub(crate) fn status_chip(app: &TuiApp) -> &'static str {
             OverlaySurface::Approval => "approval",
             OverlaySurface::Question => "question",
             OverlaySurface::Resume => "resume",
+            OverlaySurface::TurnPicker => "history turns",
             OverlaySurface::Queue => "queue",
             OverlaySurface::Dashboard => "dashboard",
             OverlaySurface::Settings => "settings",
