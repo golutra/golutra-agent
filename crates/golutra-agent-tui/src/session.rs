@@ -46,7 +46,6 @@ pub(crate) struct ResumeThreadItem {
 pub(crate) struct HistoricalTurnItem {
     pub(crate) turn_id: TurnId,
     pub(crate) prompt: String,
-    pub(crate) metadata: String,
     pub(crate) preview: Vec<HistoricalTurnPreview>,
 }
 
@@ -180,11 +179,6 @@ pub(crate) fn historical_turn_items(events: &[RuntimeEvent]) -> Vec<HistoricalTu
         let item = HistoricalTurnItem {
             turn_id,
             prompt: prompt.to_owned(),
-            metadata: format!(
-                "turn {} · event #{}",
-                super::short_id(&turn_id.to_string()),
-                event.sequence_no
-            ),
             preview: previews.get(&turn_id).cloned().unwrap_or_default(),
         };
         if let Some((sequence, existing)) = items

@@ -1238,7 +1238,7 @@ pub(crate) fn draw_turn_picker(
 ) {
     let layout = turn_picker_visual_layout(area, picker, app);
     let block = Block::default()
-        .title("Previous user turns · Enter fork · Esc close")
+        .title("Session history · Enter fork · Esc close")
         .borders(Borders::TOP);
     let content_area = block.inner(area);
     let scroll = turn_picker_scroll_offset(
@@ -1301,10 +1301,6 @@ fn turn_picker_visual_layout(
                 Style::default().fg(palette.muted),
             ),
             Span::styled(item.prompt.clone(), style),
-        ]));
-        lines.push(Line::from(vec![
-            Span::raw("    "),
-            Span::styled(item.metadata.clone(), Style::default().fg(palette.muted)),
         ]));
         for preview in &item.preview {
             let (marker, color) = match preview.kind {
