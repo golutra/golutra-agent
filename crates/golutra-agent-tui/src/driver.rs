@@ -375,7 +375,7 @@ impl TuiDriver {
         Ok(projection
             .runtime_lane
             .map_or(DriverControllerMode::Controller, |lane| {
-                if lane.active_controller.id == control_actor_id {
+                if !lane.status.is_active() || lane.active_controller.id == control_actor_id {
                     DriverControllerMode::Controller
                 } else {
                     DriverControllerMode::Observer

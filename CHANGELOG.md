@@ -6,6 +6,30 @@ follow [Semantic Versioning](https://semver.org/) where applicable.
 
 ## [Unreleased]
 
+## [0.3.8] - 2026-09-28
+
+### Fixed
+
+- Keep runtime verification, model and provider facts in `/debug` instead of
+  showing them in ordinary `/resume` and `/export` pickers.
+- Bind asynchronous session restore to the selected thread and reject stale
+  history-edit sources, preventing late results from replacing the active
+  conversation or forking the wrong session.
+- Prevent archive/delete actions against the currently attached session.
+
+### Changed
+
+- Share one session-row projection between `/resume` and `/export`, including
+  Chinese current/branch markers and consistent details.
+- Build export session rows from the paginated session catalog without one
+  event-page request per session.
+- Add regression coverage for restore races, stale history sources, picker
+  guards and ordinary-screen runtime metadata exposure.
+
+### Distribution
+
+- Align workspace crates, npm packages and SDK metadata at 0.3.8.
+
 ## [0.3.7] - 2026-09-23
 
 ### Fixed

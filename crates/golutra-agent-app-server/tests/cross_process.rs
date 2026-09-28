@@ -819,6 +819,39 @@ async fn daemon_fork_rollout_and_rebind_survive_restart() {
         .fork_thread(parent.thread_id, None)
         .await
         .expect("HTTP fork");
+    let source_events = old_transport
+        .replay_events(EventFilter {
+            session_id,
+            task_id: None,
+            after_sequence_no: None,
+        })
+        .await
+        .expect("parent events");
+    let first_turn = source_events
+        .iter()
+        .find_map(|event| event.get("turn_id").and_then(serde_json::Value::as_str))
+        .expect("first turn")
+        .parse()
+        .expect("turn id");
+    let editable = old_transport
+        .fork_thread_before_turn(parent.thread_id, first_turn)
+        .await
+        .expect("HTTP fork before prompt");
+    assert_eq!(editable.forked_from_turn_id, Some(first_turn));
+    let editable_events = old_transport
+        .replay_events(EventFilter {
+            session_id: editable.session_id,
+            task_id: None,
+            after_sequence_no: None,
+        })
+        .await
+        .expect("editable history");
+    assert!(
+        !editable_events
+            .iter()
+            .any(|event| event["event_type"] == "task_created"
+                || event["event_type"] == "assistant_message")
+    );
     let rollout = old_transport
         .export_thread_rollout(child.thread_id)
         .await
@@ -846,7 +879,7 @@ async fn daemon_fork_rollout_and_rebind_survive_restart() {
             .await
             .expect("old cwd threads")
             .len(),
-        1
+        2
     );
 
     daemon.0.kill().await.expect("stop daemon");

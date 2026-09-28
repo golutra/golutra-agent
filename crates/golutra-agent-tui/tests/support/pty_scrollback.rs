@@ -144,6 +144,9 @@ impl FixtureServer {
                     thread::sleep(Duration::from_millis(10));
                     continue;
                 };
+                // BSD/macOS 的 accept 可继承监听 socket 的非阻塞状态；等待完整请求时
+                // 必须使用阻塞读取及下面的超时，否则客户端尚未写入就会被当作空连接。
+                socket.set_nonblocking(false).unwrap();
                 socket.set_nodelay(true).unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(3)))

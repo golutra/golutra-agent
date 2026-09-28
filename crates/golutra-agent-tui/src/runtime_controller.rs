@@ -145,13 +145,16 @@ impl TuiRuntimeController {
         let mut changed = app.poll_handoff().await;
         changed |= self.sync_refresh_binding(app) | app.poll_mention_completion();
         changed |= app.poll_history_reload(true).await;
+        changed |= app.poll_session_load(&self.transport, true).await;
         if app.history_load_requested {
             app.load_older_history(&self.transport).await?;
             changed = true;
         }
         if app.session_id != self.subscribed_session || app.task_id != self.subscribed_task {
             self.pending_events.clear();
-            app.load_recent_history(&self.transport).await?;
+            if app.prepared_session_history.take() != Some(app.session_id) {
+                app.load_recent_history(&self.transport).await?;
+            }
             let subscription = subscribe(&self.transport, app).await?;
             app.refresh(&self.transport).await?;
             self.subscription = subscription;
@@ -208,13 +211,16 @@ impl TuiRuntimeController {
         let mut changed = app.poll_handoff().await;
         changed |= self.sync_refresh_binding(app) | app.poll_mention_completion();
         changed |= app.poll_history_reload(false).await;
+        changed |= app.poll_session_load(&self.transport, false).await;
         if app.history_load_requested {
             app.load_older_history(&self.transport).await?;
             changed = true;
         }
         if app.session_id != self.subscribed_session || app.task_id != self.subscribed_task {
             self.pending_events.clear();
-            app.load_recent_history(&self.transport).await?;
+            if app.prepared_session_history.take() != Some(app.session_id) {
+                app.load_recent_history(&self.transport).await?;
+            }
             let subscription = subscribe(&self.transport, app).await?;
             self.subscription = subscription;
             self.subscribed_session = app.session_id;

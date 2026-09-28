@@ -36,8 +36,8 @@ use golutra_agent_config::{
     update_provider_settings_verified,
 };
 use golutra_agent_core::{
-    ActorKind, ApprovalRequest, ApprovalScope, EventId, QueryId, SessionId, TaskId, ThreadId,
-    TurnId, UserQuestionRequest, UserQuestionResolution,
+    ActorKind, ApprovalRequest, ApprovalScope, CommandId, EventId, QueryId, SessionId, TaskId,
+    ThreadId, TurnId, UserQuestionRequest, UserQuestionResolution,
 };
 use golutra_agent_llm::{
     ProviderGenerationConfig, ProviderHeaderConfig, ProviderHeaderValue, ProviderProtocol,
@@ -45,8 +45,8 @@ use golutra_agent_llm::{
 };
 use golutra_agent_protocol::{
     CommandAck, DebugProjection, EventPageDirection, EventPageRequest, RuntimeEvent,
-    RuntimeEventType, RuntimeQuery, RuntimeQueryKind, SessionCommandKind, UserProjection,
-    pending_user_question,
+    RuntimeEventType, RuntimeQuery, RuntimeQueryKind, SessionCommandKind, SessionPageRequest,
+    SessionSummary, StateProjection, UserProjection, pending_user_question,
 };
 use golutra_agent_tui::{
     AuthConfigScope, AuthCredentialStore, OAuthLoginCommand, OpenAiCompatibleLogin,
@@ -115,6 +115,7 @@ mod rich_text;
 mod runtime_controller;
 mod session;
 mod session_banner;
+mod session_loading;
 mod settings;
 mod stream_commit;
 mod terminal_appearance;
@@ -333,6 +334,13 @@ pub(crate) enum OverlaySurface {
     Export,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum RuntimeControllerMode {
+    #[default]
+    Controller,
+    Observer,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RuntimeRefreshBinding {
     session_id: SessionId,
@@ -347,6 +355,7 @@ struct RuntimeRefreshSnapshot {
     provider_status: Option<ProviderUiStatus>,
     developer_projection: Option<Result<golutra_agent_protocol::DebugProjection, String>>,
     remote: bool,
+    controller_mode: RuntimeControllerMode,
 }
 
 #[derive(Debug, Clone)]
@@ -367,6 +376,9 @@ struct TuiApp {
     developer_error: Option<String>,
     developer_updated_at: Option<chrono::DateTime<chrono::Utc>>,
     history_reload: Option<developer_reload::PendingHistoryReload>,
+    session_load: Option<session_loading::PendingSessionLoad>,
+    retired_session_loads: Vec<JoinHandle<Result<(), String>>>,
+    prepared_session_history: Option<SessionId>,
     debug_scroll: PaneScrollState,
     debug_timeline_cache: std::cell::RefCell<Option<inline_history::DebugTimelineCache>>,
     // 生产路径只通过 append/replace/trim 修改历史，同时维护字节预算。
@@ -377,6 +389,8 @@ struct TuiApp {
     developer_detail: Option<developer_detail::DeveloperDetailState>,
     resume_picker: Option<ResumePickerState>,
     turn_picker: Option<TurnPickerState>,
+    /// 双 Esc 打开历史时锁定的来源；异步加载期间切换 UI 状态也不能误 fork 其他 thread。
+    backtrack_base: Option<(ThreadId, SessionId)>,
     queue_picker: Option<QueuePickerState>,
     approval_dialog: Option<ApprovalDialogState>,
     question_dialog: Option<QuestionDialogState>,
@@ -443,6 +457,7 @@ struct TuiApp {
     should_quit: bool,
     last_prompt_ack: Option<CommandAck>,
     last_control_ack: Option<CommandAck>,
+    controller_mode: RuntimeControllerMode,
 }
 
 /// 交互层只保留可回放的有限窗口；持久事件仍由 RuntimeStore 提供分页读取。
@@ -457,6 +472,7 @@ impl TuiApp {
             || !self.transcript.history.replay_ready
             || self.transcript.history.reflow_pending
             || self.history_reload.is_some()
+            || self.session_load.is_some()
         {
             return false;
         }
@@ -520,6 +536,8 @@ impl TuiApp {
     }
 
     pub(crate) async fn shutdown_pending_operations(&mut self) {
+        self.cancel_session_load();
+        self.reap_session_loads(true).await;
         self.shutdown_handoff().await;
         self.cancel_auth_protocol_detection();
         self.history_reload = None;
@@ -652,8 +670,40 @@ async fn load_runtime_refresh_snapshot(
             None
         }
     };
-    let (projection, provider_status, developer_projection) =
-        tokio::join!(projection, provider_status, developer_projection);
+    let controller_mode = async {
+        let value = transport
+            .query(RuntimeQuery {
+                query_id: QueryId::new(),
+                session_id: binding.session_id,
+                task_id: binding.task_id,
+                kind: RuntimeQueryKind::SessionState,
+                requester: ActorKind::Tui,
+                cursor: None,
+                timestamp: chrono::Utc::now(),
+            })
+            .await
+            .ok()
+            .and_then(|value| serde_json::from_value::<StateProjection>(value).ok());
+        value.and_then(|state| state.runtime_lane).map_or(
+            RuntimeControllerMode::Controller,
+            |lane| {
+                if lane.status.is_active()
+                    && lane.active_controller.id
+                        != transport.control_actor_id(TUI_ACTOR_ID.as_str())
+                {
+                    RuntimeControllerMode::Observer
+                } else {
+                    RuntimeControllerMode::Controller
+                }
+            },
+        )
+    };
+    let (projection, provider_status, developer_projection, controller_mode) = tokio::join!(
+        projection,
+        provider_status,
+        developer_projection,
+        controller_mode
+    );
 
     Ok(RuntimeRefreshSnapshot {
         binding,
@@ -661,6 +711,7 @@ async fn load_runtime_refresh_snapshot(
         provider_status,
         developer_projection,
         remote: transport.is_remote(),
+        controller_mode,
     })
 }
 
@@ -719,6 +770,9 @@ impl TuiApp {
             developer_error: None,
             developer_updated_at: None,
             history_reload: None,
+            session_load: None,
+            retired_session_loads: Vec::new(),
+            prepared_session_history: None,
             debug_scroll: PaneScrollState {
                 follow_tail: true,
                 ..PaneScrollState::default()
@@ -731,6 +785,7 @@ impl TuiApp {
             developer_detail: None,
             resume_picker: None,
             turn_picker: None,
+            backtrack_base: None,
             queue_picker: None,
             approval_dialog: None,
             question_dialog: None,
@@ -797,6 +852,7 @@ impl TuiApp {
             should_quit: false,
             last_prompt_ack: None,
             last_control_ack: None,
+            controller_mode: RuntimeControllerMode::Controller,
         }
     }
 
@@ -1072,6 +1128,7 @@ impl TuiApp {
         if snapshot.binding != self.runtime_refresh_binding() {
             return false;
         }
+        self.controller_mode = snapshot.controller_mode;
 
         let previous_row_count = self.transcript.scroll.row_count;
         // 同一任务等待认证期间只自动打开一次，尊重用户用 Esc 关闭向导。
@@ -1571,7 +1628,6 @@ impl TuiApp {
             self.input.clear();
             return Ok(());
         }
-
         let input = self.input.trimmed();
         if let Some(turn_id) = self.editing_queued_turn {
             return match parse_slash_input(&input) {
@@ -1590,6 +1646,14 @@ impl TuiApp {
             };
         }
         match parse_slash_input(&input) {
+            SlashInput::Prompt(_prompt)
+                if self.controller_mode == RuntimeControllerMode::Observer =>
+            {
+                self.status_message =
+                    "session is controlled by another runtime; use /takeover before sending"
+                        .to_owned();
+                Ok(())
+            }
             SlashInput::Prompt(prompt) => match mode {
                 pending_input::SubmissionMode::Submit => {
                     self.send_enter_prompt(transport, prompt).await
@@ -2640,6 +2704,19 @@ impl TuiApp {
         steer: bool,
     ) -> miette::Result<Option<CommandAck>> {
         self.last_prompt_ack = None;
+        if self.controller_mode == RuntimeControllerMode::Observer {
+            let ack = CommandAck {
+                command_id: CommandId::new(),
+                accepted: false,
+                reason: Some(
+                    "session is controlled by another runtime; use /takeover before sending"
+                        .to_owned(),
+                ),
+            };
+            self.status_message = ack.reason.clone().unwrap_or_default();
+            self.last_prompt_ack = Some(ack.clone());
+            return Ok(Some(ack));
+        }
         if prompt.trim().is_empty() {
             self.status_message = "prompt is empty".to_owned();
             return Ok(None);
@@ -3149,36 +3226,7 @@ impl TuiApp {
     }
 
     async fn open_resume_picker(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
-        let threads = transport
-            .list_threads(50)
-            .await
-            .map_err(|error| miette::miette!("{error}"))?;
-        let mut items = Vec::with_capacity(threads.len());
-        for thread in threads {
-            items.push(
-                resume_item_with_metadata(
-                    transport,
-                    thread.thread_id,
-                    thread.session_id,
-                    thread.updated_at,
-                    thread.title,
-                    thread.preview,
-                )
-                .await,
-            );
-        }
-
-        if items.is_empty() {
-            // 没有可恢复会话时，在 › /resume 下面给出结果，不打开空 picker。
-            self.push_command_result("No sessions in this cwd yet");
-            return Ok(());
-        }
-
-        self.queue_picker = None;
-        self.turn_picker = None;
-        self.editing_queued_turn = None;
-        self.resume_picker = Some(ResumePickerState::new(items));
-        self.status_message = "select a session to resume".to_owned();
+        self.start_resume_catalog(transport);
         Ok(())
     }
 
@@ -3186,54 +3234,19 @@ impl TuiApp {
         &mut self,
         transport: &RuntimeTransport,
     ) -> miette::Result<()> {
-        let events = match load_complete_event_history(transport, self.session_id, None).await {
-            Ok(history) if !history.events.is_empty() => history.events,
-            Ok(_) => self.events.clone(),
-            Err(_) if !self.events.is_empty() => self.events.clone(),
-            Err(error) => {
-                return Err(miette::miette!(
-                    "load current session turns failed: {error}"
-                ));
-            }
-        };
-        let current_session_events = events
-            .into_iter()
-            .filter(|event| event.session_id == self.session_id)
-            .collect::<Vec<_>>();
-        let items = historical_turn_items(&current_session_events);
-        if items.is_empty() {
-            self.push_command_result("No previous user turns in this session");
-            return Ok(());
-        }
-        self.resume_picker = None;
-        self.turn_picker = None;
-        self.queue_picker = None;
-        self.editing_queued_turn = None;
-        self.turn_picker = Some(TurnPickerState::new(items));
-        self.status_message =
-            "select a previous user turn; press Enter to fork, Esc to close".to_owned();
+        self.backtrack_base = Some((self.thread_id, self.session_id));
+        self.start_turn_history(transport);
         Ok(())
     }
 
     async fn open_export_flow(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
-        let threads = transport
-            .list_threads(50)
+        let sessions = load_all_resume_sessions(transport)
             .await
             .map_err(|error| miette::miette!("{error}"))?;
-        let mut items = Vec::with_capacity(threads.len());
-        for thread in threads {
-            items.push(
-                resume_item_with_metadata(
-                    transport,
-                    thread.thread_id,
-                    thread.session_id,
-                    thread.updated_at,
-                    thread.title,
-                    thread.preview,
-                )
-                .await,
-            );
-        }
+        let items = sessions
+            .into_iter()
+            .map(resume_item_from_summary)
+            .collect::<Vec<_>>();
         if items.is_empty() {
             self.push_system_message("Export", vec!["no sessions in this cwd yet".to_owned()]);
             return Ok(());
@@ -3246,8 +3259,11 @@ impl TuiApp {
         self.help_dialog = None;
         self.dashboard = None;
         self.editing_queued_turn = None;
+        let mut export_picker = ResumePickerState::new(items);
+        // 导出是审计操作，需要保留所有分支；/resume 的默认折叠只影响交互恢复。
+        export_picker.toggle_all_branches();
         self.export_flow = Some(ExportFlowState {
-            picker: ResumePickerState::new(items),
+            picker: export_picker,
             step: ExportFlowStep::SelectSession,
             range_input: ComposerInput::from_text("1"),
             destination_input: ComposerInput::default(),
@@ -3378,7 +3394,11 @@ impl TuiApp {
     }
 
     fn start_new_session(&mut self) {
+        self.cancel_session_load();
+        self.prepared_session_history = None;
         self.handoff = None;
+        self.controller_mode = RuntimeControllerMode::Controller;
+        self.last_escape_at = None;
         self.thread_id = ThreadId::new();
         self.session_id = SessionId::new();
         self.begin_history_replay();
@@ -3403,6 +3423,7 @@ impl TuiApp {
         self.reset_history_window();
         self.resume_picker = None;
         self.turn_picker = None;
+        self.backtrack_base = None;
         self.queue_picker = None;
         self.approval_dialog = None;
         self.question_dialog = None;
@@ -3417,13 +3438,44 @@ impl TuiApp {
         &mut self,
         transport: &RuntimeTransport,
         thread_id: ThreadId,
-    ) -> miette::Result<()> {
+    ) -> miette::Result<bool> {
         let thread = transport
             .resume_thread(thread_id)
             .await
             .map_err(|error| miette::miette!("{error}"))?;
-        self.thread_id = thread.thread_id;
-        self.session_id = thread.session_id;
+        if thread.thread_id == self.thread_id && thread.session_id == self.session_id {
+            // Codex 对当前 live thread 的 resume 是 no-op，保留草稿、滚动位置和投影状态。
+            self.resume_picker = None;
+            self.status_message = format!(
+                "Already viewing {}",
+                short_id(&thread.thread_id.to_string())
+            );
+            return Ok(true);
+        }
+        // Validate the target snapshot before clearing the current view. A transient
+        // projection/query failure must leave the old session visible and retryable.
+        let snapshot = load_runtime_refresh_snapshot(
+            transport,
+            RuntimeRefreshBinding {
+                session_id: thread.session_id,
+                task_id: None,
+                debug_mode: self.debug_mode,
+            },
+        )
+        .await
+        .map_err(|error| miette::miette!("{error}"))?;
+        self.reset_session_view(thread.thread_id, thread.session_id);
+        self.apply_runtime_refresh_snapshot(snapshot);
+        Ok(false)
+    }
+
+    fn reset_session_view(&mut self, thread_id: ThreadId, session_id: SessionId) {
+        self.cancel_session_load();
+        self.prepared_session_history = None;
+        self.controller_mode = RuntimeControllerMode::Controller;
+        self.last_escape_at = None;
+        self.thread_id = thread_id;
+        self.session_id = session_id;
         self.begin_history_replay();
         self.task_id = None;
         self.projection = None;
@@ -3446,13 +3498,17 @@ impl TuiApp {
         self.reset_history_window();
         self.resume_picker = None;
         self.turn_picker = None;
+        self.backtrack_base = None;
         self.queue_picker = None;
         self.approval_dialog = None;
         self.question_dialog = None;
         self.dashboard = None;
         self.editing_queued_turn = None;
         self.reset_transcript_view();
-        self.refresh(transport).await
+    }
+
+    async fn edit_selected_turn(&mut self, transport: &RuntimeTransport) {
+        self.start_prompt_edit(transport);
     }
 
     async fn resume_thread_from_command(
@@ -3460,23 +3516,19 @@ impl TuiApp {
         transport: &RuntimeTransport,
         thread_id: ThreadId,
     ) -> miette::Result<()> {
-        self.resume_thread(transport, thread_id).await?;
-        // slash / picker 成功后新会话留下 › /resume 和结果行。
-        // retry fork 走 resume_thread，不能把 /resume 记进新会话。
-        self.record_slash_command("/resume");
-        self.push_command_result(format!("Resumed {}", short_id(&self.thread_id.to_string())));
+        self.start_session_resume(transport, thread_id);
         Ok(())
     }
 
     async fn resume_selected_thread(&mut self, transport: &RuntimeTransport) -> miette::Result<()> {
-        let Some(thread_id) = self
+        if let Some(thread_id) = self
             .resume_picker
             .as_ref()
             .and_then(ResumePickerState::selected_thread_id)
-        else {
-            return Ok(());
-        };
-        self.resume_thread_from_command(transport, thread_id).await
+        {
+            self.start_session_resume(transport, thread_id);
+        }
+        Ok(())
     }
 
     async fn fork_current_thread_from_turn(
@@ -3552,6 +3604,19 @@ impl TuiApp {
             return Ok(());
         };
         let thread_id = item.thread_id;
+        if thread_id == self.thread_id
+            && matches!(
+                action,
+                SessionPickerAction::Archive | SessionPickerAction::Delete
+            )
+        {
+            if let Some(picker) = &mut self.resume_picker {
+                picker.finish_action();
+            }
+            self.status_message =
+                "the currently attached session cannot be archived or deleted".to_owned();
+            return Ok(());
+        }
         let title = picker.action_input.trimmed();
         let (kind, payload) = match action {
             SessionPickerAction::Rename => (
@@ -3632,16 +3697,25 @@ impl TuiApp {
                 .as_mut()
                 .expect("question surface")
                 .move_option(next),
-            Some(OverlaySurface::Resume) => self
-                .resume_picker
-                .as_mut()
-                .expect("resume surface")
-                .move_selection(direction),
-            Some(OverlaySurface::TurnPicker) => self
-                .turn_picker
-                .as_mut()
-                .expect("turn picker surface")
-                .move_selection(direction),
+            Some(OverlaySurface::Resume) => {
+                if self
+                    .session_load
+                    .as_ref()
+                    .is_some_and(|pending| pending.target_thread_id.is_some())
+                {
+                    self.cancel_session_load();
+                    self.status_message =
+                        "Session selection changed; press Enter to load the selected session"
+                            .to_owned();
+                }
+                self.resume_picker
+                    .as_mut()
+                    .expect("resume surface")
+                    .move_selection(direction);
+            }
+            Some(OverlaySurface::TurnPicker) => {
+                self.scroll_turn_picker_by(if next { 1 } else { -1 })
+            }
             Some(OverlaySurface::Queue) => self
                 .queue_picker
                 .as_mut()
@@ -3671,8 +3745,27 @@ impl TuiApp {
         }
     }
 
+    fn scroll_turn_picker_by(&mut self, delta: isize) {
+        let Some(picker) = self.turn_picker.as_ref() else {
+            return;
+        };
+        let max_scroll = turn_picker_max_scroll(self.layout.transcript, picker, self);
+        if let Some(picker) = &mut self.turn_picker {
+            picker.focus_pending = false;
+            picker.scroll_offset = picker.scroll_offset.min(max_scroll);
+            if delta.is_negative() {
+                picker.scroll_offset = picker.scroll_offset.saturating_sub(delta.unsigned_abs());
+            } else {
+                picker.scroll_offset = picker.scroll_offset.saturating_add(delta as usize);
+            }
+            picker.scroll_offset = picker.scroll_offset.min(max_scroll);
+        }
+    }
+
     fn close_resume_picker(&mut self) {
+        self.cancel_session_load();
         self.resume_picker = None;
+        self.backtrack_base = None;
         // 取消 picker 后留下 › /resume，下面再跟 ⎿ Resume cancelled。
         // 提交时已经 reset 过 composer；这里再清一次，避免退出全屏后把 › /re 叠在分隔线上。
         self.input.reset();
@@ -3680,7 +3773,9 @@ impl TuiApp {
     }
 
     fn close_turn_picker(&mut self) {
+        self.cancel_session_load();
         self.turn_picker = None;
+        self.backtrack_base = None;
         self.status_message = "turn rewind cancelled".to_owned();
     }
 
@@ -4294,78 +4389,79 @@ fn retry_target(events: &[RuntimeEvent]) -> Option<RetryTarget> {
     })
 }
 
-async fn resume_item_with_metadata(
+const RESUME_SESSION_PAGE_SIZE: u32 = 100;
+const MAX_RESUME_SESSION_PAGES: usize = 128;
+
+async fn load_all_resume_sessions(
     transport: &RuntimeTransport,
-    thread_id: ThreadId,
-    session_id: SessionId,
-    updated_at: chrono::DateTime<chrono::Utc>,
-    title: String,
-    preview: String,
-) -> ResumeThreadItem {
-    let metadata = transport
-        .event_page(EventPageRequest {
-            session_id,
-            task_id: None,
-            cursor: None,
-            direction: EventPageDirection::Backward,
-            limit: 128,
-        })
-        .await
-        .ok()
-        .map(|page| catalog_metadata(&page.events))
-        .unwrap_or_else(|| "status=unknown · verify=unknown · model=unknown".to_owned());
-    let metadata = format!("{metadata} · updated={}", updated_at.to_rfc3339());
-    ResumeThreadItem {
-        thread_id,
-        session_id,
-        title,
-        preview,
-        metadata,
-    }
-}
-
-fn catalog_metadata(events: &[RuntimeEvent]) -> String {
-    let mut status = "idle".to_owned();
-    let mut model = "unknown".to_owned();
-    let mut verification = "unknown".to_owned();
-    let mut ordered = events.iter().collect::<Vec<_>>();
-    ordered.sort_by_key(|event| event.sequence_no);
-    for event in ordered {
-        if event.event_type == RuntimeEventType::TaskCreated
-            && let Some(payload) = event.payload.get("payload")
-            && let Some(value) = payload.get("provider_model").and_then(Value::as_str)
+) -> Result<Vec<SessionSummary>, String> {
+    let mut sessions = Vec::new();
+    let mut cursor = None;
+    for page_number in 0..MAX_RESUME_SESSION_PAGES {
+        let page = match transport
+            .session_page(SessionPageRequest {
+                cursor: cursor.take(),
+                limit: RESUME_SESSION_PAGE_SIZE,
+            })
+            .await
         {
-            model = value.to_owned();
+            Ok(page) => page,
+            Err(error) if page_number == 0 => {
+                // Older remote app-servers may not expose /sessions/page yet. Keep
+                // `/resume` usable against them with the legacy bounded listing.
+                return transport
+                    .list_threads(50)
+                    .await
+                    .map(|threads| {
+                        threads
+                            .into_iter()
+                            .map(|thread| SessionSummary {
+                                thread_id: thread.thread_id,
+                                session_id: thread.session_id,
+                                parent_thread_id: thread.parent_thread_id,
+                                forked_from_turn_id: thread.forked_from_turn_id,
+                                title: thread.title,
+                                preview: thread.preview,
+                                created_at: thread.created_at,
+                                updated_at: thread.updated_at,
+                                recency_at: thread.recency_at,
+                            })
+                            .collect()
+                    })
+                    .map_err(|fallback| {
+                        format!(
+                            "session pagination failed: {error}; legacy listing failed: {fallback}"
+                        )
+                    });
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        sessions.extend(page.sessions);
+        if !page.has_more {
+            return Ok(sessions);
         }
-        if let Some(value) = event.payload.get("status").and_then(Value::as_str) {
-            status = value.to_owned();
-        } else if let Some(value) = catalog_status_for_event(event.event_type) {
-            status = value.to_owned();
-        }
-        if event.event_type == RuntimeEventType::VerificationCompleted {
-            verification = event
-                .payload
-                .get("record")
-                .and_then(|record| record.get("result"))
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-                .to_owned();
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            return Err(format!(
+                "session page {page_number} reported more data without a next cursor"
+            ));
         }
     }
-    format!("status={status} · verify={verification} · model={model}")
+    Err(format!(
+        "session history exceeds the {} page safety limit",
+        MAX_RESUME_SESSION_PAGES
+    ))
 }
 
-fn catalog_status_for_event(event_type: RuntimeEventType) -> Option<&'static str> {
-    match event_type {
-        RuntimeEventType::TaskCreated | RuntimeEventType::TurnStarted => Some("running"),
-        RuntimeEventType::TaskCompleted => Some("completed"),
-        RuntimeEventType::TaskAborted => Some("cancelled"),
-        RuntimeEventType::TaskInterrupted => Some("interrupted"),
-        RuntimeEventType::TaskUncertain => Some("uncertain"),
-        RuntimeEventType::TaskPaused => Some("paused"),
-        RuntimeEventType::ProviderAuthRequired => Some("waiting_authentication"),
-        RuntimeEventType::ApprovalRequested => Some("waiting_approval"),
-        _ => None,
+fn resume_item_from_summary(session: SessionSummary) -> ResumeThreadItem {
+    ResumeThreadItem {
+        thread_id: session.thread_id,
+        session_id: session.session_id,
+        parent_thread_id: session.parent_thread_id,
+        forked_from_turn_id: session.forked_from_turn_id,
+        title: session.title,
+        preview: session.preview,
+        metadata: format!("updated={}", session.updated_at.to_rfc3339()),
     }
 }
 
@@ -4714,6 +4810,7 @@ async fn run_app(
 struct OverlayScreenState {
     active: bool,
     capture_mouse: bool,
+    alternate_scroll: bool,
     saved_inline: Option<Rect>,
     inline_screen_size: Option<ratatui::layout::Size>,
     reflow_at: Option<Instant>,
@@ -4725,6 +4822,7 @@ impl OverlayScreenState {
         Self {
             active: false,
             capture_mouse: false,
+            alternate_scroll: false,
             saved_inline: None,
             inline_screen_size: None,
             reflow_at: None,
@@ -4791,7 +4889,17 @@ fn draw_interactive_frame_inner(
     }
     // 主聊天和工具详情交还终端原生选字；只有明确的选择器接管鼠标。
     let capture_mouse = app.overlay_surface().is_some() && !overlay_uses_native_mouse(app);
-    sync_overlay_screen(terminal, overlay_screen, overlay_visible, capture_mouse)?;
+    let alternate_scroll = matches!(
+        app.overlay_surface(),
+        Some(OverlaySurface::TurnPicker | OverlaySurface::Resume)
+    );
+    sync_overlay_screen(
+        terminal,
+        overlay_screen,
+        overlay_visible,
+        capture_mouse,
+        alternate_scroll,
+    )?;
     if !overlay_screen.active {
         // 弹层内的尺寸变化留到主屏恢复后处理，不能用 alternate screen 的坐标更新历史锚点。
         prepare_inline_screen(terminal, overlay_screen, inline_history, app)
@@ -4853,6 +4961,7 @@ fn sync_overlay_screen(
     overlay_screen: &mut OverlayScreenState,
     overlay_visible: bool,
     capture_mouse: bool,
+    alternate_scroll: bool,
 ) -> miette::Result<()> {
     if overlay_visible != overlay_screen.active {
         if overlay_visible {
@@ -4873,13 +4982,25 @@ fn sync_overlay_screen(
         overlay_screen.capture_mouse = capture_mouse;
         set_mouse_capture_active(capture_mouse);
     }
+    if alternate_scroll != overlay_screen.alternate_scroll {
+        execute!(terminal.backend_mut(), SetAlternateScroll(alternate_scroll))
+            .map_err(|error| miette::miette!("update overlay scroll mode: {error}"))?;
+        overlay_screen.alternate_scroll = alternate_scroll;
+        set_alternate_scroll_active(alternate_scroll);
+    }
     Ok(())
 }
 
 fn overlay_uses_native_mouse(app: &TuiApp) -> bool {
     matches!(
         app.overlay_surface(),
-        Some(OverlaySurface::Auth | OverlaySurface::Settings | OverlaySurface::Handoff)
+        Some(
+            OverlaySurface::Auth
+                | OverlaySurface::Settings
+                | OverlaySurface::Handoff
+                | OverlaySurface::Resume
+                | OverlaySurface::TurnPicker
+        )
     ) || (app.auth_operation.is_some() && app.overlay_surface().is_none())
 }
 
@@ -4898,6 +5019,7 @@ fn enter_overlay_screen(
             let _ = execute!(
                 terminal.backend_mut(),
                 event::DisableMouseCapture,
+                SetAlternateScroll(false),
                 LeaveAlternateScreen
             );
             set_alternate_screen_active(false);
@@ -4917,10 +5039,13 @@ fn leave_overlay_screen(
     execute!(
         terminal.backend_mut(),
         event::DisableMouseCapture,
+        SetAlternateScroll(false),
         LeaveAlternateScreen
     )
     .map_err(|error| miette::miette!("leave overlay screen: {error}"))?;
     overlay_screen.capture_mouse = false;
+    overlay_screen.alternate_scroll = false;
+    set_alternate_scroll_active(false);
     set_mouse_capture_active(false);
     set_alternate_screen_active(false);
     terminal
@@ -5014,8 +5139,8 @@ async fn handle_key(
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return Ok(());
     }
-    // 按住 Esc 产生的终端 Repeat 事件不能被误认为第二次独立按键。
-    if key.kind == KeyEventKind::Repeat && key.code == KeyCode::Esc {
+    // 确认和退出必须是独立按键；长按 Enter 不能把刚恢复的草稿直接发送。
+    if key.kind == KeyEventKind::Repeat && matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
         return Ok(());
     }
     if key.code != KeyCode::Esc || app.overlay_surface().is_some() {
@@ -5037,6 +5162,17 @@ async fn handle_key(
     }
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return app.interrupt_or_quit(transport).await;
+    }
+    if key.code == KeyCode::Esc && app.session_load.is_some() {
+        if app.resume_picker.is_some() {
+            app.close_resume_picker();
+        } else if app.turn_picker.is_some() {
+            app.close_turn_picker();
+        } else {
+            app.cancel_session_load();
+            app.status_message = "Session loading cancelled".to_owned();
+        }
+        return Ok(());
     }
     if key.code == KeyCode::F(1)
         || (key.code == KeyCode::Char('?')
@@ -6489,6 +6625,7 @@ fn apply_mouse_press(app: &mut TuiApp, press: UiMousePress) {
             if let Some(picker) = &mut app.turn_picker {
                 picker.selected = index.min(picker.items.len().saturating_sub(1));
             }
+            sync_turn_picker_selection_scroll(app);
         }
         UiMousePress::Queue(index) => {
             if let Some(picker) = &mut app.queue_picker {
@@ -6549,7 +6686,7 @@ async fn execute_mouse_activation(
             return Ok(());
         }
         UiMouseActivation::ForkTurn => {
-            let Some(turn_id) = app
+            let Some(_) = app
                 .turn_picker
                 .as_ref()
                 .and_then(TurnPickerState::selected_turn_id)
@@ -6557,8 +6694,7 @@ async fn execute_mouse_activation(
                 app.status_message = "no historical turn selected".to_owned();
                 return Ok(());
             };
-            app.fork_current_thread_from_turn(transport, turn_id)
-                .await?;
+            app.edit_selected_turn(transport).await;
             return Ok(());
         }
         UiMouseActivation::Approval(choice) => {
@@ -6753,6 +6889,16 @@ async fn handle_resume_picker_key(
                 picker.show_details = !picker.show_details;
             }
         }
+        KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => {
+            if let Some(picker) = &mut app.resume_picker {
+                picker.toggle_all_branches();
+                app.status_message = if picker.show_all_branches {
+                    "Showing all session branches · Alt+B hide superseded parents".to_owned()
+                } else {
+                    "Showing active session branches · Alt+B show all".to_owned()
+                };
+            }
+        }
         KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::ALT) => {
             if let Some(picker) = &mut app.resume_picker {
                 picker.begin_action(SessionPickerAction::Rename);
@@ -6882,55 +7028,66 @@ async fn handle_turn_picker_key(
 ) -> miette::Result<()> {
     match key.code {
         KeyCode::Esc => app.close_turn_picker(),
+        KeyCode::Char('q') if key.modifiers.is_empty() => app.close_turn_picker(),
         KeyCode::Up | KeyCode::Char('k') if key.code == KeyCode::Up || key.modifiers.is_empty() => {
-            if let Some(picker) = &mut app.turn_picker {
-                picker.move_selection(ResumeSelectionDirection::Previous);
-            }
+            app.scroll_turn_picker_by(-1);
         }
         KeyCode::Down | KeyCode::Char('j')
             if key.code == KeyCode::Down || key.modifiers.is_empty() =>
         {
-            if let Some(picker) = &mut app.turn_picker {
-                picker.move_selection(ResumeSelectionDirection::Next);
-            }
+            app.scroll_turn_picker_by(1);
         }
         KeyCode::PageUp => {
-            let page_size = resume_picker_page_size(app.layout.transcript);
-            if let Some(picker) = &mut app.turn_picker {
-                picker.move_selection_by_page(ResumeSelectionDirection::Previous, page_size);
-            }
+            app.scroll_turn_picker_by(-(app.layout.transcript.height.saturating_sub(1) as isize))
         }
         KeyCode::PageDown => {
-            let page_size = resume_picker_page_size(app.layout.transcript);
-            if let Some(picker) = &mut app.turn_picker {
-                picker.move_selection_by_page(ResumeSelectionDirection::Next, page_size);
-            }
+            app.scroll_turn_picker_by(app.layout.transcript.height.saturating_sub(1) as isize)
         }
         KeyCode::Home => {
             if let Some(picker) = &mut app.turn_picker {
-                picker.select_first();
+                picker.scroll_offset = 0;
+                picker.focus_pending = false;
             }
         }
         KeyCode::End => {
             if let Some(picker) = &mut app.turn_picker {
-                picker.select_last();
+                picker.scroll_offset = usize::MAX;
             }
+            app.scroll_turn_picker_by(0);
+        }
+        KeyCode::Left | KeyCode::Char('h')
+            if key.code != KeyCode::Char('h') || key.modifiers.is_empty() =>
+        {
+            if let Some(picker) = &mut app.turn_picker {
+                picker.move_selection(ResumeSelectionDirection::Previous);
+            }
+            sync_turn_picker_selection_scroll(app);
+        }
+        KeyCode::Right | KeyCode::Char('l')
+            if key.code == KeyCode::Right || key.modifiers.is_empty() =>
+        {
+            if let Some(picker) = &mut app.turn_picker {
+                picker.move_selection(ResumeSelectionDirection::Next);
+            }
+            sync_turn_picker_selection_scroll(app);
         }
         KeyCode::Enter => {
-            let Some(turn_id) = app
-                .turn_picker
-                .as_ref()
-                .and_then(TurnPickerState::selected_turn_id)
-            else {
-                app.status_message = "no historical turn selected".to_owned();
-                return Ok(());
-            };
-            app.fork_current_thread_from_turn(transport, turn_id)
-                .await?;
+            app.edit_selected_turn(transport).await;
         }
         _ => {}
     }
     Ok(())
+}
+
+fn sync_turn_picker_selection_scroll(app: &mut TuiApp) {
+    let Some(picker) = app.turn_picker.as_ref() else {
+        return;
+    };
+    let scroll = turn_picker_selection_scroll(app.layout.transcript, picker, app);
+    if let Some(picker) = &mut app.turn_picker {
+        picker.scroll_offset = scroll;
+        picker.focus_pending = false;
+    }
 }
 
 async fn handle_queue_picker_key(
@@ -7014,6 +7171,12 @@ fn restore_terminal(output: &mut impl io::Write, use_alternate_screen: bool) -> 
     let mut failures = Vec::new();
     record_terminal_failure(
         &mut failures,
+        "disable alternate scroll",
+        execute!(output, SetAlternateScroll(false)),
+    );
+    set_alternate_scroll_active(false);
+    record_terminal_failure(
+        &mut failures,
         "disable bracketed paste",
         execute!(output, DisableBracketedPaste),
     );
@@ -7067,6 +7230,12 @@ fn combine_run_and_restore(
 fn rollback_terminal_setup(error: io::Error, alternate_screen_entered: bool) -> miette::Report {
     let mut failures = vec![format!("terminal setup failed: {error}")];
     let mut stdout = io::stdout();
+    record_terminal_failure(
+        &mut failures,
+        "disable alternate scroll after setup failure",
+        execute!(stdout, SetAlternateScroll(false)),
+    );
+    set_alternate_scroll_active(false);
     record_terminal_failure(
         &mut failures,
         "disable bracketed paste after setup failure",

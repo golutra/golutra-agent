@@ -2975,38 +2975,6 @@ fn task_id_from_candidate_id(candidate_id: &str) -> Option<TaskId> {
     .and_then(|task_id| task_id.parse().ok())
 }
 
-fn fork_sequence_for_turn(events: &[RuntimeEvent], turn_id: TurnId) -> Option<u64> {
-    let first_sequence = events
-        .iter()
-        .find(|event| event.turn_id == Some(turn_id))?
-        .sequence_no;
-    if let Some(next_turn_sequence) = events
-        .iter()
-        .find(|event| {
-            event.sequence_no > first_sequence
-                && event
-                    .turn_id
-                    .is_some_and(|event_turn_id| event_turn_id != turn_id)
-        })
-        .map(|event| event.sequence_no)
-    {
-        return Some(next_turn_sequence.saturating_sub(1));
-    }
-    events
-        .iter()
-        .filter(|event| event.turn_id == Some(turn_id))
-        .filter(|event| event.event_type.is_task_terminal())
-        .map(|event| event.sequence_no)
-        .max()
-        .or_else(|| {
-            events
-                .iter()
-                .filter(|event| event.turn_id == Some(turn_id))
-                .map(|event| event.sequence_no)
-                .max()
-        })
-}
-
 fn count_regular_directory_entries(path: &Path, extension: &str) -> Result<u64, ClientError> {
     let entries = match fs::read_dir(path) {
         Ok(entries) => entries,

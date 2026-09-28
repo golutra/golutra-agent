@@ -1037,8 +1037,8 @@ async fn fork_thread(
 ) -> Result<Json<golutra_agent_store::ThreadRecord>, AppError> {
     let transport = state.attached_transport(&headers).await?;
     Ok(Json(
-        transport
-            .fork_thread(parse_thread_id(&thread_id)?, request.from_turn_id)
+        request
+            .execute(&transport, parse_thread_id(&thread_id)?)
             .await?,
     ))
 }
@@ -1046,6 +1046,23 @@ async fn fork_thread(
 #[derive(Debug, Deserialize)]
 struct ForkThreadRequest {
     from_turn_id: Option<golutra_agent_core::TurnId>,
+    before_turn_id: Option<golutra_agent_core::TurnId>,
+}
+
+impl ForkThreadRequest {
+    async fn execute(
+        &self,
+        transport: &EmbeddedTransport,
+        thread_id: golutra_agent_core::ThreadId,
+    ) -> Result<golutra_agent_store::ThreadRecord, ClientError> {
+        match (self.from_turn_id, self.before_turn_id) {
+            (Some(_), Some(_)) => Err(ClientError::InvalidSession(
+                "from_turn_id and before_turn_id are mutually exclusive".to_owned(),
+            )),
+            (None, Some(turn_id)) => transport.fork_thread_before_turn(thread_id, turn_id).await,
+            (from_turn_id, None) => transport.fork_thread(thread_id, from_turn_id).await,
+        }
+    }
 }
 
 async fn handoff_thread(
@@ -1393,6 +1410,27 @@ mod tests {
 
     const TEST_TRANSPORT_TOKEN: &str =
         "test-transport-token-000000000000000000000000000000000000000000000000";
+
+    #[tokio::test]
+    async fn fork_request_rejects_conflicting_boundaries_without_creating_a_branch() {
+        let transport = EmbeddedTransport::in_memory().await.expect("transport");
+        let before = transport.list_threads(100).await.expect("threads").len();
+        let request = ForkThreadRequest {
+            from_turn_id: Some(golutra_agent_core::TurnId::new()),
+            before_turn_id: Some(golutra_agent_core::TurnId::new()),
+        };
+        assert!(
+            request
+                .execute(&transport, transport.default_thread_id())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            transport.list_threads(100).await.expect("threads").len(),
+            before
+        );
+        transport.close().await.expect("close");
+    }
 
     fn server_info() -> AppServerInfo {
         AppServerInfo {

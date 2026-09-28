@@ -134,6 +134,7 @@ pub(crate) fn draw_ui(frame: &mut Frame<'_>, app: &mut TuiApp) {
         return;
     }
     let next_layout = ui_layout(frame.area(), app);
+    reflow_turn_picker(app, next_layout.transcript);
     if next_layout.body_mode == BodyLayoutMode::Transcript {
         app.ensure_transcript_layout(next_layout.transcript);
         let row_count = app
@@ -144,6 +145,14 @@ pub(crate) fn draw_ui(frame: &mut Frame<'_>, app: &mut TuiApp) {
         app.sync_transcript_row_count_to(app.transcript.scroll.row_count, row_count);
     }
     app.layout = next_layout;
+    if app.overlay_surface() == Some(OverlaySurface::TurnPicker)
+        && app
+            .turn_picker
+            .as_ref()
+            .is_some_and(|picker| picker.focus_pending)
+    {
+        sync_turn_picker_selection_scroll(app);
+    }
     let layout = app.layout;
     match layout.body_mode {
         BodyLayoutMode::Transcript => draw_transcript(frame, layout.transcript, app),
@@ -1072,7 +1081,6 @@ pub(crate) fn draw_resume_picker(
     current_thread_id: ThreadId,
     app: &TuiApp,
 ) {
-    let palette = app.palette();
     if let Some(action) = picker.action {
         let selected = picker.items.get(picker.selected);
         let rename_prefix = "Title: ";
@@ -1133,81 +1141,7 @@ pub(crate) fn draw_resume_picker(
     }
     let visible_count = resume_picker_page_size(area);
     let offset = resume_picker_offset(picker.selected, visible_count, picker.items.len());
-    let items = picker
-        .items
-        .iter()
-        .enumerate()
-        .skip(offset)
-        .take(visible_count)
-        .map(|(index, item)| {
-            let selected = index == picker.selected;
-            let current = item.thread_id == current_thread_id;
-            let marker = selection_marker(app, selected);
-            let current_marker = if current { "current" } else { "" };
-            let mut lines = vec![
-                Line::from(vec![
-                    Span::styled(
-                        marker,
-                        Style::default().fg(if selected {
-                            palette.accent
-                        } else {
-                            palette.muted
-                        }),
-                    ),
-                    Span::styled(
-                        format!("{} ", index + 1),
-                        Style::default().fg(palette.muted),
-                    ),
-                    Span::styled(
-                        item.title.clone(),
-                        Style::default()
-                            .fg(if selected {
-                                palette.text
-                            } else {
-                                palette.subtle
-                            })
-                            .add_modifier(if selected {
-                                Modifier::BOLD
-                            } else {
-                                Modifier::empty()
-                            }),
-                    ),
-                    Span::raw("  "),
-                    Span::styled(current_marker, Style::default().fg(palette.success)),
-                ]),
-                Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled(
-                        short_id(&item.session_id.to_string()),
-                        Style::default().fg(palette.muted),
-                    ),
-                    Span::raw("  "),
-                    Span::styled(item.preview.clone(), Style::default().fg(palette.muted)),
-                ]),
-                Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled(item.metadata.clone(), Style::default().fg(palette.subtle)),
-                ]),
-            ];
-            if selected && picker.show_details {
-                lines.push(Line::from(vec![
-                    Span::raw("    thread  "),
-                    Span::styled(
-                        item.thread_id.to_string(),
-                        Style::default().fg(palette.muted),
-                    ),
-                ]));
-                lines.push(Line::from(vec![
-                    Span::raw("    session "),
-                    Span::styled(
-                        item.session_id.to_string(),
-                        Style::default().fg(palette.muted),
-                    ),
-                ]));
-            }
-            ListItem::new(lines)
-        })
-        .collect::<Vec<_>>();
+    let items = session_picker_items(picker, current_thread_id, app, offset, visible_count);
     let filter_prefix = "Resume session · filter: ";
     let filter_prefix_width = u16::try_from(display_width(filter_prefix)).unwrap_or(u16::MAX);
     let filter_viewport = picker
@@ -1238,27 +1172,189 @@ pub(crate) fn draw_turn_picker(
 ) {
     let layout = turn_picker_visual_layout(area, picker, app);
     let block = Block::default()
-        .title("Session history · Enter fork · Esc close")
+        .title("Session history · ←→ select · ↑↓ scroll · Enter edit · Esc close")
         .borders(Borders::TOP);
     let content_area = block.inner(area);
     let scroll = turn_picker_scroll_offset(
         &layout.ranges,
         picker.selected,
         usize::from(content_area.height),
+        picker.scroll_offset,
     );
     frame.render_widget(block, area);
-    frame.render_widget(
-        Paragraph::new(layout.lines)
-            .wrap(Wrap { trim: false })
-            .scroll((ratatui_vertical_scroll(scroll, content_area.height), 0)),
-        content_area,
-    );
+    // 缓存已经按显示宽度折成物理行；这里只复制视口，不再向 Paragraph 传 u16 偏移。
+    let visible = layout
+        .lines
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(usize::from(content_area.height))
+        .map(|(row, line)| {
+            let mut line = line.clone();
+            if let Some(&(start, end)) = layout.prompt_ranges.get(picker.selected)
+                && (start..end).contains(&row)
+            {
+                for span in &mut line.spans {
+                    span.style = span
+                        .style
+                        .fg(app.palette().text)
+                        .add_modifier(Modifier::BOLD);
+                }
+                if row == start
+                    && let Some(marker) = line.spans.first_mut()
+                {
+                    let text = marker.content.to_string();
+                    marker.content = format!(
+                        "{}{}",
+                        selection_marker(app, true).chars().next().unwrap_or('>'),
+                        text.get(1..).unwrap_or_default()
+                    )
+                    .into();
+                    marker.style = marker.style.fg(app.palette().accent);
+                }
+            }
+            line
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(visible), content_area);
 }
 
 #[derive(Debug, Clone)]
-struct TurnPickerVisualLayout {
+pub(crate) struct TurnPickerVisualLayout {
+    items: std::sync::Arc<Vec<HistoricalTurnItem>>,
+    width: u16,
+    palette: TuiPalette,
     lines: Vec<Line<'static>>,
     ranges: Vec<(usize, usize)>,
+    prompt_ranges: Vec<(usize, usize)>,
+    row_anchors: Vec<(usize, usize)>,
+}
+
+/// 宽度改变时按逻辑行和显示列定位原视口；手动滚动不会突然跳回选中请求。
+fn reflow_turn_picker(app: &mut TuiApp, area: Rect) {
+    let Some(picker) = app.turn_picker.as_ref() else {
+        return;
+    };
+    let old = picker.layout_cache.borrow().clone();
+    let Some(old) = old.filter(|old| old.width != area.width.max(1)) else {
+        return;
+    };
+    if picker.focus_pending {
+        return;
+    }
+    let anchor = old
+        .row_anchors
+        .get(picker.scroll_offset)
+        .copied()
+        .unwrap_or_default();
+    let layout = turn_picker_visual_layout(area, picker, app);
+    let offset = layout
+        .row_anchors
+        .partition_point(|current| *current <= anchor)
+        .saturating_sub(1);
+    if let Some(picker) = &mut app.turn_picker {
+        picker.scroll_offset = offset.min(
+            layout
+                .lines
+                .len()
+                .saturating_sub(usize::from(area.height.saturating_sub(1))),
+        );
+    }
+}
+
+#[cfg(test)]
+mod turn_layout_tests {
+    use super::*;
+
+    fn app() -> TuiApp {
+        TuiApp::new(
+            ThreadId::new(),
+            SessionId::new(),
+            None,
+            false,
+            "mock".into(),
+            None,
+        )
+    }
+
+    fn item(prompt: String) -> HistoricalTurnItem {
+        HistoricalTurnItem {
+            turn_id: TurnId::new(),
+            prompt,
+            attachment_paths: Vec::new(),
+            preview: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn single_line_beyond_u16_renders_tail_with_cjk_and_graphemes() {
+        let mut app = app();
+        let prompt = format!("{}终点🏁", "中文👩‍💻".repeat(66_000));
+        app.turn_picker = Some(TurnPickerState::new(vec![item(prompt)]));
+        let area = Rect::new(0, 0, 6, 8);
+        let picker = app.turn_picker.as_ref().unwrap();
+        let layout = turn_picker_visual_layout(area, picker, &app);
+        assert!(layout.lines.len() > usize::from(u16::MAX));
+        assert!(layout.lines.iter().all(|line| line.width() <= 6));
+        let max_scroll = turn_picker_max_scroll(area, picker, &app);
+        app.turn_picker.as_mut().unwrap().scroll_offset = max_scroll;
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(6, 8)).unwrap();
+        terminal
+            .draw(|frame| draw_turn_picker(frame, area, app.turn_picker.as_ref().unwrap(), &app))
+            .unwrap();
+        let text = super::super::tests::terminal_buffer_display_rows(&terminal).join("\n");
+        assert!(text.replace('\n', "").contains("终点"), "{text}");
+        assert!(text.contains('🏁'), "{text}");
+        app.turn_picker = Some(TurnPickerState::new(vec![item("中文👩‍💻结尾".into())]));
+        for width in [1, 2, 3] {
+            let layout = turn_picker_visual_layout(
+                Rect::new(0, 0, width, 8),
+                app.turn_picker.as_ref().unwrap(),
+                &app,
+            );
+            assert!(!layout.lines.is_empty());
+            assert!(
+                layout
+                    .lines
+                    .iter()
+                    .any(|line| line.to_string().contains("👩‍💻"))
+            );
+        }
+    }
+
+    #[test]
+    fn navigation_reuses_layout_and_resize_preserves_manual_position() {
+        let mut app = app();
+        app.turn_picker = Some(TurnPickerState::new(vec![
+            item("0123456789".repeat(100)),
+            item("second".into()),
+        ]));
+        let area = Rect::new(0, 0, 10, 8);
+        let first = turn_picker_visual_layout(area, app.turn_picker.as_ref().unwrap(), &app);
+        app.turn_picker.as_mut().unwrap().selected = 0;
+        let second = turn_picker_visual_layout(area, app.turn_picker.as_ref().unwrap(), &app);
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        let picker = app.turn_picker.as_mut().unwrap();
+        picker.focus_pending = false;
+        picker.scroll_offset = 40;
+        let anchor = first.row_anchors[40];
+        reflow_turn_picker(&mut app, Rect::new(0, 0, 20, 8));
+        let picker = app.turn_picker.as_ref().unwrap();
+        let resized = picker.layout_cache.borrow().clone().unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&first, &resized));
+        assert_eq!(resized.row_anchors[picker.scroll_offset], anchor);
+        assert_ne!(picker.scroll_offset, 0);
+        assert_eq!(picker.selected, 0);
+        let picker = app.turn_picker.as_mut().unwrap();
+        std::sync::Arc::make_mut(&mut picker.items)[0].prompt = "changed".into();
+        let changed = turn_picker_visual_layout(
+            Rect::new(0, 0, 20, 8),
+            app.turn_picker.as_ref().unwrap(),
+            &app,
+        );
+        assert!(!std::sync::Arc::ptr_eq(&resized, &changed));
+        assert!(changed.lines[0].to_string().contains("changed"));
+    }
 }
 
 /// 按实际换行后的高度构造历史 turn 预览，滚动和鼠标命中都复用同一份区块边界。
@@ -1266,14 +1362,24 @@ fn turn_picker_visual_layout(
     area: Rect,
     picker: &TurnPickerState,
     app: &TuiApp,
-) -> TurnPickerVisualLayout {
+) -> std::sync::Arc<TurnPickerVisualLayout> {
     let palette = app.palette();
     let width = area.width.max(1);
+    if let Some(cache) = picker.layout_cache.borrow().as_ref()
+        && cache.width == width
+        && cache.palette == palette
+        && std::sync::Arc::ptr_eq(&cache.items, &picker.items)
+    {
+        return cache.clone();
+    }
     let mut lines = Vec::new();
     let mut ranges = Vec::with_capacity(picker.items.len());
+    let mut prompt_ranges = Vec::with_capacity(picker.items.len());
+    let mut row_anchors = Vec::new();
+    let mut logical_index = 0;
     let mut visual_rows = 0_usize;
     for (index, item) in picker.items.iter().enumerate() {
-        let selected = index == picker.selected;
+        let selected = false;
         let style = Style::default()
             .fg(if selected {
                 palette.text
@@ -1287,6 +1393,8 @@ fn turn_picker_visual_layout(
             });
         let start = visual_rows;
         let block_line_start = lines.len();
+        let prompt = super::tool_detail_data::terminal_text(&item.prompt);
+        let mut prompt_lines = prompt.split('\n');
         lines.push(Line::from(vec![
             Span::styled(
                 selection_marker(app, selected),
@@ -1300,8 +1408,15 @@ fn turn_picker_visual_layout(
                 format!("{} ", index + 1),
                 Style::default().fg(palette.muted),
             ),
-            Span::styled(item.prompt.clone(), style),
+            Span::styled(prompt_lines.next().unwrap_or_default().to_owned(), style),
         ]));
+        for text in prompt_lines {
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(text.to_owned(), style),
+            ]));
+        }
+        let prompt_line_end = lines.len();
         for preview in &item.preview {
             let (marker, color) = match preview.kind {
                 HistoricalTurnPreviewKind::Assistant => ("    • ", palette.subtle),
@@ -1321,45 +1436,85 @@ fn turn_picker_visual_layout(
             }
         }
         lines.push(Line::default());
-        let end = start.saturating_add(
-            lines[block_line_start..]
-                .iter()
-                .map(|line| turn_picker_line_count(line, width))
-                .sum(),
-        );
+        let logical = lines.split_off(block_line_start);
+        let prompt_logical_count = prompt_line_end - block_line_start;
+        let mut prompt_end = start;
+        for (index, line) in logical.into_iter().enumerate() {
+            let mut column = 0;
+            for row in super::rich_text::wrap_detail_spans(&line.spans, usize::from(width)) {
+                row_anchors.push((logical_index, column));
+                column += row.width();
+                lines.push(row);
+            }
+            logical_index += 1;
+            if index < prompt_logical_count {
+                prompt_end = lines.len();
+            }
+        }
+        let end = lines.len();
         visual_rows = end;
         ranges.push((start, end));
+        prompt_ranges.push((start, prompt_end));
     }
-    TurnPickerVisualLayout { lines, ranges }
+    let layout = std::sync::Arc::new(TurnPickerVisualLayout {
+        items: picker.items.clone(),
+        width,
+        palette,
+        lines,
+        ranges,
+        prompt_ranges,
+        row_anchors,
+    });
+    *picker.layout_cache.borrow_mut() = Some(layout.clone());
+    layout
 }
 
-fn turn_picker_line_count(line: &Line<'static>, width: u16) -> usize {
-    Paragraph::new(line.clone())
-        .wrap(Wrap { trim: false })
-        .line_count(width)
-        .max(1)
-}
-
-/// 让当前选中的 turn 完整进入可视区域；超长 turn 至少从其首行开始展示。
+/// 将手动滚动位置限制在完整预览内容的有效范围内。
 pub(crate) fn turn_picker_scroll_offset(
     ranges: &[(usize, usize)],
-    selected: usize,
+    _selected: usize,
     visible_rows: usize,
+    requested: usize,
 ) -> usize {
     if ranges.is_empty() || visible_rows == 0 {
         return 0;
     }
-    let (start, end) = ranges[selected.min(ranges.len().saturating_sub(1))];
     let total_rows = ranges.last().map(|(_, end)| *end).unwrap_or(0);
     let max_scroll = total_rows.saturating_sub(visible_rows);
-    let offset = if end.saturating_sub(start) > visible_rows {
+    requested.min(max_scroll)
+}
+
+pub(crate) fn turn_picker_selection_scroll(
+    area: Rect,
+    picker: &TurnPickerState,
+    app: &TuiApp,
+) -> usize {
+    let layout = turn_picker_visual_layout(area, picker, app);
+    let visible_rows = usize::from(area.height.saturating_sub(1));
+    let selected = picker.selected.min(layout.ranges.len().saturating_sub(1));
+    let (start, end) = layout.ranges.get(selected).copied().unwrap_or((0, 0));
+    let current =
+        turn_picker_scroll_offset(&layout.ranges, selected, visible_rows, picker.scroll_offset);
+    if end.saturating_sub(start) > visible_rows {
+        return start;
+    }
+    if start < current {
         start
-    } else if end > visible_rows {
+    } else if end > current.saturating_add(visible_rows) {
         end.saturating_sub(visible_rows)
     } else {
-        0
-    };
-    offset.min(max_scroll)
+        current
+    }
+}
+
+pub(crate) fn turn_picker_max_scroll(area: Rect, picker: &TurnPickerState, app: &TuiApp) -> usize {
+    let layout = turn_picker_visual_layout(area, picker, app);
+    turn_picker_scroll_offset(
+        &layout.ranges,
+        picker.selected,
+        usize::from(area.height.saturating_sub(1)),
+        usize::MAX,
+    )
 }
 
 pub(crate) fn draw_queue_picker(
@@ -2324,6 +2479,111 @@ fn wrapped_text_height(value: &str, width: u16) -> usize {
         .max(1)
 }
 
+fn session_picker_items(
+    picker: &ResumePickerState,
+    current_thread_id: ThreadId,
+    app: &TuiApp,
+    offset: usize,
+    visible_count: usize,
+) -> Vec<ListItem<'static>> {
+    let palette = app.palette();
+    picker
+        .items
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(visible_count)
+        .map(|(index, item)| {
+            let selected = index == picker.selected;
+            let current = item.thread_id == current_thread_id;
+            let marker = selection_marker(app, selected);
+            let current_marker = if current { "当前" } else { "" };
+            let mut lines = vec![
+                Line::from(vec![
+                    Span::styled(
+                        marker,
+                        Style::default().fg(if selected {
+                            palette.accent
+                        } else {
+                            palette.muted
+                        }),
+                    ),
+                    Span::styled(
+                        format!("{} ", index + 1),
+                        Style::default().fg(palette.muted),
+                    ),
+                    Span::styled(
+                        item.title.clone(),
+                        Style::default()
+                            .fg(if selected {
+                                palette.text
+                            } else {
+                                palette.subtle
+                            })
+                            .add_modifier(if selected {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                    if item.forked_from_turn_id.is_some() {
+                        Span::styled("分支", Style::default().fg(palette.muted))
+                    } else {
+                        Span::raw("")
+                    },
+                    Span::raw("  "),
+                    Span::styled(current_marker, Style::default().fg(palette.success)),
+                ]),
+                Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(
+                        short_id(&item.session_id.to_string()),
+                        Style::default().fg(palette.muted),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(item.preview.clone(), Style::default().fg(palette.muted)),
+                ]),
+                Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(item.metadata.clone(), Style::default().fg(palette.subtle)),
+                ]),
+            ];
+            if selected && picker.show_details {
+                lines.push(Line::from(vec![
+                    Span::raw("    thread  "),
+                    Span::styled(
+                        item.thread_id.to_string(),
+                        Style::default().fg(palette.muted),
+                    ),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::raw("    session "),
+                    Span::styled(
+                        item.session_id.to_string(),
+                        Style::default().fg(palette.muted),
+                    ),
+                ]));
+                if let Some(parent_thread_id) = item.parent_thread_id {
+                    lines.push(Line::from(vec![
+                        Span::raw("    parent  "),
+                        Span::styled(
+                            parent_thread_id.to_string(),
+                            Style::default().fg(palette.muted),
+                        ),
+                    ]));
+                }
+                if item.forked_from_turn_id.is_some() {
+                    lines.push(Line::from(vec![
+                        Span::raw("    branch  "),
+                        Span::styled("history edit", Style::default().fg(palette.muted)),
+                    ]));
+                }
+            }
+            ListItem::new(lines)
+        })
+        .collect()
+}
+
 pub(crate) fn draw_export_flow(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -2525,67 +2785,9 @@ fn draw_resume_picker_with_title(
     title: &str,
     app: &TuiApp,
 ) {
-    let palette = app.palette();
     let visible_count = resume_picker_page_size(area);
     let offset = resume_picker_offset(picker.selected, visible_count, picker.items.len());
-    let items = picker
-        .items
-        .iter()
-        .enumerate()
-        .skip(offset)
-        .take(visible_count)
-        .map(|(index, item)| {
-            let selected = index == picker.selected;
-            let current = item.thread_id == current_thread_id;
-            let marker = selection_marker(app, selected);
-            let current_marker = if current { "current" } else { "" };
-            ListItem::new(vec![
-                Line::from(vec![
-                    Span::styled(
-                        marker,
-                        Style::default().fg(if selected {
-                            palette.accent
-                        } else {
-                            palette.muted
-                        }),
-                    ),
-                    Span::styled(
-                        format!("{} ", index + 1),
-                        Style::default().fg(palette.muted),
-                    ),
-                    Span::styled(
-                        item.title.clone(),
-                        Style::default()
-                            .fg(if selected {
-                                palette.text
-                            } else {
-                                palette.subtle
-                            })
-                            .add_modifier(if selected {
-                                Modifier::BOLD
-                            } else {
-                                Modifier::empty()
-                            }),
-                    ),
-                    Span::raw("  "),
-                    Span::styled(current_marker, Style::default().fg(palette.success)),
-                ]),
-                Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled(
-                        short_id(&item.session_id.to_string()),
-                        Style::default().fg(palette.muted),
-                    ),
-                    Span::raw("  "),
-                    Span::styled(item.preview.clone(), Style::default().fg(palette.muted)),
-                ]),
-                Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled(item.metadata.clone(), Style::default().fg(palette.subtle)),
-                ]),
-            ])
-        })
-        .collect::<Vec<_>>();
+    let items = session_picker_items(picker, current_thread_id, app, offset, visible_count);
     frame.render_widget(
         List::new(items).block(Block::default().title(title).borders(Borders::TOP)),
         area,
@@ -2796,7 +2998,12 @@ fn turn_mouse_regions(
 ) -> Vec<OverlayMouseRegion> {
     let layout = turn_picker_visual_layout(area, picker, app);
     let visible_rows = usize::from(area.height.saturating_sub(1));
-    let scroll = turn_picker_scroll_offset(&layout.ranges, picker.selected, visible_rows);
+    let scroll = turn_picker_scroll_offset(
+        &layout.ranges,
+        picker.selected,
+        visible_rows,
+        picker.scroll_offset,
+    );
     layout
         .ranges
         .iter()
@@ -2928,7 +3135,7 @@ pub(crate) fn draw_bottom_pane(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) 
             "Type filter   Enter resume   Alt+I details   Alt+R rename   Alt+A archive   Alt+D delete",
         ),
         Some(OverlaySurface::TurnPicker) => {
-            Some("Up/Down select   Enter fork from turn   Esc close")
+            Some("Left/Right select   Up/Down scroll   Enter edit   Esc close")
         }
         Some(OverlaySurface::Queue) => {
             Some("Enter edit   Delete cancel prompt   Up/Down select   Esc close")

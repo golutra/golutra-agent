@@ -410,6 +410,17 @@ turn/start         turn/steer          turn/interrupt    turn/takeover
 task/reconcile     approval/resolve    turn/status       runtime/events/replay
 ```
 
+`thread/fork` and `POST /threads/{thread_id}/fork` accept either `from_turn_id`
+(include that turn) or `before_turn_id` (exclude that turn and subsequent history).
+The two fields are mutually exclusive; omitting both copies the complete history.
+Prompt editing uses `before_turn_id` and restores the selected text in the composer
+without submitting it. Forks preserve the source thread and do not rewind workspace files.
+Queued turns use their execution start as the boundary, rather than their enqueue time.
+The store excludes future queue events and their command journal entries even if received
+before that boundary, preserving complete predecessor replies and tool results. Copied
+causal session/task/turn IDs and internal event links follow the new branch identities;
+links outside the copied history are dropped, with parent provenance kept in ThreadForked.
+
 HTTP and WebSocket clients must send the bearer token and the negotiated
 `x-golutra-agent-protocol-version`. Remote HTTP connections use
 `GOLUTRA_AGENT_TRANSPORT_TOKEN`; local daemon discovery reads the owner-only token

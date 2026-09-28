@@ -1604,11 +1604,23 @@ async fn fork_transaction_copies_boundary_history_and_remaps_runtime_ids() {
     let parent_session_id = SessionId::new();
     let parent_task_id = TaskId::new();
     let parent_turn_id = TurnId::new();
+    let causal_only_turn = TurnId::new();
+    let outside_event = EventId::new();
+    let context = golutra_agent_core::CausalContext {
+        session_id: Some(parent_session_id),
+        task_id: Some(parent_task_id),
+        turn_id: Some(parent_turn_id),
+        provider_round_id: Some("original-provider-round".to_owned()),
+        ..Default::default()
+    };
     let first = store
         .append_event_assigning_sequence(RuntimeEvent {
             schema_version: golutra_agent_core::RUNTIME_EVENT_SCHEMA_VERSION,
-            causal_context: Default::default(),
-            causal_links: Vec::new(),
+            causal_context: context.clone(),
+            causal_links: vec![golutra_agent_core::CausalLink {
+                event_id: outside_event,
+                relation: golutra_agent_core::CausalRelation::Parent,
+            }],
             id: EventId::new(),
             sequence_no: 0,
             session_id: parent_session_id,
@@ -1632,12 +1644,18 @@ async fn fork_transaction_copies_boundary_history_and_remaps_runtime_ids() {
     let second = store
         .append_event_assigning_sequence(RuntimeEvent {
             schema_version: golutra_agent_core::RUNTIME_EVENT_SCHEMA_VERSION,
-            causal_context: Default::default(),
-            causal_links: Vec::new(),
+            causal_context: golutra_agent_core::CausalContext {
+                turn_id: Some(causal_only_turn),
+                ..context
+            },
+            causal_links: vec![golutra_agent_core::CausalLink {
+                event_id: first.id,
+                relation: golutra_agent_core::CausalRelation::RespondsTo,
+            }],
             id: EventId::new(),
             sequence_no: 0,
             session_id: parent_session_id,
-            turn_id: Some(parent_turn_id),
+            turn_id: None,
             task_id: Some(parent_task_id),
             parent_event_id: Some(first.id),
             event_type: RuntimeEventType::AssistantMessage,
@@ -1708,7 +1726,18 @@ async fn fork_transaction_copies_boundary_history_and_remaps_runtime_ids() {
     assert_ne!(forked[0].task_id, Some(parent_task_id));
     assert_eq!(forked[0].task_id, forked[1].task_id);
     assert_ne!(forked[0].turn_id, Some(parent_turn_id));
-    assert_eq!(forked[0].turn_id, forked[1].turn_id);
+    assert_eq!(forked[1].turn_id, None);
+    assert_eq!(forked[0].causal_context.turn_id, forked[0].turn_id);
+    assert_ne!(forked[1].causal_context.turn_id, Some(causal_only_turn));
+    assert!(forked[1].causal_context.turn_id.is_some());
+    assert_eq!(forked[1].causal_context.session_id, Some(child.session_id));
+    assert_eq!(forked[1].causal_context.task_id, forked[1].task_id);
+    assert_eq!(
+        forked[1].causal_context.provider_round_id.as_deref(),
+        Some("original-provider-round")
+    );
+    assert!(forked[0].causal_links.is_empty());
+    assert_eq!(forked[1].causal_links[0].event_id, forked[0].id);
     assert_eq!(
         forked[0].payload["session_id"],
         child.session_id.to_string()

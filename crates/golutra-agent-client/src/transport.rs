@@ -316,6 +316,17 @@ impl EmbeddedTransport {
             .await
     }
 
+    pub async fn fork_thread_before_turn(
+        &self,
+        thread_id: ThreadId,
+        turn_id: TurnId,
+    ) -> Result<ThreadRecord, ClientError> {
+        self.application
+            .session_service()
+            .fork_thread_before_turn(thread_id, turn_id)
+            .await
+    }
+
     pub async fn handoff_thread(
         &self,
         thread_id: ThreadId,
@@ -708,6 +719,24 @@ impl HttpSseTransport {
         thread_id: ThreadId,
         from_turn_id: Option<TurnId>,
     ) -> Result<ThreadRecord, ClientError> {
+        self.fork_thread_request(thread_id, json!({"from_turn_id": from_turn_id}))
+            .await
+    }
+
+    pub async fn fork_thread_before_turn(
+        &self,
+        thread_id: ThreadId,
+        turn_id: TurnId,
+    ) -> Result<ThreadRecord, ClientError> {
+        self.fork_thread_request(thread_id, json!({"before_turn_id": turn_id}))
+            .await
+    }
+
+    async fn fork_thread_request(
+        &self,
+        thread_id: ThreadId,
+        request: Value,
+    ) -> Result<ThreadRecord, ClientError> {
         let response = self
             .send_attached(|attachment_id| {
                 self.authenticated(
@@ -715,7 +744,7 @@ impl HttpSseTransport {
                         .post(self.url(&format!("/threads/{thread_id}/fork"))),
                 )
                 .header(APP_SERVER_ATTACHMENT_HEADER, attachment_id)
-                .json(&json!({"from_turn_id": from_turn_id}))
+                .json(&request)
                 .timeout(Duration::from_secs(30))
             })
             .await?;
@@ -1905,6 +1934,25 @@ impl RuntimeTransport {
             Self::LocalIpc(transport) => transport.fork_thread(thread_id, from_turn_id).await,
             Self::LocalDaemon(transport) | Self::Remote(transport) => {
                 transport.fork_thread(thread_id, from_turn_id).await
+            }
+        }
+    }
+
+    pub async fn fork_thread_before_turn(
+        &self,
+        thread_id: ThreadId,
+        turn_id: TurnId,
+    ) -> Result<ThreadRecord, ClientError> {
+        match self {
+            Self::Embedded(transport) => {
+                transport.fork_thread_before_turn(thread_id, turn_id).await
+            }
+            #[cfg(unix)]
+            Self::LocalIpc(transport) => {
+                transport.fork_thread_before_turn(thread_id, turn_id).await
+            }
+            Self::LocalDaemon(transport) | Self::Remote(transport) => {
+                transport.fork_thread_before_turn(thread_id, turn_id).await
             }
         }
     }

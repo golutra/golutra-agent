@@ -266,6 +266,24 @@ impl RuntimeHost {
         thread_id: ThreadId,
         from_turn_id: Option<TurnId>,
     ) -> Result<ThreadRecord, ClientError> {
+        self.fork_thread_at(thread_id, from_turn_id, false).await
+    }
+
+    /// Create an editable branch containing only history before the selected prompt.
+    pub async fn fork_thread_before_turn(
+        &self,
+        thread_id: ThreadId,
+        turn_id: TurnId,
+    ) -> Result<ThreadRecord, ClientError> {
+        self.fork_thread_at(thread_id, Some(turn_id), true).await
+    }
+
+    async fn fork_thread_at(
+        &self,
+        thread_id: ThreadId,
+        from_turn_id: Option<TurnId>,
+        before_turn: bool,
+    ) -> Result<ThreadRecord, ClientError> {
         let parent = self
             .storage
             .repositories
@@ -294,16 +312,15 @@ impl RuntimeHost {
             .events
             .load(parent.session_id, None, None)
             .await?;
-        let through_sequence_no = match from_turn_id {
-            Some(turn_id) => fork_sequence_for_turn(&parent_events, turn_id).ok_or_else(|| {
-                ClientError::InvalidSession(format!(
-                    "turn `{turn_id}` was not found in thread `{thread_id}`"
-                ))
-            })?,
-            None => parent_events
-                .last()
-                .map(|event| event.sequence_no)
-                .unwrap_or_default(),
+        let (through_sequence_no, excluded_events) = match from_turn_id {
+            Some(turn_id) => fork_history_boundary(&parent_events, turn_id, before_turn)?,
+            None => (
+                parent_events
+                    .last()
+                    .map(|event| event.sequence_no)
+                    .unwrap_or_default(),
+                HashSet::new(),
+            ),
         };
         let now = chrono::Utc::now();
         let child_thread_id = ThreadId::new();
@@ -320,7 +337,9 @@ impl RuntimeHost {
                 .runtime_paths
                 .as_ref()
                 .map(|paths| paths.rollout_path(child_thread_id).display().to_string()),
-            title: format!("Fork of {}", parent.title),
+            // 历史编辑分支共享根会话的可读标题，避免连续回退后出现
+            // `Fork of Fork of ...`，真实 parent/thread lineage 仍由 ID 字段保存。
+            title: history_fork_title(&parent.title),
             preview: parent.preview.clone(),
             created_at: now,
             updated_at: now,
@@ -333,7 +352,12 @@ impl RuntimeHost {
             .storage
             .repositories
             .threads
-            .fork(&child, parent.session_id, through_sequence_no)
+            .fork_excluding(
+                &child,
+                parent.session_id,
+                through_sequence_no,
+                &excluded_events,
+            )
             .await?;
         for event in &forked_events {
             self.publish_live_event(event.clone());
@@ -371,6 +395,7 @@ impl RuntimeHost {
                 "parent_thread_id": parent.thread_id,
                 "forked_from_turn_id": from_turn_id,
                 "forked_from_sequence_no": through_sequence_no,
+                "before_turn": before_turn,
             }),
         ))
         .await?;
@@ -671,4 +696,197 @@ impl RuntimeHost {
         self.storage.repositories.threads.upsert(&thread).await?;
         Ok(())
     }
+}
+
+/// 将旧数据或上游传入的递归分支标题压平到单层展示名。
+fn history_fork_title(parent_title: &str) -> String {
+    let mut base = parent_title.trim();
+    while let Some(rest) = base.strip_prefix("Fork of ") {
+        base = rest.trim_start();
+    }
+    format!("Fork of {base}")
+}
+
+/// 匹配顶层 turn id 和因历史恢复写入的 causal_context.turn_id，兼容旧事件格式。
+fn event_matches_turn(event: &RuntimeEvent, turn_id: TurnId) -> bool {
+    event.turn_id == Some(turn_id) || event.causal_context.turn_id == Some(turn_id)
+}
+
+fn event_command_id(event: &RuntimeEvent) -> Option<String> {
+    event
+        .payload
+        .get("command_id")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            event
+                .payload
+                .pointer("/payload/command_id")
+                .and_then(Value::as_str)
+        })
+        .map(str::to_owned)
+}
+
+fn validate_before_turn_boundary(
+    events: &[RuntimeEvent],
+    turn_id: TurnId,
+) -> Result<(), ClientError> {
+    let matching = events
+        .iter()
+        .filter(|event| event_matches_turn(event, turn_id))
+        .collect::<Vec<_>>();
+    if matching.is_empty() {
+        return Ok(());
+    }
+    if matching.iter().any(|event| {
+        event
+            .payload
+            .get("steer")
+            .and_then(Value::as_bool)
+            .or_else(|| {
+                event
+                    .payload
+                    .pointer("/payload/steer")
+                    .and_then(Value::as_bool)
+            })
+            .unwrap_or(false)
+    }) {
+        return Err(ClientError::InvalidSession(
+            "the selected prompt is a steer and cannot be branched independently".to_owned(),
+        ));
+    }
+    let has_started = matching
+        .iter()
+        .any(|event| event.event_type == RuntimeEventType::TurnStarted);
+    // 一个 task 可消费多轮队列输入，终态属于最后一轮；后续同 task 的终态
+    // 或下一轮开始也证明当前轮已经交接，不能要求每轮都有 TaskCompleted。
+    let has_terminal = matching.iter().any(|source| {
+        events.iter().any(|event| {
+            event.sequence_no >= source.sequence_no
+                && event.task_id == source.task_id
+                && (event.event_type.is_task_terminal()
+                    || (event.event_type == RuntimeEventType::TurnStarted
+                        && !event_matches_turn(event, turn_id)))
+        }) || source.event_type == RuntimeEventType::TurnCancelled
+    });
+    if has_started && !has_terminal {
+        return Err(ClientError::InvalidSession(
+            "the selected prompt belongs to a turn that is still in progress".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// 按消费顺序截取对话，不能以入队时间截断前一轮尚未完成的工具/回复。
+fn fork_history_boundary(
+    events: &[RuntimeEvent],
+    turn_id: TurnId,
+    before: bool,
+) -> Result<(u64, HashSet<EventId>), ClientError> {
+    if before {
+        validate_before_turn_boundary(events, turn_id)?;
+    }
+    let activations = turn_activations(events);
+    let steers = events
+        .iter()
+        .filter(|event| {
+            event
+                .payload
+                .get("steer")
+                .or_else(|| event.payload.pointer("/payload/steer"))
+                .and_then(Value::as_bool)
+                == Some(true)
+        })
+        .filter_map(|event| event.turn_id.or(event.causal_context.turn_id))
+        .collect::<HashSet<_>>();
+    let selected = *activations.get(&turn_id).ok_or_else(|| {
+        ClientError::InvalidSession(format!("turn `{turn_id}` was not found in thread"))
+    })?;
+    let through = if before {
+        selected.saturating_sub(1)
+    } else {
+        activations
+            .iter()
+            .filter(|(id, sequence)| {
+                **id != turn_id && !steers.contains(id) && **sequence > selected
+            })
+            .map(|(_, sequence)| *sequence)
+            .min()
+            .map(|sequence| sequence.saturating_sub(1))
+            .unwrap_or_else(|| events.last().map(|event| event.sequence_no).unwrap_or(0))
+    };
+    let consumed = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.event_type,
+                RuntimeEventType::TaskCreated | RuntimeEventType::TurnStarted
+            )
+        })
+        .filter_map(|event| event.turn_id.or(event.causal_context.turn_id))
+        .collect::<HashSet<_>>();
+    let excluded_turns = activations
+        .iter()
+        .filter(|(id, activation)| **activation > through || !consumed.contains(id))
+        .map(|(id, _)| *id)
+        .collect::<HashSet<_>>();
+    let excluded_commands = events
+        .iter()
+        .filter(|event| {
+            event
+                .turn_id
+                .or(event.causal_context.turn_id)
+                .is_some_and(|id| excluded_turns.contains(&id))
+        })
+        .filter_map(event_command_id)
+        .collect::<HashSet<_>>();
+    let excluded_events = events
+        .iter()
+        .filter(|event| {
+            event
+                .turn_id
+                .or(event.causal_context.turn_id)
+                .is_some_and(|id| excluded_turns.contains(&id))
+                || event_command_id(event).is_some_and(|id| excluded_commands.contains(&id))
+        })
+        .map(|event| event.id)
+        .collect();
+    Ok((through, excluded_events))
+}
+
+fn turn_activations(events: &[RuntimeEvent]) -> HashMap<TurnId, u64> {
+    let commands = events
+        .iter()
+        .filter(|event| event.event_type == RuntimeEventType::CommandReceived)
+        .filter_map(|event| event_command_id(event).map(|id| (id, event.sequence_no)))
+        .collect::<HashMap<_, _>>();
+    let mut activations = HashMap::new();
+    let mut queued = HashSet::new();
+    for event in events {
+        let Some(id) = event.turn_id.or(event.causal_context.turn_id) else {
+            continue;
+        };
+        let sequence = event_command_id(event)
+            .and_then(|id| commands.get(&id).copied())
+            .unwrap_or(event.sequence_no);
+        activations.entry(id).or_insert(sequence);
+        match event.event_type {
+            RuntimeEventType::TurnQueued => {
+                queued.insert(id);
+            }
+            RuntimeEventType::TurnStarted => {
+                activations.insert(id, event.sequence_no);
+                queued.remove(&id);
+            }
+            _ => {}
+        }
+    }
+    // 未消费/取消的队列输入没有可执行边界，放在已完成历史尾部；不能切断当时活动的工具调用。
+    let end = events
+        .last()
+        .map(|event| event.sequence_no.saturating_add(1))
+        .unwrap_or(0);
+    for id in queued {
+        activations.insert(id, end);
+    }
+    activations
 }

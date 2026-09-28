@@ -525,6 +525,8 @@ fn driver_binding_preflight_keeps_search_local_and_sessions_fixed() {
     app.resume_picker = Some(ResumePickerState::new(vec![ResumeThreadItem {
         thread_id: ThreadId::new(),
         session_id: SessionId::new(),
+        parent_thread_id: None,
+        forked_from_turn_id: None,
         title: "other session".to_owned(),
         preview: String::new(),
         metadata: String::new(),
@@ -680,6 +682,8 @@ fn snapshot_state_redacts_transient_secrets() {
     let picker = ResumePickerState::new(vec![ResumeThreadItem {
         thread_id: ThreadId::new(),
         session_id: SessionId::new(),
+        parent_thread_id: None,
+        forked_from_turn_id: None,
         title: format!("Authorization: Bearer {secret}"),
         preview: format!("token={secret}"),
         metadata: String::new(),
@@ -768,6 +772,8 @@ async fn rejected_mouse_activation_does_not_change_local_selection() {
         ResumeThreadItem {
             thread_id: ThreadId::new(),
             session_id: SessionId::new(),
+            parent_thread_id: None,
+            forked_from_turn_id: None,
             title: "first".to_owned(),
             preview: String::new(),
             metadata: String::new(),
@@ -775,6 +781,8 @@ async fn rejected_mouse_activation_does_not_change_local_selection() {
         ResumeThreadItem {
             thread_id: ThreadId::new(),
             session_id: SessionId::new(),
+            parent_thread_id: None,
+            forked_from_turn_id: None,
             title: "second".to_owned(),
             preview: String::new(),
             metadata: String::new(),

@@ -314,6 +314,14 @@ impl RuntimeSessionService {
         self.host.fork_thread(thread_id, from_turn_id).await
     }
 
+    pub async fn fork_thread_before_turn(
+        &self,
+        thread_id: ThreadId,
+        turn_id: TurnId,
+    ) -> Result<ThreadRecord, ClientError> {
+        self.host.fork_thread_before_turn(thread_id, turn_id).await
+    }
+
     pub async fn handoff_thread(
         &self,
         thread_id: ThreadId,

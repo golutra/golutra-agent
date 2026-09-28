@@ -233,6 +233,19 @@ impl UnixIpcTransport {
         .await
     }
 
+    pub async fn fork_thread_before_turn(
+        &self,
+        thread_id: ThreadId,
+        turn_id: TurnId,
+    ) -> Result<ThreadRecord, ClientError> {
+        self.attached_json(
+            "POST",
+            &format!("/threads/{thread_id}/fork"),
+            Some(json!({"before_turn_id": turn_id})),
+        )
+        .await
+    }
+
     pub async fn handoff_thread(
         &self,
         thread_id: ThreadId,

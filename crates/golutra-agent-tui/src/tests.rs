@@ -924,11 +924,173 @@ async fn double_escape_opens_current_session_turn_picker() {
     handle_key(escape(), &mut app, &transport)
         .await
         .expect("second escape");
+    app.poll_session_load(&transport, true).await;
     let picker = app.turn_picker.as_ref().expect("turn picker");
     assert!(app.resume_picker.is_none());
+    assert_eq!(
+        app.backtrack_base,
+        Some((current_thread_id, current_session_id))
+    );
     assert_eq!(picker.items[picker.selected].turn_id, second_turn);
     assert_eq!(picker.items[picker.selected].prompt, "second prompt");
-    assert!(app.status_message.contains("fork"));
+    assert!(app.status_message.contains("Enter edit"));
+}
+
+#[tokio::test]
+async fn turn_picker_scrolls_vertically_and_selects_horizontally() {
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    let first_turn = TurnId::new();
+    let second_turn = TurnId::new();
+    app.turn_picker = Some(TurnPickerState::new(vec![
+        HistoricalTurnItem {
+            turn_id: first_turn,
+            prompt: "first\n原始请求第二行".to_owned(),
+            attachment_paths: Vec::new(),
+            preview: Vec::new(),
+        },
+        HistoricalTurnItem {
+            turn_id: second_turn,
+            prompt: "second\n".repeat(20),
+            attachment_paths: Vec::new(),
+            preview: Vec::new(),
+        },
+    ]));
+
+    let mut terminal = Terminal::new(TestBackend::new(60, 12)).expect("terminal");
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw latest");
+    let initial_scroll = app.turn_picker.as_ref().unwrap().scroll_offset;
+    assert!(initial_scroll > 0);
+    assert_eq!(
+        app.turn_picker.as_ref().unwrap().selected_turn_id(),
+        Some(second_turn)
+    );
+    handle_key(
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("scroll up");
+    assert_eq!(
+        app.turn_picker.as_ref().map(|picker| picker.scroll_offset),
+        Some(initial_scroll - 1)
+    );
+    assert_eq!(
+        app.turn_picker.as_ref().map(|picker| picker.selected),
+        Some(1)
+    );
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("manual scroll survives redraw");
+    assert_eq!(
+        app.turn_picker.as_ref().unwrap().scroll_offset,
+        initial_scroll - 1
+    );
+    handle_key(
+        KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("older");
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw oldest");
+    assert_eq!(
+        app.turn_picker.as_ref().unwrap().selected_turn_id(),
+        Some(first_turn)
+    );
+    assert_eq!(app.turn_picker.as_ref().unwrap().scroll_offset, 0);
+    let rendered = terminal_buffer_display_rows(&terminal).join("\n");
+    assert!(rendered.contains("first"));
+    assert!(rendered.contains("原始请求第二行"));
+
+    handle_key(
+        KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("select next turn");
+    assert_eq!(
+        app.turn_picker.as_ref().map(|picker| picker.selected),
+        Some(1)
+    );
+    assert_eq!(
+        app.turn_picker
+            .as_ref()
+            .map(|picker| picker.selected_turn_id()),
+        Some(Some(second_turn))
+    );
+    handle_key(
+        KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("end");
+    let bottom = app.turn_picker.as_ref().unwrap().scroll_offset;
+    handle_key(
+        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("bottom clamp");
+    assert_eq!(app.turn_picker.as_ref().unwrap().scroll_offset, bottom);
+    handle_key(
+        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("up from bottom");
+    assert_eq!(app.turn_picker.as_ref().unwrap().scroll_offset, bottom - 1);
+    assert!(overlay_uses_native_mouse(&app));
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Drag(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        assert!(
+            handle_mouse(
+                MouseEvent {
+                    kind,
+                    column: 5,
+                    row: 3,
+                    modifiers: KeyModifiers::NONE
+                },
+                &mut app
+            )
+            .is_none()
+        );
+    }
+    assert_eq!(
+        app.turn_picker.as_ref().unwrap().selected_turn_id(),
+        Some(second_turn)
+    );
+    let session = app.session_id;
+    app.input.set_text("未发送的草稿");
+    handle_key(
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("close");
+    assert!(app.turn_picker.is_none());
+    assert_eq!(app.session_id, session);
+    assert_eq!(app.input.text(), "未发送的草稿");
 }
 
 #[tokio::test]
@@ -987,7 +1149,7 @@ fn historical_turn_items_deduplicate_turn_updates_and_ignore_missing_ids() {
         session_id,
         task_id,
         RuntimeEventType::TaskCreated,
-        json!({"payload": {"prompt": "initial"}}),
+        json!({"payload": {"prompt": "initial", "attachments": [{"path": "note.txt"}]}}),
     );
     initial.turn_id = Some(turn);
     let mut updated = transcript_event(
@@ -995,7 +1157,7 @@ fn historical_turn_items_deduplicate_turn_updates_and_ignore_missing_ids() {
         session_id,
         task_id,
         RuntimeEventType::TurnUpdated,
-        json!({"payload": {"prompt": "updated"}}),
+        json!({"payload": {"prompt": "  updated\n原文  "}}),
     );
     updated.turn_id = Some(turn);
     let mut assistant = transcript_event(
@@ -1016,8 +1178,361 @@ fn historical_turn_items_deduplicate_turn_updates_and_ignore_missing_ids() {
     let items = historical_turn_items(&[initial, updated, assistant, missing_id]);
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].turn_id, turn);
-    assert_eq!(items[0].prompt, "updated");
+    assert_eq!(items[0].prompt, "  updated\n原文  ");
+    assert_eq!(items[0].attachment_paths, ["note.txt"]);
     assert_eq!(items[0].preview[0].text, "assistant preview");
+}
+
+#[test]
+fn historical_turn_items_use_causal_turn_ids_and_hide_steering_prompts() {
+    let session_id = SessionId::new();
+    let task_id = TaskId::new();
+    let visible_turn = TurnId::new();
+    let steer_turn = TurnId::new();
+    let mut visible = transcript_event(
+        1,
+        session_id,
+        task_id,
+        RuntimeEventType::TaskCreated,
+        json!({"payload": {"prompt": "causal prompt"}}),
+    );
+    visible.causal_context.turn_id = Some(visible_turn);
+    let mut steer = transcript_event(
+        2,
+        session_id,
+        task_id,
+        RuntimeEventType::TurnQueued,
+        json!({"payload": {"prompt": "steer prompt", "steer": true}}),
+    );
+    steer.turn_id = Some(steer_turn);
+
+    let items = historical_turn_items(&[visible, steer]);
+
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].turn_id, visible_turn);
+    assert_eq!(items[0].prompt, "causal prompt");
+}
+
+#[tokio::test]
+async fn enter_restores_prompt_before_its_reply_without_submitting_and_preserves_source() {
+    let _guard = env_lock_guard().await;
+    struct RestoreHome(Option<std::ffi::OsString>);
+    impl Drop for RestoreHome {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.0 {
+                    Some(value) => std::env::set_var("GOLUTRA_AGENT_HOME", value),
+                    None => std::env::remove_var("GOLUTRA_AGENT_HOME"),
+                }
+            }
+        }
+    }
+    let home = tempfile::tempdir().expect("home");
+    let cwd = tempfile::tempdir().expect("workspace");
+    let _restore = RestoreHome(std::env::var_os("GOLUTRA_AGENT_HOME"));
+    unsafe {
+        std::env::set_var("GOLUTRA_AGENT_HOME", home.path());
+    }
+    apply_auth_mock().expect("isolated mock provider");
+    let transport = RuntimeTransport::Embedded(
+        golutra_agent_client::EmbeddedTransport::from_home_and_cwd(home.path(), cwd.path())
+            .await
+            .expect("transport"),
+    );
+    let session_id = transport.default_session_id();
+    for prompt in ["first saved request", "second saved request"] {
+        assert!(
+            transport
+                .send_command(session_command(
+                    session_id,
+                    SessionCommandKind::Prompt,
+                    json!({"prompt": prompt, "yolo": true})
+                ))
+                .await
+                .expect("prompt")
+                .accepted
+        );
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let history = load_complete_event_history(&transport, session_id, None)
+                    .await
+                    .expect("history");
+                if let Some(created) = history
+                    .events
+                    .iter()
+                    .rev()
+                    .find(|event| event.event_type == RuntimeEventType::TaskCreated)
+                    && history.events.iter().any(|event| {
+                        event.task_id == created.task_id
+                            && event.sequence_no > created.sequence_no
+                            && event.event_type.is_task_terminal()
+                    })
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("mock task finished");
+    }
+    let parent = load_complete_event_history(&transport, session_id, None)
+        .await
+        .expect("parent history");
+    let items = historical_turn_items(&parent.events);
+    assert_eq!(items.len(), 2);
+    assert!(
+        !items[0].preview.is_empty(),
+        "fixture includes a prior reply"
+    );
+    for selected in [1, 0] {
+        let mut app = TuiApp::new(
+            transport.default_thread_id(),
+            session_id,
+            None,
+            false,
+            "ready (mock)".to_owned(),
+            None,
+        );
+        app.workspace_path = cwd.path().to_path_buf();
+        app.apply_loaded_history(
+            load_complete_event_history(&transport, session_id, None)
+                .await
+                .expect("load source"),
+        );
+        app.turn_picker = Some(TurnPickerState::new(items.clone()));
+        app.turn_picker.as_mut().unwrap().selected = selected;
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
+        terminal
+            .draw(|frame| draw_ui(frame, &mut app))
+            .expect("history preview");
+        let original_prompt = app.turn_picker.as_ref().unwrap().items[selected]
+            .prompt
+            .clone();
+        std::sync::Arc::make_mut(&mut app.turn_picker.as_mut().unwrap().items)[selected].prompt =
+            "stale prompt".to_owned();
+        app.edit_selected_turn(&transport).await;
+        app.poll_session_load(&transport, true).await;
+        assert_eq!(app.session_id, session_id);
+        assert!(app.status_message.contains("history changed"));
+        std::sync::Arc::make_mut(&mut app.turn_picker.as_mut().unwrap().items)[selected].prompt =
+            original_prompt;
+        handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut app,
+            &transport,
+        )
+        .await
+        .expect("confirm");
+        app.poll_session_load(&transport, true).await;
+        assert!(app.turn_picker.is_none(), "{}", app.status_message);
+        assert_ne!(app.session_id, session_id);
+        assert_eq!(app.input.text(), items[selected].prompt);
+        handle_key(
+            KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Repeat),
+            &mut app,
+            &transport,
+        )
+        .await
+        .expect("ignore held Enter");
+        assert_eq!(app.input.text(), items[selected].prompt);
+        assert!(app.transcript.history.reflow_pending);
+        assert_eq!(historical_turn_items(&app.events).len(), selected);
+        assert!(!app.events.iter().any(|event| {
+            event
+                .payload
+                .pointer("/payload/prompt")
+                .and_then(Value::as_str)
+                == Some(items[selected].prompt.as_str())
+        }));
+        terminal
+            .draw(|frame| draw_ui(frame, &mut app))
+            .expect("restored composer");
+        assert!(
+            terminal_buffer_display_rows(&terminal)
+                .join("\n")
+                .contains(&items[selected].prompt)
+        );
+        let unchanged = load_complete_event_history(&transport, session_id, None)
+            .await
+            .expect("source unchanged");
+        assert!(
+            unchanged.events.starts_with(&parent.events),
+            "existing source events are immutable"
+        );
+        assert_eq!(historical_turn_items(&unchanged.events).len(), 2);
+        app.reap_session_loads(true).await;
+        assert!(
+            transport
+                .list_threads(100)
+                .await
+                .unwrap()
+                .iter()
+                .any(|thread| thread.thread_id == app.thread_id)
+        );
+    }
+    transport.close().await.expect("close runtime");
+}
+
+#[tokio::test]
+async fn failed_prompt_restore_keeps_session_draft_and_selection() {
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    let mut app = TuiApp::new(
+        transport.default_thread_id(),
+        transport.default_session_id(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.input.set_text("keep draft");
+    app.turn_picker = Some(TurnPickerState::new(vec![HistoricalTurnItem {
+        turn_id: TurnId::new(),
+        prompt: "unavailable prompt".to_owned(),
+        attachment_paths: Vec::new(),
+        preview: Vec::new(),
+    }]));
+    handle_key(
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("handled error");
+    app.poll_session_load(&transport, true).await;
+    assert_eq!(app.session_id, transport.default_session_id());
+    assert_eq!(app.input.text(), "keep draft");
+    assert!(app.turn_picker.is_some());
+    assert!(app.status_message.contains("Could not restore"));
+}
+
+#[test]
+fn turn_picker_renders_selected_prompt_beyond_u16_history_rows() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "mock".to_owned(),
+        None,
+    );
+    app.turn_picker = Some(TurnPickerState::new(vec![
+        HistoricalTurnItem {
+            turn_id: TurnId::new(),
+            prompt: "old request".to_owned(),
+            attachment_paths: Vec::new(),
+            preview: vec![HistoricalTurnPreview {
+                kind: HistoricalTurnPreviewKind::Assistant,
+                text: "old reply line\n".repeat(66_000),
+            }],
+        },
+        HistoricalTurnItem {
+            turn_id: TurnId::new(),
+            prompt: "LATEST_BOUNDARY_PROMPT".to_owned(),
+            attachment_paths: Vec::new(),
+            preview: Vec::new(),
+        },
+    ]));
+    let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("terminal");
+    terminal
+        .draw(|frame| draw_ui(frame, &mut app))
+        .expect("draw");
+    assert!(app.turn_picker.as_ref().unwrap().scroll_offset > usize::from(u16::MAX));
+    assert!(terminal_buffer_text(&terminal).contains("LATEST_BOUNDARY_PROMPT"));
+}
+
+#[tokio::test]
+async fn left_reaches_original_prompt_after_loading_history() {
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    let prompts = [
+        "'/Users/skyseek/Desktop/test/chaojimali'，写一个超级玛丽，尽量还原原版",
+        "继续",
+        "玩不了啊，而且角色悬浮在空中",
+        "继续",
+        "继续",
+        "不能移动",
+    ];
+    let turns = prompts.map(|_| TurnId::new());
+    let mut events = prompts
+        .iter()
+        .enumerate()
+        .map(|(index, prompt)| {
+            let mut event = transcript_event(
+                index as u64 + 1,
+                app.session_id,
+                TaskId::new(),
+                RuntimeEventType::TaskCreated,
+                json!({"payload": {"prompt": prompt}}),
+            );
+            event.turn_id = Some(turns[index]);
+            event
+        })
+        .collect::<Vec<_>>();
+    let mut update = events[0].clone();
+    update.sequence_no = 100;
+    update.event_type = RuntimeEventType::TurnUpdated;
+    events.push(update);
+    events.reverse();
+    app.turn_picker = Some(TurnPickerState::new(historical_turn_items(&events)));
+    assert_eq!(app.turn_picker.as_ref().unwrap().items.len(), 6);
+    let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("terminal");
+    for index in (0..6).rev() {
+        terminal
+            .draw(|frame| draw_ui(frame, &mut app))
+            .expect("draw history");
+        let picker = app.turn_picker.as_ref().unwrap();
+        assert_eq!(picker.selected_turn_id(), Some(turns[index]));
+        assert_eq!(picker.items[picker.selected].prompt, prompts[index]);
+        if index > 0 {
+            handle_key(
+                KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+                &mut app,
+                &transport,
+            )
+            .await
+            .expect("older prompt");
+        }
+    }
+    let rendered = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(rendered.contains("chaojimali"));
+    handle_key(
+        KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+        &mut app,
+        &transport,
+    )
+    .await
+    .expect("oldest boundary");
+    assert_eq!(
+        app.turn_picker.as_ref().unwrap().selected_turn_id(),
+        Some(turns[0])
+    );
+    for turn in turns.iter().skip(1) {
+        handle_key(
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            &mut app,
+            &transport,
+        )
+        .await
+        .expect("newer prompt");
+        assert_eq!(
+            app.turn_picker.as_ref().unwrap().selected_turn_id(),
+            Some(*turn)
+        );
+    }
 }
 
 #[tokio::test]
@@ -1857,6 +2372,7 @@ async fn cancelling_resume_keeps_the_submitted_slash_command_in_transcript() {
             .await
             .expect("submit /resume")
     );
+    app.poll_session_load(&transport, true).await;
     assert!(app.input.is_empty());
     app.command_messages
         .retain(|item| item.role == TranscriptRole::User);
@@ -1932,6 +2448,7 @@ async fn resume_without_sessions_reports_the_empty_result_under_the_slash_comman
             .await
             .expect("submit /resume")
     );
+    app.poll_session_load(&transport, true).await;
     assert!(app.resume_picker.is_none());
     assert_eq!(app.status_message, "No sessions in this cwd yet");
     assert_eq!(
@@ -2637,6 +3154,8 @@ fn resume_keeps_an_oversized_latest_response_above_the_composer() {
     app.resume_picker = Some(ResumePickerState::new(vec![ResumeThreadItem {
         thread_id: app.thread_id,
         session_id,
+        parent_thread_id: None,
+        forked_from_turn_id: None,
         title: "resume target".to_owned(),
         preview: "long response".to_owned(),
         metadata: String::new(),
@@ -5322,6 +5841,7 @@ async fn runtime_prompt_stacks_above_user_workflows_and_restores_them() {
         provider_status: None,
         developer_projection: None,
         remote: false,
+        controller_mode: RuntimeControllerMode::Controller,
     });
     assert!(app.auth_dialog.is_some());
     assert!(app.export_flow.is_some());
@@ -6634,6 +7154,7 @@ async fn auth_escape_stays_closed_during_waiting_authentication_refresh() {
             provider_status: None,
             developer_projection: None,
             remote: false,
+            controller_mode: RuntimeControllerMode::Controller,
         });
     };
     refresh(&mut app, &projection);
@@ -8427,7 +8948,7 @@ fn file_changes_are_compact_in_normal_mode_and_detailed_in_developer_mode() {
     assert!(developer_text.contains("changes files=1 +2 -1 complete=true"));
 }
 
-fn transcript_event(
+pub(super) fn transcript_event(
     sequence_no: u64,
     session_id: SessionId,
     task_id: TaskId,
@@ -8509,7 +9030,7 @@ fn terminal_buffer_rows(terminal: &Terminal<TestBackend>) -> Vec<String> {
         .collect()
 }
 
-fn terminal_buffer_display_rows(terminal: &Terminal<TestBackend>) -> Vec<String> {
+pub(super) fn terminal_buffer_display_rows(terminal: &Terminal<TestBackend>) -> Vec<String> {
     let buffer = terminal.backend().buffer();
     let area = buffer.area;
     (area.top()..area.bottom())
@@ -9678,13 +10199,11 @@ fn overlay_mouse_clicks_select_every_interactive_surface() {
         .into_iter()
         .find(|region| region.press == UiMousePress::Resume(1))
         .expect("second session region");
-    assert_eq!(
-        click_overlay(&mut app, second.area.x, second.area.y),
-        Some(UiMouseActivation::ResumeSession)
-    );
+    assert_eq!(click_overlay(&mut app, second.area.x, second.area.y), None);
     assert_eq!(
         app.resume_picker.as_ref().expect("resume picker").selected,
-        1
+        0,
+        "native terminal selection leaves the picker unchanged"
     );
     app.resume_picker = None;
 
@@ -10176,6 +10695,8 @@ fn resume_item(title: &str) -> ResumeThreadItem {
     ResumeThreadItem {
         thread_id: ThreadId::new(),
         session_id: SessionId::new(),
+        parent_thread_id: None,
+        forked_from_turn_id: None,
         title: title.to_owned(),
         preview: format!("{title} preview"),
         metadata: String::new(),
@@ -10258,6 +10779,8 @@ async fn session_pickers_support_page_boundary_and_wheel_navigation() {
         .map(|index| ResumeThreadItem {
             thread_id: ThreadId::new(),
             session_id: SessionId::new(),
+            parent_thread_id: None,
+            forked_from_turn_id: None,
             title: format!("session-{index}"),
             preview: format!("preview-{index}"),
             metadata: String::new(),
@@ -10318,7 +10841,11 @@ async fn session_pickers_support_page_boundary_and_wheel_navigation() {
         },
         &mut app,
     );
-    assert_eq!(app.resume_picker.as_ref().expect("picker").selected, 1);
+    assert_eq!(
+        app.resume_picker.as_ref().expect("picker").selected,
+        0,
+        "native terminal wheel mode must not let an application mouse event select a session"
+    );
 
     app.resume_picker = None;
     app.export_flow = Some(ExportFlowState {
@@ -10380,6 +10907,7 @@ async fn session_picker_actions_update_runtime_and_visible_items() {
     app.open_resume_picker(&transport)
         .await
         .expect("open session picker");
+    app.poll_session_load(&transport, true).await;
 
     {
         let picker = app.resume_picker.as_mut().expect("resume picker");
@@ -10448,6 +10976,90 @@ async fn session_picker_actions_update_runtime_and_visible_items() {
     assert!(threads.iter().all(|thread| {
         thread.thread_id != archive_thread_id && thread.thread_id != delete_thread_id
     }));
+
+    {
+        let picker = app.resume_picker.as_mut().expect("resume picker");
+        picker.selected = picker
+            .items
+            .iter()
+            .position(|item| item.thread_id == current_thread_id)
+            .expect("current target");
+        assert!(picker.begin_action(SessionPickerAction::Archive));
+    }
+    app.apply_session_picker_action(&transport)
+        .await
+        .expect("current session guard");
+    assert!(
+        app.status_message
+            .contains("currently attached session cannot be archived or deleted")
+    );
+    assert!(
+        transport
+            .list_threads(50)
+            .await
+            .expect("runtime threads after guard")
+            .iter()
+            .any(|thread| thread.thread_id == current_thread_id)
+    );
+}
+
+#[tokio::test]
+async fn resume_picker_loads_all_session_pages() {
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    for index in 0..105 {
+        let ack = transport
+            .send_command(session_command(
+                SessionId::new(),
+                SessionCommandKind::Create,
+                json!({
+                    "_thread_id": ThreadId::new().to_string(),
+                    "prompt": format!("paged session {index}"),
+                }),
+            ))
+            .await
+            .expect("create paged session");
+        assert!(ack.accepted);
+    }
+    let mut app = TuiApp::new(
+        transport.default_thread_id(),
+        transport.default_session_id(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+
+    app.open_resume_picker(&transport)
+        .await
+        .expect("open paged session picker");
+    app.layout.transcript = Rect::new(0, 0, 80, 24);
+    app.poll_session_load(&transport, true).await;
+
+    assert_eq!(app.resume_picker.as_ref().expect("picker").items.len(), 105);
+    app.poll_session_load(&transport, true).await;
+    let visible_items = app.resume_picker.as_ref().unwrap().items.iter();
+    assert!(
+        visible_items
+            .clone()
+            .all(|item| item.metadata.starts_with("updated="))
+    );
+    assert!(visible_items.clone().all(|item| {
+        !item.metadata.contains("status=")
+            && !item.metadata.contains("verify=")
+            && !item.metadata.contains("model=")
+    }));
+    app.resume_picker.as_mut().unwrap().select_last();
+    app.poll_session_load(&transport, true).await;
+    app.poll_session_load(&transport, true).await;
+    assert!(
+        app.resume_picker
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .all(|item| item.metadata.starts_with("updated="))
+    );
+    app.shutdown_pending_operations().await;
 }
 
 #[tokio::test]
@@ -10518,6 +11130,10 @@ async fn resume_thread_clears_previous_visible_transcript_state() {
     app.resume_thread_from_command(&transport, target_thread_id)
         .await
         .expect("resume");
+    app.poll_session_load(&transport, true).await;
+
+    assert_eq!(app.thread_id, target_thread_id);
+    assert_eq!(app.session_id, target_session_id);
 
     assert_eq!(
         app.command_messages
@@ -10535,10 +11151,229 @@ async fn resume_thread_clears_previous_visible_transcript_state() {
         "resume success must leave a command result: {:?}",
         app.command_messages[1].body
     );
-    assert!(app.events.is_empty());
+    assert!(!app.events.is_empty());
     assert!(app.input.is_empty());
     assert_eq!(app.slash_selected, 0);
     assert_eq!(app.transcript.scroll.offset_from_bottom, 0);
+}
+
+#[tokio::test]
+async fn resuming_the_current_thread_is_a_noop_and_keeps_draft_and_scroll() {
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    let thread_id = transport.default_thread_id();
+    let session_id = transport.default_session_id();
+    transport
+        .send_command(session_command(
+            session_id,
+            SessionCommandKind::Create,
+            json!({"_thread_id": thread_id.to_string(), "prompt": "current"}),
+        ))
+        .await
+        .expect("register current thread");
+    let mut app = TuiApp::new(
+        thread_id,
+        session_id,
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.input.set_text("draft that must survive");
+    app.events.push(transcript_event(
+        1,
+        session_id,
+        TaskId::new(),
+        RuntimeEventType::AssistantMessage,
+        json!({"content": "existing response"}),
+    ));
+    app.record_slash_command("/resume");
+    app.transcript.scroll.offset_from_bottom = 7;
+    app.transcript.scroll.row_count = 18;
+    app.transcript.scroll.follow_tail = false;
+
+    app.resume_thread_from_command(&transport, thread_id)
+        .await
+        .expect("same-thread resume");
+    app.poll_session_load(&transport, true).await;
+
+    assert_eq!(app.thread_id, thread_id);
+    assert_eq!(app.session_id, session_id);
+    assert_eq!(app.input.text(), "draft that must survive");
+    assert_eq!(app.events.len(), 1);
+    assert_eq!(app.transcript.scroll.offset_from_bottom, 7);
+    assert_eq!(app.transcript.scroll.row_count, 18);
+    assert_eq!(
+        app.command_messages
+            .iter()
+            .filter(|item| item.role == TranscriptRole::User)
+            .count(),
+        1,
+        "same-thread resume must not duplicate the slash command"
+    );
+    assert_eq!(
+        app.command_messages
+            .iter()
+            .filter(|item| item.role == TranscriptRole::CommandResult)
+            .count(),
+        0,
+        "same-thread resume must not append a replay result row"
+    );
+}
+
+#[tokio::test]
+async fn resume_picker_completion_does_not_duplicate_the_original_slash_command() {
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    let target_thread_id = ThreadId::new();
+    let target_session_id = SessionId::new();
+    transport
+        .send_command(session_command(
+            target_session_id,
+            SessionCommandKind::Prompt,
+            json!({
+                "prompt": "resume target",
+                "_thread_id": target_thread_id.to_string(),
+            }),
+        ))
+        .await
+        .expect("create resumable thread");
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        transport.default_session_id(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.record_slash_command("/resume");
+
+    app.resume_thread_from_command(&transport, target_thread_id)
+        .await
+        .expect("resume target");
+    app.poll_session_load(&transport, true).await;
+
+    assert_eq!(
+        app.command_messages
+            .iter()
+            .filter(|item| item.role == TranscriptRole::User)
+            .count(),
+        1,
+        "picker completion must keep one original /resume command"
+    );
+}
+
+#[tokio::test]
+async fn failed_prompt_edit_branch_cleanup_removes_the_child_thread() {
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    let parent_session_id = transport.default_session_id();
+    let parent_thread_id = transport.default_thread_id();
+    let child_session_id = SessionId::new();
+    let child_thread_id = ThreadId::new();
+    transport
+        .send_command(session_command(
+            child_session_id,
+            SessionCommandKind::Create,
+            json!({
+                "_thread_id": child_thread_id.to_string(),
+                "parent_thread_id": parent_thread_id.to_string(),
+                "prompt": "temporary prompt edit branch",
+            }),
+        ))
+        .await
+        .expect("register child branch");
+    let app = TuiApp::new(
+        parent_thread_id,
+        parent_session_id,
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+
+    session_loading::cleanup_branch(&transport, parent_session_id, child_thread_id)
+        .await
+        .expect("cleanup child branch");
+
+    let threads = transport.list_threads(100).await.expect("list threads");
+    assert!(
+        threads
+            .iter()
+            .all(|thread| thread.thread_id != child_thread_id),
+        "cleanup status: {}; threads: {threads:?}",
+        app.status_message
+    );
+}
+
+#[tokio::test]
+async fn observer_resume_view_blocks_new_prompt_until_takeover() {
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    let mut app = TuiApp::new(
+        transport.default_thread_id(),
+        transport.default_session_id(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.controller_mode = RuntimeControllerMode::Observer;
+    app.input.set_text("must remain a draft");
+
+    app.send_prompt(&transport).await.expect("observer prompt");
+
+    assert_eq!(app.input.text(), "must remain a draft");
+    assert!(app.status_message.contains("use /takeover before sending"));
+    app.send_steering_prompt(&transport, "must also remain a draft".to_owned())
+        .await
+        .expect("observer steering");
+    assert!(app.status_message.contains("use /takeover before sending"));
+}
+
+#[tokio::test]
+async fn observer_resume_view_allows_takeover_command_to_reach_runtime() {
+    let transport = RuntimeTransport::in_memory().await.expect("transport");
+    let mut app = TuiApp::new(
+        transport.default_thread_id(),
+        transport.default_session_id(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.controller_mode = RuntimeControllerMode::Observer;
+    app.input.set_text("/takeover");
+
+    app.send_prompt(&transport).await.expect("takeover command");
+
+    assert!(!app.status_message.contains("use /takeover before sending"));
+    assert!(app.input.is_empty());
+}
+
+#[test]
+fn resume_picker_leaves_native_terminal_selection_enabled() {
+    let mut app = TuiApp::new(
+        ThreadId::new(),
+        SessionId::new(),
+        None,
+        false,
+        "ready (mock)".to_owned(),
+        None,
+    );
+    app.resume_picker = Some(ResumePickerState::new(vec![resume_item(
+        "copyable history",
+    )]));
+    assert!(overlay_uses_native_mouse(&app));
+    assert!(
+        handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 4,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut app,
+        )
+        .is_none()
+    );
+    assert_eq!(app.resume_picker.as_ref().unwrap().selected, 0);
 }
 
 #[tokio::test]
@@ -10597,6 +11432,8 @@ async fn export_enters_running_before_poll_and_finishes_asynchronously() {
         picker: ResumePickerState::new(vec![ResumeThreadItem {
             thread_id,
             session_id,
+            parent_thread_id: None,
+            forked_from_turn_id: None,
             title: "export fixture".to_owned(),
             preview: "export this session".to_owned(),
             metadata: String::new(),
@@ -10680,11 +11517,15 @@ fn start_new_session_resets_visible_tui_state() {
     app.transcript.scroll.offset_from_bottom = 7;
     app.transcript.scroll.row_count = 20;
     app.transcript.scroll.follow_tail = false;
+    app.controller_mode = RuntimeControllerMode::Observer;
+    app.last_escape_at = Some(Instant::now());
 
     app.start_new_session();
 
     assert_ne!(app.thread_id, original_thread_id);
     assert_ne!(app.session_id, original_session_id);
+    assert_eq!(app.controller_mode, RuntimeControllerMode::Controller);
+    assert!(app.last_escape_at.is_none());
     assert!(app.task_id.is_none());
     assert!(app.projection.is_none());
     assert!(app.developer_projection.is_none());
@@ -11194,17 +12035,22 @@ fn resume_picker_offset_keeps_selected_item_visible() {
 }
 
 #[test]
-fn turn_picker_scroll_tracks_variable_height_blocks() {
+fn turn_picker_manual_scroll_does_not_follow_selection() {
     let ranges = [(0, 3), (3, 9), (9, 12)];
-    assert_eq!(turn_picker_scroll_offset(&ranges, 0, 4), 0);
-    assert_eq!(turn_picker_scroll_offset(&ranges, 1, 4), 3);
-    assert_eq!(turn_picker_scroll_offset(&ranges, 2, 4), 8);
+    assert_eq!(turn_picker_scroll_offset(&ranges, 0, 4, 0), 0);
+    assert_eq!(turn_picker_scroll_offset(&ranges, 1, 4, 0), 0);
+    assert_eq!(turn_picker_scroll_offset(&ranges, 2, 4, 0), 0);
+    assert_eq!(turn_picker_scroll_offset(&ranges, 0, 4, 8), 8);
 }
 
 #[test]
-fn turn_picker_scroll_starts_long_block_at_its_first_line() {
+fn turn_picker_scroll_clamps_to_document_bounds() {
     let ranges = [(0, 2), (2, 12)];
-    assert_eq!(turn_picker_scroll_offset(&ranges, 1, 4), 2);
+    assert_eq!(turn_picker_scroll_offset(&ranges, 1, 4, 0), 0);
+    let long_range = [(0, 12)];
+    assert_eq!(turn_picker_scroll_offset(&long_range, 0, 4, 4), 4);
+    assert_eq!(turn_picker_scroll_offset(&long_range, 0, 4, usize::MAX), 8);
+    assert_eq!(turn_picker_scroll_offset(&[], 0, 4, usize::MAX), 0);
 }
 
 #[test]

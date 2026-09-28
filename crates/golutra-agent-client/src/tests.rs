@@ -3628,9 +3628,13 @@ async fn queued_prompts_can_be_updated_and_cancelled_durably() {
         .send_command(command(session_id, "sleep"))
         .await
         .expect("blocking prompt");
-    wait_for_status(&transport, session_id, TaskStatus::WaitingApproval).await;
+    let waiting = wait_for_status(&transport, session_id, TaskStatus::WaitingApproval).await;
 
-    for prompt in ["original queued prompt", "cancelled queued prompt"] {
+    for prompt in [
+        "original queued prompt",
+        "cancelled queued prompt",
+        "last queued prompt",
+    ] {
         let ack = transport
             .send_command(command_with_payload(
                 session_id,
@@ -3705,7 +3709,7 @@ async fn queued_prompts_can_be_updated_and_cancelled_durably() {
         .recoverable_pending_turns(session_id, Some(active_task_id))
         .await
         .expect("recoverable turns");
-    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered.len(), 2);
     assert_eq!(recovered[0].pending.turn_id, updated_turn_id);
     assert_eq!(recovered[0].pending.content, "edited queued prompt");
 
@@ -3734,11 +3738,79 @@ async fn queued_prompts_can_be_updated_and_cancelled_durably() {
     transport
         .send_command(runtime_command(
             session_id,
-            SessionCommandKind::Abort,
-            json!({}),
+            SessionCommandKind::Deny,
+            json!({"approval_id": waiting["pending_approval"]}),
         ))
         .await
-        .expect("abort active task");
+        .expect("release first turn");
+    let completed = wait_for_task_completed_count(&transport, session_id, 1).await;
+    let parent = transport
+        .host
+        .storage
+        .repositories
+        .threads
+        .by_session(session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let consumed = completed
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.event_type,
+                RuntimeEventType::TaskCreated | RuntimeEventType::TurnStarted
+            )
+        })
+        .filter_map(|event| event.turn_id)
+        .collect::<Vec<_>>();
+    assert_eq!(consumed.len(), 3);
+    for (index, turn_id) in consumed.iter().enumerate() {
+        let child = transport
+            .fork_thread_before_turn(parent.thread_id, *turn_id)
+            .await
+            .unwrap();
+        let events = transport
+            .host
+            .storage
+            .store
+            .load_events(child.session_id, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == RuntimeEventType::AssistantMessage)
+                .count(),
+            index
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.event_type != RuntimeEventType::TurnCancelled)
+        );
+        if index > 0 {
+            for source in completed.iter().filter(|event| {
+                event.turn_id == Some(consumed[0])
+                    && event.event_type == RuntimeEventType::ToolCompleted
+            }) {
+                assert!(
+                    events
+                        .iter()
+                        .any(|event| event.event_type == RuntimeEventType::ToolCompleted
+                            && event.payload.get("call_id") == source.payload.get("call_id"))
+                );
+            }
+        }
+    }
+    let after = transport
+        .host
+        .storage
+        .store
+        .load_events(session_id, None, None)
+        .await
+        .unwrap();
+    assert!(after.starts_with(&completed));
+    transport.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -6408,6 +6480,431 @@ async fn rollout_sync_removes_only_projections_without_thread_records() {
         "user data\n"
     );
     assert!(uuid_directory.is_dir());
+}
+
+#[tokio::test]
+async fn fork_before_turn_excludes_selected_and_future_events_and_preserves_parent() {
+    let transport = EmbeddedTransport::in_memory().await.expect("transport");
+    let session_id = transport.default_session_id();
+    transport
+        .host
+        .upsert_current_thread(session_id, &json!({"prompt": "fixture"}))
+        .await
+        .expect("register source thread");
+    let turns = [TurnId::new(), TurnId::new()];
+    for (index, turn) in turns.iter().enumerate() {
+        let task_id = TaskId::new();
+        let command_id = CommandId::new();
+        let mut command_received = history_projection_event(
+            transport.host.next_sequence_no(),
+            *turn,
+            RuntimeEventType::CommandReceived,
+            json!({"command_id": command_id}),
+        );
+        command_received.session_id = session_id;
+        command_received.turn_id = None;
+        command_received.task_id = None;
+        transport
+            .host
+            .record_event(command_received)
+            .await
+            .expect("seed command journal event");
+        for (event_type, payload) in [
+            (
+                RuntimeEventType::TaskCreated,
+                json!({
+                    "command_id": command_id,
+                    "payload": {"prompt": format!("prompt {index}")}
+                }),
+            ),
+            (
+                RuntimeEventType::AssistantMessage,
+                json!({"content": format!("answer {index}")}),
+            ),
+            (
+                RuntimeEventType::TaskCompleted,
+                json!({"summary": "done", "status": "completed"}),
+            ),
+        ] {
+            let mut event = history_projection_event(
+                transport.host.next_sequence_no(),
+                *turn,
+                event_type,
+                payload,
+            );
+            event.session_id = session_id;
+            event.task_id = Some(task_id);
+            transport
+                .host
+                .record_event(event)
+                .await
+                .expect("seed event");
+        }
+    }
+    let parent = transport
+        .host
+        .storage
+        .store
+        .load_events(session_id, None, None)
+        .await
+        .expect("parent");
+    for (index, turn) in turns.iter().enumerate() {
+        let child = transport
+            .fork_thread_before_turn(transport.default_thread_id(), *turn)
+            .await
+            .expect("branch");
+        let events = transport
+            .host
+            .storage
+            .store
+            .load_events(child.session_id, None, None)
+            .await
+            .expect("child");
+        let prompts = events
+            .iter()
+            .filter(|event| event.event_type == RuntimeEventType::TaskCreated)
+            .collect::<Vec<_>>();
+        assert_eq!(prompts.len(), index);
+        let answers = events
+            .iter()
+            .filter(|event| event.event_type == RuntimeEventType::AssistantMessage)
+            .collect::<Vec<_>>();
+        assert_eq!(answers.len(), index);
+        if index > 0 {
+            assert_eq!(answers[0].payload["content"], "answer 0");
+        }
+        assert_eq!(child.parent_thread_id, Some(transport.default_thread_id()));
+        assert_eq!(child.forked_from_turn_id, Some(*turn));
+        let command_id = parent
+            .iter()
+            .find(|event| event.turn_id == Some(*turn))
+            .and_then(|event| event.payload.get("command_id"))
+            .and_then(Value::as_str)
+            .expect("selected turn command id");
+        let boundary = parent
+            .iter()
+            .find(|event| {
+                event.event_type == RuntimeEventType::CommandReceived
+                    && event.payload.get("command_id").and_then(Value::as_str) == Some(command_id)
+            })
+            .expect("selected command journal event")
+            .sequence_no
+            - 1;
+        assert_eq!(child.forked_from_sequence_no, Some(boundary));
+        assert!(
+            events
+                .iter()
+                .all(|event| !parent.iter().any(|source| source.id == event.id))
+        );
+    }
+    assert_eq!(
+        transport
+            .host
+            .storage
+            .store
+            .load_events(session_id, None, None)
+            .await
+            .expect("source"),
+        parent
+    );
+    let count = transport.list_threads(100).await.expect("threads").len();
+    assert!(
+        transport
+            .fork_thread_before_turn(transport.default_thread_id(), TurnId::new())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        transport.list_threads(100).await.expect("threads").len(),
+        count
+    );
+    transport.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn fork_before_turn_rejects_steers_and_in_progress_turns() {
+    let transport = EmbeddedTransport::in_memory().await.expect("transport");
+    let session_id = transport.default_session_id();
+    transport
+        .host
+        .upsert_current_thread(session_id, &json!({"prompt": "fixture"}))
+        .await
+        .expect("register source thread");
+
+    let in_progress_turn = TurnId::new();
+    let mut started = history_projection_event(
+        transport.host.next_sequence_no(),
+        in_progress_turn,
+        RuntimeEventType::TurnStarted,
+        json!({}),
+    );
+    started.session_id = session_id;
+    transport
+        .host
+        .record_event(started)
+        .await
+        .expect("record in-progress turn");
+    let error = transport
+        .fork_thread_before_turn(transport.default_thread_id(), in_progress_turn)
+        .await
+        .expect_err("in-progress turn must not branch");
+    assert!(
+        error.to_string().contains("still in progress")
+            || error.to_string().contains("cannot be forked while")
+    );
+
+    let mut completed = history_projection_event(
+        transport.host.next_sequence_no(),
+        in_progress_turn,
+        RuntimeEventType::TaskCompleted,
+        json!({"status": "completed"}),
+    );
+    completed.session_id = session_id;
+    transport
+        .host
+        .record_event(completed)
+        .await
+        .expect("complete in-progress turn");
+
+    let steer_turn = TurnId::new();
+    let mut steer = history_projection_event(
+        transport.host.next_sequence_no(),
+        steer_turn,
+        RuntimeEventType::TurnQueued,
+        json!({"payload": {"prompt": "steer", "steer": true}}),
+    );
+    steer.session_id = session_id;
+    transport
+        .host
+        .record_event(steer)
+        .await
+        .expect("record steer");
+    let error = transport
+        .fork_thread_before_turn(transport.default_thread_id(), steer_turn)
+        .await
+        .expect_err("steer must not branch");
+    assert!(
+        error.to_string().contains("steer"),
+        "unexpected error: {error}"
+    );
+
+    assert_eq!(transport.list_threads(100).await.expect("threads").len(), 1);
+    transport.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn fork_queued_turns_keeps_complete_predecessors_and_filters_future_commands() {
+    let transport = EmbeddedTransport::in_memory().await.expect("transport");
+    let session_id = transport.default_session_id();
+    transport
+        .host
+        .upsert_current_thread(session_id, &json!({"prompt": "A"}))
+        .await
+        .unwrap();
+    let turns = [TurnId::new(), TurnId::new(), TurnId::new(), TurnId::new()];
+    let commands = [
+        CommandId::new(),
+        CommandId::new(),
+        CommandId::new(),
+        CommandId::new(),
+    ];
+    let task = TaskId::new();
+    // B/C/D 在 A 的工具调用期间入队，B 更新、D 取消；整个 task 只有 C 的终态。
+    let fixtures = [
+        (
+            0,
+            RuntimeEventType::TaskCreated,
+            json!({"command_id": commands[0], "payload": {"prompt": "A"}}),
+        ),
+        (
+            0,
+            RuntimeEventType::ToolStarted,
+            json!({"call_id": "tool-A"}),
+        ),
+        (
+            1,
+            RuntimeEventType::CommandReceived,
+            json!({"command_id": commands[1]}),
+        ),
+        (
+            1,
+            RuntimeEventType::TurnQueued,
+            json!({"command_id": commands[1], "payload": {"prompt": "B"}, "runtime_lane": {"pending_turns": [turns[1], turns[2], turns[3]]}}),
+        ),
+        (
+            2,
+            RuntimeEventType::CommandReceived,
+            json!({"command_id": commands[2]}),
+        ),
+        (
+            2,
+            RuntimeEventType::TurnQueued,
+            json!({"command_id": commands[2], "payload": {"prompt": "C"}}),
+        ),
+        (
+            3,
+            RuntimeEventType::CommandReceived,
+            json!({"command_id": commands[3]}),
+        ),
+        (
+            3,
+            RuntimeEventType::TurnQueued,
+            json!({"command_id": commands[3], "payload": {"prompt": "D"}}),
+        ),
+        (
+            1,
+            RuntimeEventType::TurnUpdated,
+            json!({"command_id": commands[1], "payload": {"prompt": "updated B"}}),
+        ),
+        (
+            3,
+            RuntimeEventType::TurnCancelled,
+            json!({"command_id": commands[3]}),
+        ),
+        (
+            0,
+            RuntimeEventType::ToolCompleted,
+            json!({"call_id": "tool-A"}),
+        ),
+        (
+            0,
+            RuntimeEventType::AssistantMessage,
+            json!({"content": "answer A"}),
+        ),
+        (
+            1,
+            RuntimeEventType::TurnStarted,
+            json!({"payload": {"prompt": "updated B"}}),
+        ),
+        (
+            1,
+            RuntimeEventType::ToolStarted,
+            json!({"call_id": "tool-B"}),
+        ),
+        (
+            1,
+            RuntimeEventType::ToolCompleted,
+            json!({"call_id": "tool-B"}),
+        ),
+        (
+            1,
+            RuntimeEventType::AssistantMessage,
+            json!({"content": "answer B"}),
+        ),
+        (
+            2,
+            RuntimeEventType::TurnStarted,
+            json!({"payload": {"prompt": "C"}}),
+        ),
+        (
+            2,
+            RuntimeEventType::AssistantMessage,
+            json!({"content": "answer C"}),
+        ),
+        (
+            2,
+            RuntimeEventType::TaskCompleted,
+            json!({"status": "completed"}),
+        ),
+    ];
+    for (index, kind, payload) in fixtures {
+        let mut event = history_projection_event(
+            transport.host.next_sequence_no(),
+            turns[index],
+            kind,
+            payload,
+        );
+        event.session_id = session_id;
+        event.task_id = Some(task);
+        if kind == RuntimeEventType::CommandReceived {
+            event.turn_id = None;
+        }
+        transport.host.record_event(event).await.unwrap();
+    }
+    let parent = transport
+        .host
+        .storage
+        .store
+        .load_events(session_id, None, None)
+        .await
+        .unwrap();
+    for (index, turn) in turns.iter().take(3).enumerate() {
+        for before in [true, false] {
+            let child = if before {
+                transport
+                    .fork_thread_before_turn(transport.default_thread_id(), *turn)
+                    .await
+            } else {
+                transport
+                    .fork_thread(transport.default_thread_id(), Some(*turn))
+                    .await
+            }
+            .unwrap();
+            let events = transport
+                .host
+                .storage
+                .store
+                .load_events(child.session_id, None, None)
+                .await
+                .unwrap();
+            let kept = index + usize::from(!before);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| e.event_type == RuntimeEventType::AssistantMessage)
+                    .count(),
+                kept
+            );
+            let calls = events
+                .iter()
+                .filter(|e| e.event_type == RuntimeEventType::ToolStarted)
+                .map(|e| &e.payload["call_id"])
+                .collect::<Vec<_>>();
+            let results = events
+                .iter()
+                .filter(|e| e.event_type == RuntimeEventType::ToolCompleted)
+                .map(|e| &e.payload["call_id"])
+                .collect::<Vec<_>>();
+            assert_eq!(calls, results);
+            assert_eq!(calls.len(), kept.min(2));
+            for command_id in commands.iter().skip(kept) {
+                assert!(
+                    events
+                        .iter()
+                        .all(|e| e.payload.get("command_id") != Some(&json!(command_id)))
+                );
+            }
+            for event in &events {
+                if let Some(pending) = event
+                    .payload
+                    .pointer("/runtime_lane/pending_turns")
+                    .and_then(Value::as_array)
+                {
+                    assert!(pending.iter().all(|value| {
+                        events
+                            .iter()
+                            .any(|event| event.turn_id.map(|id| json!(id)).as_ref() == Some(value))
+                    }));
+                }
+            }
+            assert!(
+                events
+                    .iter()
+                    .all(|e| e.event_type != RuntimeEventType::TurnCancelled)
+            );
+        }
+    }
+    assert_eq!(
+        transport
+            .host
+            .storage
+            .store
+            .load_events(session_id, None, None)
+            .await
+            .unwrap(),
+        parent
+    );
+    transport.close().await.unwrap();
 }
 
 #[tokio::test]

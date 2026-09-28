@@ -35,7 +35,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::{AppError, AppState};
+use super::{AppError, AppState, ForkThreadRequest};
 
 const MAX_RPC_REPLAY_EVENTS: u32 = 512;
 
@@ -684,17 +684,10 @@ async fn thread_fork(
     let (transport, attachment_id) =
         resolve_transport(state, params, attachment_hint, temporary_attachment).await?;
     let thread_id = parse_thread(required_string(params, "thread_id")?)?;
-    let from_turn_id = params
-        .get("from_turn_id")
-        .and_then(Value::as_str)
-        .map(|value| {
-            value
-                .parse()
-                .map_err(|_| RpcDispatchError::new(-32602, "invalid turn_id"))
-        })
-        .transpose()?;
-    let record = transport
-        .fork_thread(thread_id, from_turn_id)
+    let request: ForkThreadRequest = serde_json::from_value(params.clone())
+        .map_err(|error| RpcDispatchError::new(-32602, format!("invalid fork request: {error}")))?;
+    let record = request
+        .execute(&transport, thread_id)
         .await
         .map_err(RpcDispatchError::from_client)?;
     Ok(json!({"attachment_id": attachment_id, "thread": record}))

@@ -31,6 +31,33 @@ use unicode_width::UnicodeWidthStr;
 const MAX_OSC52_BYTES: usize = 100 * 1024;
 static ALTERNATE_SCREEN_ACTIVE: AtomicBool = AtomicBool::new(true);
 static MOUSE_CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
+static ALTERNATE_SCROLL_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// 将全屏滚轮转换为方向键，同时保留终端原生文字选择。
+pub(crate) struct SetAlternateScroll(pub bool);
+
+impl crossterm::Command for SetAlternateScroll {
+    fn write_ansi(&self, writer: &mut impl std::fmt::Write) -> std::fmt::Result {
+        writer.write_str(if self.0 { "\x1b[?1007h" } else { "\x1b[?1007l" })
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "alternate scroll requires ANSI",
+        ))
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        true
+    }
+}
+
+pub(crate) fn set_alternate_scroll_active(active: bool) {
+    ALTERNATE_SCROLL_ACTIVE.store(active, Ordering::Relaxed);
+}
 
 /// Crossterm backend that keeps adjacent wide glyphs contiguous in the output stream.
 ///
@@ -458,6 +485,7 @@ fn suspend_terminal() -> io::Result<()> {
             &mut io::stdout(),
             alternate_screen,
             MOUSE_CAPTURE_ACTIVE.load(Ordering::Relaxed),
+            ALTERNATE_SCROLL_ACTIVE.load(Ordering::Relaxed),
         );
         let raw_restore = enable_raw_mode();
         return Err(combine_terminal_errors(
@@ -477,6 +505,7 @@ fn resume_terminal() -> io::Result<()> {
         &mut io::stdout(),
         ALTERNATE_SCREEN_ACTIVE.load(Ordering::Relaxed),
         MOUSE_CAPTURE_ACTIVE.load(Ordering::Relaxed),
+        ALTERNATE_SCROLL_ACTIVE.load(Ordering::Relaxed),
     );
     let raw_mode = enable_raw_mode();
     combine_terminal_results([
@@ -517,6 +546,7 @@ fn suspend_terminal_output(writer: &mut impl Write, alternate_screen: bool) -> i
     execute!(
         writer,
         DisableBracketedPaste,
+        SetAlternateScroll(false),
         crossterm::event::DisableMouseCapture
     )?;
     if alternate_screen {
@@ -529,9 +559,11 @@ fn resume_terminal_output(
     writer: &mut impl Write,
     alternate_screen: bool,
     capture_mouse: bool,
+    alternate_scroll: bool,
 ) -> io::Result<()> {
     if alternate_screen {
         execute!(writer, EnterAlternateScreen)?;
+        execute!(writer, SetAlternateScroll(alternate_scroll))?;
     }
     if capture_mouse {
         execute!(writer, crossterm::event::EnableMouseCapture)?;
@@ -657,20 +689,20 @@ mod tests {
     #[test]
     fn suspended_terminal_preserves_inline_and_alternate_screen_modes() {
         let mut auth_resume = Vec::new();
-        resume_terminal_output(&mut auth_resume, true, false).expect("auth resume");
+        resume_terminal_output(&mut auth_resume, true, false, false).expect("auth resume");
         assert!(contains_bytes(&auth_resume, b"\x1b[?1049h"));
         assert!(!contains_bytes(&auth_resume, b"\x1b[?1000h"));
         let mut alternate_suspend = Vec::new();
         suspend_terminal_output(&mut alternate_suspend, true).expect("alternate suspend");
         let mut alternate_resume = Vec::new();
-        resume_terminal_output(&mut alternate_resume, true, true).expect("alternate resume");
+        resume_terminal_output(&mut alternate_resume, true, true, false).expect("alternate resume");
         assert!(contains_bytes(&alternate_suspend, b"\x1b[?1049l"));
         assert!(contains_bytes(&alternate_resume, b"\x1b[?1049h"));
 
         let mut inline_suspend = Vec::new();
         suspend_terminal_output(&mut inline_suspend, false).expect("inline suspend");
         let mut inline_resume = Vec::new();
-        resume_terminal_output(&mut inline_resume, false, false).expect("inline resume");
+        resume_terminal_output(&mut inline_resume, false, false, false).expect("inline resume");
         assert!(!contains_bytes(&inline_suspend, b"\x1b[?1049l"));
         assert!(!contains_bytes(&inline_resume, b"\x1b[?1049h"));
 
@@ -679,6 +711,21 @@ mod tests {
         }
         assert!(contains_bytes(&alternate_resume, b"\x1b[?1000h"));
         assert!(!contains_bytes(&inline_resume, b"\x1b[?1000h"));
+    }
+
+    #[test]
+    fn history_resume_restores_wheel_translation_without_mouse_capture() {
+        let mut output = Vec::new();
+        resume_terminal_output(&mut output, true, false, true).expect("history resume");
+        assert!(contains_bytes(&output, b"\x1b[?1049h\x1b[?1007h"));
+        assert!(!contains_bytes(&output, b"\x1b[?1000h"));
+        output.clear();
+        suspend_terminal_output(&mut output, true).expect("history suspend");
+        assert!(contains_bytes(&output, b"\x1b[?1007l"));
+        assert!(contains_bytes(&output, b"\x1b[?1049l"));
+        output.clear();
+        resume_terminal_output(&mut output, false, false, true).expect("inline resume");
+        assert!(!contains_bytes(&output, b"\x1b[?1007h"));
     }
 
     #[test]

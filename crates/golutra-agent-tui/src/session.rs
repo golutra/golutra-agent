@@ -24,6 +24,9 @@ pub(crate) struct ResumePickerState {
     pub(crate) show_details: bool,
     pub(crate) action: Option<SessionPickerAction>,
     pub(crate) action_input: ComposerInput,
+    /// 默认隐藏已被历史编辑分支替代的父项；原始条目仍保留，便于搜索、删除和审计。
+    pub(crate) show_all_branches: bool,
+    pub(crate) current_thread_id: Option<ThreadId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +40,8 @@ pub(crate) enum SessionPickerAction {
 pub(crate) struct ResumeThreadItem {
     pub(crate) thread_id: ThreadId,
     pub(crate) session_id: SessionId,
+    pub(crate) parent_thread_id: Option<ThreadId>,
+    pub(crate) forked_from_turn_id: Option<TurnId>,
     pub(crate) title: String,
     pub(crate) preview: String,
     pub(crate) metadata: String,
@@ -46,6 +51,7 @@ pub(crate) struct ResumeThreadItem {
 pub(crate) struct HistoricalTurnItem {
     pub(crate) turn_id: TurnId,
     pub(crate) prompt: String,
+    pub(crate) attachment_paths: Vec<String>,
     pub(crate) preview: Vec<HistoricalTurnPreview>,
 }
 
@@ -63,13 +69,24 @@ pub(crate) enum HistoricalTurnPreviewKind {
 
 #[derive(Debug, Clone)]
 pub(crate) struct TurnPickerState {
-    pub(crate) items: Vec<HistoricalTurnItem>,
+    pub(crate) items: std::sync::Arc<Vec<HistoricalTurnItem>>,
+    pub(crate) layout_cache:
+        std::cell::RefCell<Option<std::sync::Arc<super::render::TurnPickerVisualLayout>>>,
     pub(crate) selected: usize,
+    pub(crate) scroll_offset: usize,
+    pub(crate) focus_pending: bool,
 }
 
 impl TurnPickerState {
     pub(crate) fn new(items: Vec<HistoricalTurnItem>) -> Self {
-        Self { items, selected: 0 }
+        let selected = items.len().saturating_sub(1);
+        Self {
+            items: std::sync::Arc::new(items),
+            layout_cache: Default::default(),
+            selected,
+            scroll_offset: 0,
+            focus_pending: true,
+        }
     }
 
     pub(crate) fn selected_turn_id(&self) -> Option<TurnId> {
@@ -87,37 +104,11 @@ impl TurnPickerState {
                 (self.selected + 1).min(self.items.len().saturating_sub(1))
             }
         };
-    }
-
-    pub(crate) fn move_selection_by_page(
-        &mut self,
-        direction: ResumeSelectionDirection,
-        page_size: usize,
-    ) {
-        if self.items.is_empty() {
-            self.selected = 0;
-            return;
-        }
-        let page_size = page_size.max(1);
-        self.selected = match direction {
-            ResumeSelectionDirection::Previous => self.selected.saturating_sub(page_size),
-            ResumeSelectionDirection::Next => self
-                .selected
-                .saturating_add(page_size)
-                .min(self.items.len().saturating_sub(1)),
-        };
-    }
-
-    pub(crate) fn select_first(&mut self) {
-        self.selected = 0;
-    }
-
-    pub(crate) fn select_last(&mut self) {
-        self.selected = self.items.len().saturating_sub(1);
+        self.focus_pending = true;
     }
 }
 
-/// 从持久事件中提取可回退的用户 turn，并按最近使用顺序排列。
+/// 按首次出现的时间排列用户 turn；更新正文不改变其历史位置。
 /// 同一个 turn 可能写入多个更新事件，最后一次非空 prompt 才是用户看到的内容。
 pub(crate) fn historical_turn_items(events: &[RuntimeEvent]) -> Vec<HistoricalTurnItem> {
     let mut items = Vec::<(u64, HistoricalTurnItem)>::new();
@@ -125,7 +116,7 @@ pub(crate) fn historical_turn_items(events: &[RuntimeEvent]) -> Vec<HistoricalTu
     ordered.sort_by_key(|event| event.sequence_no);
     let mut previews = HashMap::<TurnId, Vec<HistoricalTurnPreview>>::new();
     for event in &ordered {
-        let Some(turn_id) = event.turn_id else {
+        let Some(turn_id) = event_turn_id(event) else {
             continue;
         };
         let (kind, text) = match event.event_type {
@@ -163,7 +154,12 @@ pub(crate) fn historical_turn_items(events: &[RuntimeEvent]) -> Vec<HistoricalTu
         ) {
             continue;
         }
-        let Some(turn_id) = event.turn_id else {
+        if event_is_steer(event) {
+            // Codex cannot branch independently from a steering prompt. Keep it out of
+            // the picker instead of allowing Enter to create an invalid branch.
+            continue;
+        }
+        let Some(turn_id) = event_turn_id(event) else {
             continue;
         };
         let Some(prompt) = event
@@ -171,28 +167,57 @@ pub(crate) fn historical_turn_items(events: &[RuntimeEvent]) -> Vec<HistoricalTu
             .get("payload")
             .and_then(|payload| payload.get("prompt"))
             .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|prompt| !prompt.is_empty())
+            .filter(|prompt| !prompt.trim().is_empty())
         else {
             continue;
         };
         let item = HistoricalTurnItem {
             turn_id,
             prompt: prompt.to_owned(),
+            attachment_paths: event
+                .payload
+                .pointer("/payload/attachments")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|attachment| attachment.get("path").and_then(Value::as_str))
+                .map(str::to_owned)
+                .collect(),
             preview: previews.get(&turn_id).cloned().unwrap_or_default(),
         };
-        if let Some((sequence, existing)) = items
+        if let Some((_, existing)) = items
             .iter_mut()
             .find(|(_, existing)| existing.turn_id == turn_id)
         {
-            *sequence = event.sequence_no;
+            let mut item = item;
+            if event.payload.pointer("/payload/attachments").is_none() {
+                item.attachment_paths.clone_from(&existing.attachment_paths);
+            }
             *existing = item;
         } else {
             items.push((event.sequence_no, item));
         }
     }
-    items.sort_by(|left, right| right.0.cmp(&left.0));
+    items.sort_by_key(|(sequence, _)| *sequence);
     items.into_iter().map(|(_, item)| item).collect()
+}
+
+fn event_turn_id(event: &RuntimeEvent) -> Option<TurnId> {
+    event.turn_id.or(event.causal_context.turn_id)
+}
+
+fn event_is_steer(event: &RuntimeEvent) -> bool {
+    event
+        .payload
+        .get("steer")
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            event
+                .payload
+                .pointer("/payload/steer")
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,8 +277,28 @@ pub(crate) enum ResumeSelectionDirection {
 }
 
 impl ResumePickerState {
+    /// 分页到达时保留搜索词、选择和用户已改过的目录条目。
+    pub(crate) fn append_items(&mut self, items: Vec<ResumeThreadItem>) {
+        let mut known = self
+            .all_items
+            .iter()
+            .map(|item| item.thread_id)
+            .collect::<std::collections::HashSet<_>>();
+        self.all_items.extend(
+            items
+                .into_iter()
+                .map(normalize_resume_item)
+                .filter(|item| known.insert(item.thread_id)),
+        );
+        self.refresh_search();
+    }
+
     pub(crate) fn new(items: Vec<ResumeThreadItem>) -> Self {
-        Self {
+        let items = items
+            .into_iter()
+            .map(normalize_resume_item)
+            .collect::<Vec<_>>();
+        let mut state = Self {
             all_items: items.clone(),
             items,
             selected: 0,
@@ -261,7 +306,11 @@ impl ResumePickerState {
             show_details: false,
             action: None,
             action_input: ComposerInput::default(),
-        }
+            show_all_branches: false,
+            current_thread_id: None,
+        };
+        state.refresh_search();
+        state
     }
 
     pub(crate) fn selected_thread_id(&self) -> Option<ThreadId> {
@@ -328,9 +377,22 @@ impl ResumePickerState {
     pub(crate) fn refresh_search(&mut self) {
         let selected_thread = self.selected_thread_id();
         let query = self.search.text().trim().to_lowercase();
+        let superseded = if self.show_all_branches {
+            std::collections::HashSet::new()
+        } else {
+            self.all_items
+                .iter()
+                .filter(|item| item.forked_from_turn_id.is_some())
+                .filter_map(|item| item.parent_thread_id)
+                .collect::<std::collections::HashSet<_>>()
+        };
         self.items = self
             .all_items
             .iter()
+            .filter(|item| {
+                !superseded.contains(&item.thread_id)
+                    || self.current_thread_id == Some(item.thread_id)
+            })
             .filter(|item| {
                 query.is_empty()
                     || item.title.to_lowercase().contains(&query)
@@ -349,6 +411,16 @@ impl ResumePickerState {
             })
             .unwrap_or_default()
             .min(self.items.len().saturating_sub(1));
+    }
+
+    pub(crate) fn toggle_all_branches(&mut self) {
+        self.show_all_branches = !self.show_all_branches;
+        self.refresh_search();
+    }
+
+    pub(crate) fn set_current_thread_id(&mut self, thread_id: ThreadId) {
+        self.current_thread_id = Some(thread_id);
+        self.refresh_search();
     }
 
     pub(crate) fn begin_action(&mut self, action: SessionPickerAction) -> bool {
@@ -387,6 +459,17 @@ impl ResumePickerState {
         }
         self.refresh_search();
     }
+}
+
+fn normalize_resume_item(mut item: ResumeThreadItem) -> ResumeThreadItem {
+    if item.forked_from_turn_id.is_some() {
+        let mut base = item.title.trim();
+        while let Some(rest) = base.strip_prefix("Fork of ") {
+            base = rest.trim_start();
+        }
+        item.title = base.to_owned();
+    }
+    item
 }
 
 pub(crate) fn session_command(
@@ -531,4 +614,59 @@ pub(crate) fn parse_turn_id(value: &str) -> miette::Result<TurnId> {
     value
         .parse()
         .map_err(|error: uuid::Error| miette::miette!("invalid turn id: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(
+        thread_id: ThreadId,
+        parent_thread_id: Option<ThreadId>,
+        forked_from_turn_id: Option<TurnId>,
+        title: &str,
+    ) -> ResumeThreadItem {
+        ResumeThreadItem {
+            thread_id,
+            session_id: SessionId::new(),
+            parent_thread_id,
+            forked_from_turn_id,
+            title: title.to_owned(),
+            preview: String::new(),
+            metadata: String::new(),
+        }
+    }
+
+    #[test]
+    fn resume_picker_hides_superseded_history_parents_and_can_reveal_them() {
+        let parent = ThreadId::new();
+        let child = ThreadId::new();
+        let sibling = ThreadId::new();
+        let mut picker = ResumePickerState::new(vec![
+            item(parent, None, None, "workspace"),
+            item(
+                child,
+                Some(parent),
+                Some(TurnId::new()),
+                "Fork of Fork of workspace",
+            ),
+            item(
+                sibling,
+                Some(parent),
+                Some(TurnId::new()),
+                "Fork of workspace",
+            ),
+        ]);
+
+        assert_eq!(picker.items.len(), 2);
+        assert!(!picker.items.iter().any(|item| item.thread_id == parent));
+        assert!(picker.items.iter().all(|item| item.title == "workspace"));
+
+        picker.set_current_thread_id(parent);
+        assert!(picker.items.iter().any(|item| item.thread_id == parent));
+
+        picker.toggle_all_branches();
+        assert_eq!(picker.items.len(), 3);
+        assert!(picker.items.iter().any(|item| item.thread_id == parent));
+    }
 }

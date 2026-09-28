@@ -2520,6 +2520,23 @@ impl RuntimeStore {
         parent_session_id: SessionId,
         through_sequence_no: u64,
     ) -> StoreResult<Vec<RuntimeEvent>> {
+        self.create_forked_thread_excluding(
+            child,
+            parent_session_id,
+            through_sequence_no,
+            &HashSet::new(),
+        )
+        .await
+    }
+
+    /// 原子复制边界内的事件；排队输入可能早于前一轮回复，允许排除这些非连续事件。
+    pub async fn create_forked_thread_excluding(
+        &self,
+        child: &ThreadRecord,
+        parent_session_id: SessionId,
+        through_sequence_no: u64,
+        excluded_events: &HashSet<EventId>,
+    ) -> StoreResult<Vec<RuntimeEvent>> {
         let mut transaction = self.pool.begin().await?;
         let rows = sqlx::query(
             r#"
@@ -2533,13 +2550,14 @@ impl RuntimeStore {
         .bind(i64::try_from(through_sequence_no).unwrap_or(i64::MAX))
         .fetch_all(&mut *transaction)
         .await?;
-        let parent_events = rows
+        let mut parent_events = rows
             .into_iter()
             .map(|row| {
                 let event_json: String = row.try_get("event_json")?;
                 Ok(serde_json::from_str::<RuntimeEvent>(&event_json)?)
             })
             .collect::<StoreResult<Vec<_>>>()?;
+        parent_events.retain(|event| !excluded_events.contains(&event.id));
 
         let event_ids = parent_events
             .iter()
@@ -2547,12 +2565,20 @@ impl RuntimeStore {
             .collect::<HashMap<_, _>>();
         let task_ids = parent_events
             .iter()
-            .filter_map(|event| event.task_id)
+            .flat_map(|event| {
+                [event.task_id, event.causal_context.task_id]
+                    .into_iter()
+                    .flatten()
+            })
             .map(|task_id| (task_id, TaskId::new()))
             .collect::<HashMap<_, _>>();
         let turn_ids = parent_events
             .iter()
-            .filter_map(|event| event.turn_id)
+            .flat_map(|event| {
+                [event.turn_id, event.causal_context.turn_id]
+                    .into_iter()
+                    .flatten()
+            })
             .map(|turn_id| (turn_id, TurnId::new()))
             .collect::<HashMap<_, _>>();
         let replacements = fork_id_replacements(
@@ -2574,6 +2600,34 @@ impl RuntimeStore {
             event.parent_event_id = event
                 .parent_event_id
                 .and_then(|event_id| event_ids.get(&event_id).copied());
+            // 会话内的因果引用随复制重映射，边界外引用不伪装成 child 内部事件。
+            // 原始 run/provider/tool 身份仍描述实际发生过的执行；来源由 ThreadForked 记录。
+            if event.causal_context.session_id == Some(parent_session_id) {
+                event.causal_context.session_id = Some(child.session_id);
+            }
+            event.causal_context.task_id = event.causal_context.task_id.map(|id| task_ids[&id]);
+            event.causal_context.turn_id = event.causal_context.turn_id.map(|id| turn_ids[&id]);
+            event.causal_links.retain_mut(|link| {
+                if let Some(id) = event_ids.get(&link.event_id) {
+                    link.event_id = *id;
+                    true
+                } else {
+                    false
+                }
+            });
+            // 队列快照可能早于实际分支边界；不能把已排除的后续输入 ID 带入 child。
+            if let Some(pending) = event
+                .payload
+                .pointer_mut("/runtime_lane/pending_turns")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                pending.retain(|value| {
+                    value
+                        .as_str()
+                        .and_then(|id| id.parse::<TurnId>().ok())
+                        .is_some_and(|id| turn_ids.contains_key(&id))
+                });
+            }
             remap_json_ids(&mut event.payload, &replacements);
             append_event_in_transaction(&mut transaction, &event).await?;
             forked_events.push(event);

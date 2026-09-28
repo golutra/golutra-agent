@@ -2058,6 +2058,10 @@ async fn daemon_driver_enforces_binding_and_survives_disconnect_and_restart() {
     );
     let mut before_restart = SocketConnection::connect(&socket_c).await;
     let ready_before = before_restart.receive("ready").await;
+    assert_eq!(
+        ready_before["controller_mode"], "controller",
+        "completed task must not retain its former controller: {ready_before}"
+    );
     let instance_id = ready_before["instance_id"]
         .as_str()
         .expect("restart instance")
@@ -2123,6 +2127,7 @@ async fn daemon_driver_enforces_binding_and_survives_disconnect_and_restart() {
     let mut after_restart = SocketConnection::connect(&socket_c).await;
     let ready_after = after_restart.receive("ready").await;
     assert_eq!(ready_after["instance_id"], instance_id);
+    assert_eq!(ready_after["controller_mode"], "controller");
     after_restart
         .send(json!({"request_id": "state-after", "type": "state"}))
         .await;

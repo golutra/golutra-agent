@@ -1512,6 +1512,53 @@ mod boundary_tests {
     use super::*;
 
     #[test]
+    fn prompt_edit_rebuilds_native_history_after_switching_session() {
+        let session_id = SessionId::new();
+        let mut app = TuiApp::new(
+            ThreadId::new(),
+            session_id,
+            None,
+            false,
+            "mock".into(),
+            None,
+        );
+        app.enable_inline_history();
+        let mut terminal = Terminal::with_options(
+            ratatui::backend::TestBackend::new(80, 24),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Inline(3),
+            },
+        )
+        .unwrap();
+        let mut history = InlineHistoryState::new(session_id);
+        history.native_scrollback = true;
+        app.push_system_message(
+            "later reply",
+            vec!["must leave the active screen".to_owned()],
+        );
+        history.flush(&mut terminal, &mut app).unwrap();
+        app.reset_session_view(ThreadId::new(), SessionId::new());
+        app.transcript.history.replay_ready = true;
+        app.transcript.history.reflow_pending = true;
+        app.input.set_text("original prompt");
+        let mut clears = 0;
+        history
+            .flush_with_rebuild(&mut terminal, &mut app, |terminal| {
+                clears += 1;
+                terminal.clear()
+            })
+            .unwrap();
+        assert_eq!(clears, 1);
+        assert!(!app.transcript.history.reflow_pending);
+        assert_eq!(app.input.text(), "original prompt");
+        history
+            .flush_with_rebuild(&mut terminal, &mut app, |_| {
+                panic!("ordinary redraw must not clear history again")
+            })
+            .unwrap();
+    }
+
+    #[test]
     fn resize_reflow_waits_for_complete_source_and_retains_request_after_write_failure() {
         let session_id = SessionId::new();
         let mut app = TuiApp::new(

@@ -523,4 +523,22 @@ impl ThreadRepository {
             .create_forked_thread(child, parent_session_id, through_sequence_no)
             .await
     }
+
+    /// 复制完整对话边界，排除尚未消费的队列输入及关联命令。
+    pub async fn fork_excluding(
+        &self,
+        child: &ThreadRecord,
+        parent_session_id: SessionId,
+        through_sequence_no: u64,
+        excluded_events: &std::collections::HashSet<golutra_agent_core::EventId>,
+    ) -> StoreResult<Vec<RuntimeEvent>> {
+        self.store
+            .create_forked_thread_excluding(
+                child,
+                parent_session_id,
+                through_sequence_no,
+                excluded_events,
+            )
+            .await
+    }
 }
