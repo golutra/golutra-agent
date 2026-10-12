@@ -6,6 +6,37 @@ follow [Semantic Versioning](https://semver.org/) where applicable.
 
 ## [Unreleased]
 
+## [0.3.9] - 2026-10-12
+
+### Fixed
+
+- Resolve background validation from the owned process's terminal result and
+  reconstruct test summaries split across consecutive output chunks.
+- Recover superseded validation failures after a successful rerun while keeping
+  workspace freshness, cancellation and hard-failure checks intact.
+- Reset consecutive empty-response counts on useful tool progress and distinguish
+  non-final continuations from empty final responses, with bounded idle recovery.
+- Preserve runtime termination reasons and associated evidence in final task
+  events, stored diagnostics and terminal status displays.
+- Retain complete Responses tool arguments supplied only by terminal events.
+- Keep missing retry usage and costs unknown instead of reporting complete totals.
+- Resolve the real macOS Git executable before sandboxed patch execution.
+
+### Changed
+
+- Add bounded Responses stream diagnostics without recording message bodies,
+  tool arguments or credentials.
+- Share effective process-validation and usage-coverage logic across consumers;
+  keep successful tool results compact without removing effective parameters.
+- Show task and build identity in `/status` and update completed process markers.
+
+### Distribution and validation
+
+- Align workspace, npm and SDK metadata at 0.3.9.
+- The implementation passed 2,193 workspace tests, with four explicit skips,
+  and 12 controlled-provider CLI scenarios including expected failures.
+- Six-platform release automation validates packages before npm publication.
+
 ## [0.3.8] - 2026-09-28
 
 ### Fixed
