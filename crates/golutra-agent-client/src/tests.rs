@@ -1383,8 +1383,7 @@ async fn runtime_host_reuses_one_process_supervisor_across_tool_executors() {
         )
         .await
         .expect("second executor");
-    sleep(Duration::from_millis(100)).await;
-    let reconnected = second
+    let mut reconnected = second
         .execute(
             ToolRequest {
                 tool_call_id: ToolCallId::new(),
@@ -1398,6 +1397,15 @@ async fn runtime_host_reuses_one_process_supervisor_across_tool_executors() {
         )
         .await
         .expect("reconnect from next turn");
+
+    // 重连不承诺进程已结束；按真实终态等待，避免机器负载改变测试结论。
+    if reconnected.envelope.structured_facts["process_state"] == "running" {
+        reconnected = second.execute(ToolRequest {
+            tool_call_id: ToolCallId::new(), provider_tool_call_id: None,
+            session_id, turn_id: Some(TurnId::new()), tool_name: "shell_session".into(),
+            arguments: json!({"action":"wait","process_id":process_id,"cursor":0,"wait_ms":5000,"wait_for_terminal":true}),
+        }, CancellationToken::new()).await.expect("wait for reconnected process");
+    }
 
     assert_eq!(
         reconnected.envelope.structured_facts["process_state"],

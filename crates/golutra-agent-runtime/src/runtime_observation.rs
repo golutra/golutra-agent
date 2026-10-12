@@ -12,7 +12,8 @@ pub(super) struct RunObservation {
 
 impl RunObservation {
     pub(super) fn observe(&mut self, record: &golutra_agent_core::TokenUsageRecord) {
-        let complete = record.input_tokens.is_some()
+        let complete = record.usage_complete
+            && record.input_tokens.is_some()
             && record.output_tokens.is_some()
             && record.usage_source == "provider";
         self.usage_complete =

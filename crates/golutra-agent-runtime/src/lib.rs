@@ -205,11 +205,13 @@ mod correction_progress;
 mod harness;
 mod lane;
 mod objective_evidence;
+mod process_validation;
 mod provider_recovery;
 mod provider_retry;
 mod provider_session;
 mod response_control;
 mod validation_freshness;
+mod validation_output;
 use validation_freshness::validation_is_current;
 mod step_machine;
 mod trace;
@@ -376,6 +378,10 @@ pub struct AgentTaskRequest {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentLoopOutcome {
+    /// 非验收导致的运行时停止原因；宿主不再从展示字符串猜测来源。
+    pub runtime_stop_reason: Option<String>,
+    /// 运行时停止与验收失败分别归因，避免 Blocked 被默认解释为权限失败。
+    pub runtime_failure_class: Option<golutra_agent_core::FailureClass>,
     pub verification: VerificationRecord,
     pub verification_plan: VerificationPlan,
     pub loop_decision: LoopDecision,
@@ -1541,8 +1547,7 @@ where
         let mut current_turn_touched_code = current_task_contract.requires_workspace_evidence();
         let mut guard_reason = None;
         let mut failure_families = FailureFamilyLedger::default();
-        let mut empty_response_count = 0_u32;
-        let mut response_control = response_control::ResponseControl;
+        let mut response_control = response_control::ResponseControl::default();
         let default_max_elapsed_ms = self.governor.limits().max_elapsed_ms;
         let mut current_max_elapsed_ms = turn_overrides
             .max_elapsed_ms
@@ -1908,13 +1913,14 @@ where
                             current_task_contract.requires_workspace_evidence();
                         tool_reports.clear();
                         tool_attempts.clear();
+                        guard_reason = None;
                         turn_state = TurnState::new(current_turn_id);
                         goal_ledger.original_objective = current_objective.clone();
                         goal_ledger.success_criteria = current_completion_criteria.clone();
                         goal_ledger.current_plan = current_completion_criteria.clone();
                         goal_ledger.completed_steps.clear();
                         goal_ledger.open_risks.clear();
-                        response_control = response_control::ResponseControl;
+                        response_control = response_control::ResponseControl::default();
                     }
                     control
                         .set_active_execution_surface(current_execution_mode, current_tool_profile);
@@ -2206,44 +2212,47 @@ where
                         &mut trace,
                     )
                     .await;
-                let (provider_response, completed_request) = match provider_result {
-                    Ok(result) => result,
-                    Err(provider_session::ProviderSessionError::DeadlineExceeded { reason }) => {
-                        runtime_deadline_guard_emitted = true;
-                        finish_runtime_step(
-                            &mut step_machine,
-                            step_snapshot.clone(),
-                            "runtime-deadline",
-                            false,
-                            elapsed_millis(current_turn_started_at),
-                            &mut trace,
-                        );
-                        guard_reason = Some(reason);
-                        break 'agent_loop;
-                    }
-                    Err(provider_session::ProviderSessionError::Provider(error)) => {
-                        trace(AgentLoopTraceEvent::ProviderFailed {
-                            request_id: provider_request_id,
-                            provider_id,
-                            model_id,
-                            error: error.to_string(),
-                            metadata: error.metadata().cloned(),
-                        });
-                        finish_runtime_step(
-                            &mut step_machine,
-                            step_snapshot.clone(),
-                            format!("provider-error:{error}"),
-                            false,
-                            elapsed_millis(current_turn_started_at),
-                            &mut trace,
-                        );
-                        return Err(if error == ProviderError::Cancelled {
-                            AgentLoopError::Cancelled
-                        } else {
-                            AgentLoopError::Provider(error)
-                        });
-                    }
-                };
+                let (provider_response, completed_request, attempts_complete) =
+                    match provider_result {
+                        Ok(result) => result,
+                        Err(provider_session::ProviderSessionError::DeadlineExceeded {
+                            reason,
+                        }) => {
+                            runtime_deadline_guard_emitted = true;
+                            finish_runtime_step(
+                                &mut step_machine,
+                                step_snapshot.clone(),
+                                "runtime-deadline",
+                                false,
+                                elapsed_millis(current_turn_started_at),
+                                &mut trace,
+                            );
+                            guard_reason = Some(reason);
+                            break 'agent_loop;
+                        }
+                        Err(provider_session::ProviderSessionError::Provider(error)) => {
+                            trace(AgentLoopTraceEvent::ProviderFailed {
+                                request_id: provider_request_id,
+                                provider_id,
+                                model_id,
+                                error: error.to_string(),
+                                metadata: error.metadata().cloned(),
+                            });
+                            finish_runtime_step(
+                                &mut step_machine,
+                                step_snapshot.clone(),
+                                format!("provider-error:{error}"),
+                                false,
+                                elapsed_millis(current_turn_started_at),
+                                &mut trace,
+                            );
+                            return Err(if error == ProviderError::Cancelled {
+                                AgentLoopError::Cancelled
+                            } else {
+                                AgentLoopError::Provider(error)
+                            });
+                        }
+                    };
                 let step_wait_ms = control.retry_wait_ms.saturating_sub(retry_wait_before_step);
                 step_machine.exclude_recovery_wait(step_wait_ms);
                 if step_wait_ms >= 60_000 {
@@ -2258,7 +2267,7 @@ where
                 {
                     last_assistant_message = Some(message.content.trim().to_owned());
                 }
-                let usage_record =
+                let mut usage_record =
                     token_usage_record_with_cache_identity_and_estimates_and_tool_digests(
                         &plan,
                         &completed_request,
@@ -2270,6 +2279,8 @@ where
                         &plan.message_estimates,
                         &provider_tool_schema_digests,
                     );
+                // 成功响应只报告最后一次尝试；此前失败的消耗未知，保留已知值但不宣称完整。
+                usage_record.usage_complete &= attempts_complete;
                 run_observation.observe(&usage_record);
                 if usage_record.usage_source == "provider"
                     && let Some(input_tokens) = usage_record.input_tokens
@@ -2361,7 +2372,10 @@ where
                 }
 
                 if provider_response.tool_calls.is_empty() {
-                    if let Some(message) = provider_response.message {
+                    if let Some(message) = provider_response
+                        .message
+                        .filter(|message| !message.content.trim().is_empty())
+                    {
                         append_plan_message(
                             &mut plan,
                             message,
@@ -2376,9 +2390,8 @@ where
                             },
                             &mut message_token_total,
                         );
-                        empty_response_count = 0;
-                    } else {
-                        empty_response_count = empty_response_count.saturating_add(1);
+                    } else if !continue_response {
+                        let empty_response_count = response_control.record_empty_final();
                         if empty_response_count < 2 {
                             finish_runtime_step(
                                 &mut step_machine,
@@ -2432,6 +2445,7 @@ where
                     }
 
                     if continue_response {
+                        // 协议显式续写不是空 Final；仍受原有预算、取消和进展保护约束。
                         // 续写沿用当前历史、任务预算和工具结果，不能当成新任务重置计数。
                         if provider_response.finish_reason
                             == golutra_agent_llm::ProviderFinishReason::Length
@@ -3419,8 +3433,11 @@ where
                     .iter()
                     .any(|report| {
                         !report.changed_files.is_empty()
-                            || objective_validation_report(report)
-                                .is_some_and(|validation| validation.passed)
+                            || new_validation_progress(
+                                report,
+                                &tool_reports,
+                                tool_reports_before_step,
+                            )
                     });
                 let step_completion = finish_runtime_step(
                     &mut step_machine,
@@ -3733,10 +3750,13 @@ where
                     // transient first attempt cannot poison a completed read.
                     if !passed
                         && let Some(validation) =
-                            objective_validation_for_report(report, &objective_recovery)
+                            objective_validation_for_report(
+                                process_validation::validation_origin(report, &tool_reports),
+                                &objective_recovery,
+                            )
                     {
                         let (_, objective_recovered) = objective_validation_check_status(
-                            report,
+                            process_validation::validation_origin(report, &tool_reports),
                             &validation,
                             &objective_recovery,
                         );
@@ -3861,6 +3881,8 @@ where
                             "objective:unknown"
                         }
                     };
+                    let validation_report =
+                        process_validation::resolve_validation_report(report, &tool_reports);
                     command_checks.push(VerificationCheck {
                         kind: VerificationCheckKind::ObjectiveValidation,
                         name: format!(
@@ -3877,7 +3899,7 @@ where
                             .and_then(serde_json::Value::as_str)
                             .map(ToOwned::to_owned),
                         passed,
-                        evidence_refs: report.envelope.evidence_refs.clone(),
+                        evidence_refs: validation_report.envelope.evidence_refs.clone(),
                         message: if validation.passed && !passed {
                             "validation predates later workspace changes; rerun the relevant check".to_owned()
                         } else if recovered {
@@ -4145,6 +4167,7 @@ where
                     reason: reason.clone(),
                 });
                 verification.residual_risks.push(reason);
+                guard_reason = verification.residual_risks.last().cloned();
             }
             trace(AgentLoopTraceEvent::VerificationCompleted {
                 record: verification.clone(),
@@ -4157,6 +4180,9 @@ where
                 &verification,
                 last_budget_state,
             );
+            if let Some(reason) = &guard_reason {
+                loop_decision.reason.clone_from(reason);
+            }
             if best_effort_complete {
                 loop_decision.action = LoopAction::StopSuccess;
                 loop_decision.reason = "task contract satisfied; optional objective validation remains unverified (best effort)".to_owned();
@@ -4176,6 +4202,8 @@ where
 
             let final_message = if best_effort_complete {
                 last_assistant_message
+            } else if let Some(reason) = &guard_reason {
+                Some(format!("Could not complete: {reason}."))
             } else {
                 completion::final_message(last_assistant_message, &tool_reports, &verification)
             };
@@ -4190,6 +4218,14 @@ where
             }
 
             break Ok(AgentLoopOutcome {
+                runtime_failure_class: guard_reason.as_ref().map(|_| {
+                    if verification.policy_status == "policy_blocked" {
+                        golutra_agent_core::FailureClass::Policy
+                    } else {
+                        golutra_agent_core::FailureClass::RuntimeControlFlow
+                    }
+                }),
+                runtime_stop_reason: guard_reason,
                 final_message,
                 verification,
                 verification_plan,
@@ -4261,7 +4297,7 @@ where
             let result = self
                 .complete_with_retry_visibility(provider_request, deadline, control, trace, false)
                 .await;
-            let (response, completed_request) = match result {
+            let (response, completed_request, attempts_complete) = match result {
                 Ok(result) => result,
                 Err(provider_session::ProviderSessionError::Provider(error)) => {
                     if matches!(error, ProviderError::Cancelled) {
@@ -4290,7 +4326,7 @@ where
                 }
             };
             let completed_contract = self.contract_for_completed_request(&completed_request);
-            let usage_record = auxiliary_provider_usage_record(
+            let mut usage_record = auxiliary_provider_usage_record(
                 &completed_request,
                 &response,
                 Some(task.session_id),
@@ -4298,6 +4334,7 @@ where
                 &completed_contract.cost_model,
                 self.cache_identity_for_completed_request(&completed_request),
             );
+            usage_record.usage_complete &= attempts_complete;
             trace(AgentLoopTraceEvent::TokenUsageRecorded(
                 usage_record.clone(),
             ));
@@ -4338,7 +4375,7 @@ where
         deadline: Option<tokio::time::Instant>,
         control: &mut AgentExecutionControl,
         trace: &mut F,
-    ) -> Result<(ProviderResponse, ProviderRequest), provider_session::ProviderSessionError>
+    ) -> Result<(ProviderResponse, ProviderRequest, bool), provider_session::ProviderSessionError>
     where
         F: FnMut(AgentLoopTraceEvent) + Send,
     {
@@ -4353,7 +4390,7 @@ where
         control: &mut AgentExecutionControl,
         trace: &mut F,
         emit_stream: bool,
-    ) -> Result<(ProviderResponse, ProviderRequest), provider_session::ProviderSessionError>
+    ) -> Result<(ProviderResponse, ProviderRequest, bool), provider_session::ProviderSessionError>
     where
         F: FnMut(AgentLoopTraceEvent) + Send,
     {
@@ -4368,6 +4405,7 @@ where
         let mut active_provider_id = request.provider_id.clone();
         let mut active_model_id = request.model_id.clone();
         let mut recovery_wait_started = None;
+        let mut attempts_complete = true;
         let mut on_event = |event| match event {
             provider_session::ProviderSessionEvent::Streamed {
                 provider_id,
@@ -4384,6 +4422,7 @@ where
                 }
             }
             provider_session::ProviderSessionEvent::Recovery(mut recovery) => {
+                attempts_complete = false;
                 if recovery.phase == RecoveryPhase::Waiting {
                     recovery_wait_started = Some(tokio::time::Instant::now());
                 } else if let Some(started) = recovery_wait_started.take() {
@@ -4452,7 +4491,7 @@ where
                 reason: reason.clone(),
             });
         }
-        result
+        result.map(|(response, request)| (response, request, attempts_complete))
     }
 
     fn contract_for_completed_request(
@@ -4574,21 +4613,21 @@ fn optional_open_attempt(
     reports: &[ToolExecutionReport],
 ) -> bool {
     let successful_diagnostic = report.envelope.status == ToolResultStatus::Ok
-        && objective_validation_report(report).is_some_and(|check| {
+        && effective_objective_validation(report, reports).is_some_and(|check| {
             check.passed && check.kind == objective_evidence::ObjectiveValidationKind::Diagnostic
         });
     // 独立验收仍必须真实通过且针对当前工作区；不能把旧探索假设强制套在新交付上。
     let diagnostic_superseded = contract.completion_criteria.is_empty()
         && successful_diagnostic
-        && !validation_is_current(report, reports)
+        && !effective_validation_is_current(report, reports)
         && reports.iter().any(|later| {
             later.envelope.status == ToolResultStatus::Ok
                 && (later.envelope.tool_name == "external_verifier"
-                    || objective_validation_report(later).is_some_and(|check| {
+                    || effective_objective_validation(later, reports).is_some_and(|check| {
                         check.passed
                             && check.kind == objective_evidence::ObjectiveValidationKind::Test
                     }))
-                && validation_is_current(later, reports)
+                && effective_validation_is_current(later, reports)
         });
     let later_success = attempts
         .iter()
@@ -4597,9 +4636,9 @@ fn optional_open_attempt(
             reports.iter().any(|later| {
                 later.envelope.status == ToolResultStatus::Ok
                     && (later.envelope.tool_name == "external_verifier"
-                        || (objective_validation_report(later).is_some_and(|check| {
+                        || (effective_objective_validation(later, reports).is_some_and(|check| {
                             check.passed
-                                && validation_is_current(later, reports)
+                                && effective_validation_is_current(later, reports)
                                 && (report.envelope.status != ToolResultStatus::Ok
                                     || check.kind
                                         == objective_evidence::ObjectiveValidationKind::Test)
@@ -4678,13 +4717,48 @@ struct ObjectiveValidationRecoveryContext<'a> {
     attempts: &'a [ToolAttemptMetadata],
 }
 
+/// 所有非展示消费者共用同一进程终态；观察调用沿用启动命令的验证身份。
+fn effective_objective_validation(
+    report: &ToolExecutionReport,
+    reports: &[ToolExecutionReport],
+) -> Option<ObjectiveValidationOutcome> {
+    let origin = process_validation::validation_origin(report, reports);
+    objective_validation_report(&process_validation::resolve_validation_report(
+        origin, reports,
+    ))
+}
+
+fn effective_validation_is_current(
+    report: &ToolExecutionReport,
+    reports: &[ToolExecutionReport],
+) -> bool {
+    validation_is_current(
+        process_validation::validation_origin(report, reports),
+        reports,
+    )
+}
+
+/// 同一已完成进程反复读取不算新进展；首次得到当前代码的成功验证才重置保护。
+fn new_validation_progress(
+    report: &ToolExecutionReport,
+    reports: &[ToolExecutionReport],
+    before: usize,
+) -> bool {
+    let origin = process_validation::validation_origin(report, reports);
+    effective_objective_validation(origin, reports).is_some_and(|v| v.passed)
+        && validation_is_current(origin, reports)
+        && !(effective_objective_validation(origin, &reports[..before]).is_some_and(|v| v.passed)
+            && validation_is_current(origin, &reports[..before]))
+}
+
 fn objective_validation_for_report(
     report: &ToolExecutionReport,
     context: &ObjectiveValidationRecoveryContext<'_>,
 ) -> Option<ObjectiveValidationOutcome> {
-    objective_validation_report(report).or_else(|| {
+    let report = process_validation::resolve_validation_report(report, context.reports);
+    objective_validation_report(&report).or_else(|| {
         explicitly_requested_inspection_validation(
-            report,
+            &report,
             context.objective,
             context.completion_criteria,
             context.contract,
@@ -4717,7 +4791,11 @@ fn objective_validation_check_status(
         return (false, false);
     };
     let attempt = &context.attempts[attempt_index];
-    if !validation.passed && !attempt.recoverable_failure {
+    let effective_report = process_validation::resolve_validation_report(report, context.reports);
+    let recoverable_process_failure = report.envelope.status == ToolResultStatus::Ok
+        && report.envelope.structured_facts["process_state"] == "running"
+        && tool_failure_is_recoverable(&effective_report);
+    if !(validation.passed || attempt.recoverable_failure || recoverable_process_failure) {
         return (false, false);
     }
     let recovered = context.reports.iter().any(|later_report| {
@@ -4737,15 +4815,7 @@ fn objective_validation_check_status(
         {
             return false;
         }
-        let later_validation = objective_validation_report(later_report).or_else(|| {
-            explicitly_requested_inspection_validation(
-                later_report,
-                context.objective,
-                context.completion_criteria,
-                context.contract,
-                context.workspace_root,
-            )
-        });
+        let later_validation = objective_validation_for_report(later_report, context);
         later_validation.is_some_and(|candidate| {
             candidate.passed
                 && validation_is_current(later_report, context.reports)

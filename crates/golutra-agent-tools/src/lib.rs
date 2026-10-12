@@ -100,6 +100,7 @@ pub const CONTRACT_PATH_VERIFIER_TOOL: &str = "contract_path_verifier";
 
 mod builtin;
 mod model_patch;
+mod patch_program;
 mod process;
 mod process_supervisor;
 mod project_verifier;
@@ -2698,7 +2699,7 @@ impl ToolRuntime {
     ) -> Result<process::ShellOutput, ToolError> {
         run_process_with_progress(
             ProcessExecutionRequest {
-                program: "git",
+                program: patch_program::git_program().await,
                 args,
                 cwd: self.policy.workspace_root(),
                 workspace_root: self.policy.workspace_root(),
@@ -5535,6 +5536,8 @@ fn prune_redundant_success_facts(tool_name: &str, status: ToolResultStatus, fact
             }
         }
         "write_file" | "edit_file" | "apply_patch" => {
+            // 改动正文已在调用参数中；完整预览留给 TUI 与审计，不在成功回包中重复回放。
+            object.remove("change_preview");
             if object.contains_key("changed_paths") {
                 object.remove("changed_files");
             }
@@ -5546,6 +5549,22 @@ fn prune_redundant_success_facts(tool_name: &str, status: ToolResultStatus, fact
             }
         }
         "shell" | "shell_session" => {
+            if object.get("terminal") == Some(&Value::Bool(true))
+                && object.get("exit_code") == Some(&Value::from(0))
+            {
+                // 进程已成功结束时这些调度参数不再有操作意义；句柄和输出游标仍可用于续读。
+                for key in [
+                    "execution_mode",
+                    "dispatch_batch_size",
+                    "elapsed_ms",
+                    "process_lifetime_scope",
+                    "survives_runtime_exit",
+                    "wait_strategy",
+                    "wait_for_terminal",
+                ] {
+                    object.remove(key);
+                }
+            }
             object.remove("output_bytes");
             object.remove("output_lines");
             remove_false_fact(object, "timed_out");

@@ -53,6 +53,56 @@ fn task() -> AgentTaskRequest {
 }
 
 #[tokio::test]
+async fn silent_continuations_reach_final_response_but_unbounded_silence_stops() {
+    struct SilentProvider(AtomicUsize, bool);
+    #[async_trait]
+    impl LlmProvider for SilentProvider {
+        fn contract(&self) -> ProviderContract {
+            MockProvider::text_response("").contract()
+        }
+        async fn complete(
+            &self,
+            request: ProviderRequest,
+        ) -> Result<ProviderResponse, ProviderError> {
+            let step = self.0.fetch_add(1, Ordering::SeqCst);
+            assert!(step < 12, "silent continuation escaped its bound");
+            let mut response =
+                MockProvider::text_response(if step == 2 && self.1 { "done" } else { "" })
+                    .complete(request)
+                    .await?;
+            if step != 2 || !self.1 {
+                response.finish_reason = ProviderFinishReason::Continue;
+            }
+            Ok(response)
+        }
+    }
+    for finishes in [true, false] {
+        let root = tempdir().unwrap();
+        let agent = AgentLoop::new(
+            SilentProvider(AtomicUsize::new(0), finishes),
+            ContextBuilder::default(),
+            BasicToolExecutor::new(WorkspacePolicy::new(root.path()).unwrap()),
+        );
+        let outcome = agent.run(task()).await;
+        if finishes {
+            assert_eq!(
+                outcome.unwrap().loop_decision.action,
+                LoopAction::StopSuccess
+            );
+            assert_eq!(agent.provider.0.load(Ordering::SeqCst), 3);
+        } else {
+            assert!(
+                outcome
+                    .unwrap_err()
+                    .to_string()
+                    .contains("continuation repeatedly")
+            );
+            assert_eq!(agent.provider.0.load(Ordering::SeqCst), 9);
+        }
+    }
+}
+
+#[tokio::test]
 async fn truncated_and_explicit_continuation_keep_history_and_only_stop_at_normal_end() {
     let workspace = tempdir().unwrap();
     let provider = TerminalProvider {

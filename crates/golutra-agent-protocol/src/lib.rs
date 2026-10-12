@@ -10,6 +10,7 @@ pub mod session;
 pub mod storage;
 pub mod trace;
 pub mod tui_driver;
+pub mod usage;
 pub mod version;
 
 pub use agent::*;
@@ -24,4 +25,5 @@ pub use session::*;
 pub use storage::*;
 pub use trace::*;
 pub use tui_driver::*;
+pub use usage::*;
 pub use version::*;

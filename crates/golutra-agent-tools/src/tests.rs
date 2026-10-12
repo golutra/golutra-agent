@@ -1483,6 +1483,65 @@ fn model_visible_tool_result_preserves_complete_common_process_output() {
 }
 
 #[test]
+fn successful_mutation_omits_duplicate_preview_without_changing_audit_facts() {
+    for tool in ["write_file", "edit_file", "apply_patch"] {
+        let mut envelope = projection_envelope(
+            tool,
+            ToolResultStatus::Ok,
+            "file updated",
+            json!({"path":"a.rs", "change_preview":{"diff":"+new content"}, "content_digest":"sha256:new", "idempotent":false}),
+            None,
+        );
+        let original = envelope.structured_facts.clone();
+        let (header, _) = parse_model_visible_tool_result(&model_visible_tool_result(&envelope));
+        assert!(header["structured_facts"].get("change_preview").is_none());
+        assert_eq!(header["structured_facts"]["content_digest"], "sha256:new");
+        assert_eq!(envelope.structured_facts, original);
+        envelope.status = ToolResultStatus::Error;
+        let (header, _) = parse_model_visible_tool_result(&model_visible_tool_result(&envelope));
+        assert_eq!(
+            header["structured_facts"]["change_preview"],
+            original["change_preview"]
+        );
+    }
+}
+
+#[test]
+fn finished_process_omits_scheduling_facts_but_retains_output_continuation() {
+    for tool in ["shell", "shell_session"] {
+        for (terminal, exit_code) in [(true, 0), (false, 0), (true, 1)] {
+            let envelope = projection_envelope(
+                tool,
+                ToolResultStatus::Ok,
+                "process result",
+                json!({"terminal":terminal, "exit_code":exit_code, "process_id":"proc-1", "output_cursor":42,
+                    "output_has_more":true, "output_lost":true, "output_truncated":true, "workspace_scan_pending":true,
+                    "execution_mode":"background", "wait_strategy":"notify", "effective_wait_ms":1000}),
+                Some("new output"),
+            );
+            let (header, output) =
+                parse_model_visible_tool_result(&model_visible_tool_result(&envelope));
+            let facts = &header["structured_facts"];
+            assert_eq!(
+                facts.get("wait_strategy").is_none(),
+                terminal && exit_code == 0
+            );
+            assert_eq!(facts["process_id"], "proc-1");
+            assert_eq!(facts["output_cursor"], 42);
+            for key in [
+                "output_has_more",
+                "output_lost",
+                "output_truncated",
+                "workspace_scan_pending",
+            ] {
+                assert_eq!(facts[key], true);
+            }
+            assert_eq!(output.as_deref(), Some("new output"));
+        }
+    }
+}
+
+#[test]
 fn model_visible_tool_result_marks_process_excerpt_capture_clipping() {
     let output = "中文输出\n".repeat(2_048);
     for tool_name in ["shell", "shell_session"] {

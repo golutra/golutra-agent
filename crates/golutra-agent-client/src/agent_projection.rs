@@ -22,6 +22,7 @@ pub struct AgentEventProjector {
     task_id: Option<TaskId>,
     turn_id: Option<TurnId>,
     final_message: Option<String>,
+    failure_detail: Option<String>,
     verification: Option<VerificationRecord>,
     outcome: Option<TaskOutcome>,
     last_sequence_no: Option<u64>,
@@ -39,6 +40,7 @@ impl AgentEventProjector {
             task_id: None,
             turn_id: None,
             final_message: None,
+            failure_detail: None,
             verification: None,
             outcome: None,
             last_sequence_no: None,
@@ -109,6 +111,21 @@ impl AgentEventProjector {
         }
         if self.turn_id.is_none() && self.command_matches(&event) {
             self.turn_id = event.turn_id;
+        }
+        // 请求失败可能恢复；只保存运行时明确结束执行的原因，不把瞬态 provider 错误升级为任务失败。
+        match event.event_type {
+            RuntimeEventType::LoopDecided => {
+                if let Some(error) = payload_text(&event, "error") {
+                    self.failure_detail = Some(error.to_owned());
+                }
+            }
+            RuntimeEventType::LoopGuardTriggered => {
+                self.failure_detail = payload_text(&event, "summary").map(ToOwned::to_owned);
+            }
+            RuntimeEventType::TurnStarted
+            | RuntimeEventType::ProviderStarted
+            | RuntimeEventType::ProviderCompleted => self.failure_detail = None,
+            _ => {}
         }
         if event.event_type == RuntimeEventType::AssistantMessage
             && let Some(content) = event.payload.get("content").and_then(Value::as_str)
@@ -198,10 +215,16 @@ impl AgentEventProjector {
                         task_id,
                         turn_id,
                         status,
-                        error: event
-                            .payload
-                            .get("summary")
-                            .and_then(Value::as_str)
+                        error: payload_text(&event, "error")
+                            .or_else(|| {
+                                matches!(
+                                    status,
+                                    TaskStatus::Failed | TaskStatus::Blocked | TaskStatus::Partial
+                                )
+                                .then_some(self.failure_detail.as_deref())
+                                .flatten()
+                            })
+                            .or_else(|| payload_text(&event, "summary"))
                             .unwrap_or("runtime task did not complete successfully")
                             .to_owned(),
                         final_message: self.final_message.clone(),
@@ -290,6 +313,14 @@ impl AgentEventProjector {
             .and_then(|value| value.parse::<CommandId>().ok())
             == Some(command_id)
     }
+}
+
+fn payload_text<'a>(event: &'a RuntimeEvent, key: &str) -> Option<&'a str> {
+    event
+        .payload
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
 }
 
 fn item_from_event(event: &RuntimeEvent) -> AgentItem {
@@ -583,6 +614,189 @@ mod tests {
         assert_eq!(result.final_message.as_deref(), Some("done"));
         assert_eq!(result.verification.as_ref(), Some(&verification));
         assert_eq!(result.last_sequence_no, Some(7));
+    }
+
+    #[test]
+    fn failed_turn_preserves_runtime_cause_across_verification_and_foreign_events() {
+        let thread = thread_ref();
+        let task_id = TaskId::new();
+        let turn_id = TurnId::new();
+        let mut projector = AgentEventProjector::new(thread.clone(), None);
+        for (sequence, kind, payload) in [
+            (1, RuntimeEventType::TurnStarted, json!({})),
+            (
+                2,
+                RuntimeEventType::ProviderFailed,
+                json!({"error": "invalid_prompt"}),
+            ),
+            (
+                3,
+                RuntimeEventType::LoopDecided,
+                json!({
+                    "summary": "truncated failure",
+                    "error": "provider failed: invalid_prompt: upstream rejected this request"
+                }),
+            ),
+            (4, RuntimeEventType::VerificationCompleted, json!({})),
+        ] {
+            projector.project(event(
+                &thread,
+                sequence,
+                Some(task_id),
+                Some(turn_id),
+                kind,
+                payload,
+            ));
+        }
+        assert!(
+            projector
+                .project(event(
+                    &thread,
+                    5,
+                    Some(TaskId::new()),
+                    Some(TurnId::new()),
+                    RuntimeEventType::LoopDecided,
+                    json!({"error": "unrelated failure"}),
+                ))
+                .is_none()
+        );
+        let terminal = projector.project(event(
+            &thread,
+            6,
+            Some(task_id),
+            None,
+            RuntimeEventType::TaskCompleted,
+            json!({"status": "failed", "summary": "runtime task finished with Failed"}),
+        ));
+        assert!(
+            matches!(terminal, Some(AgentStreamEvent::TurnFailed { error, .. })
+            if error == "provider failed: invalid_prompt: upstream rejected this request")
+        );
+    }
+
+    #[test]
+    fn failed_turn_does_not_reuse_recovered_or_transient_errors() {
+        for error_kind in [
+            RuntimeEventType::ProviderFailed,
+            RuntimeEventType::LoopDecided,
+        ] {
+            for recovery in [
+                RuntimeEventType::ProviderStarted,
+                RuntimeEventType::ProviderCompleted,
+                RuntimeEventType::TurnStarted,
+            ] {
+                let thread = thread_ref();
+                let task = TaskId::new();
+                let turn = TurnId::new();
+                let mut projector = AgentEventProjector::new(thread.clone(), None);
+                for (sequence, kind, payload) in [
+                    (1, RuntimeEventType::TurnStarted, json!({})),
+                    (2, error_kind, json!({"error": "old failure"})),
+                    (3, recovery, json!({})),
+                    (4, RuntimeEventType::LoopDecided, json!({"error": "  "})),
+                ] {
+                    projector.project(event(
+                        &thread,
+                        sequence,
+                        Some(task),
+                        Some(turn),
+                        kind,
+                        payload,
+                    ));
+                }
+                let terminal = projector.project(event(
+                    &thread,
+                    5,
+                    Some(task),
+                    None,
+                    RuntimeEventType::TaskCompleted,
+                    json!({"status": "failed", "summary": "verification failed"}),
+                ));
+                assert!(
+                    matches!(terminal, Some(AgentStreamEvent::TurnFailed { error, .. })
+                    if error == "verification failed")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn guard_reason_survives_blocked_partial_and_failed_but_not_cancellation() {
+        for status in ["blocked", "partial", "failed", "cancelled"] {
+            let thread = thread_ref();
+            let task = TaskId::new();
+            let turn = TurnId::new();
+            let mut projector = AgentEventProjector::new(thread.clone(), None);
+            projector.project(event(
+                &thread,
+                1,
+                Some(task),
+                Some(turn),
+                RuntimeEventType::TurnStarted,
+                json!({}),
+            ));
+            projector.project(event(&thread, 2, Some(task), Some(turn), RuntimeEventType::LoopGuardTriggered, json!({"summary":"provider returned empty responses repeatedly", "trigger":"empty_response"})));
+            let terminal = projector.project(event(
+                &thread,
+                3,
+                Some(task),
+                Some(turn),
+                RuntimeEventType::TaskCompleted,
+                json!({"status":status,"summary":"terminal fallback"}),
+            ));
+            let expected = if status == "cancelled" {
+                "terminal fallback"
+            } else {
+                "provider returned empty responses repeatedly"
+            };
+            assert!(
+                matches!(terminal, Some(AgentStreamEvent::TurnFailed { error, .. }) if error == expected)
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_terminal_error_and_cancellation_override_old_runtime_failure() {
+        for (status, explicit, expected) in [
+            (
+                "failed",
+                Some("terminal storage failed"),
+                "terminal storage failed",
+            ),
+            ("cancelled", None, "owner cancelled"),
+        ] {
+            let thread = thread_ref();
+            let task = TaskId::new();
+            let turn = TurnId::new();
+            let mut projector = AgentEventProjector::new(thread.clone(), None);
+            projector.project(event(
+                &thread,
+                1,
+                Some(task),
+                Some(turn),
+                RuntimeEventType::TurnStarted,
+                json!({}),
+            ));
+            projector.project(event(
+                &thread,
+                2,
+                Some(task),
+                Some(turn),
+                RuntimeEventType::LoopDecided,
+                json!({"error": "old failure"}),
+            ));
+            let terminal = projector.project(event(
+                &thread,
+                3,
+                Some(task),
+                None,
+                RuntimeEventType::TaskCompleted,
+                json!({"status": status, "summary": "owner cancelled", "error": explicit}),
+            ));
+            assert!(
+                matches!(terminal, Some(AgentStreamEvent::TurnFailed { error, .. }) if error == expected)
+            );
+        }
     }
 
     #[test]

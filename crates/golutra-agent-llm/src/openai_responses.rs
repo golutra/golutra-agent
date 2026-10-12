@@ -594,6 +594,10 @@ impl OpenAiResponsesProvider {
             let mut response =
                 responses_provider_response(end, &model_id, &self.config.provider_id, diagnostics)?;
             response.finish_reason = terminal.finish_reason()?;
+            // 有些上游只发送 arguments.done；增量累积可能为空，成功终帧的完整调用才是最终事实。
+            if let Some(completed_tools) = terminal.take_completed_tools() {
+                response.tool_calls = completed_tools;
+            }
             if response.finish_reason == ProviderFinishReason::Length && !tool_calls.is_empty() {
                 // 通用库在 incomplete 分支可能丢弃捕获的调用；预览存在也不能误作纯文本续写。
                 return Err(ProviderError::Malformed {
@@ -608,6 +612,7 @@ impl OpenAiResponsesProvider {
                 &response,
                 tool_calls.keys().map(String::as_str),
             )?;
+            response.raw_metadata["responses_stream"] = terminal.diagnostics();
             return Ok(response);
         }
     }

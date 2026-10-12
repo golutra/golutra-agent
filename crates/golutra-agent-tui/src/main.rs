@@ -2989,6 +2989,7 @@ impl TuiApp {
                     format!(
                         "task {}",
                         self.task_id
+                            .or_else(|| self.projection.as_ref().and_then(|p| p.task_id))
                             .map(|id| id.to_string())
                             .unwrap_or_else(|| "auto".to_owned())
                     ),
@@ -3006,6 +3007,7 @@ impl TuiApp {
                         .recovery
                         .details(chrono::Utc::now()),
                 );
+                details.extend(dashboard::diagnostic_status_lines(&self.events));
                 self.push_system_message("Status", details);
             }
             SlashCommand::Plan => {

@@ -90,36 +90,7 @@ pub(super) fn objective_validation_report(
         let kind = objective_validation_command_kind(command)?;
         let identity =
             validation_identity_in_workdir(objective_validation_command_identity(command)?, report);
-        let exited_cleanly = shell_report_exited_cleanly(report);
-        let status = if !exited_cleanly {
-            ObjectiveValidationStatus::Failed
-        } else if kind == ObjectiveValidationKind::Test && !test_report_executed_tests(report) {
-            ObjectiveValidationStatus::Unknown
-        } else {
-            ObjectiveValidationStatus::Passed
-        };
-        let passed = status == ObjectiveValidationStatus::Passed;
-        let message = match (kind, exited_cleanly, passed) {
-            (_, false, _) => "validation command did not exit successfully".to_owned(),
-            (ObjectiveValidationKind::Test, true, false) => {
-                "test command exited successfully but no executed test was observed".to_owned()
-            }
-            (ObjectiveValidationKind::Test, true, true) => {
-                "test command passed with executed tests".to_owned()
-            }
-            (ObjectiveValidationKind::FileState, true, true) => {
-                "file-state command passed".to_owned()
-            }
-            (_, true, true) => "diagnostic command passed".to_owned(),
-            _ => "objective validation is unresolved".to_owned(),
-        };
-        return Some(ObjectiveValidationOutcome {
-            kind,
-            identity,
-            status,
-            passed,
-            message,
-        });
+        return Some(shell_validation_outcome(report, kind, identity));
     }
     None
 }
@@ -159,6 +130,17 @@ fn prepared_objective_validation_report(
     let kind = ObjectiveValidationKind::from_label(metadata.get("kind")?.as_str()?)?;
     let identity =
         validation_identity_in_workdir(metadata.get("identity")?.as_str()?.to_owned(), report);
+    Some(shell_validation_outcome(report, kind, identity))
+}
+
+fn shell_validation_outcome(
+    report: &ToolExecutionReport,
+    kind: ObjectiveValidationKind,
+    identity: String,
+) -> ObjectiveValidationOutcome {
+    if let Some(pending) = pending_validation(report, kind, &identity) {
+        return pending;
+    }
     let exited_cleanly = shell_report_exited_cleanly(report);
     let executed_tests =
         kind != ObjectiveValidationKind::Test || test_report_executed_tests(report);
@@ -181,13 +163,29 @@ fn prepared_objective_validation_report(
             ObjectiveValidationKind::Diagnostic => "diagnostic command passed".to_owned(),
         }
     };
-    Some(ObjectiveValidationOutcome {
+    ObjectiveValidationOutcome {
         kind,
         identity,
         status,
         passed,
         message,
-    })
+    }
+}
+
+fn pending_validation(
+    report: &ToolExecutionReport,
+    kind: ObjectiveValidationKind,
+    identity: &str,
+) -> Option<ObjectiveValidationOutcome> {
+    (report.envelope.status == ToolResultStatus::Ok
+        && report.envelope.structured_facts["process_state"] == "running")
+        .then(|| ObjectiveValidationOutcome {
+            kind,
+            identity: identity.to_owned(),
+            status: ObjectiveValidationStatus::Unknown,
+            passed: false,
+            message: "validation process is still running; wait for its terminal result".to_owned(),
+        })
 }
 
 /// 使用执行器已经解析的实际目录，避免相同命令在不同子项目之间错误互相复验。

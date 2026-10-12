@@ -631,6 +631,18 @@ impl RuntimeHost {
         status: TaskStatus,
         outcome: golutra_agent_core::TaskOutcome,
     ) -> Result<(), ClientError> {
+        self.finish_lane_with_diagnostic(task, status, outcome, None)
+            .await
+    }
+
+    /// 终止原因随终态持久化；晚连接和只读终态的客户端不依赖先前流事件才能解释失败。
+    pub(super) async fn finish_lane_with_diagnostic(
+        &self,
+        task: &HostedAgentTask,
+        status: TaskStatus,
+        outcome: golutra_agent_core::TaskOutcome,
+        diagnostic: Option<Value>,
+    ) -> Result<(), ClientError> {
         let awaiting_external = matches!(
             outcome.external_verification,
             golutra_agent_core::ExternalVerificationStatus::Pending
@@ -649,6 +661,10 @@ impl RuntimeHost {
                     json!(format!("runtime task finished with {status:?}"));
                 transition.event.payload["status"] = json!(status);
                 transition.event.payload["outcome"] = json!(outcome.clone());
+                if let Some(diagnostic) = &diagnostic {
+                    transition.event.payload["error"] = diagnostic["reason"].clone();
+                    transition.event.payload["termination"] = diagnostic.clone();
+                }
                 transition.event.payload["post_task_governance"] = json!({"status": "pending"});
                 self.record_event(transition.event).await?
             }
@@ -663,6 +679,8 @@ impl RuntimeHost {
                         "summary": format!("persisted runtime task finished with {status:?}"),
                         "status": status,
                         "outcome": outcome.clone(),
+                        "error": diagnostic.as_ref().map(|d| d["reason"].clone()),
+                        "termination": diagnostic,
                         "post_task_governance": {"status": "pending"},
                     }),
                 ))

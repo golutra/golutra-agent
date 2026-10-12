@@ -6,10 +6,11 @@ use std::sync::{
 };
 
 use async_trait::async_trait;
-use golutra_agent_core::ProviderContract;
+use golutra_agent_core::{ProviderContract, SessionId, TaskId, TurnId};
 use golutra_agent_llm::{MockProvider, ProviderErrorMetadata};
 
 use super::*;
+use crate::{AgentLoop, AgentLoopTraceEvent, AgentTaskRequest};
 
 struct FaultProvider {
     calls: AtomicUsize,
@@ -65,6 +66,60 @@ impl LlmProvider for FaultProvider {
 
     fn contract(&self) -> ProviderContract {
         MockProvider::text_response("").contract()
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn recovered_stream_keeps_known_usage_but_marks_the_logical_request_incomplete() {
+    for failures in [0, 1] {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut provider = FaultProvider::offline(failures);
+        provider.preview = true;
+        let agent = AgentLoop::new(
+            provider,
+            golutra_agent_context::ContextBuilder::default(),
+            golutra_agent_tools::BasicToolExecutor::new(
+                golutra_agent_policy::WorkspacePolicy::new(workspace.path()).unwrap(),
+            ),
+        );
+        let mut trace = Vec::new();
+        let outcome = agent
+            .run_with_trace(
+                AgentTaskRequest {
+                    session_id: SessionId::new(),
+                    task_id: TaskId::new(),
+                    turn_id: TurnId::new(),
+                    objective: "say hello".into(),
+                    completion_criteria: Vec::new(),
+                    output_schema: None,
+                    touched_code: false,
+                    contributors: Vec::new(),
+                    tools: Vec::new(),
+                },
+                |event| trace.push(event),
+            )
+            .await
+            .unwrap();
+        assert!(outcome.final_message.unwrap().contains("完成"));
+        assert_eq!(agent.provider.calls.load(Ordering::SeqCst), failures + 1);
+        let records = trace
+            .iter()
+            .filter_map(|event| match event {
+                AgentLoopTraceEvent::TokenUsageRecorded(record) => Some(record),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].input_tokens.is_some());
+        assert!(records[0].output_tokens.is_some());
+        assert_eq!(records[0].usage_complete, failures == 0);
+        assert!(
+            std::fs::read_dir(workspace.path())
+                .unwrap()
+                .next()
+                .is_none(),
+            "unfinished tool preview must not write files"
+        );
     }
 }
 

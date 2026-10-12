@@ -159,6 +159,10 @@ Output rules:
 
 - normal progress and bounded runtime/tool observations go to `stderr`;
 - the final assistant message goes to `stdout`;
+- `turn.failed.error` retains the runtime's terminal failure cause when available,
+  including upstream rejection codes. A recovered provider error does not become
+  the cause of a later failure, and cancellation keeps its own terminal reason.
+  The status remains failed; preserving the cause does not retry a rejected request.
 - `--json` emits normalized lifecycle/item/runtime events as JSONL on
   `stdout`, with no human progress stream;
 - `-` or a non-terminal stdin supplies the prompt;
@@ -663,6 +667,40 @@ An old task's terminal event cannot complete a newly queued turn. The durable
 bounded adapter contract for clients.
 
 ## Verification Matrix
+
+Background shell validation remains unresolved while the process is running.
+The runtime joins later built-in `shell_session` observations by process ID,
+command, working directory and authoritative PID, then uses the first terminal
+result for verification. Output observed before exit and later reads of that
+same terminal event remain available as test evidence. Raw reports are retained;
+unrelated processes, cancellation, timeouts and zero executed tests cannot turn
+into a successful check. Workspace freshness is measured from the original
+validation launch so concurrent source edits still require revalidation.
+
+Verification reconstructs lines across contiguous output cursors of the same
+owned process. Missing output, overlap, redaction length changes and unrelated
+processes cannot be joined into fabricated evidence. Pending lines are bounded
+at 16 KiB. Validation, recovery and material-progress checks share the same
+effective process result; reading a completed process repeatedly is not progress.
+
+The empty-response guard counts consecutive final replies without usable text or
+tool calls. A tool-bearing response resets this count; whitespace alone does not.
+Explicit Continue/Length responses follow continuation semantics. Eight silent
+continuations are allowed before stopping without progress, in addition to the
+existing execution budget and cancellation rules. Counts belong to the current
+turn and reset when a new queued turn begins, not when a correction retries.
+This recovery does not declare a task complete merely because a tool ran.
+
+Failed, blocked and partial runtime outcomes persist a `termination` diagnostic
+with the reason, source, task/turn, verification and evidence references. Clients
+can explain the terminal event without having observed every previous stream
+event. Guard causes take precedence over downstream missing-evidence messages;
+verification diagnostics reference the failing check's evidence.
+
+`/status` distinguishes the latest unsuccessful task from the current task and
+shows the runtime build/source identity plus the local TUI executable path.
+Updating source or compiling a candidate does not replace a desktop app's bundled
+runtime; validate that build identity when testing a new deployment.
 
 The implementation is exercised at each boundary:
 

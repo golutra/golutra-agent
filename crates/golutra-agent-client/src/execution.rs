@@ -21,6 +21,46 @@ const MIN_RECENT_HISTORY_TOKENS: u64 = 1_024;
 const ACTIVE_PATH_COMPACTION_MAX_DEPTH: u32 = 65_536;
 const MAX_RESUME_PROVIDER_REQUEST_BYTES: u64 = 16 * 1024 * 1024;
 pub(super) const MAX_RESUME_PROVIDER_MESSAGES: usize = 16_384;
+/// 将运行时的显式停止事实转成有界终态诊断，避免协议消费者解析展示文本。
+fn termination_diagnostic(
+    status: TaskStatus,
+    outcome: &golutra_agent_runtime::AgentLoopOutcome,
+) -> Option<Value> {
+    if outcome.candidate_ready_for_external_verification
+        || !matches!(
+            status,
+            TaskStatus::Failed | TaskStatus::Blocked | TaskStatus::Partial
+        )
+    {
+        return None;
+    }
+    let reason = outcome
+        .runtime_stop_reason
+        .as_deref()
+        .or_else(|| {
+            outcome
+                .final_message
+                .as_deref()
+                .and_then(|message| message.lines().next())
+        })
+        .unwrap_or(&outcome.loop_decision.reason);
+    let evidence = outcome
+        .verification
+        .checks
+        .iter()
+        .filter(|check| !check.passed)
+        .flat_map(|check| check.evidence_refs.iter())
+        .take(16)
+        .collect::<Vec<_>>();
+    Some(json!({
+        "source": if outcome.runtime_stop_reason.is_some() { "runtime_guard" } else { "verification" },
+        "failure_class": outcome.runtime_failure_class.unwrap_or(golutra_agent_core::FailureClass::Verification),
+        "reason": reason.chars().take(1024).collect::<String>(),
+        "task_id": outcome.loop_decision.task_id, "turn_id": outcome.final_turn_id,
+        "verification_id": outcome.verification.verification_id, "evidence_refs": evidence,
+    }))
+}
+
 fn memory_candidate_limit(context_budget: u64) -> usize {
     if context_budget == 0 {
         return 0;
@@ -1621,13 +1661,21 @@ impl RuntimeHost {
             ..task.clone()
         };
         let final_objective = outcome.verification.objective.clone();
-        let task_outcome = super::execution_trace::task_outcome_with_external_verification(
+        let mut task_outcome = super::execution_trace::task_outcome_with_external_verification(
             terminal_status,
             &outcome.verification,
             outcome.defer_external_verification,
             outcome.candidate_ready_for_external_verification,
         );
-        self.finish_lane_with_outcome(&final_task, terminal_status, task_outcome)
+        if let Some(class) = outcome.runtime_failure_class {
+            task_outcome.failure_class = Some(class);
+            task_outcome.next_action =
+                outcome.loop_decision.next_step.clone().or_else(|| {
+                    Some("inspect the runtime termination reason before retrying".into())
+                });
+        }
+        let diagnostic = termination_diagnostic(terminal_status, &outcome);
+        self.finish_lane_with_diagnostic(&final_task, terminal_status, task_outcome, diagnostic)
             .await?;
         // 记忆隔离和评估都在 host-owned post-task worker 中执行；终态事件提交后立即
         // 释放执行 worker，避免非用户关键的治理 IO 拉长端到端尾延迟。

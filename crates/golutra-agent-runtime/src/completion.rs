@@ -127,7 +127,8 @@ fn evidence_backed_failure_message(
         .checks
         .iter()
         .rev()
-        .find(|check| !check.passed && check.kind != VerificationCheckKind::ToolExecution)
+        .find(|check| !check.passed && check.kind != VerificationCheckKind::ToolExecution);
+    let failed_message = failed_check
         .map(|check| check.message.trim())
         .filter(|message| !message.is_empty())
         .or_else(|| verification.residual_risks.first().map(String::as_str))
@@ -156,8 +157,9 @@ fn evidence_backed_failure_message(
         *families.entry(family).or_default() += 1;
     }
     let dominant_family = families.into_iter().max_by_key(|(_, failures)| *failures);
-    let evidence = verification
-        .evidence_refs
+    let evidence = failed_check
+        .map(|check| &check.evidence_refs)
+        .unwrap_or(&verification.evidence_refs)
         .iter()
         .take(3)
         .map(ToString::to_string)
@@ -165,7 +167,7 @@ fn evidence_backed_failure_message(
     let mut message = format!(
         "Could not complete. Verification {:?}: {}.",
         verification.result,
-        bounded_text(failed_check, 240)
+        bounded_text(failed_message, 240)
     );
     if let Some((family, failures)) = dominant_family {
         message.push_str(&format!(

@@ -920,6 +920,17 @@ async fn openai_responses_provider_matches_sse_goldens_and_auth_headers() {
     assert_eq!(response.usage.reasoning_tokens, Some(1));
     assert_eq!(response.usage.total_tokens, Some(15));
     assert_eq!(response.raw_metadata["response_id"], "resp_golden_text");
+    let boundary = &response.raw_metadata["responses_stream"];
+    assert_eq!(boundary["terminal_seen"], true);
+    assert!(boundary["frame_count"].as_u64().is_some_and(|n| n > 0));
+    assert!(boundary["frame_bytes"].as_u64().is_some_and(|n| n > 0));
+    assert!(
+        boundary
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|v| !v.is_string() || v == "stop")
+    );
     let diagnostics = ProviderTransportDiagnostics::from_raw_metadata(&response.raw_metadata)
         .expect("Responses stream diagnostics");
     assert_eq!(diagnostics.transport, "responses_sse");
@@ -1474,6 +1485,69 @@ async fn responses_measure_tool_ready_wait_without_executing_partial_calls() {
         "expected controlled stream tail delay, observed {delay} ms"
     );
     eprintln!("controlled tool-ready-to-terminal delay: {delay} ms");
+}
+
+#[tokio::test]
+async fn responses_completed_output_supplies_arguments_without_deltas_or_with_partial_deltas() {
+    for delta in [None, Some("{\"path\":"), Some("{\"path\":\"old.txt\"}")] {
+        let mut body = String::new();
+        let output = ["a.txt", "b.txt"].into_iter().enumerate().map(|(index, path)| {
+            let item = json!({"type":"function_call", "call_id":format!("call_{index}"),
+                "name":"read_file", "arguments":json!({"path":path}).to_string(), "status":"completed"});
+            let added = json!({"type":"response.output_item.added", "output_index":index,
+                "item":{"type":"function_call", "call_id":format!("call_{index}"), "name":"read_file", "arguments":""}});
+            body.push_str(&format!("event: response.output_item.added\ndata: {added}\n\n"));
+            if let Some(delta) = delta {
+                let frame = json!({"type":"response.function_call_arguments.delta", "output_index":index, "delta":delta});
+                body.push_str(&format!("event: response.function_call_arguments.delta\ndata: {frame}\n\n"));
+            }
+            let done = json!({"type":"response.function_call_arguments.done", "output_index":index, "arguments":item["arguments"]});
+            body.push_str(&format!("event: response.function_call_arguments.done\ndata: {done}\n\n"));
+            item
+        }).collect::<Vec<_>>();
+        let completed = json!({"type":"response.completed", "response":{
+            "id":"resp_done_only", "status":"completed", "model":"gpt-golden", "output":output}});
+        body.push_str(&format!("event: response.completed\ndata: {completed}\n\n"));
+        let (base_url, _) =
+            spawn_provider_sequence(vec![TestProviderResponse::sse(200, body)]).await;
+        let response = openai_responses_provider(base_url)
+            .complete(simple_request("gpt-golden"))
+            .await
+            .unwrap();
+        assert_eq!(response.tool_calls.len(), 2);
+        assert_eq!(response.tool_calls[0].arguments, json!({"path":"a.txt"}));
+        assert_eq!(response.tool_calls[1].arguments, json!({"path":"b.txt"}));
+        assert_eq!(response.finish_reason, ProviderFinishReason::ToolCalls);
+    }
+}
+
+#[tokio::test]
+async fn responses_completed_tool_arguments_keep_bounds_and_invalid_json_truth() {
+    for (arguments, duplicate, should_error) in [
+        ("{broken".to_owned(), false, false),
+        ("x".repeat(256 * 1024 + 1), false, true),
+        ("{}".to_owned(), true, true),
+    ] {
+        let item = json!({"type":"function_call", "call_id":"call_1", "name":"read_file", "arguments":arguments});
+        let output = if duplicate {
+            vec![item.clone(), item]
+        } else {
+            vec![item]
+        };
+        let completed = json!({"type":"response.completed", "response":{
+            "id":"resp_bounds", "status":"completed", "model":"gpt-golden", "output":output}});
+        let body = format!("event: response.completed\ndata: {completed}\n\n");
+        let (base_url, _) =
+            spawn_provider_sequence(vec![TestProviderResponse::sse(200, body)]).await;
+        let result = openai_responses_provider(base_url)
+            .complete(simple_request("gpt-golden"))
+            .await;
+        if should_error {
+            assert!(matches!(result, Err(ProviderError::Malformed { .. })));
+        } else {
+            assert_eq!(result.unwrap().tool_calls[0].arguments, json!("{broken"));
+        }
+    }
 }
 
 #[tokio::test]

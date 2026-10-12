@@ -59,6 +59,14 @@
 - 任务执行中遇到缺失/损坏 provider 配置会进入 durable `ProviderAuthRequired` 和 `WaitingAuthentication`；任一已 attach 客户端可在完成 verified install 后提交 `ProviderConfigured/ProviderAuthSubmitted` 使原任务从安全边界继续，也可提交 `ProviderAuthCancelled` 取消。该链路已有 embedded 与跨进程 daemon 回归。
 - TUI 已有 provider onboarding gate 和 `/auth` setup；已有 active provider 时不会首屏打断，但输入 `/auth` 可随时重新打开同一套选型并覆盖同名 profile。Web 首次 provider onboarding 不在当前产品范围，CLI 非交互场景保持结构化诊断。
 
+## Responses 工具完成边界
+
+Responses 工具参数以成功 `response.completed` 中的完整调用为准；部分兼容上游只有
+`arguments.done` 而没有参数 delta，不能把增量累积为空解释为模型提交了空参数。
+完整调用复用已有参数解析和大小限制，并拒绝重复 call ID；只有完整响应才能进入工具执行。
+无完整 output 的流继续使用已捕获调用与缺失调用校验，截断和失败不会因已有参数而升级成功。
+encrypted reasoning 的回放链路保持独立。
+
 ## 缓存能力与会话亲和
 
 缓存字段不是按 endpoint 字符串猜测，而是在配置入口一次性解析为
@@ -570,3 +578,11 @@ probe 结果进入 capability matrix，但不能把一次 probe 成功当作永�
 - runtime event、artifact、projection、debug export 中没有明文 key。
 - 重启后 provider selection 可恢复，secret 从 environment 或 `$GOLUTRA_AGENT_HOME/credentials.json` 中的 SecretRef 解析。
 - committed golden tests 不读取用户配置；专用 live env 配齐时，`just provider-live-smoke` 对目标 endpoint 发起最小真实请求。
+# Responses boundary diagnostics
+
+Successful Responses requests persist a bounded `responses_stream` metadata
+object: frame count/bytes, unparsed frame count, terminal presence, finish reason,
+end_turn and final message/tool/reasoning item counts. It contains no raw SSE,
+prompt text, tool arguments or credentials. These facts help distinguish an
+upstream empty final output from an adapter that lost expected output items.
+Historical records without these facts cannot establish that distinction.

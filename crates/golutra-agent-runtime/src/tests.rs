@@ -31,6 +31,8 @@ mod correction_feedback_tests;
 mod long_task_compaction_tests;
 #[path = "long_task_correction_tests.rs"]
 mod long_task_correction_tests;
+#[path = "process_validation_tests.rs"]
+mod process_validation_tests;
 #[path = "unlimited_task_tests.rs"]
 mod unlimited_task_tests;
 #[path = "validation_shell_tests.rs"]
@@ -3328,7 +3330,7 @@ async fn fallback_completion_and_usage_are_attributed_to_the_actual_provider() {
     assert!(trace.iter().any(|event| matches!(
         event,
         AgentLoopTraceEvent::TokenUsageRecorded(record)
-            if record.provider_id == "mock" && record.model_id == "mock-model"
+            if record.provider_id == "mock" && record.model_id == "mock-model" && !record.usage_complete
     )));
     let usage_index = trace
         .iter()

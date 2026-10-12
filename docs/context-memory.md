@@ -143,6 +143,11 @@ tool result excerpts
 `tool_schema_tokens_estimated`、`tool_result_tokens_estimated`、`provider_total_tokens` 和
 `usage_complete`。`provider_total_tokens` 只接受 provider 明确返回的总量；当总量缺失
 时，输入与输出之和只能作为标注为 aggregate 的展示值，不能回写成 provider 事实。
+同一逻辑请求重试或切换 provider 后，成功响应中的数字仅覆盖最后一次尝试，
+`usage_complete` 保持 false；不为失败尝试伪造响应 ID 或补零。会话用量与子任务预算还会
+联合读取请求生命周期和 recovery 事件，因此旧记录中成功响应的完整标记也不能掩盖
+未报告用量的尝试。Usage 页的 Requests 是逻辑请求数；有缺口时已知 token 仅作为下限，
+缺失费用显示 unknown，只有完整且明确报告的零费用才能显示 `$0.000000`。
 provider 不返回工具分项时，`tool_schema_tokens_estimated` 来自本轮实际发送的 tool contract
 预算，`tool_result_tokens_estimated` 来自进入 request 的 tool result 片段；这两个字段是本地估算，
 不会冒充 provider usage。

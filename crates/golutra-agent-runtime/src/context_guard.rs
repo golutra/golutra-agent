@@ -103,6 +103,8 @@ where
         content: final_message.clone(),
     });
     AgentLoopOutcome {
+        runtime_stop_reason: Some(reason.clone()),
+        runtime_failure_class: Some(golutra_agent_core::FailureClass::Context),
         loop_decision: LoopDecision {
             decision_id: LoopDecisionId::new(),
             task_id: request.task_id,

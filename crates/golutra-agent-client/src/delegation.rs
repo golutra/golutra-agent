@@ -1260,33 +1260,15 @@ async fn child_usage(
 }
 
 fn summarize_child_usage(events: &[RuntimeEvent]) -> (Option<u64>, Option<u64>, Option<u64>) {
+    if golutra_agent_protocol::ProviderUsageCoverage::from_events(events).has_unreported_attempts {
+        return (None, None, None);
+    }
     let usage_events = events
         .iter()
         .filter(|event| event.event_type == RuntimeEventType::TokenUsageRecorded)
         .collect::<Vec<_>>();
     if usage_events.is_empty() {
         return (None, None, None);
-    }
-
-    // resume 后失败的请求可能没有 usage；累计值不变不能被解释为本轮实际消耗为零。
-    let mut pending_requests = std::collections::HashSet::new();
-    for event in events.iter().filter(|event| {
-        matches!(
-            event.event_type,
-            RuntimeEventType::ProviderStarted
-                | RuntimeEventType::ProviderCompleted
-                | RuntimeEventType::ProviderFailed
-        )
-    }) {
-        let Some(request_id) = event
-            .payload
-            .get("provider_request_id")
-            .and_then(Value::as_str)
-            .and_then(|value| value.parse::<golutra_agent_core::ProviderRequestId>().ok())
-        else {
-            return (None, None, None);
-        };
-        pending_requests.insert(request_id);
     }
 
     let mut total_tokens = 0_u64;
@@ -1308,7 +1290,6 @@ fn summarize_child_usage(events: &[RuntimeEvent]) -> (Option<u64>, Option<u64>, 
             cost_complete = false;
             continue;
         };
-        pending_requests.remove(&record.request_event_id);
         match record.output_tokens {
             Some(tokens) => output_tokens = output_tokens.saturating_add(tokens),
             None => output_complete = false,
@@ -1334,9 +1315,9 @@ fn summarize_child_usage(events: &[RuntimeEvent]) -> (Option<u64>, Option<u64>, 
         }
     }
     (
-        (tokens_complete && pending_requests.is_empty()).then_some(total_tokens),
-        (cost_complete && pending_requests.is_empty()).then_some(estimated_cost_microusd),
-        (output_complete && pending_requests.is_empty()).then_some(output_tokens),
+        tokens_complete.then_some(total_tokens),
+        cost_complete.then_some(estimated_cost_microusd),
+        output_complete.then_some(output_tokens),
     )
 }
 
@@ -2243,7 +2224,7 @@ mod tests {
             tool_result_tokens_estimated: None,
             tool_estimated_tokens: None,
             provider_total_tokens,
-            usage_complete: false,
+            usage_complete: input_tokens.is_some() && output_tokens.is_some(),
             session_id: None,
             cache_identity: None,
         })
@@ -2336,6 +2317,24 @@ mod tests {
         )];
 
         assert_eq!(summarize_child_usage(&events), (None, Some(7), Some(6)));
+    }
+
+    #[test]
+    fn child_usage_does_not_release_budget_after_an_unmetered_retry() {
+        let session = SessionId::new();
+        let record = usage_record(Some(10), Some(4), Some(6), Some(0.000_007));
+        let events = [
+            host_event(
+                1,
+                session,
+                None,
+                RuntimeEventType::RetryScheduled,
+                RuntimeEventSource::Provider,
+                json!({"provider_request_id": record["request_event_id"], "recovery": {"phase": "waiting", "attempt": 1}}),
+            ),
+            usage_event(session, Some(record)),
+        ];
+        assert_eq!(summarize_child_usage(&events), (None, None, None));
     }
 
     #[test]

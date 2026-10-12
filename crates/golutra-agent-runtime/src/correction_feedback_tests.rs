@@ -34,6 +34,32 @@ fn correction_actions_follow_failure_types_and_latest_results() {
 }
 
 #[test]
+fn final_failure_references_the_failed_check_not_the_first_global_evidence() {
+    let (mut record, reports) = fixture(5);
+    for check in &mut record.checks {
+        check.passed = true;
+    }
+    let failed = record
+        .checks
+        .iter_mut()
+        .rev()
+        .find(|c| c.kind == VerificationCheckKind::ObjectiveValidation)
+        .unwrap();
+    failed.passed = false;
+    let relevant = failed.evidence_refs.clone();
+    record.result = VerificationResult::Fail;
+    let message = completion::final_message(None, &reports, &record).unwrap();
+    assert!(message.contains(&relevant[0].to_string()));
+    for id in record
+        .evidence_refs
+        .iter()
+        .filter(|id| !relevant.contains(id))
+    {
+        assert!(!message.contains(&id.to_string()));
+    }
+}
+
+#[test]
 fn missing_evidence_requests_validation_without_claiming_tests_failed() {
     let (mut record, _) = fixture(0);
     record.assertions.clear();
