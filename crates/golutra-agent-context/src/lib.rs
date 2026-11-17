@@ -2310,7 +2310,7 @@ pub fn estimate_message_token(message: &ProviderMessage) -> u64 {
     let metadata_tokens = if message.metadata.openai_responses_replay_items.is_empty() {
         0
     } else {
-        serde_json::to_string(&message.metadata)
+        serde_json::to_string(&serde_json::json!({"openai_responses_replay_items": message.metadata.openai_responses_replay_items}))
             .map(|metadata| estimate_tokens(&metadata))
             .unwrap_or_default()
     };
@@ -2323,6 +2323,8 @@ pub fn estimate_message_token(message: &ProviderMessage) -> u64 {
                 .sum::<u64>(),
         )
         .saturating_add(metadata_tokens)
+        // 图片按保守视觉预算计入，不把 base64 当正文，也不能当零成本。
+        .saturating_add((message.metadata.images.len() as u64).saturating_mul(4_096))
 }
 
 #[must_use]

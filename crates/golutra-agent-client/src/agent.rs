@@ -12,6 +12,7 @@ use crate::{
 use golutra_agent_core::{
     Actor, ActorKind, CommandId, SessionId, TaskId, TaskReconciliationDecision, ThreadId,
 };
+use golutra_agent_llm::ProviderReasoningEffort;
 use golutra_agent_protocol::{
     AgentSteerOptions, AgentStreamEvent, AgentThreadRef, AgentTurnExecutionOptions,
     AgentTurnOptions, AgentTurnResult, AgentTurnStart, EventFilter, RuntimeQuery, RuntimeQueryKind,
@@ -19,6 +20,16 @@ use golutra_agent_protocol::{
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
+
+/// Per-turn provider selection, resolved by the runtime host without changing
+/// stored preferences or loading credentials in the calling application.
+#[derive(Debug, Clone, Default)]
+pub struct AgentTurnProviderOptions {
+    pub profile: Option<String>,
+    pub model: Option<String>,
+    /// None inherits; Some(None) clears a configured effort to the provider default.
+    pub reasoning_effort: Option<Option<ProviderReasoningEffort>>,
+}
 
 #[derive(Debug, Clone)]
 pub struct AgentClient {
@@ -156,8 +167,13 @@ impl AgentThread {
         prompt: impl Into<String>,
         options: AgentTurnOptions,
     ) -> Result<TurnHandle, ClientError> {
-        self.start_turn_inner(prompt, options, Some(AgentTurnExecutionOptions::default()))
-            .await
+        self.start_turn_inner(
+            prompt,
+            options,
+            Some(AgentTurnExecutionOptions::default()),
+            AgentTurnProviderOptions::default(),
+        )
+        .await
     }
 
     pub async fn start_turn_legacy(
@@ -165,7 +181,8 @@ impl AgentThread {
         prompt: impl Into<String>,
         options: AgentTurnOptions,
     ) -> Result<TurnHandle, ClientError> {
-        self.start_turn_inner(prompt, options, None).await
+        self.start_turn_inner(prompt, options, None, AgentTurnProviderOptions::default())
+            .await
     }
 
     pub async fn start_turn_with_execution_options(
@@ -174,7 +191,23 @@ impl AgentThread {
         options: AgentTurnOptions,
         execution: AgentTurnExecutionOptions,
     ) -> Result<TurnHandle, ClientError> {
-        self.start_turn_inner(prompt, options, Some(execution))
+        self.start_turn_inner(
+            prompt,
+            options,
+            Some(execution),
+            AgentTurnProviderOptions::default(),
+        )
+        .await
+    }
+
+    pub async fn start_turn_with_provider_options(
+        &self,
+        prompt: impl Into<String>,
+        options: AgentTurnOptions,
+        execution: AgentTurnExecutionOptions,
+        provider: AgentTurnProviderOptions,
+    ) -> Result<TurnHandle, ClientError> {
+        self.start_turn_inner(prompt, options, Some(execution), provider)
             .await
     }
 
@@ -183,6 +216,7 @@ impl AgentThread {
         prompt: impl Into<String>,
         options: AgentTurnOptions,
         execution: Option<AgentTurnExecutionOptions>,
+        provider: AgentTurnProviderOptions,
     ) -> Result<TurnHandle, ClientError> {
         let prompt = prompt.into();
         if prompt.trim().is_empty() {
@@ -214,7 +248,16 @@ impl AgentThread {
                 after_sequence_no: cursor,
             })
             .await?;
-        let payload = turn_payload(prompt, self.thread.thread_id, &options, execution)?;
+        let mut payload = turn_payload(prompt, self.thread.thread_id, &options, execution)?;
+        if let Some(profile) = provider.profile {
+            payload["provider_profile"] = json!(profile);
+        }
+        if let Some(model) = provider.model {
+            payload["provider_model"] = json!(model);
+        }
+        if let Some(effort) = provider.reasoning_effort {
+            payload["provider_reasoning_effort"] = serde_json::to_value(effort)?;
+        }
         let ack = self
             .client
             .transport

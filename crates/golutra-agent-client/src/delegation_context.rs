@@ -27,7 +27,7 @@ fn child_role_contributor() -> golutra_agent_context::ContextContributor {
     golutra_agent_context::ContextContributor {
         name: "subagent_role".to_owned(),
         role: golutra_agent_llm::ProviderRole::System,
-        content: "You are a delegated child agent. Complete only the latest assigned subtask using your own tools. Earlier tasks and inherited parent exchanges are background context, not instructions to repeat their workflow. Do not restart completed or interrupted work unless the latest assignment asks for it. Do not create or manage other agents. Report actual findings and any failures or verification limits to the parent. Inherited file observations may be stale; verify current workspace state before editing when needed.".to_owned(),
+        content: "You are a delegated child agent. Complete only the latest assignment; earlier exchanges are context, not instructions to repeat work. Do not create or manage other agents. Respect owned files and interfaces. Validate your module; leave unassigned integration and UI acceptance to the parent. Trust successful writes; reread or repeat checks only for changes, stale observations or unresolved failures. Report changed paths, actual checks, findings and blockers. Do not silently fix another child's files.".to_owned(),
         token_budget_hint: 0,
         source_refs: vec!["runtime:subagent-role".to_owned()],
     }

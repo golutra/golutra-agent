@@ -339,6 +339,7 @@ fn driver_rejects_session_switching_slash_commands() {
         "/resume",
         "/resume 019f79f6-c084-7210-a891-a12832a20f14",
         "/fork 019f79f6-c084-7210-a891-a12832a20f14",
+        "/agents open reviewer",
     ] {
         let error = ensure_session_binding_is_immutable(command)
             .expect_err("session switch must be rejected");
@@ -375,7 +376,19 @@ fn explicit_task_binding_is_read_only_for_prompts() {
     let task_id = Some(TaskId::new());
     assert!(ensure_task_binding_allows_slash(task_id, "/status").is_ok());
     assert!(ensure_task_binding_allows_slash(task_id, "/debug").is_ok());
-    for command in ["/abort", "/pause", "/approve", "/compact", "/auth mock"] {
+    for command in ["/agents", "/agents page 32", "/agents show reviewer"] {
+        assert!(ensure_task_binding_allows_slash(task_id, command).is_ok());
+    }
+    for command in [
+        "/abort",
+        "/pause",
+        "/approve",
+        "/compact",
+        "/auth mock",
+        "/agents cancel reviewer",
+        "/agents continue reviewer task",
+        "/agents open reviewer",
+    ] {
         let error = ensure_task_binding_allows_slash(task_id, command)
             .expect_err("task-bound slash control must be rejected");
         assert_eq!(driver_error_code(&error), "task_binding_read_only");

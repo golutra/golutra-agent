@@ -8,7 +8,8 @@ use std::{ops::Deref, sync::Arc};
 
 use golutra_agent_context::ContextBuilder;
 use golutra_agent_core::{
-    ApprovalResolution, TaskContract, VerificationRequirement, WorkspaceChangeRequirement,
+    ApprovalResolution, BackgroundResult, TaskContract, VerificationRequirement,
+    WorkspaceChangeRequirement,
 };
 use golutra_agent_llm::{LlmProvider, PromptCacheScope};
 use golutra_agent_protocol::{AgentExecutionMode, AgentToolProfile};
@@ -96,6 +97,7 @@ pub struct ConfiguredAgentRun {
     tool_profile_is_explicit: bool,
     governor_usage: AgentGovernorUsage,
     task_contract_is_explicit: bool,
+    background_results: Vec<BackgroundResult>,
 }
 
 impl ConfiguredAgentRun {
@@ -108,6 +110,7 @@ impl ConfiguredAgentRun {
             tool_profile_is_explicit: false,
             governor_usage: AgentGovernorUsage::default(),
             task_contract_is_explicit: false,
+            background_results: Vec::new(),
         }
     }
 
@@ -192,6 +195,13 @@ impl ConfiguredAgentRun {
     #[must_use]
     pub fn with_governor_usage(mut self, usage: AgentGovernorUsage) -> Self {
         self.governor_usage = usage;
+        self
+    }
+
+    /// Attach durable observations to this admitted input without manufacturing a user message.
+    #[must_use]
+    pub fn with_background_results(mut self, results: Vec<BackgroundResult>) -> Self {
+        self.background_results = results;
         self
     }
 }
@@ -348,7 +358,12 @@ where
             tool_profile_is_explicit: _,
             governor_usage,
             task_contract_is_explicit: _,
+            background_results,
         } = run;
+        control.pending_turns.enqueue_background_results(
+            background_results,
+            super::BackgroundDeliveryMode::Passive,
+        )?;
         let turn_overrides = AgentTurnOverrides {
             max_elapsed_ms: run.max_elapsed_ms,
             defer_external_verification: run.defer_external_verification,

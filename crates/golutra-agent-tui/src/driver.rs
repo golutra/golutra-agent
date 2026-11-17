@@ -1137,6 +1137,12 @@ fn is_quiescent_status(status: TaskStatus) -> bool {
 }
 
 fn ensure_session_binding_is_immutable(text: &str) -> miette::Result<()> {
+    if matches!(parse_slash_input(text), SlashInput::Command(SlashCommand::Agents {action,..}) if action=="open")
+    {
+        return Err(miette::miette!(
+            "session_binding_immutable: a TUI Driver cannot switch sessions; start another Driver bound to the target session"
+        ));
+    }
     if matches!(
         parse_slash_input(text),
         SlashInput::Command(
@@ -1231,7 +1237,7 @@ fn ensure_task_binding_allows_slash(task_id: Option<TaskId>, text: &str) -> miet
         return Ok(());
     };
     let read_only = matches!(
-        command,
+        &command,
         SlashCommand::Help
             | SlashCommand::WhatsNew
             | SlashCommand::Export
@@ -1246,7 +1252,9 @@ fn ensure_task_binding_allows_slash(task_id: Option<TaskId>, text: &str) -> miet
             | SlashCommand::Quit
             | SlashCommand::Auth(SlashAuthCommand::Status | SlashAuthCommand::Protocols)
     );
-    if read_only {
+    if read_only
+        || matches!(&command, SlashCommand::Agents {action,..} if matches!(action.as_str(),"list"|"page"|"show"))
+    {
         return Ok(());
     }
     Err(miette::miette!(

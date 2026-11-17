@@ -6,16 +6,64 @@
 | --- | --- | --- |
 | `spawn` (default) | `task` | Create an independent child session; wait for completion by default. Files are shared unless `isolation: "worktree"` is selected. |
 | `status` | `child_session_id` | Read the latest state and available findings, including after reconnect. |
+| `list` | none | Page the parent's durable child registry with `cursor` and `page_size` (maximum 16). Return names, current execution, state and pending message count. |
 | `wait` | `child_session_id` or `child_session_ids` | Wait up to `wait_ms` (default and maximum 60 seconds). Multiple targets default to `wait_mode: "any"`; `all` waits for every target. Expiration does not cancel or restart children. |
-| `send_input` | `child_session_id`, `task` | Supplement an active child through the runtime's durable steering queue. Repeated input identities are deduplicated. A completed child rejects steering. |
+| `send_input` | `child_session_id`, `task` | `delivery_mode: "continue"` steers an active child or resumes an eligible idle child in the same session. `queue_only` durably stores a message without starting execution. Omitting the mode preserves active-only steering. Repeated call identities are deduplicated. |
 | `resume` | `child_session_id`, `task` | Start another turn in the same child session with its history. Active or uncertain children cannot be restarted this way. |
 | `cancel` | `child_session_id` | Request cancellation; use `wait` to observe termination. |
 
 Use `run_in_background: true` on spawn/resume to obtain the child session and execution task handles after durable startup, without waiting for its answer. Admission failure returns a failure result instead of an unbacked handle. Background work remains supervised by the host and subject to explicit child cancellation and delegation limits. Interrupting a parent response alone does not cancel background children. Read the result before claiming completion. A finished child is archived from the ordinary thread list; resume reopens that same thread.
 
+An optional `name` on spawn gives the child a stable name unique within its parent.
+`child_session_id` stays fixed across continuation; `child_task_id` identifies each execution.
+Use `expected_child_task_id` for an execution-bound follow-up. Reusing a call ID with
+different content fails, while an identical retry returns the admitted operation.
+Queued messages are bounded to 128 per child and 8 KiB each, survive reconnect, and
+are acknowledged only after the child context and its artifacts are durable.
+
+## Questions and interactive controls
+
+A child's permitted `ask_user` call returns a structured blocked result with
+`needs_parent_input`, `question_id` and `questions`. It does not wait on an invisible
+user channel. The parent can resolve the question or ask the user when necessary.
+Continue that same child with the answer, `expected_child_task_id` and
+`reply_to_question_id`. A different execution, question, or cancelled child rejects
+the answer. `queue_only` does not accept execution-bound answers. Tool-profile and
+approval restrictions still apply; child questions do not grant new permissions.
+
+The TUI provides `/agents`, `/agents page <cursor>`, `/agents show <name-or-session>`,
+`/agents cancel <name-or-session>`, `/agents continue <name-or-session> <task>` and
+`/agents open <name-or-session>`. Inspection keeps the parent attached. Cancellation
+checks the parent controller and the selected child execution. Continue sends the
+request through the parent agent's budget and admission controls. Open is available
+when the parent is idle and shows the command for returning to the parent.
+A task-bound Driver permits only list/page/show; every Driver retains its fixed
+session and rejects open. Default displays show names, assignments and states.
+Quote names containing spaces, for example `/agents show "code reviewer"`.
+`/agents continue "code reviewer" don't change 'this'` preserves the follow-up text.
+
 The `explore` agent type sets an explicit forbidden-workspace-change contract. Only file reads and strictly read-only direct shell commands are exposed. Scripts, pipelines, redirects, background processes and write tools are rejected at execution, including provider-generated parallel write batches. The existing workspace policy and sandbox remain active. Resuming an exploration child cannot silently remove its read-only restriction.
 
 ## Result contract
+
+Spawn/resume accepts `tool_profile: "none" | "coding" | "full"`. Omission inherits;
+an explicit profile can only narrow the parent's tools and the child's previous
+profile. Resume and `explore` cannot restore tools disabled by `none`. The runtime
+also rejects calls outside that profile, even if a provider invents a tool call.
+
+An optional `assignment` records `owned_paths`, `new_paths`, `interfaces`, `checks`
+and `acceptance`. Paths must be workspace-relative; new paths must be owned paths.
+Owned paths become required delivery paths in the existing verifier. Checks are
+instructions to the child, not commands automatically executed on admission.
+Acceptance is a behavioral checklist for the child's evidence report and parent
+review, not a machine-verifiable assertion inferred from arbitrary prose.
+Results retain `child_acceptance_status: "requires_parent_review"` and the criteria;
+a successful execution does not certify them. Explicit runtime contracts and
+failed objective checks keep their existing enforcement.
+Omitted assignments persist on resume. The parent owns unassigned integration and
+browser acceptance; children report local checks and integration blockers.
+File ownership is a responsibility contract, **not a filesystem sandbox**. Existing
+workspace policy, read-only `explore`, and tool profiles remain the enforced limits.
 
 Execution, verification and findings are separate:
 
@@ -23,7 +71,8 @@ Execution, verification and findings are separate:
 - `child_execution_status` distinguishes a returned response from a stopped or running task.
 - `child_verification_status`, `child_verification_issues` and `child_diagnostic` describe verification independently.
 - `child_findings_available` indicates whether assistant output exists. Unverified findings are retained without changing a failure into a verified success.
-- Results are paged by Unicode character, using `offset` and `limit`. When `child_result_has_more` is true, query `status` with `child_result_next_offset`. If the provider projection reports `model_visible_truncated`, repeat the same page with a smaller limit. Reading does not consume or delete the result.
+- Results are paged by Unicode character, using `offset` and `limit`. When `child_result_has_more` is true, query `status` with `child_result_next_offset`; projection truncation also returns the next visible character offset. Reading does not consume or delete the result.
+- `child_result_coverage` describes the supplied range, character count and full-result coverage. A final page alone is not full coverage. Batch budgeting trims long bodies independently, retains short findings and failure states, and explicitly counts omitted results when even metadata exceeds the budget. Full results remain readable through `status`.
 
 The full original answer remains in child events. Synthetic runtime failure messages do not replace the answer returned to the parent. Tool-level errors retain findings and diagnostics where available. A partial task remains distinguishable from a provider failure, cancellation, runtime deadline, or an expired wait.
 
@@ -46,7 +95,7 @@ legacy checkpoints without the output counter retain their previous conservative
 total-based charge. Unsettled crash-recovery reservations still exhaust the
 available admission cap until durable settlement replaces them.
 
-Implementation boundaries: `delegation` owns child startup/cleanup, `delegation_control` owns lifecycle requests and result projection, `delegation_policy` owns limits, `delegation_context` owns explicit context inheritance, `delegation_notifications` owns durable completion delivery, and `RuntimeVerificationService` owns contract-aware verification.
+Implementation boundaries: `delegation` owns child startup/cleanup, `delegation_control` owns lifecycle requests and result projection, `delegation_registry` owns durable discovery/mailbox access, `delegation_policy` owns limits, `delegation_context` owns explicit context inheritance, and `RuntimeVerificationService` owns contract-aware verification. Managed completion uses the shared background observer/inbox; `delegation_notifications` retains audit and legacy recovery.
 
 ## Explicit parent context
 
@@ -70,6 +119,15 @@ There is no cumulative child-count or execution-count limit. Finished children r
 
 Send multiple independent `subagent` calls with `run_in_background: true` in one provider response. Startup handlers can run concurrently after the batch's checkpoints succeed. Child execution then runs independently. Resume calls for the same child cannot share a batch, and overlapping wait target sets form a scheduling barrier. `send_input`, cancellation and other lifecycle changes remain ordered.
 
+Once module interfaces are known, keep that dispatch response short and give each
+child distinct file ownership. Write the parent's independent integration files in
+the next response while children run. Large file writes in the dispatch response
+delay every child because tools start after the complete response is received.
+This is scheduling guidance, not speculative execution of unfinished tool calls.
+The stable execution instructions apply this ordering to delegation and other
+independent background operations; the compact tool description repeats the
+relevant reminder. Actual model adherence must still be measured.
+
 Shared checkpoint objects are fully written and synced in temporary files before atomic, non-overwriting publication. Concurrent startup cannot observe a half-written checksum object. Existing objects must still match exactly; genuine corruption fails explicitly. Unpublished temporary objects are excluded from object collection.
 
 ```json
@@ -78,6 +136,18 @@ Shared checkpoint objects are fully written and synced in temporary files before
 
 Batch results include `child_results` and `child_pending_ids`. Failed, interrupted and Partial children are terminal for waiting purposes; terminal does not mean successful. Each result keeps its own session/task identity, findings and verification facts. Results are repeatable and never consumed by a wait; request `status` for a child to page its complete output.
 
+New parent input interrupts a subagent wait with `wait_interrupted: "input"` after
+durable startup. The input remains queued for the parent, and the child continues.
+Waiting itself does not occupy one of the 16 background tool execution slots.
+
+Conflicting filesystem mutations in different sessions of the same host coordinate
+through canonical path leases. The lease starts before the before-image and remains
+through mutation/comparison; supervised shell retains it until the process is reaped.
+Ancestor/descendant paths conflict; disjoint paths/worktrees can run concurrently.
+Opaque write commands claim the workspace. Delegation itself never holds that lease.
+Same-session ordering remains the loop's responsibility. These are process-local
+leases, not cross-host locks or a strict FIFO fairness guarantee.
+
 Once a batch wait has observed an execution's terminal result, it retains that
 result instead of querying the session's latest execution again. A concurrent
 resume cannot replace the completed result with a newer running task. Pending
@@ -85,9 +155,36 @@ items are refreshed so simultaneous completions remain visible.
 
 ## Completion delivery and cancellation
 
-Child completion is persisted as a `SubagentUpdated` event in the parent session. TUI cards update independently, and archived cards receive a single completion notice. The model receives a bounded runtime observation at a request boundary; results already returned by a completed tool call are not injected again. Notifications survive reconnect, and missing notices can be reconstructed from persisted launch/result records after orphan reconciliation. Completed or cancelled parent tasks are not automatically restarted; later input can consume the persisted history.
+Hosted child executions register with the same durable batch/inbox as background
+shell and browser work, without consuming a tool execution permit. Results are
+quietly stored. A running parent attaches current results to its next already
+scheduled model request. This does not request inference or emit a notification.
+New user input consumes available results first; otherwise, a sealed
+batch can continue the existing parent loop once when all its members settle.
+Cancelled, paused, handed-off, unknown or waiting-for-user work does not acquire an
+automatic continuation. An ended parent is not secretly restarted.
 
-Waiters receive the actual result before notification finalization, while the host continues supervising the notification owner. Shutdown cannot overwrite an already published result with a cleanup error. Reconstructed notices bind the original execution task, so a later resume cannot supply findings for an earlier launch. Notification lookup advances an event cursor and caches only relevant facts, with limits of 32 sessions, 4,096 facts and 2 MiB per session; oversized histories rebuild from durable storage rather than dropping notices.
+Child-internal background tools belong to the child's own batch; the parent receives
+the child execution result, not those internal tool outputs. `SubagentUpdated`
+remains an audit/TUI fact and legacy recovery path. Managed results do not inject a
+second legacy model notification. A result already present in the parent's request
+history gets a small durable delivery acknowledgement instead of repeated findings;
+verification also avoids double-counting the same terminal execution. Matching uses
+both child session and execution task, so an old result cannot replace a new one.
+
+When the inbox delivery arrives after a final provider request already captured
+the full terminal wait/status findings, the loop acknowledges it against that
+durable request without asking the model for another summary. It then rechecks
+user input, cancellation and remaining background work. Truncated findings,
+unread pages, findings removed by context compaction, and a different execution of
+the same child still require delivery; a status handle alone is insufficient.
+
+Tool availability follows explicit tool profiles and task contracts. Quoted text
+such as a child's “no tools” instruction does not remove the parent's tools.
+Callers that require an empty tool catalog use `AgentToolProfile::None`; natural
+language instructions remain part of the model's task.
+
+Waiters receive the actual result before notification finalization, while the host continues supervising the notification owner. Shutdown cannot overwrite an already published result with a cleanup error. Reconstructed notices bind the original execution task, so a later resume cannot supply findings for an earlier launch. Notification lookup advances an event cursor, removes settled managed launches and uses separate per-session locks for database paging. The global cache lock is not held across database I/O. Cache limits remain 32 sessions, 4,096 facts and 2 MiB per session; oversized unresolved legacy histories rebuild from durable storage rather than dropping notices. Discovery uses the durable registry, independent of this cache.
 
 An execution releases its concurrency slot when its result is published after child cleanup, archiving and usage settlement. Pending notification persistence does not block an immediate resume. The notification owner stays supervised until it finishes; status selects the latest execution instead of preferring an older pending notification. A second genuinely active execution in the same child session remains prohibited.
 
@@ -121,6 +218,14 @@ answer budget. Large findings still require explicit pagination; necessary statu
 queries, reads and verification remain available.
 
 ## Validation
+
+For the asynchronous integration, schema 9 migration and current regression gates,
+see [the 2026-11-17 validation report](subagent-validation-2026-11-17.md).
+For the subsequent result-delivery refactor, explicit tool profiles, assignment
+contracts and four live game samples, see the
+[delivery refactor report](subagent-delivery-refactor-2026-11-17.md).
+The real-provider measurements below are historical September results and do not
+validate the new implementation with a live model or real browser.
 
 An opt-in real-provider functional check uses isolated credentials/workspace: two background children, one explicit fork, bounded waits and a same-child resume. It verifies durable child execution records and returned sentinel facts, reports parent and whole-task usage separately, and retains owner-only evidence.
 

@@ -19,24 +19,28 @@ path = "src/main.rs"
 [dependencies]
 chrono.workspace = true
 clap.workspace = true
-golutra-agent-app-server = { path = "../golutra-agent-app-server", version = "0.3.9" }
-golutra-agent-auth = { path = "../golutra-agent-auth", version = "0.3.9" }
-golutra-agent-client = { path = "../golutra-agent-client", version = "0.3.9" }
-golutra-agent-code-intelligence = { path = "../golutra-agent-code-intelligence", version = "0.3.9" }
-golutra-agent-config = { path = "../golutra-agent-config", version = "0.3.9" }
+golutra-agent-app-server = { path = "../golutra-agent-app-server", version = "4.0.0" }
+golutra-agent-auth = { path = "../golutra-agent-auth", version = "4.0.0" }
+golutra-agent-client = { path = "../golutra-agent-client", version = "4.0.0" }
+golutra-agent-code-intelligence = { path = "../golutra-agent-code-intelligence", version = "4.0.0" }
+golutra-agent-config = { path = "../golutra-agent-config", version = "4.0.0" }
 golutra-agent-core.workspace = true
-golutra-agent-eval = { path = "../golutra-agent-eval", version = "0.3.9" }
-golutra-agent-llm = { path = "../golutra-agent-llm", version = "0.3.9" }
-golutra-agent-plugin = { path = "../golutra-agent-plugin", version = "0.3.9" }
+golutra-agent-eval = { path = "../golutra-agent-eval", version = "4.0.0" }
+golutra-agent-llm = { path = "../golutra-agent-llm", version = "4.0.0" }
+golutra-agent-plugin = { path = "../golutra-agent-plugin", version = "4.0.0" }
 golutra-agent-project-service.workspace = true
 golutra-agent-protocol.workspace = true
+golutra-agent-tools = { path = "../golutra-agent-tools", version = "4.0.0" }
 miette.workspace = true
 rmcp.workspace = true
+reqwest.workspace = true
+tempfile.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 secrecy.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

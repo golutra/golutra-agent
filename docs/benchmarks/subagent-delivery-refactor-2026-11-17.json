@@ -1,0 +1,2240 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-11-17",
+  "report": "../subagent-delivery-refactor-2026-11-17.md",
+  "scope": "Final local delivery refactor acceptance; generated original artifacts and manual repairs reported separately.",
+  "environment": {
+    "os": "macOS",
+    "target": "aarch64-apple-darwin",
+    "buildProfile": "debug",
+    "provider": "golutra",
+    "model": "grok-4.7",
+    "reasoningEffort": "low"
+  },
+  "regression": {
+    "targets": 59,
+    "passed": 2374,
+    "failed": 0,
+    "ignored": 11,
+    "log": "workspace-final.log",
+    "counting": "Last test result per Running target; nested child-process summaries excluded.",
+    "clippy": {
+      "passed": true,
+      "scope": "workspace all-targets locked -D warnings",
+      "log": "clippy-last.log"
+    }
+  },
+  "runtimeProbe": {
+    "meta": {
+      "workspace": "/tmp/golutra-delivery-refactor.YOYthy/probe-last/probe",
+      "runDir": "/tmp/golutra-delivery-refactor.YOYthy/probe-last/probe-state",
+      "startedAt": "2026-11-17T08:26:38.082Z",
+      "binarySha256": "1db760760752496987f2b856dc449be750258bbeb6a1e384c59b8b88569f5e0f",
+      "args": [
+        "--cwd",
+        "/tmp/golutra-delivery-refactor.YOYthy/probe-last/probe",
+        "exec",
+        "--json",
+        "--run-dir",
+        "/tmp/golutra-delivery-refactor.YOYthy/probe-last/probe-state",
+        "--yolo",
+        "--approval-mode",
+        "auto",
+        "--no-project-verifier-discovery",
+        "--max-elapsed-ms",
+        "180000",
+        "--output-last-message",
+        "/tmp/golutra-delivery-refactor.YOYthy/probe-last/probe-answer.md",
+        "--tool-profile",
+        "coding",
+        "-"
+      ],
+      "wallSeconds": 16.028531958,
+      "exitCode": 0,
+      "signal": null,
+      "finishedAt": "2026-11-17T08:26:54.180Z"
+    },
+    "source": {
+      "schema_version": 1,
+      "package_version": "0.3.9",
+      "git_commit": "fa1d695559e03d3251e25cc80f8ac73c9bf09077",
+      "dirty": true,
+      "source_digest": "sha256:0a5a28542de6b8de02460cb35ba806cf6539d1ca1e89fa82b9473bb5b8ddf665",
+      "cargo_lock_digest": "sha256:04710b6e7872ed1e951210b244924737d4632c5724f7910b5f8e170a0d28ab3a",
+      "target": "aarch64-apple-darwin",
+      "profile": "debug",
+      "features": [],
+      "rustc_version": "rustc 1.93.0 (254b59607 2026-01-19)",
+      "binary_checksum": null
+    },
+    "childCount": 8,
+    "childExecutions": 9,
+    "peak": 8,
+    "failedTasks": 0,
+    "toolCatalogs": [
+      {
+        "owner": "square1",
+        "taskId": "01a1e89d-973a-7443-a373-b36e59cc1adf",
+        "toolCount": 0
+      },
+      {
+        "owner": "square2",
+        "taskId": "01a1e89d-9793-7d92-8449-34ac7270da32",
+        "toolCount": 0
+      },
+      {
+        "owner": "square3",
+        "taskId": "01a1e89d-97a5-7601-8b7e-3c0e3f90b752",
+        "toolCount": 0
+      },
+      {
+        "owner": "square4",
+        "taskId": "01a1e89d-97c4-7910-8d70-e23f75e3f8a4",
+        "toolCount": 0
+      },
+      {
+        "owner": "square5",
+        "taskId": "01a1e89d-97ef-73d0-bf40-6afab52cf845",
+        "toolCount": 0
+      },
+      {
+        "owner": "square6",
+        "taskId": "01a1e89d-980f-7cf3-86d0-8d46218f36b3",
+        "toolCount": 0
+      },
+      {
+        "owner": "square7",
+        "taskId": "01a1e89d-9832-76a0-9447-d459d4c7f159",
+        "toolCount": 0
+      },
+      {
+        "owner": "square8",
+        "taskId": "01a1e89d-9856-7ef3-b74f-f3707aeff7e7",
+        "toolCount": 0
+      },
+      {
+        "owner": "square1",
+        "taskId": "01a1e89d-aff3-75a1-9eed-3ad42c799001",
+        "toolCount": 0
+      }
+    ],
+    "processes": {
+      "total": 0,
+      "terminal": 0
+    },
+    "inbox": {
+      "total": 9,
+      "delivered": 9,
+      "deliveryLagMs": [
+        2011,
+        1894,
+        1450,
+        1209,
+        1137,
+        1077,
+        1011,
+        958,
+        1934
+      ]
+    },
+    "providerRetries": 0,
+    "providerRequestsWithoutUsage": 0,
+    "noToolParentResponses": 1,
+    "answer": "{\"squares\":[1,4,9,16,25,36,49,64],\"sum\":204,\"resumed\":81}",
+    "tasks": [
+      {
+        "name": "square1",
+        "sessionId": "5200d343-50e8-51aa-ae96-bf576c2498af",
+        "taskId": "01a1e89d-973a-7443-a373-b36e59cc1adf",
+        "startSeconds": 5.175,
+        "endSeconds": 6.156,
+        "status": "completed",
+        "admissionMs": 230,
+        "effort": "low",
+        "toolProfile": "none",
+        "assignment": {
+          "acceptance": [
+            "Return only the requested number"
+          ]
+        }
+      },
+      {
+        "name": "square2",
+        "sessionId": "f067f53e-60f7-5432-b6aa-26f7b9f79e10",
+        "taskId": "01a1e89d-9793-7d92-8449-34ac7270da32",
+        "startSeconds": 5.265,
+        "endSeconds": 6.282,
+        "status": "completed",
+        "admissionMs": 317,
+        "effort": "low",
+        "toolProfile": "none",
+        "assignment": {
+          "acceptance": [
+            "Return only the requested number"
+          ]
+        }
+      },
+      {
+        "name": "square3",
+        "sessionId": "054a74fa-d4ec-5247-853d-c4e4b1178e54",
+        "taskId": "01a1e89d-97a5-7601-8b7e-3c0e3f90b752",
+        "startSeconds": 5.282,
+        "endSeconds": 6.741,
+        "status": "completed",
+        "admissionMs": 331,
+        "effort": "low",
+        "toolProfile": "none",
+        "assignment": {
+          "acceptance": [
+            "Return only the requested number"
+          ]
+        }
+      },
+      {
+        "name": "square4",
+        "sessionId": "919b9c63-c39c-5705-90cd-43654785efef",
+        "taskId": "01a1e89d-97c4-7910-8d70-e23f75e3f8a4",
+        "startSeconds": 5.315,
+        "endSeconds": 6.672,
+        "status": "completed",
+        "admissionMs": 360,
+        "effort": "low",
+        "toolProfile": "none",
+        "assignment": {
+          "acceptance": [
+            "Return only the requested number"
+          ]
+        }
+      },
+      {
+        "name": "square5",
+        "sessionId": "9cd73dbd-6dab-5f6d-828e-bf46ab4c68e2",
+        "taskId": "01a1e89d-97ef-73d0-bf40-6afab52cf845",
+        "startSeconds": 5.358,
+        "endSeconds": 6.76,
+        "status": "completed",
+        "admissionMs": 401,
+        "effort": "low",
+        "toolProfile": "none",
+        "assignment": {
+          "acceptance": [
+            "Return only the requested number"
+          ]
+        }
+      },
+      {
+        "name": "square6",
+        "sessionId": "eff1b4c7-8006-5140-8dae-1318ec067a4d",
+        "taskId": "01a1e89d-980f-7cf3-86d0-8d46218f36b3",
+        "startSeconds": 5.39,
+        "endSeconds": 6.723,
+        "status": "completed",
+        "admissionMs": 430,
+        "effort": "low",
+        "toolProfile": "none",
+        "assignment": {
+          "acceptance": [
+            "Return only the requested number"
+          ]
+        }
+      },
+      {
+        "name": "square7",
+        "sessionId": "4d59a0b2-ef6a-503e-8aee-9e80e3e54417",
+        "taskId": "01a1e89d-9832-76a0-9447-d459d4c7f159",
+        "startSeconds": 5.427,
+        "endSeconds": 6.775,
+        "status": "completed",
+        "admissionMs": 464,
+        "effort": "low",
+        "toolProfile": "none",
+        "assignment": {
+          "acceptance": [
+            "Return only the requested number"
+          ]
+        }
+      },
+      {
+        "name": "square8",
+        "sessionId": "f61d0e71-5636-55c4-8b1a-2c0f4d2a3b93",
+        "taskId": "01a1e89d-9856-7ef3-b74f-f3707aeff7e7",
+        "startSeconds": 5.462,
+        "endSeconds": 6.69,
+        "status": "completed",
+        "admissionMs": 496,
+        "effort": "low",
+        "toolProfile": "none",
+        "assignment": {
+          "acceptance": [
+            "Return only the requested number"
+          ]
+        }
+      },
+      {
+        "name": "square1",
+        "sessionId": "5200d343-50e8-51aa-ae96-bf576c2498af",
+        "taskId": "01a1e89d-aff3-75a1-9eed-3ad42c799001",
+        "startSeconds": 11.505,
+        "endSeconds": 12.452,
+        "status": "completed",
+        "admissionMs": 89,
+        "effort": "low",
+        "toolProfile": "none",
+        "assignment": {
+          "acceptance": [
+            "Return only the requested number"
+          ]
+        }
+      }
+    ]
+  },
+  "gameBenchmark": {
+    "evidenceRoot": "/tmp/golutra-delivery-refactor.YOYthy/live-final",
+    "order": [
+      4,
+      8,
+      8,
+      4
+    ],
+    "samples": [
+      {
+        "arm": "run-1-c4",
+        "cap": 4,
+        "wallSeconds": 218.52396695800002,
+        "exitCode": 0,
+        "interrupted": false,
+        "binarySha256": "6aae2d971d9dd6057c7c91d83ac4ce86c39a0ab7b0132594663126b7af712e87",
+        "source": {
+          "schema_version": 1,
+          "package_version": "0.3.9",
+          "git_commit": "fa1d695559e03d3251e25cc80f8ac73c9bf09077",
+          "dirty": true,
+          "source_digest": "sha256:0a5a28542de6b8de02460cb35ba806cf6539d1ca1e89fa82b9473bb5b8ddf665",
+          "cargo_lock_digest": "sha256:04710b6e7872ed1e951210b244924737d4632c5724f7910b5f8e170a0d28ab3a",
+          "target": "aarch64-apple-darwin",
+          "profile": "debug",
+          "features": [],
+          "rustc_version": "rustc 1.93.0 (254b59607 2026-01-19)",
+          "binary_checksum": null
+        },
+        "contractSha256": "4ade8486b827a3b355c0ba4851349dd7ab612b656b2778bfa2944bd50a4e9a6b",
+        "verifierSha256": "e51a0c8ebf3cd3b8e55f22ee2ee59737f136009d4c5eff181bccbb72ed4fc832",
+        "childCount": 8,
+        "childExecutions": 8,
+        "peak": 4,
+        "failedTasks": 0,
+        "firstChildSeconds": 50.921,
+        "childWindowSeconds": 134.519,
+        "childExecutionSeconds": 321.288,
+        "meanActiveChildren": 2.3884209665549103,
+        "admissionMs": {
+          "count": 8,
+          "min": 169,
+          "median": 224.5,
+          "max": 313,
+          "total": 1874
+        },
+        "usage": {
+          "parent": {
+            "requests": 16,
+            "input": 438172,
+            "output": 13803,
+            "cachedInput": 363776,
+            "total": 451975,
+            "incomplete": 0,
+            "providerSeconds": 184.08999999999997
+          },
+          "children": {
+            "input": {
+              "requests": 3,
+              "input": 19782,
+              "output": 2308,
+              "cachedInput": 9856,
+              "total": 22090,
+              "incomplete": 0,
+              "providerSeconds": 20.939999999999998
+            },
+            "player": {
+              "requests": 5,
+              "input": 30698,
+              "output": 717,
+              "cachedInput": 18176,
+              "total": 31415,
+              "incomplete": 0,
+              "providerSeconds": 10.209999999999987
+            },
+            "combat": {
+              "requests": 3,
+              "input": 20074,
+              "output": 2628,
+              "cachedInput": 11648,
+              "total": 22702,
+              "incomplete": 0,
+              "providerSeconds": 28.587999999999994
+            },
+            "enemies": {
+              "requests": 8,
+              "input": 95382,
+              "output": 7514,
+              "cachedInput": 76288,
+              "total": 102896,
+              "incomplete": 0,
+              "providerSeconds": 104.815
+            },
+            "collisions": {
+              "requests": 7,
+              "input": 70535,
+              "output": 3461,
+              "cachedInput": 48128,
+              "total": 73996,
+              "incomplete": 0,
+              "providerSeconds": 43.474000000000004
+            },
+            "renderer": {
+              "requests": 6,
+              "input": 46671,
+              "output": 3472,
+              "cachedInput": 30848,
+              "total": 50143,
+              "incomplete": 0,
+              "providerSeconds": 39.153000000000034
+            },
+            "ui": {
+              "requests": 5,
+              "input": 38710,
+              "output": 4199,
+              "cachedInput": 31488,
+              "total": 42909,
+              "incomplete": 0,
+              "providerSeconds": 45.543000000000006
+            },
+            "audio": {
+              "requests": 5,
+              "input": 32713,
+              "output": 1796,
+              "cachedInput": 28160,
+              "total": 34509,
+              "incomplete": 0,
+              "providerSeconds": 21.331000000000017
+            }
+          },
+          "total": 832635,
+          "input": 792737,
+          "output": 39898,
+          "cachedInput": 618368,
+          "knownUsageRecords": 58,
+          "incompleteRecords": 0,
+          "missingRequests": 0
+        },
+        "providerRetries": 0,
+        "toolErrors": 14,
+        "resourceWaitMs": {
+          "count": 23,
+          "min": 0,
+          "median": 0,
+          "max": 0,
+          "total": 0
+        },
+        "backgroundQueueMs": {
+          "count": 0,
+          "min": null,
+          "median": null,
+          "max": null,
+          "total": null
+        },
+        "inbox": {
+          "total": 8,
+          "delivered": 8,
+          "deliveryLagMs": {
+            "count": 8,
+            "min": 2321,
+            "median": 8803,
+            "max": 32251,
+            "total": 94968
+          }
+        },
+        "processes": {
+          "total": 13,
+          "terminal": 13
+        },
+        "noToolParentResponses": 1,
+        "quality": {
+          "logic": {
+            "passed": 23,
+            "failed": 0,
+            "exitCode": 0
+          },
+          "browser": {
+            "completed": true,
+            "passed": 15,
+            "failed": 0,
+            "failures": []
+          },
+          "visual": {
+            "arm": "run-1-c4",
+            "reviewed": true,
+            "passed": true,
+            "method": "manual_screenshot_review",
+            "screenshots": [
+              "run-1-c4-before.png",
+              "run-1-c4-narrow-title.png",
+              "run-1-c4-narrow-paused.png",
+              "run-1-c4-gameover.png"
+            ],
+            "findings": []
+          },
+          "fixtureUnchanged": true
+        },
+        "tasks": [
+          {
+            "name": "input",
+            "startSeconds": 50.921,
+            "endSeconds": 72.371,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "player",
+            "startSeconds": 50.941,
+            "endSeconds": 61.872,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "combat",
+            "startSeconds": 50.963,
+            "endSeconds": 80.149,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "enemies",
+            "startSeconds": 51.004,
+            "endSeconds": 157.28,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "collisions",
+            "startSeconds": 120.278,
+            "endSeconds": 164.886,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "renderer",
+            "startSeconds": 120.297,
+            "endSeconds": 160.529,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "ui",
+            "startSeconds": 120.32,
+            "endSeconds": 166.803,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "audio",
+            "startSeconds": 163.318,
+            "endSeconds": 185.44,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          }
+        ]
+      },
+      {
+        "arm": "run-2-c8",
+        "cap": 8,
+        "wallSeconds": 170.544924,
+        "exitCode": 0,
+        "interrupted": false,
+        "binarySha256": "6aae2d971d9dd6057c7c91d83ac4ce86c39a0ab7b0132594663126b7af712e87",
+        "source": {
+          "schema_version": 1,
+          "package_version": "0.3.9",
+          "git_commit": "fa1d695559e03d3251e25cc80f8ac73c9bf09077",
+          "dirty": true,
+          "source_digest": "sha256:0a5a28542de6b8de02460cb35ba806cf6539d1ca1e89fa82b9473bb5b8ddf665",
+          "cargo_lock_digest": "sha256:04710b6e7872ed1e951210b244924737d4632c5724f7910b5f8e170a0d28ab3a",
+          "target": "aarch64-apple-darwin",
+          "profile": "debug",
+          "features": [],
+          "rustc_version": "rustc 1.93.0 (254b59607 2026-01-19)",
+          "binary_checksum": null
+        },
+        "contractSha256": "4ade8486b827a3b355c0ba4851349dd7ab612b656b2778bfa2944bd50a4e9a6b",
+        "verifierSha256": "e51a0c8ebf3cd3b8e55f22ee2ee59737f136009d4c5eff181bccbb72ed4fc832",
+        "childCount": 8,
+        "childExecutions": 8,
+        "peak": 8,
+        "failedTasks": 0,
+        "firstChildSeconds": 38.633,
+        "childWindowSeconds": 99.14599999999999,
+        "childExecutionSeconds": 499.366,
+        "meanActiveChildren": 5.036673189034354,
+        "admissionMs": {
+          "count": 8,
+          "min": 290,
+          "median": 409,
+          "max": 571,
+          "total": 3394
+        },
+        "usage": {
+          "parent": {
+            "requests": 12,
+            "input": 248953,
+            "output": 9005,
+            "cachedInput": 181376,
+            "total": 257958,
+            "incomplete": 0,
+            "providerSeconds": 128.72500000000002
+          },
+          "children": {
+            "input": {
+              "requests": 6,
+              "input": 52657,
+              "output": 4896,
+              "cachedInput": 35968,
+              "total": 57553,
+              "incomplete": 0,
+              "providerSeconds": 61.871000000000016
+            },
+            "player": {
+              "requests": 4,
+              "input": 25492,
+              "output": 1202,
+              "cachedInput": 19072,
+              "total": 26694,
+              "incomplete": 0,
+              "providerSeconds": 12.625
+            },
+            "combat": {
+              "requests": 5,
+              "input": 37977,
+              "output": 4199,
+              "cachedInput": 12928,
+              "total": 42176,
+              "incomplete": 0,
+              "providerSeconds": 54.41399999999999
+            },
+            "enemies": {
+              "requests": 7,
+              "input": 64007,
+              "output": 5200,
+              "cachedInput": 41216,
+              "total": 69207,
+              "incomplete": 0,
+              "providerSeconds": 62.28699999999999
+            },
+            "collisions": {
+              "requests": 9,
+              "input": 94433,
+              "output": 5632,
+              "cachedInput": 69888,
+              "total": 100065,
+              "incomplete": 0,
+              "providerSeconds": 76.42200000000005
+            },
+            "renderer": {
+              "requests": 8,
+              "input": 78798,
+              "output": 7968,
+              "cachedInput": 52736,
+              "total": 86766,
+              "incomplete": 0,
+              "providerSeconds": 96.464
+            },
+            "ui": {
+              "requests": 11,
+              "input": 133172,
+              "output": 7316,
+              "cachedInput": 118272,
+              "total": 140488,
+              "incomplete": 0,
+              "providerSeconds": 93.63700000000001
+            },
+            "audio": {
+              "requests": 4,
+              "input": 24906,
+              "output": 2692,
+              "cachedInput": 11904,
+              "total": 27598,
+              "incomplete": 0,
+              "providerSeconds": 28.061000000000014
+            }
+          },
+          "total": 808505,
+          "input": 760395,
+          "output": 48110,
+          "cachedInput": 543360,
+          "knownUsageRecords": 66,
+          "incompleteRecords": 0,
+          "missingRequests": 0
+        },
+        "providerRetries": 0,
+        "toolErrors": 16,
+        "resourceWaitMs": {
+          "count": 26,
+          "min": 0,
+          "median": 0,
+          "max": 0,
+          "total": 0
+        },
+        "backgroundQueueMs": {
+          "count": 0,
+          "min": null,
+          "median": null,
+          "max": null,
+          "total": null
+        },
+        "inbox": {
+          "total": 8,
+          "delivered": 8,
+          "deliveryLagMs": {
+            "count": 8,
+            "min": 2415,
+            "median": 24554.5,
+            "max": 44576,
+            "total": 177029
+          }
+        },
+        "processes": {
+          "total": 22,
+          "terminal": 22
+        },
+        "noToolParentResponses": 1,
+        "quality": {
+          "logic": {
+            "passed": 23,
+            "failed": 0,
+            "exitCode": 0
+          },
+          "browser": {
+            "completed": true,
+            "passed": 15,
+            "failed": 0,
+            "failures": []
+          },
+          "visual": {
+            "arm": "run-2-c8",
+            "reviewed": true,
+            "passed": false,
+            "method": "manual_screenshot_review",
+            "screenshots": [
+              "run-2-c8-before.png",
+              "run-2-c8-narrow-title.png",
+              "run-2-c8-narrow-paused.png",
+              "run-2-c8-gameover.png"
+            ],
+            "findings": [
+              "At 420×840, the HUD mute/actions row overlaps both the title and paused heading. The original remains unchanged; a separate CSS repair is verified under repairs/."
+            ]
+          },
+          "fixtureUnchanged": true
+        },
+        "tasks": [
+          {
+            "name": "input",
+            "startSeconds": 38.633,
+            "endSeconds": 101.847,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "player",
+            "startSeconds": 38.694,
+            "endSeconds": 52.127,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "combat",
+            "startSeconds": 38.721,
+            "endSeconds": 94.306,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "enemies",
+            "startSeconds": 38.743,
+            "endSeconds": 103.049,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "collisions",
+            "startSeconds": 38.792,
+            "endSeconds": 117.352,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "renderer",
+            "startSeconds": 38.844,
+            "endSeconds": 137.779,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "ui",
+            "startSeconds": 38.891,
+            "endSeconds": 134.849,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "audio",
+            "startSeconds": 38.945,
+            "endSeconds": 68.32,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          }
+        ]
+      },
+      {
+        "arm": "run-3-c8",
+        "cap": 8,
+        "wallSeconds": 217.9376425,
+        "exitCode": 0,
+        "interrupted": false,
+        "binarySha256": "6aae2d971d9dd6057c7c91d83ac4ce86c39a0ab7b0132594663126b7af712e87",
+        "source": {
+          "schema_version": 1,
+          "package_version": "0.3.9",
+          "git_commit": "fa1d695559e03d3251e25cc80f8ac73c9bf09077",
+          "dirty": true,
+          "source_digest": "sha256:0a5a28542de6b8de02460cb35ba806cf6539d1ca1e89fa82b9473bb5b8ddf665",
+          "cargo_lock_digest": "sha256:04710b6e7872ed1e951210b244924737d4632c5724f7910b5f8e170a0d28ab3a",
+          "target": "aarch64-apple-darwin",
+          "profile": "debug",
+          "features": [],
+          "rustc_version": "rustc 1.93.0 (254b59607 2026-01-19)",
+          "binary_checksum": null
+        },
+        "contractSha256": "4ade8486b827a3b355c0ba4851349dd7ab612b656b2778bfa2944bd50a4e9a6b",
+        "verifierSha256": "e51a0c8ebf3cd3b8e55f22ee2ee59737f136009d4c5eff181bccbb72ed4fc832",
+        "childCount": 8,
+        "childExecutions": 8,
+        "peak": 8,
+        "failedTasks": 0,
+        "firstChildSeconds": 129.436,
+        "childWindowSeconds": 64.82499999999999,
+        "childExecutionSeconds": 381.339,
+        "meanActiveChildren": 5.882591592749712,
+        "admissionMs": {
+          "count": 8,
+          "min": 258,
+          "median": 434.5,
+          "max": 559,
+          "total": 3413
+        },
+        "usage": {
+          "parent": {
+            "requests": 13,
+            "input": 297311,
+            "output": 12009,
+            "cachedInput": 247552,
+            "total": 309320,
+            "incomplete": 0,
+            "providerSeconds": 171.922
+          },
+          "children": {
+            "input": {
+              "requests": 5,
+              "input": 40524,
+              "output": 4515,
+              "cachedInput": 23424,
+              "total": 45039,
+              "incomplete": 0,
+              "providerSeconds": 57.55199999999999
+            },
+            "player": {
+              "requests": 6,
+              "input": 42498,
+              "output": 3050,
+              "cachedInput": 28160,
+              "total": 45548,
+              "incomplete": 0,
+              "providerSeconds": 36.432000000000016
+            },
+            "combat": {
+              "requests": 3,
+              "input": 20922,
+              "output": 3144,
+              "cachedInput": 9728,
+              "total": 24066,
+              "incomplete": 0,
+              "providerSeconds": 40.186999999999955
+            },
+            "enemies": {
+              "requests": 4,
+              "input": 33253,
+              "output": 4999,
+              "cachedInput": 22272,
+              "total": 38252,
+              "incomplete": 0,
+              "providerSeconds": 63.82899999999998
+            },
+            "collisions": {
+              "requests": 5,
+              "input": 40193,
+              "output": 4933,
+              "cachedInput": 24064,
+              "total": 45126,
+              "incomplete": 0,
+              "providerSeconds": 58.76400000000004
+            },
+            "renderer": {
+              "requests": 4,
+              "input": 33064,
+              "output": 4869,
+              "cachedInput": 17152,
+              "total": 37933,
+              "incomplete": 0,
+              "providerSeconds": 57.99399999999997
+            },
+            "ui": {
+              "requests": 5,
+              "input": 36811,
+              "output": 3032,
+              "cachedInput": 22016,
+              "total": 39843,
+              "incomplete": 0,
+              "providerSeconds": 37.77000000000004
+            },
+            "audio": {
+              "requests": 5,
+              "input": 31816,
+              "output": 1698,
+              "cachedInput": 18944,
+              "total": 33514,
+              "incomplete": 0,
+              "providerSeconds": 21.889999999999986
+            }
+          },
+          "total": 618641,
+          "input": 576392,
+          "output": 42249,
+          "cachedInput": 413312,
+          "knownUsageRecords": 50,
+          "incompleteRecords": 0,
+          "missingRequests": 0
+        },
+        "providerRetries": 0,
+        "toolErrors": 12,
+        "resourceWaitMs": {
+          "count": 24,
+          "min": 0,
+          "median": 0,
+          "max": 0,
+          "total": 0
+        },
+        "backgroundQueueMs": {
+          "count": 0,
+          "min": null,
+          "median": null,
+          "max": null,
+          "total": null
+        },
+        "inbox": {
+          "total": 8,
+          "delivered": 8,
+          "deliveryLagMs": {
+            "count": 8,
+            "min": 2337,
+            "median": 15336,
+            "max": 42169,
+            "total": 140069
+          }
+        },
+        "processes": {
+          "total": 15,
+          "terminal": 15
+        },
+        "noToolParentResponses": 1,
+        "quality": {
+          "logic": {
+            "passed": 23,
+            "failed": 0,
+            "exitCode": 0
+          },
+          "browser": {
+            "completed": true,
+            "passed": 15,
+            "failed": 0,
+            "failures": []
+          },
+          "visual": {
+            "arm": "run-3-c8",
+            "reviewed": true,
+            "passed": true,
+            "method": "manual_screenshot_review",
+            "screenshots": [
+              "run-3-c8-before.png",
+              "run-3-c8-narrow-title.png",
+              "run-3-c8-narrow-paused.png",
+              "run-3-c8-gameover.png"
+            ],
+            "findings": []
+          },
+          "fixtureUnchanged": true
+        },
+        "tasks": [
+          {
+            "name": "input",
+            "startSeconds": 129.436,
+            "endSeconds": 187.898,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "player",
+            "startSeconds": 129.531,
+            "endSeconds": 166.908,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "combat",
+            "startSeconds": 129.57,
+            "endSeconds": 170.495,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "enemies",
+            "startSeconds": 129.605,
+            "endSeconds": 194.261,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "collisions",
+            "startSeconds": 129.654,
+            "endSeconds": 189.377,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "renderer",
+            "startSeconds": 129.681,
+            "endSeconds": 188.499,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "ui",
+            "startSeconds": 129.722,
+            "endSeconds": 168.451,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "audio",
+            "startSeconds": 129.768,
+            "endSeconds": 152.417,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          }
+        ]
+      },
+      {
+        "arm": "run-4-c4",
+        "cap": 4,
+        "wallSeconds": 276.51104254100005,
+        "exitCode": 0,
+        "interrupted": false,
+        "binarySha256": "6aae2d971d9dd6057c7c91d83ac4ce86c39a0ab7b0132594663126b7af712e87",
+        "source": {
+          "schema_version": 1,
+          "package_version": "0.3.9",
+          "git_commit": "fa1d695559e03d3251e25cc80f8ac73c9bf09077",
+          "dirty": true,
+          "source_digest": "sha256:0a5a28542de6b8de02460cb35ba806cf6539d1ca1e89fa82b9473bb5b8ddf665",
+          "cargo_lock_digest": "sha256:04710b6e7872ed1e951210b244924737d4632c5724f7910b5f8e170a0d28ab3a",
+          "target": "aarch64-apple-darwin",
+          "profile": "debug",
+          "features": [],
+          "rustc_version": "rustc 1.93.0 (254b59607 2026-01-19)",
+          "binary_checksum": null
+        },
+        "contractSha256": "4ade8486b827a3b355c0ba4851349dd7ab612b656b2778bfa2944bd50a4e9a6b",
+        "verifierSha256": "e51a0c8ebf3cd3b8e55f22ee2ee59737f136009d4c5eff181bccbb72ed4fc832",
+        "childCount": 8,
+        "childExecutions": 8,
+        "peak": 4,
+        "failedTasks": 0,
+        "firstChildSeconds": 28.526,
+        "childWindowSeconds": 181.38600000000002,
+        "childExecutionSeconds": 458.396,
+        "meanActiveChildren": 2.527185119027929,
+        "admissionMs": {
+          "count": 8,
+          "min": 90,
+          "median": 229,
+          "max": 290,
+          "total": 1652
+        },
+        "usage": {
+          "parent": {
+            "requests": 18,
+            "input": 531287,
+            "output": 12547,
+            "cachedInput": 422656,
+            "total": 543834,
+            "incomplete": 0,
+            "providerSeconds": 210.13000000000008
+          },
+          "children": {
+            "input": {
+              "requests": 4,
+              "input": 31993,
+              "output": 4684,
+              "cachedInput": 21760,
+              "total": 36677,
+              "incomplete": 0,
+              "providerSeconds": 57.73999999999999
+            },
+            "player": {
+              "requests": 4,
+              "input": 25908,
+              "output": 1565,
+              "cachedInput": 19072,
+              "total": 27473,
+              "incomplete": 0,
+              "providerSeconds": 19.629
+            },
+            "combat": {
+              "requests": 4,
+              "input": 27883,
+              "output": 2486,
+              "cachedInput": 15232,
+              "total": 30369,
+              "incomplete": 0,
+              "providerSeconds": 36.741
+            },
+            "enemies": {
+              "requests": 7,
+              "input": 72079,
+              "output": 5308,
+              "cachedInput": 40576,
+              "total": 77387,
+              "incomplete": 0,
+              "providerSeconds": 73.249
+            },
+            "collisions": {
+              "requests": 8,
+              "input": 85213,
+              "output": 5085,
+              "cachedInput": 46080,
+              "total": 90298,
+              "incomplete": 0,
+              "providerSeconds": 76.55599999999997
+            },
+            "renderer": {
+              "requests": 6,
+              "input": 64173,
+              "output": 4995,
+              "cachedInput": 39808,
+              "total": 69168,
+              "incomplete": 0,
+              "providerSeconds": 66.364
+            },
+            "ui": {
+              "requests": 6,
+              "input": 60728,
+              "output": 6426,
+              "cachedInput": 35968,
+              "total": 67154,
+              "incomplete": 0,
+              "providerSeconds": 94.59700000000001
+            },
+            "audio": {
+              "requests": 4,
+              "input": 26990,
+              "output": 1928,
+              "cachedInput": 10112,
+              "total": 28918,
+              "incomplete": 0,
+              "providerSeconds": 26.53700000000002
+            }
+          },
+          "total": 971278,
+          "input": 926254,
+          "output": 45024,
+          "cachedInput": 651264,
+          "knownUsageRecords": 61,
+          "incompleteRecords": 0,
+          "missingRequests": 0
+        },
+        "providerRetries": 0,
+        "toolErrors": 1,
+        "resourceWaitMs": {
+          "count": 28,
+          "min": 0,
+          "median": 0,
+          "max": 0,
+          "total": 0
+        },
+        "backgroundQueueMs": {
+          "count": 0,
+          "min": null,
+          "median": null,
+          "max": null,
+          "total": null
+        },
+        "inbox": {
+          "total": 8,
+          "delivered": 8,
+          "deliveryLagMs": {
+            "count": 8,
+            "min": 3434,
+            "median": 25185.5,
+            "max": 61272,
+            "total": 218335
+          }
+        },
+        "processes": {
+          "total": 20,
+          "terminal": 20
+        },
+        "noToolParentResponses": 1,
+        "quality": {
+          "logic": {
+            "passed": 23,
+            "failed": 0,
+            "exitCode": 0
+          },
+          "browser": {
+            "completed": true,
+            "passed": 15,
+            "failed": 0,
+            "failures": []
+          },
+          "visual": {
+            "arm": "run-4-c4",
+            "reviewed": true,
+            "passed": true,
+            "method": "manual_screenshot_review",
+            "screenshots": [
+              "run-4-c4-before.png",
+              "run-4-c4-narrow-title.png",
+              "run-4-c4-narrow-paused.png",
+              "run-4-c4-gameover.png"
+            ],
+            "findings": []
+          },
+          "fixtureUnchanged": true
+        },
+        "tasks": [
+          {
+            "name": "input",
+            "startSeconds": 28.526,
+            "endSeconds": 86.88,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "player",
+            "startSeconds": 28.546,
+            "endSeconds": 48.804,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "combat",
+            "startSeconds": 28.569,
+            "endSeconds": 65.979,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "enemies",
+            "startSeconds": 28.614,
+            "endSeconds": 102.983,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "collisions",
+            "startSeconds": 100.967,
+            "endSeconds": 178.664,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "renderer",
+            "startSeconds": 100.988,
+            "endSeconds": 168.395,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "ui",
+            "startSeconds": 114.187,
+            "endSeconds": 209.912,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "audio",
+            "startSeconds": 121.805,
+            "endSeconds": 148.981,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          }
+        ]
+      }
+    ],
+    "groups": [
+      {
+        "cap": 4,
+        "samples": 2,
+        "wallSeconds": {
+          "count": 2,
+          "min": 218.52396695800002,
+          "median": 247.51750474950003,
+          "max": 276.51104254100005,
+          "total": 495.03500949900007
+        },
+        "tokens": {
+          "count": 2,
+          "min": 832635,
+          "median": 901956.5,
+          "max": 971278,
+          "total": 1803913
+        },
+        "runtimeSucceeded": 2,
+        "logicPassed": 2,
+        "browserBehaviorPassed": 2,
+        "visualPassed": 2,
+        "acceptancePassed": 2
+      },
+      {
+        "cap": 8,
+        "samples": 2,
+        "wallSeconds": {
+          "count": 2,
+          "min": 170.544924,
+          "median": 194.24128325,
+          "max": 217.9376425,
+          "total": 388.4825665
+        },
+        "tokens": {
+          "count": 2,
+          "min": 618641,
+          "median": 713573,
+          "max": 808505,
+          "total": 1427146
+        },
+        "runtimeSucceeded": 2,
+        "logicPassed": 2,
+        "browserBehaviorPassed": 2,
+        "visualPassed": 1,
+        "acceptancePassed": 1
+      }
+    ],
+    "limits": [
+      "Two samples per setting; no stable P95 or optimal-cap claim.",
+      "Generation and browser acceptance measured separately.",
+      "Automated browser behavior checks do not prove visual correctness; missing manual review stays null.",
+      "Tokens are usage, not a price estimate.",
+      "Original attempts and products retained; no winner selection."
+    ]
+  },
+  "retainedPreliminary": {
+    "evidenceRoot": "/tmp/golutra-delivery-refactor.YOYthy/live",
+    "order": [
+      4,
+      8
+    ],
+    "samples": [
+      {
+        "arm": "run-1-c4",
+        "cap": 4,
+        "wallSeconds": 227.138820792,
+        "exitCode": 0,
+        "interrupted": false,
+        "binarySha256": "c22700c808b8a35474c0cb3c2acbc932a2437831a21e9df01979a24661dbd109",
+        "source": {
+          "schema_version": 1,
+          "package_version": "0.3.9",
+          "git_commit": "fa1d695559e03d3251e25cc80f8ac73c9bf09077",
+          "dirty": true,
+          "source_digest": "sha256:3d1e6f57805fa81c89a3ca59d65a12770ef2f873359e57d91c9627f56de02c1b",
+          "cargo_lock_digest": "sha256:04710b6e7872ed1e951210b244924737d4632c5724f7910b5f8e170a0d28ab3a",
+          "target": "aarch64-apple-darwin",
+          "profile": "debug",
+          "features": [],
+          "rustc_version": "rustc 1.93.0 (254b59607 2026-01-19)",
+          "binary_checksum": null
+        },
+        "contractSha256": "4ade8486b827a3b355c0ba4851349dd7ab612b656b2778bfa2944bd50a4e9a6b",
+        "verifierSha256": "e51a0c8ebf3cd3b8e55f22ee2ee59737f136009d4c5eff181bccbb72ed4fc832",
+        "childCount": 8,
+        "childExecutions": 8,
+        "peak": 4,
+        "failedTasks": 0,
+        "firstChildSeconds": 36.028,
+        "childWindowSeconds": 135.83300000000003,
+        "childExecutionSeconds": 369.721,
+        "meanActiveChildren": 2.721879072095882,
+        "admissionMs": {
+          "count": 8,
+          "min": 95,
+          "median": 224,
+          "max": 267,
+          "total": 1695
+        },
+        "usage": {
+          "parent": {
+            "requests": 16,
+            "input": 431497,
+            "output": 12118,
+            "cachedInput": 283648,
+            "total": 443615,
+            "incomplete": 0,
+            "providerSeconds": 164.81
+          },
+          "children": {
+            "input": {
+              "requests": 7,
+              "input": 57298,
+              "output": 3987,
+              "cachedInput": 46848,
+              "total": 61285,
+              "incomplete": 0,
+              "providerSeconds": 53.201999999999984
+            },
+            "player": {
+              "requests": 4,
+              "input": 23641,
+              "output": 1418,
+              "cachedInput": 13824,
+              "total": 25059,
+              "incomplete": 0,
+              "providerSeconds": 19.662999999999997
+            },
+            "combat": {
+              "requests": 5,
+              "input": 33117,
+              "output": 2021,
+              "cachedInput": 22272,
+              "total": 35138,
+              "incomplete": 0,
+              "providerSeconds": 31.338000000000015
+            },
+            "enemies": {
+              "requests": 4,
+              "input": 32324,
+              "output": 4449,
+              "cachedInput": 11264,
+              "total": 36773,
+              "incomplete": 0,
+              "providerSeconds": 59.02099999999999
+            },
+            "collisions": {
+              "requests": 6,
+              "input": 52256,
+              "output": 3034,
+              "cachedInput": 35328,
+              "total": 55290,
+              "incomplete": 0,
+              "providerSeconds": 35.56699999999998
+            },
+            "renderer": {
+              "requests": 4,
+              "input": 33539,
+              "output": 5400,
+              "cachedInput": 23552,
+              "total": 38939,
+              "incomplete": 0,
+              "providerSeconds": 64.25599999999999
+            },
+            "ui": {
+              "requests": 5,
+              "input": 47360,
+              "output": 5893,
+              "cachedInput": 19072,
+              "total": 53253,
+              "incomplete": 0,
+              "providerSeconds": 74.80299999999998
+            },
+            "audio": {
+              "requests": 6,
+              "input": 40417,
+              "output": 1854,
+              "cachedInput": 28800,
+              "total": 42271,
+              "incomplete": 0,
+              "providerSeconds": 23.436999999999998
+            }
+          },
+          "total": 791623,
+          "input": 751449,
+          "output": 40174,
+          "cachedInput": 484608,
+          "knownUsageRecords": 57,
+          "incompleteRecords": 0,
+          "missingRequests": 0
+        },
+        "providerRetries": 0,
+        "toolErrors": 12,
+        "resourceWaitMs": {
+          "count": 25,
+          "min": 0,
+          "median": 0,
+          "max": 0,
+          "total": 0
+        },
+        "backgroundQueueMs": {
+          "count": 0,
+          "min": null,
+          "median": null,
+          "max": null,
+          "total": null
+        },
+        "inbox": {
+          "total": 8,
+          "delivered": 8,
+          "deliveryLagMs": {
+            "count": 8,
+            "min": 479,
+            "median": 17501,
+            "max": 46316,
+            "total": 169484
+          }
+        },
+        "processes": {
+          "total": 13,
+          "terminal": 13
+        },
+        "noToolParentResponses": 1,
+        "quality": {
+          "logic": {
+            "passed": 23,
+            "failed": 0,
+            "exitCode": 0
+          },
+          "browser": {
+            "completed": false,
+            "passed": 11,
+            "failed": 1,
+            "failures": [
+              {
+                "name": "browser sequence completed",
+                "pass": false,
+                "evidence": "ElementResolutionError: Selector [data-action=\"pause\"] matched 2 elements (2 visible, 0 hidden). Candidates: 1. button \"Resume\" (visible); 2. button \"Resume\" (visible). Use a current snapshot ref or a more specific role, text, or CSS selector."
+              }
+            ]
+          },
+          "fixtureUnchanged": true
+        },
+        "tasks": [
+          {
+            "name": "input",
+            "startSeconds": 36.028,
+            "endSeconds": 90.672,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "player",
+            "startSeconds": 36.046,
+            "endSeconds": 56.813,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "combat",
+            "startSeconds": 36.07,
+            "endSeconds": 68.884,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "enemies",
+            "startSeconds": 36.117,
+            "endSeconds": 96.008,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "collisions",
+            "startSeconds": 108.618,
+            "endSeconds": 145.019,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "renderer",
+            "startSeconds": 108.637,
+            "endSeconds": 173.683,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "ui",
+            "startSeconds": 108.659,
+            "endSeconds": 184.471,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "audio",
+            "startSeconds": 114.097,
+            "endSeconds": 138.443,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          }
+        ]
+      },
+      {
+        "arm": "run-2-c8",
+        "cap": 8,
+        "wallSeconds": 389.72523574999997,
+        "exitCode": 1,
+        "interrupted": true,
+        "binarySha256": "c22700c808b8a35474c0cb3c2acbc932a2437831a21e9df01979a24661dbd109",
+        "source": {
+          "schema_version": 1,
+          "package_version": "0.3.9",
+          "git_commit": "fa1d695559e03d3251e25cc80f8ac73c9bf09077",
+          "dirty": true,
+          "source_digest": "sha256:3d1e6f57805fa81c89a3ca59d65a12770ef2f873359e57d91c9627f56de02c1b",
+          "cargo_lock_digest": "sha256:04710b6e7872ed1e951210b244924737d4632c5724f7910b5f8e170a0d28ab3a",
+          "target": "aarch64-apple-darwin",
+          "profile": "debug",
+          "features": [],
+          "rustc_version": "rustc 1.93.0 (254b59607 2026-01-19)",
+          "binary_checksum": null
+        },
+        "contractSha256": "4ade8486b827a3b355c0ba4851349dd7ab612b656b2778bfa2944bd50a4e9a6b",
+        "verifierSha256": "e51a0c8ebf3cd3b8e55f22ee2ee59737f136009d4c5eff181bccbb72ed4fc832",
+        "childCount": 8,
+        "childExecutions": 8,
+        "peak": 8,
+        "failedTasks": 5,
+        "firstChildSeconds": 52.355,
+        "childWindowSeconds": 331.712,
+        "childExecutionSeconds": 1328.5200000000002,
+        "meanActiveChildren": 4.005040517075054,
+        "admissionMs": {
+          "count": 8,
+          "min": 287,
+          "median": 417.5,
+          "max": 570,
+          "total": 3464
+        },
+        "usage": {
+          "parent": {
+            "requests": 13,
+            "input": 335391,
+            "output": 11444,
+            "cachedInput": 257024,
+            "total": 346835,
+            "incomplete": 0,
+            "providerSeconds": 182.543
+          },
+          "children": {
+            "input": {
+              "requests": 4,
+              "input": 30090,
+              "output": 3222,
+              "cachedInput": 15744,
+              "total": 33312,
+              "incomplete": 0,
+              "providerSeconds": 44.10599999999999
+            },
+            "player": {
+              "requests": 3,
+              "input": 18721,
+              "output": 1462,
+              "cachedInput": 9728,
+              "total": 20183,
+              "incomplete": 0,
+              "providerSeconds": 18.80700000000001
+            },
+            "combat": {
+              "requests": 38,
+              "input": 1286313,
+              "output": 18377,
+              "cachedInput": 1181952,
+              "total": 1304690,
+              "incomplete": 0,
+              "providerSeconds": 308.8420000000001
+            },
+            "enemies": {
+              "requests": 11,
+              "input": 198991,
+              "output": 9919,
+              "cachedInput": 103296,
+              "total": 208910,
+              "incomplete": 0,
+              "providerSeconds": 154.84499999999997
+            },
+            "collisions": {
+              "requests": 29,
+              "input": 870169,
+              "output": 19342,
+              "cachedInput": 780032,
+              "total": 889511,
+              "incomplete": 0,
+              "providerSeconds": 311.794
+            },
+            "renderer": {
+              "requests": 4,
+              "input": 33641,
+              "output": 4724,
+              "cachedInput": 23168,
+              "total": 38365,
+              "incomplete": 0,
+              "providerSeconds": 57.105000000000004
+            },
+            "ui": {
+              "requests": 4,
+              "input": 33653,
+              "output": 4650,
+              "cachedInput": 17408,
+              "total": 38303,
+              "incomplete": 0,
+              "providerSeconds": 54.282
+            },
+            "audio": {
+              "requests": 39,
+              "input": 1430619,
+              "output": 16712,
+              "cachedInput": 1324160,
+              "total": 1447331,
+              "incomplete": 0,
+              "providerSeconds": 296.83899999999994
+            }
+          },
+          "total": 4327440,
+          "input": 4237588,
+          "output": 89852,
+          "cachedInput": 3712512,
+          "knownUsageRecords": 145,
+          "incompleteRecords": 0,
+          "missingRequests": 3
+        },
+        "providerRetries": 0,
+        "toolErrors": 7,
+        "resourceWaitMs": {
+          "count": 80,
+          "min": 0,
+          "median": 0,
+          "max": 2046,
+          "total": 2264
+        },
+        "backgroundQueueMs": {
+          "count": 0,
+          "min": null,
+          "median": null,
+          "max": null,
+          "total": null
+        },
+        "inbox": {
+          "total": 8,
+          "delivered": 5,
+          "deliveryLagMs": {
+            "count": 5,
+            "min": 13124,
+            "median": 26617,
+            "max": 52899,
+            "total": 160547
+          }
+        },
+        "processes": {
+          "total": 87,
+          "terminal": 87
+        },
+        "noToolParentResponses": 0,
+        "quality": {
+          "logic": {
+            "passed": 23,
+            "failed": 0,
+            "exitCode": 0
+          },
+          "browser": null,
+          "fixtureUnchanged": true
+        },
+        "tasks": [
+          {
+            "name": "input",
+            "startSeconds": 52.355,
+            "endSeconds": 97.069,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "player",
+            "startSeconds": 52.438,
+            "endSeconds": 71.735,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "combat",
+            "startSeconds": 52.458,
+            "endSeconds": 384.067,
+            "status": "cancelled",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "enemies",
+            "startSeconds": 52.479,
+            "endSeconds": 209.327,
+            "status": "partial",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "collisions",
+            "startSeconds": 52.517,
+            "endSeconds": 384.059,
+            "status": "cancelled",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "renderer",
+            "startSeconds": 52.577,
+            "endSeconds": 110.576,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "ui",
+            "startSeconds": 52.622,
+            "endSeconds": 107.745,
+            "status": "completed",
+            "effort": "low",
+            "toolProfile": "coding"
+          },
+          {
+            "name": "audio",
+            "startSeconds": 52.664,
+            "endSeconds": 384.052,
+            "status": "cancelled",
+            "effort": "low",
+            "toolProfile": "coding"
+          }
+        ]
+      }
+    ],
+    "groups": [
+      {
+        "cap": 4,
+        "samples": 1,
+        "wallSeconds": {
+          "count": 1,
+          "min": 227.138820792,
+          "median": 227.138820792,
+          "max": 227.138820792,
+          "total": 227.138820792
+        },
+        "tokens": {
+          "count": 1,
+          "min": 791623,
+          "median": 791623,
+          "max": 791623,
+          "total": 791623
+        },
+        "runtimeSucceeded": 1,
+        "logicPassed": 1,
+        "browserPassed": 0
+      },
+      {
+        "cap": 8,
+        "samples": 1,
+        "wallSeconds": {
+          "count": 1,
+          "min": 389.72523574999997,
+          "median": 389.72523574999997,
+          "max": 389.72523574999997,
+          "total": 389.72523574999997
+        },
+        "tokens": {
+          "count": 1,
+          "min": 4327440,
+          "median": 4327440,
+          "max": 4327440,
+          "total": 4327440
+        },
+        "runtimeSucceeded": 0,
+        "logicPassed": 1,
+        "browserPassed": 0
+      }
+    ],
+    "limits": [
+      "Two samples per setting; no stable P95 or optimal-cap claim.",
+      "Generation and browser acceptance measured separately.",
+      "Tokens are usage, not a price estimate.",
+      "Original attempts and products retained; no winner selection."
+    ]
+  },
+  "manualRepairs": [
+    {
+      "originalArm": "run-2-c8",
+      "workspace": "/tmp/golutra-delivery-refactor.YOYthy/live-final/repairs/run-2-c8",
+      "countedInOriginalTimingOrScore": false,
+      "changedFiles": [
+        "styles.css"
+      ],
+      "reason": "Fixed-height padding placed the narrow overlay underneath the two-row HUD; use grid rows sized by actual HUD height.",
+      "logic": {
+        "workspace": "/tmp/golutra-delivery-refactor.YOYthy/live-final/repairs/run-2-c8",
+        "passed": 23,
+        "failed": 0,
+        "total": 23,
+        "results": [
+          {
+            "name": "all delivery files exist and are nonempty",
+            "passed": true
+          },
+          {
+            "name": "all JavaScript modules parse",
+            "passed": true
+          },
+          {
+            "name": "HTML wires canvas, stylesheet and module entry",
+            "passed": true
+          },
+          {
+            "name": "required module exports load in Node without DOM side effects",
+            "passed": true
+          },
+          {
+            "name": "title, start and initial state",
+            "passed": true
+          },
+          {
+            "name": "cardinal movement and diagonal normalization",
+            "passed": true
+          },
+          {
+            "name": "player remains within arena bounds",
+            "passed": true
+          },
+          {
+            "name": "projectile firing, direction and cooldown",
+            "passed": true
+          },
+          {
+            "name": "projectiles expire",
+            "passed": true
+          },
+          {
+            "name": "enemy spawn and pursuit",
+            "passed": true
+          },
+          {
+            "name": "same seed gives deterministic enemy state",
+            "passed": true
+          },
+          {
+            "name": "waves progress with elapsed time",
+            "passed": true
+          },
+          {
+            "name": "bullet kill gives score once and consumes bullet",
+            "passed": true
+          },
+          {
+            "name": "contact damage respects invulnerability",
+            "passed": true
+          },
+          {
+            "name": "health pickup heals and is consumed",
+            "passed": true
+          },
+          {
+            "name": "death changes mode and emits gameover",
+            "passed": true
+          },
+          {
+            "name": "pause freezes all simulation and resumes",
+            "passed": true
+          },
+          {
+            "name": "restart resets prior run state in place",
+            "passed": true
+          },
+          {
+            "name": "large or invalid delta cannot corrupt or fast-forward state",
+            "passed": true
+          },
+          {
+            "name": "long active simulation remains finite and bounded",
+            "passed": true
+          },
+          {
+            "name": "real input listeners handle keyup, blur and disposal",
+            "passed": true
+          },
+          {
+            "name": "audio gracefully degrades without AudioContext",
+            "passed": true
+          },
+          {
+            "name": "renderer draws each lifecycle mode",
+            "passed": true
+          }
+        ]
+      },
+      "browser": {
+        "arm": "run-2-c8",
+        "completed": true,
+        "passed": 15,
+        "failed": 0,
+        "checks": [
+          {
+            "name": "title",
+            "pass": true
+          },
+          {
+            "name": "mute label and aria",
+            "pass": true,
+            "evidence": {
+              "action": "mute",
+              "ordinal": 0,
+              "text": "Unmute",
+              "pressed": "true",
+              "visible": true,
+              "left": 997.5703125,
+              "top": 6,
+              "right": 1074,
+              "bottom": 42
+            }
+          },
+          {
+            "name": "unmute label and aria",
+            "pass": true,
+            "evidence": {
+              "action": "mute",
+              "ordinal": 0,
+              "text": "Mute",
+              "pressed": "false",
+              "visible": true,
+              "left": 1015.5859375,
+              "top": 6,
+              "right": 1074,
+              "bottom": 42
+            }
+          },
+          {
+            "name": "keyboard movement",
+            "pass": true
+          },
+          {
+            "name": "keyboard firing",
+            "pass": true
+          },
+          {
+            "name": "real kill and score",
+            "pass": true,
+            "evidence": {
+              "kills": 1,
+              "score": 10
+            }
+          },
+          {
+            "name": "pause freezes simulation",
+            "pass": true
+          },
+          {
+            "name": "resume button label",
+            "pass": true
+          },
+          {
+            "name": "paused mute feedback",
+            "pass": true,
+            "evidence": {
+              "action": "mute",
+              "ordinal": 0,
+              "text": "Unmute",
+              "pressed": "true",
+              "visible": true,
+              "left": 997.5703125,
+              "top": 6,
+              "right": 1074,
+              "bottom": 42
+            }
+          },
+          {
+            "name": "narrow controls fit",
+            "pass": true,
+            "evidence": [
+              {
+                "action": "pause",
+                "ordinal": 0,
+                "text": "Resume",
+                "pressed": "true",
+                "visible": true,
+                "left": 4,
+                "top": 31,
+                "right": 207.3203125,
+                "bottom": 67
+              },
+              {
+                "action": "mute",
+                "ordinal": 0,
+                "text": "Unmute",
+                "pressed": "true",
+                "visible": true,
+                "left": 213.3203125,
+                "top": 31,
+                "right": 416,
+                "bottom": 67
+              },
+              {
+                "action": "pause",
+                "ordinal": 1,
+                "text": "Resume",
+                "pressed": "true",
+                "visible": true,
+                "left": 15,
+                "top": 133.234375,
+                "right": 92.0703125,
+                "bottom": 169.234375
+              }
+            ]
+          },
+          {
+            "name": "resume",
+            "pass": true
+          },
+          {
+            "name": "P pauses",
+            "pass": true
+          },
+          {
+            "name": "natural game over",
+            "pass": true
+          },
+          {
+            "name": "restart resets run",
+            "pass": true,
+            "evidence": {
+              "mode": "playing",
+              "elapsed": 0,
+              "score": 0,
+              "kills": 0,
+              "wave": 1,
+              "player": {
+                "x": 480,
+                "y": 300,
+                "r": 14,
+                "speed": 260,
+                "hp": 3,
+                "maxHp": 3,
+                "cooldown": 0,
+                "invulnerable": 0
+              },
+              "bullets": [],
+              "enemies": []
+            }
+          },
+          {
+            "name": "no observed page errors",
+            "pass": true,
+            "evidence": []
+          }
+        ]
+      },
+      "visual": {
+        "arm": "run-2-c8",
+        "reviewed": true,
+        "passed": true,
+        "method": "manual_screenshot_review",
+        "screenshots": [
+          "run-2-c8-before.png",
+          "run-2-c8-narrow-title.png",
+          "run-2-c8-narrow-paused.png",
+          "run-2-c8-gameover.png"
+        ],
+        "findings": [],
+        "narrowTitleGeometry": {
+          "viewport": {
+            "width": 420,
+            "height": 840
+          },
+          "hudBottom": 71,
+          "titleTop": 86
+        }
+      }
+    }
+  ],
+  "cleanup": {
+    "browserSpace": 31,
+    "browserSpaceFinished": true,
+    "previewPid": 95266,
+    "previewReaped": true,
+    "previewExitCode": 143,
+    "benchmarkProcessScanMatches": 0,
+    "finalGameProcesses": {
+      "total": 70,
+      "terminal": 70
+    }
+  },
+  "delivery": {
+    "committed": false,
+    "pushed": false,
+    "npmPublished": false
+  },
+  "limitations": [
+    "Only two final samples per concurrency cap; no causal speedup, stable P95 or optimal cap conclusion.",
+    "Original behavior checks pass in four games, but manual visual acceptance passes in only three; repaired result is separate.",
+    "Only macOS arm64 debug and grok-4.7 low exercised in these live games.",
+    "No long-duration/high-effort/cross-platform live-game validation.",
+    "Source baseline is dirty; installed npm 0.3.9 does not automatically include these changes.",
+    "Raw evidence is in a temporary directory and may be cleaned by the OS."
+  ]
+}

@@ -1,8 +1,8 @@
 use fs2::FileExt;
 use golutra_agent_core::{
-    ArtifactId, ArtifactRecord, BusyPolicyDecision, CommandId, ContextSnapshot, EventId,
-    EvidenceRecord, PostTaskJob, PostTaskJobId, PostTaskJobKind, PostTaskJobStatus, SessionId,
-    TaskId, ThreadId, Timestamp, ToolResultEnvelope, TurnId, VerificationPlan,
+    ArtifactId, ArtifactRecord, BackgroundResult, BusyPolicyDecision, CommandId, ContextSnapshot,
+    EventId, EvidenceRecord, PostTaskJob, PostTaskJobId, PostTaskJobKind, PostTaskJobStatus,
+    SessionId, TaskId, ThreadId, Timestamp, ToolResultEnvelope, TurnId, VerificationPlan,
 };
 use golutra_agent_protocol::{
     ArtifactReadRequest, CommandAck, DebugEventWindow, DebugProjection, RuntimeEvent,
@@ -25,8 +25,12 @@ use std::{
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
+mod background;
+mod subagents;
+pub use subagents::{SubagentMessage, SubagentRecord};
 mod compatibility;
 mod migrations;
+pub use background::BackgroundRepository;
 pub use compatibility::{DataCompatibility, DataCompatibilityReport, inspect_data_compatibility};
 mod projection;
 mod repositories;
@@ -79,6 +83,8 @@ pub enum StoreError {
     Migration(String),
     #[error("invalid tool completion bundle: {0}")]
     InvalidToolCompletionBundle(String),
+    #[error("invalid background task operation: {0}")]
+    InvalidBackgroundOperation(String),
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
@@ -396,6 +402,17 @@ impl RuntimeStore {
         Ok(event)
     }
 
+    /// Retrieve a durable event by identity before retrying an idempotent producer callback.
+    pub async fn event_by_id(&self, event_id: EventId) -> StoreResult<Option<RuntimeEvent>> {
+        let json: Option<String> =
+            sqlx::query_scalar("SELECT event_json FROM runtime_events WHERE event_id=?")
+                .bind(event_id.to_string())
+                .fetch_optional(&self.pool)
+                .await?;
+        json.map(|json| Ok(serde_json::from_str(&json)?))
+            .transpose()
+    }
+
     /// Atomically commits one tool completion and all facts that it references.
     ///
     /// Immutable blobs are verified and linked before the SQLite transaction.
@@ -413,7 +430,28 @@ impl RuntimeStore {
         let evidence = evidence.to_vec();
         await_store_operation(tokio::spawn(async move {
             store
-                .append_tool_completed_bundle_inner(event, &artifacts, &evidence)
+                .append_tool_completed_bundle_inner(event, &artifacts, &evidence, None)
+                .await
+        }))
+        .await
+    }
+
+    /// Commit the terminal audit and its inbox observation at one durable boundary.
+    /// A crash cannot leave a known completed operation looking abandoned on recovery.
+    pub async fn append_background_completed_bundle(
+        &self,
+        event: RuntimeEvent,
+        artifacts: &[(ArtifactRecord, Vec<u8>)],
+        evidence: &[EvidenceRecord],
+        result: &BackgroundResult,
+    ) -> StoreResult<RuntimeEvent> {
+        let store = self.clone();
+        let artifacts = artifacts.to_vec();
+        let evidence = evidence.to_vec();
+        let result = result.clone();
+        await_store_operation(tokio::spawn(async move {
+            store
+                .append_tool_completed_bundle_inner(event, &artifacts, &evidence, Some(&result))
                 .await
         }))
         .await
@@ -424,8 +462,12 @@ impl RuntimeStore {
         event: RuntimeEvent,
         artifacts: &[(ArtifactRecord, Vec<u8>)],
         evidence: &[EvidenceRecord],
+        background_result: Option<&BackgroundResult>,
     ) -> StoreResult<RuntimeEvent> {
         validate_tool_completion_bundle(&event, artifacts, evidence)?;
+        if let Some(result) = background_result {
+            background::validate_completion_bundle(&event, result)?;
+        }
         let _artifact_lock = self.acquire_artifact_store_lock().await?;
 
         let mut prepared = Vec::with_capacity(artifacts.len());
@@ -459,6 +501,9 @@ impl RuntimeStore {
         let transaction_result = async {
             let mut transaction = self.pool.begin().await?;
             let operation = async {
+                if let Some(result) = background_result {
+                    background::lock_batch(&mut transaction, result.batch_id).await?;
+                }
                 for (artifact, _) in artifacts {
                     insert_artifact_metadata_in_transaction(&mut transaction, artifact).await?;
                 }
@@ -467,6 +512,14 @@ impl RuntimeStore {
                 }
                 validate_bundle_references_in_transaction(&mut transaction, &event, evidence)
                     .await?;
+                if let Some(result) = background_result {
+                    background::validate_completion_references(&mut transaction, result).await?;
+                    if !background::finish_in_transaction(&mut transaction, result).await? {
+                        return Err(StoreError::InvalidBackgroundOperation(
+                            "background completion already has a durable result".to_owned(),
+                        ));
+                    }
+                }
                 append_event_assigning_sequence_in_transaction(&mut transaction, event).await
             }
             .await;
@@ -3468,9 +3521,12 @@ fn validate_tool_completion_bundle(
     artifacts: &[(ArtifactRecord, Vec<u8>)],
     evidence: &[EvidenceRecord],
 ) -> StoreResult<()> {
-    if event.event_type != RuntimeEventType::ToolCompleted {
+    if !matches!(
+        event.event_type,
+        RuntimeEventType::ToolCompleted | RuntimeEventType::BackgroundTaskUpdated
+    ) {
         return Err(StoreError::InvalidToolCompletionBundle(
-            "event type must be ToolCompleted".to_owned(),
+            "event type must be ToolCompleted or BackgroundTaskUpdated".to_owned(),
         ));
     }
     event

@@ -741,11 +741,19 @@ pub struct ProviderMessage {
 pub struct ProviderMessageMetadata {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub openai_responses_replay_items: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ProviderImage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderImage {
+    pub mime_type: String,
+    pub base64: String,
 }
 
 impl ProviderMessageMetadata {
     fn is_empty(&self) -> bool {
-        self.openai_responses_replay_items.is_empty()
+        self.openai_responses_replay_items.is_empty() && self.images.is_empty()
     }
 }
 
@@ -2421,6 +2429,16 @@ fn openai_message(message: &ProviderMessage) -> Value {
         },
         "content": message.content,
     });
+    if message.role == ProviderRole::User && !message.metadata.images.is_empty() {
+        let mut parts = vec![json!({"type": "text", "text": message.content})];
+        parts.extend(message.metadata.images.iter().map(|image| {
+            json!({
+                "type": "image_url",
+                "image_url": {"url": format!("data:{};base64,{}", image.mime_type, image.base64)}
+            })
+        }));
+        value["content"] = json!(parts);
+    }
     if let Some(tool_call_id) = &message.tool_call_id {
         value["tool_call_id"] = Value::String(tool_call_id.clone());
     }
@@ -2519,8 +2537,23 @@ pub fn provider_tool_description(tool_name: &str) -> &'static str {
         "runtime_status" => {
             "Read a bounded current-task summary: active processes and children, recent unresolved tool failures, validation, request usage and elapsed time. No arguments; no polling required when existing completion notifications suffice."
         }
+        "browser_status" => {
+            "Inspect the configured Ego browser and this session's Space without taking control."
+        }
+        "browser_help" => {
+            "Read the installed Ego SDK guide in pages before browser use. Follow next_offset; the runtime supplies task/page handles."
+        }
+        "browser_run" => {
+            "Control the session's Ego browser using JavaScript. Observe before unfamiliar actions; verify results. Use browser.screenshot(page) for model-visible images. Never automatically replay uncertain side effects."
+        }
+        "browser_handoff" => {
+            "Give the current browser Space to the user and wait for their confirmation before resuming."
+        }
+        "browser_finish" => {
+            "Finish a successful browser goal; close intermediate pages and optionally keep the result pages."
+        }
         "subagent" => {
-            "Spawn returns child_session_id; omit it on spawn. run_in_background runs concurrently; completion reported. Use returned handles for status/wait/send_input/resume/cancel; wait accepts child_session_ids. explore: read-only. Children cannot delegate."
+            "Spawn independent work together with run_in_background:true and separate files; keep dispatch brief, write parent files next response. Use returned child_session_id; omit it on spawn. Wait: child_session_ids, wait_ms<=60000. Children cannot delegate."
         }
         "list_dir" => "List entries in a workspace-relative directory.",
         "rg_search" => "Search workspace files with ripgrep.",

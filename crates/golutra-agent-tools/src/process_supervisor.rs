@@ -824,16 +824,32 @@ impl ProcessSupervisor {
         &self,
         request: ProcessStartRequest<'_>,
     ) -> Result<ProcessSnapshot, ToolError> {
-        self.start_with_input(request, None, true, false).await
+        self.start_with_input(request, None, true, false)
+            .await?
+            .ok_or_else(|| ToolError::Execution("process start was cancelled".to_owned()))
     }
 
+    /// `None` means cancellation was observed before spawning a process.
+    #[cfg(test)]
     pub(crate) async fn start_with_input(
         &self,
         request: ProcessStartRequest<'_>,
         input: Option<&[u8]>,
         keep_stdin: bool,
         tty: bool,
-    ) -> Result<ProcessSnapshot, ToolError> {
+    ) -> Result<Option<ProcessSnapshot>, ToolError> {
+        self.start_with_input_and_lease(request, input, keep_stdin, tty, None)
+            .await
+    }
+
+    pub(crate) async fn start_with_input_and_lease(
+        &self,
+        request: ProcessStartRequest<'_>,
+        input: Option<&[u8]>,
+        keep_stdin: bool,
+        tty: bool,
+        resource_lease: Option<super::resources::ResourceLease>,
+    ) -> Result<Option<ProcessSnapshot>, ToolError> {
         if self.inner.shutdown.is_cancelled() {
             return Err(ToolError::Execution(
                 "process supervisor is shutting down".to_owned(),
@@ -876,7 +892,7 @@ impl ProcessSupervisor {
                 )));
             }
             drop(start_guard);
-            return self.poll_for(&existing, 0, request.wait_ms).await;
+            return self.poll_for(&existing, 0, request.wait_ms).await.map(Some);
         }
         let entries = self
             .inner
@@ -899,9 +915,7 @@ impl ProcessSupervisor {
         }
 
         if request.cancellation.is_cancelled() {
-            return Err(ToolError::Execution(
-                "process start was cancelled".to_owned(),
-            ));
+            return Ok(None);
         }
         let scratch = tempfile::Builder::new()
             .prefix("golutra-agent-process-")
@@ -1111,23 +1125,28 @@ impl ProcessSupervisor {
         let workspace_before = request.workspace_before;
         let timeout = Duration::from_millis(request.timeout_ms.max(1));
         let supervisor_inner = Arc::downgrade(&self.inner);
-        tokio::spawn(supervise_process(
-            Arc::clone(&entry),
-            child,
-            stdout_reader,
-            stderr_reader,
-            scratch,
-            shutdown,
-            process_control,
-            task_cancellation,
-            workspace_root,
-            workspace_before,
-            timeout,
-            supervisor_inner,
-        ));
+        let supervised_entry = Arc::clone(&entry);
+        tokio::spawn(async move {
+            let _resource_lease = resource_lease;
+            supervise_process(
+                supervised_entry,
+                child,
+                stdout_reader,
+                stderr_reader,
+                scratch,
+                shutdown,
+                process_control,
+                task_cancellation,
+                workspace_root,
+                workspace_before,
+                timeout,
+                supervisor_inner,
+            )
+            .await;
+        });
         drop(start_guard);
 
-        self.poll_for(&entry, 0, request.wait_ms).await
+        self.poll_for(&entry, 0, request.wait_ms).await.map(Some)
     }
 
     pub(crate) async fn poll(

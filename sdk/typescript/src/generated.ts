@@ -120,6 +120,8 @@ export type RuntimeEventType =
   | "tool_progress"
   | "tool_completed"
   | "process_updated"
+  | "background_task_updated"
+  | "background_results_consumed"
   | "subagent_updated"
   | "policy_evaluated"
   | "verification_completed"
@@ -386,6 +388,7 @@ export type MemoryStatus =
   "proposed" | "quarantined" | "active" | "deprecated" | "rolled_back" | "expired";
 export type RuntimeQueryKind =
   | "session_state"
+  | "subagents"
   | "task_state"
   | "user_projection"
   | "debug_projection"

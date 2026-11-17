@@ -85,6 +85,9 @@ define_id!(RegressionCampaignId);
 define_id!(RegressionExecutionId);
 define_id!(MemoryCandidateId);
 define_id!(UserStepId);
+define_id!(BackgroundBatchId);
+define_id!(BackgroundTaskId);
+define_id!(BackgroundResultId);
 
 impl From<TaskId> for RunId {
     fn from(value: TaskId) -> Self {

@@ -1,6 +1,6 @@
 {
   "name": "@golutra/agent",
-  "version": "0.3.9",
+  "version": "4.0.0",
   "description": "Simple local coding agent with background work and full observability",
   "license": "Apache-2.0",
   "bin": {
@@ -14,7 +14,7 @@
     "README.md"
   ],
   "engines": {
-    "node": ">=18"
+    "node": ">=20.18.1"
   },
   "publishConfig": {
     "access": "public"
@@ -33,5 +33,8 @@
     "agent-runtime",
     "tui"
   ],
-  "type": "module"
+  "type": "module",
+  "dependencies": {
+    "@jackwener/opencli": "2.0.3"
+  }
 }

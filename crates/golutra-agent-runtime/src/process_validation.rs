@@ -13,6 +13,15 @@ pub(super) fn resolve_validation_report<'a>(
     reports: &[ToolExecutionReport],
 ) -> Cow<'a, ToolExecutionReport> {
     let facts = &report.envelope.structured_facts;
+    if facts["result_pending"] == true
+        && let Some(terminal) = reports.iter().find(|candidate| {
+            candidate.envelope.tool_call_id == report.envelope.tool_call_id
+                && candidate.envelope.structured_facts["background_result_id"].is_string()
+                && candidate.envelope.structured_facts["terminal"] == true
+        })
+    {
+        return Cow::Owned(terminal.clone());
+    }
     if report.envelope.tool_name != "shell"
         || report.envelope.status != ToolResultStatus::Ok
         || report.envelope.risk == "external_mcp_tool"

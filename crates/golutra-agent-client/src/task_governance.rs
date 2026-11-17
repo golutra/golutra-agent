@@ -1,6 +1,7 @@
 //! 任务终态后的评估输入、durable job、候选事件与 memory quarantine 编排。
 
 use super::*;
+use golutra_agent_tools::ToolExecutionReport;
 
 pub(super) fn is_security_policy_violation(evaluation: &PolicyEvaluation) -> bool {
     match evaluation.decision {
@@ -12,6 +13,10 @@ pub(super) fn is_security_policy_violation(evaluation: &PolicyEvaluation) -> boo
     }
 }
 
+#[cfg(test)]
+#[path = "task_governance_background_tests.rs"]
+mod background_tests;
+
 fn policy_violation_count(events: &[RuntimeEvent]) -> usize {
     events
         .iter()
@@ -22,10 +27,85 @@ fn policy_violation_count(events: &[RuntimeEvent]) -> usize {
         .count()
 }
 
+/// Admission receipts and background completion describe one invocation. A terminal
+/// background audit wins even when a very fast worker publishes it before its receipt.
+fn effective_tool_events(events: &[RuntimeEvent]) -> Vec<&RuntimeEvent> {
+    let mut positions = HashMap::new();
+    let mut selected: Vec<&RuntimeEvent> = Vec::new();
+    for event in events.iter().filter(|event| {
+        matches!(
+            event.event_type,
+            RuntimeEventType::ToolCompleted | RuntimeEventType::BackgroundTaskUpdated
+        )
+    }) {
+        let identity = event
+            .payload
+            .pointer("/envelope/tool_call_id")
+            .and_then(Value::as_str)
+            .map(|id| format!("call:{id}"))
+            .unwrap_or_else(|| format!("event:{}", event.id));
+        let key = (event.session_id, identity);
+        if let Some(&index) = positions.get(&key) {
+            let previous: &RuntimeEvent = selected[index];
+            if event.event_type == RuntimeEventType::BackgroundTaskUpdated
+                || previous.event_type != RuntimeEventType::BackgroundTaskUpdated
+            {
+                selected[index] = event;
+            }
+        } else {
+            positions.insert(key, selected.len());
+            selected.push(event);
+        }
+    }
+    selected
+}
+
+fn tool_report_counts(reports: &[ToolExecutionReport]) -> (usize, usize) {
+    let calls = reports
+        .iter()
+        .map(|report| report.envelope.tool_call_id)
+        .collect::<HashSet<_>>();
+    let artifacts = reports
+        .iter()
+        .flat_map(|report| report.artifacts.iter().map(|artifact| artifact.artifact_id))
+        .collect::<HashSet<_>>();
+    (calls.len(), artifacts.len())
+}
+
+fn tool_event_artifact_count(events: &[&RuntimeEvent]) -> usize {
+    let mut artifacts = HashSet::<ArtifactId>::new();
+    for event in events {
+        if let Some(references) = event
+            .payload
+            .get("tool_artifact_refs")
+            .and_then(Value::as_array)
+        {
+            artifacts.extend(
+                references
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter_map(|id| id.parse::<ArtifactId>().ok()),
+            );
+        } else if let Some(id) = event
+            .payload
+            .pointer("/envelope/raw_artifact_ref")
+            .and_then(Value::as_str)
+            .and_then(|id| id.parse::<ArtifactId>().ok())
+        {
+            artifacts.insert(id);
+        }
+    }
+    artifacts.len()
+}
+
 fn trajectory_summary(events: &[RuntimeEvent]) -> TrajectorySummary {
     let mut summary = TrajectorySummary::default();
     let mut context_tokens = Vec::new();
     let mut failures = HashMap::<String, TrajectoryFailureCluster>::new();
+    let tool_events = effective_tool_events(events)
+        .into_iter()
+        .map(|event| event.id)
+        .collect::<HashSet<_>>();
     for event in events {
         match event.event_type {
             RuntimeEventType::ProviderCompleted => {
@@ -43,7 +123,9 @@ fn trajectory_summary(events: &[RuntimeEvent]) -> TrajectorySummary {
                     context_tokens.push(tokens);
                 }
             }
-            RuntimeEventType::ToolCompleted => {
+            RuntimeEventType::ToolCompleted | RuntimeEventType::BackgroundTaskUpdated
+                if tool_events.contains(&event.id) =>
+            {
                 summary.tool_calls = summary.tool_calls.saturating_add(1);
                 let status = event
                     .payload
@@ -144,17 +226,14 @@ impl RuntimeHost {
         task: &HostedAgentTask,
         input: HostedTaskEvaluation<'_>,
     ) {
+        let (tool_count, artifact_count) = tool_report_counts(input.tool_reports);
         let request = post_task::PostTaskScheduleRequest {
             task: task.clone(),
             objective: input.objective.to_owned(),
             task_status: input.task_status,
             verification: input.verification.clone(),
-            tool_count: input.tool_reports.len(),
-            artifact_count: input
-                .tool_reports
-                .iter()
-                .map(|report| report.artifacts.len())
-                .sum(),
+            tool_count,
+            artifact_count,
             failure_summary: input.failure_summary.clone(),
             latency: input.latency,
         };
@@ -238,11 +317,7 @@ impl RuntimeHost {
         task: &HostedAgentTask,
         input: HostedTaskEvaluation<'_>,
     ) -> Result<TaskEvaluationInput, ClientError> {
-        let artifact_count = input
-            .tool_reports
-            .iter()
-            .map(|report| report.artifacts.len())
-            .sum();
+        let (tool_count, artifact_count) = tool_report_counts(input.tool_reports);
         let evaluation_input = self
             .build_task_evaluation_input(
                 task,
@@ -250,7 +325,7 @@ impl RuntimeHost {
                     objective: input.objective.to_owned(),
                     task_status: input.task_status,
                     verification: input.verification,
-                    tool_count: input.tool_reports.len(),
+                    tool_count,
                     artifact_count,
                     failure_summary: input.failure_summary,
                     latency: input.latency,
@@ -523,15 +598,8 @@ impl RuntimeHost {
             .and_then(|value| serde_json::from_value(value).ok());
         let token_usage = token_usage_records(&events)?;
         let policy_violation_count = policy_violation_count(&events);
-        let tool_events = events
-            .iter()
-            .filter(|event| event.event_type == RuntimeEventType::ToolCompleted)
-            .collect::<Vec<_>>();
-        let artifact_count = tool_events
-            .iter()
-            .filter_map(|event| event.payload.get("envelope"))
-            .filter_map(|envelope| envelope.get("raw_artifact_ref"))
-            .count();
+        let tool_events = effective_tool_events(&events);
+        let artifact_count = tool_event_artifact_count(&tool_events);
         let failure_summary = events
             .iter()
             .rev()
@@ -971,9 +1039,9 @@ impl RuntimeHost {
             .and_then(Value::as_str)
             .filter(|message| !message.trim().is_empty())
             .unwrap_or("verified completion");
-        let tool_facts = events
+        let tool_events = effective_tool_events(&events);
+        let tool_facts = tool_events
             .iter()
-            .filter(|event| event.event_type == RuntimeEventType::ToolCompleted)
             .filter_map(|event| event.payload.get("summary").and_then(Value::as_str))
             .collect::<Vec<_>>()
             .join("; ");

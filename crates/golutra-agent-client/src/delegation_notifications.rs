@@ -10,7 +10,8 @@ const MAX_CACHED_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Default)]
 pub(crate) struct NotificationCache {
-    sessions: std::collections::HashMap<SessionId, NotificationIndex>,
+    sessions:
+        std::collections::HashMap<SessionId, (u64, Arc<tokio::sync::Mutex<NotificationIndex>>)>,
     clock: u64,
 }
 
@@ -19,12 +20,65 @@ struct NotificationIndex {
     cursor: Option<u64>,
     facts: Arc<Vec<RuntimeEvent>>,
     bytes: usize,
-    last_used: u64,
 }
 
 impl NotificationIndex {
     fn apply(&mut self, event: RuntimeEvent) {
         self.cursor = Some(event.sequence_no);
+        if matches!(
+            event.event_type,
+            RuntimeEventType::TaskCreated | RuntimeEventType::CompactionCompleted
+        ) {
+            let published = self
+                .facts
+                .iter()
+                .filter(|fact| fact.event_type == RuntimeEventType::SubagentUpdated)
+                .filter_map(|fact| fact.payload["tool_call_id"].as_str().map(str::to_owned))
+                .collect::<std::collections::HashSet<_>>();
+            Arc::make_mut(&mut self.facts).retain(|fact| {
+                !matches!(
+                    fact.event_type,
+                    RuntimeEventType::TaskCreated
+                        | RuntimeEventType::CompactionCompleted
+                        | RuntimeEventType::SubagentUpdated
+                ) && !fact.payload["tool_call_id"]
+                    .as_str()
+                    .is_some_and(|id| published.contains(id))
+                    && !fact.payload["envelope"]["tool_call_id"]
+                        .as_str()
+                        .is_some_and(|id| published.contains(id))
+            });
+            self.bytes = self
+                .facts
+                .iter()
+                .map(|fact| fact.payload.to_string().len() + 256)
+                .sum();
+        }
+        let managed = match event.event_type {
+            RuntimeEventType::SubagentUpdated => event.payload["facts"]["background"] == true,
+            RuntimeEventType::ToolCompleted => {
+                event.payload["envelope"]["tool_name"] == "subagent"
+                    && event.payload["envelope"]["structured_facts"]["background"] == true
+            }
+            _ => false,
+        };
+        if managed {
+            let call = event.payload["tool_call_id"]
+                .as_str()
+                .or_else(|| event.payload["envelope"]["tool_call_id"].as_str());
+            if let Some(call) = call {
+                Arc::make_mut(&mut self.facts).retain(|fact| {
+                    fact.payload["tool_call_id"] != call
+                        && fact.payload["envelope"]["tool_call_id"] != call
+                });
+                self.bytes = self
+                    .facts
+                    .iter()
+                    .map(|fact| fact.payload.to_string().len() + 256)
+                    .sum();
+            }
+            return;
+        }
         let relevant = match event.event_type {
             RuntimeEventType::TaskCreated
             | RuntimeEventType::CompactionCompleted
@@ -46,8 +100,30 @@ async fn notification_facts(
     host: &RuntimeHost,
     session: SessionId,
 ) -> Result<Arc<Vec<RuntimeEvent>>, ClientError> {
-    let mut cache = host.execution.delegation_notification_cache.lock().await;
-    let mut index = cache.sessions.get(&session).cloned().unwrap_or_default();
+    let shared = {
+        let mut cache = host.execution.delegation_notification_cache.lock().await;
+        cache.clock = cache.clock.saturating_add(1);
+        let clock = cache.clock;
+        let entry = cache.sessions.entry(session).or_insert_with(|| {
+            (
+                clock,
+                Arc::new(tokio::sync::Mutex::new(NotificationIndex::default())),
+            )
+        });
+        entry.0 = clock;
+        let shared = entry.1.clone();
+        if cache.sessions.len() > MAX_CACHED_SESSIONS
+            && let Some(oldest) = cache
+                .sessions
+                .iter()
+                .min_by_key(|(_, entry)| entry.0)
+                .map(|(id, _)| *id)
+        {
+            cache.sessions.remove(&oldest);
+        }
+        shared
+    };
+    let mut index = shared.lock().await;
     loop {
         let page = host
             .storage
@@ -63,102 +139,24 @@ async fn notification_facts(
             break;
         }
     }
-    cache.clock = cache.clock.saturating_add(1);
-    index.last_used = cache.clock;
     let facts = index.facts.clone();
     // 超大历史仍从持久层完整读取，不以丢通知换取缓存命中。
-    if index.bytes <= MAX_CACHED_BYTES && index.facts.len() <= MAX_CACHED_FACTS {
-        cache.sessions.insert(session, index);
-        if cache.sessions.len() > MAX_CACHED_SESSIONS
-            && let Some(oldest) = cache
-                .sessions
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(id, _)| *id)
+    if index.bytes > MAX_CACHED_BYTES || index.facts.len() > MAX_CACHED_FACTS {
+        let mut cache = host.execution.delegation_notification_cache.lock().await;
+        if cache
+            .sessions
+            .get(&session)
+            .is_some_and(|(_, cached)| Arc::ptr_eq(cached, &shared))
         {
-            cache.sessions.remove(&oldest);
+            cache.sessions.remove(&session);
         }
-    } else {
-        cache.sessions.remove(&session);
     }
     Ok(facts)
 }
 
-/// 沿用通知索引与投影，只返回属于该父线程的最近子任务；查询不会发布或消费通知。
+/// Read the durable registry; querying never publishes or consumes notifications.
 pub(super) async fn status(host: &RuntimeHost, session: SessionId) -> Result<Value, ClientError> {
-    let events = notification_facts(host, session).await?;
-    let parent = host
-        .storage
-        .repositories
-        .threads
-        .by_session(session)
-        .await?;
-    let mut seen = std::collections::HashSet::new();
-    let mut children = Vec::new();
-    // 子任务结果先发布、通知后落盘；先读当前操作，避免这个正常窗口漏掉仍在运行的子任务。
-    let mut active = host
-        .execution
-        .delegation_operations
-        .lock()
-        .await
-        .values()
-        .filter(|operation| operation.belongs_to(session))
-        .filter_map(|operation| {
-            control::operation_session(operation)
-                .map(|child| (operation.execution_finished(), operation.created_at, child))
-        })
-        .collect::<Vec<_>>();
-    active.sort_by_key(|(finished, created, _)| (*finished, std::cmp::Reverse(*created)));
-    let mut candidates = active
-        .into_iter()
-        .map(|(_, _, child)| child)
-        .collect::<Vec<_>>();
-    for event in events.iter().rev() {
-        let facts = if event.event_type == RuntimeEventType::SubagentUpdated {
-            &event.payload["facts"]
-        } else if event.event_type == RuntimeEventType::ToolCompleted
-            && event.payload["envelope"]["tool_name"] == "subagent"
-        {
-            &event.payload["envelope"]["structured_facts"]
-        } else {
-            continue;
-        };
-        let Some(child) = facts["child_session_id"]
-            .as_str()
-            .and_then(|id| id.parse::<SessionId>().ok())
-        else {
-            continue;
-        };
-        candidates.push(child);
-    }
-    for child in candidates {
-        if !seen.insert(child) || children.len() >= 16 {
-            continue;
-        }
-        let Some(thread) = host.storage.repositories.threads.by_session(child).await? else {
-            continue;
-        };
-        if parent
-            .as_ref()
-            .is_none_or(|parent| thread.parent_thread_id != Some(parent.thread_id))
-        {
-            continue;
-        }
-        let state = host
-            .storage
-            .repositories
-            .projections
-            .state(child, None)
-            .await?;
-        children.push(
-            json!({"child_session_id":child, "task_id":state.active_task_id,
-            "status":state.task_status}),
-        );
-    }
-    Ok(
-        json!({"available":true, "scope":"parent_session", "children":children,
-        "truncated":seen.len() > 16}),
-    )
+    registry::list(host, session, 0, 16).await
 }
 
 pub(super) async fn publish(
@@ -167,19 +165,29 @@ pub(super) async fn publish(
     result: &Result<TaskDelegationOutput, ClientError>,
 ) -> Result<(), ClientError> {
     let _guard = host.execution.delegation_notification_lock.lock().await;
-    let events = notification_facts(host, request.session_id).await?;
     let id = EventId(deterministic_uuid(
         &request.tool_call_id.to_string(),
         "subagent-completion",
     ));
-    if events.iter().any(|event| event.id == id) {
+    if host.storage.store.event_by_id(id).await?.is_some() {
         return Ok(());
     }
+    let events = notification_facts(host, request.session_id).await?;
     let origin = events.iter().rev().find(|event| {
         event.event_type == RuntimeEventType::ToolStarted
             && event.payload.get("tool_call_id").and_then(Value::as_str)
                 == Some(&request.tool_call_id.to_string())
     });
+    let task_id = match origin.and_then(|event| event.task_id) {
+        Some(task_id) => Some(task_id),
+        None => host
+            .storage
+            .store
+            .background()
+            .find_task_by_tool_call(host.workspace_id, request.session_id, request.tool_call_id)
+            .await?
+            .map(|task| task.scope.task_id),
+    };
     let payload = match result {
         Ok(output) => {
             json!({"tool_call_id":request.tool_call_id,"summary":output.summary,"content":output.content,"facts":output.structured_facts})
@@ -193,7 +201,7 @@ pub(super) async fn publish(
         id,
         sequence_no: 0,
         session_id: request.session_id,
-        task_id: origin.and_then(|event| event.task_id),
+        task_id,
         turn_id: request.turn_id,
         parent_event_id: origin.map(|event| event.id),
         causal_context: Default::default(),
@@ -228,7 +236,9 @@ pub(super) async fn load(
     Ok(events
         .iter()
         .filter(|event| {
-            event.event_type == RuntimeEventType::SubagentUpdated && event.sequence_no > boundary
+            event.event_type == RuntimeEventType::SubagentUpdated
+                && event.sequence_no > boundary
+                && event.payload["facts"]["background"] != true
         })
         .map(|event| DelegationNotification {
             id: format!("event:{}", event.id),
@@ -250,6 +260,11 @@ pub(super) async fn load(
 
 async fn reconcile(host: &RuntimeHost, session: SessionId) -> Result<(), ClientError> {
     let events = notification_facts(host, session).await?;
+    let origins: std::collections::HashMap<_, _> = events
+        .iter()
+        .filter(|event| event.event_type == RuntimeEventType::ToolStarted)
+        .filter_map(|event| event.payload["tool_call_id"].as_str().map(|id| (id, event)))
+        .collect();
     let published: std::collections::HashSet<_> = events
         .iter()
         .filter(|event| event.event_type == RuntimeEventType::SubagentUpdated)
@@ -272,10 +287,7 @@ async fn reconcile(host: &RuntimeHost, session: SessionId) -> Result<(), ClientE
         else {
             continue;
         };
-        let origin = events.iter().find(|event| {
-            event.event_type == RuntimeEventType::ToolStarted
-                && event.payload.get("tool_call_id").and_then(Value::as_str) == Some(call_id)
-        });
+        let origin = origins.get(call_id).copied();
         if origin.is_none_or(|event| {
             !matches!(
                 event
@@ -487,6 +499,75 @@ mod tests {
         assert!(notices[0].content.contains("original findings"));
         assert!(!notices[0].content.contains("later findings"));
         assert_eq!(load(&host, parent).await.unwrap().len(), 1);
+        host.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn managed_subagent_history_keeps_a_small_incremental_cache_after_5000_events() {
+        let host = RuntimeHost::in_memory().await.unwrap();
+        let session = host.default_session_id();
+        for _ in 0..1700 {
+            let call = ToolCallId::new();
+            for (kind, payload) in [
+                (RuntimeEventType::TaskCreated, json!({})),
+                (
+                    RuntimeEventType::ToolStarted,
+                    json!({"tool_name":"subagent","tool_call_id":call}),
+                ),
+                (
+                    RuntimeEventType::ToolCompleted,
+                    json!({"envelope":{"tool_name":"subagent","tool_call_id":call,"structured_facts":{"background":true}}}),
+                ),
+            ] {
+                host.storage
+                    .repositories
+                    .events
+                    .append_assigning_sequence(host_event(
+                        0,
+                        session,
+                        None,
+                        kind,
+                        RuntimeEventSource::Runtime,
+                        payload,
+                    ))
+                    .await
+                    .unwrap();
+            }
+        }
+        let start = std::time::Instant::now();
+        let first = notification_facts(&host, session).await.unwrap();
+        let cold = start.elapsed();
+        assert_eq!(
+            first.len(),
+            1,
+            "settled managed launches are not retained in the legacy index"
+        );
+        let mut samples = Vec::new();
+        for _ in 0..100 {
+            let start = std::time::Instant::now();
+            let next = notification_facts(&host, session).await.unwrap();
+            samples.push(start.elapsed().as_micros());
+            assert!(
+                Arc::ptr_eq(&first, &next),
+                "must not fall back to replaying the full event history"
+            );
+        }
+        samples.sort_unstable();
+        let cache = host.execution.delegation_notification_cache.lock().await;
+        let shared = cache.sessions.get(&session).unwrap().1.clone();
+        drop(cache);
+        let index = shared.lock().await;
+        assert!(index.cursor.unwrap() >= 5100);
+        assert!(index.bytes < 1024);
+        eprintln!(
+            "managed-history events=5100 warm_samples=100 cold_us={} warm_p50_us={} warm_p95_us={} retained_facts={} retained_payload_bytes={}",
+            cold.as_micros(),
+            samples[49],
+            samples[94],
+            index.facts.len(),
+            index.bytes
+        );
+        drop(index);
         host.close().await.unwrap();
     }
 

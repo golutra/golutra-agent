@@ -1,4 +1,4 @@
-//! 当前数据格式检查与进程使用期锁；仅空库可初始化，历史格式拒绝打开。
+//! Schema inspection and process leases. Only exact v7/v8 baselines can upgrade.
 
 use crate::{StoreError, StoreResult, migrations};
 use fs2::FileExt;
@@ -61,7 +61,7 @@ pub async fn inspect_data_compatibility(pool: &SqlitePool) -> StoreResult<DataCo
         sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")
             .fetch_one(pool)
             .await?;
-    let reason = if objects == 0 {
+    let reason = if objects == 0 || migrations::can_upgrade_applied(&applied) {
         None
     } else {
         migrations::validate_applied(&applied).err()
@@ -137,7 +137,8 @@ async fn lock_shared(file: &File) -> StoreResult<()> {
     unreachable!()
 }
 
-/// 旧/未知格式在业务写入前拒绝；仅全空库可在独占锁下初始化。
+/// Unknown formats are rejected before writes. Initialization and the exact supported
+/// upgrade both require an exclusive process lease, so old readers cannot stay open.
 pub(crate) async fn prepare_shared_store(pool: &SqlitePool, file: File) -> StoreResult<Arc<File>> {
     lock_shared(&file).await?;
     let report = inspect_data_compatibility(pool).await?;
@@ -148,7 +149,10 @@ pub(crate) async fn prepare_shared_store(pool: &SqlitePool, file: File) -> Store
                 report.reason.unwrap_or_default()
             )));
         }
-        DataCompatibility::Supported => return Ok(Arc::new(file)),
+        DataCompatibility::Supported if report.schema_version == migrations::CURRENT_VERSION => {
+            return Ok(Arc::new(file));
+        }
+        DataCompatibility::Supported => {}
         DataCompatibility::Uninitialized => {}
     }
     FileExt::unlock(&file).map_err(|error| StoreError::Migration(error.to_string()))?;
@@ -173,7 +177,9 @@ pub(crate) async fn prepare_shared_store(pool: &SqlitePool, file: File) -> Store
         match FileExt::try_lock_shared(&file) {
             Ok(()) => {
                 let current = inspect_data_compatibility(pool).await?;
-                if current.status == DataCompatibility::Supported {
+                if current.status == DataCompatibility::Supported
+                    && current.schema_version == migrations::CURRENT_VERSION
+                {
                     return Ok(Arc::new(file));
                 }
                 if current.status == DataCompatibility::Unsupported {
@@ -198,7 +204,9 @@ pub(crate) async fn prepare_shared_store(pool: &SqlitePool, file: File) -> Store
 
 pub(crate) async fn require_supported(pool: &SqlitePool) -> StoreResult<()> {
     let report = inspect_data_compatibility(pool).await?;
-    if report.status != DataCompatibility::Supported {
+    if report.status != DataCompatibility::Supported
+        || report.schema_version != migrations::CURRENT_VERSION
+    {
         return Err(StoreError::Migration(format!(
             "data_unsupported: schema changed while open: {report:?}"
         )));

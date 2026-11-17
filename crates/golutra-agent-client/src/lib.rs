@@ -146,6 +146,7 @@ pub(crate) fn runtime_identity() -> String {
 mod agent;
 mod agent_projection;
 mod application;
+mod background;
 mod causal_recorder;
 mod change_tracker;
 mod command;
@@ -186,7 +187,7 @@ mod trace;
 mod trace_integrity;
 mod transport;
 
-pub use agent::{AgentClient, AgentThread, TurnHandle};
+pub use agent::{AgentClient, AgentThread, AgentTurnProviderOptions, TurnHandle};
 pub use agent_projection::AgentEventProjector;
 pub use application::{
     GovernedRuntime, RuntimeApplication, RuntimeCommandService, RuntimeGovernanceService,
@@ -445,6 +446,7 @@ struct RuntimeHostExecutionState {
     rollout_threads: Mutex<HashMap<SessionId, Arc<ThreadRecord>>>,
     provider_auth_waiters: Mutex<HashMap<SessionId, PendingProviderAuth>>,
     process_supervisor: ProcessSupervisor,
+    background_supervisor: golutra_agent_tools::BackgroundToolSupervisor,
     process_event_worker: StdMutex<Option<tokio::task::JoinHandle<()>>>,
     workspace_change_tracker: Mutex<change_tracker::WorkspaceChangeTracker>,
     rollout_projection_failures: Mutex<HashMap<SessionId, String>>,
@@ -479,6 +481,7 @@ impl Drop for RuntimeHost {
         // 先锁存并终止受管进程，再广播 runtime 取消，避免通用收尾先让
         // child.wait 完成并把一次受控终止误记为自然失败。
         self.execution.process_supervisor.shutdown();
+        self.execution.background_supervisor.shutdown();
         self.execution.shutdown.cancel();
         if let Ok(mut worker) = self.execution.post_task_worker.lock()
             && let Some(worker) = worker.take()
@@ -1385,7 +1388,7 @@ struct HostedTaskControl {
     abort_handle: AbortHandle,
     completion: watch::Receiver<bool>,
     delegation: Option<delegation_policy::DelegationContext>,
-    _session_lease: Option<Arc<File>>,
+    _session_lease: Option<Arc<ExecutionLease>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -1405,6 +1408,20 @@ impl ProviderTurnSettings {
     }
 
     fn normalize_queued_payload(&self, payload: &mut Value) -> Result<(), &'static str> {
+        if let Some(effort) = payload.get("provider_reasoning_effort") {
+            let active = self
+                .generation_config
+                .as_ref()
+                .and_then(|config| config.get("reasoning_effort"))
+                .unwrap_or(&Value::Null);
+            if effort != active {
+                return Err("queued prompt cannot change provider settings while a task is active");
+            }
+            payload
+                .as_object_mut()
+                .expect("prompt payload is an object")
+                .remove("provider_reasoning_effort");
+        }
         let requested = Self::from_payload(payload);
         if (requested.profile.is_some() && requested.profile != self.profile)
             || (requested.model.is_some() && requested.model != self.model)
@@ -1426,8 +1443,20 @@ impl ProviderTurnSettings {
     }
 }
 
+#[derive(Debug)]
+struct ExecutionLease(File);
+
+impl Drop for ExecutionLease {
+    fn drop(&mut self) {
+        // A fork or duplicated descriptor can outlive this owner. Closing our
+        // descriptor alone does not release an open-description flock on Unix.
+        // Arc keeps the explicit unlock at the last actual runtime owner.
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
 enum SessionLeaseAttempt {
-    Acquired(Option<Arc<File>>),
+    Acquired(Option<Arc<ExecutionLease>>),
     Busy,
 }
 
@@ -1477,7 +1506,12 @@ impl RuntimeHost {
     /// to persist its terminal state before the host is torn down.
     pub async fn close(&self) -> Result<(), ClientError> {
         self.execution.shutdown.cancel();
+        self.execution.background_supervisor.shutdown();
         let work_result = self.shutdown_active_work().await;
+        self.execution
+            .background_supervisor
+            .shutdown_and_wait()
+            .await;
         let process_result = self
             .execution
             .process_supervisor
@@ -1848,6 +1882,7 @@ impl RuntimeHost {
                 rollout_threads: Mutex::new(HashMap::new()),
                 provider_auth_waiters: Mutex::new(HashMap::new()),
                 process_supervisor: ProcessSupervisor::new(),
+                background_supervisor: golutra_agent_tools::BackgroundToolSupervisor::new(),
                 process_event_worker: StdMutex::new(None),
                 workspace_change_tracker: Mutex::new(
                     change_tracker::WorkspaceChangeTracker::default(),
@@ -2214,7 +2249,7 @@ impl RuntimeHost {
         self: Arc<Self>,
         session_id: SessionId,
         mut pending_turns: Vec<RecoveredPendingTurn>,
-        session_lease: Option<Arc<File>>,
+        session_lease: Option<Arc<ExecutionLease>>,
     ) -> Result<(), ClientError> {
         if pending_turns.is_empty() {
             return Ok(());
@@ -2435,6 +2470,17 @@ impl RuntimeHost {
         artifacts: &[(ArtifactRecord, Vec<u8>)],
         evidence: &[golutra_agent_core::EvidenceRecord],
     ) -> Result<(), ClientError> {
+        self.record_tool_completed_bundle_with_background(event, artifacts, evidence, None)
+            .await
+    }
+
+    async fn record_tool_completed_bundle_with_background(
+        &self,
+        event: RuntimeEvent,
+        artifacts: &[(ArtifactRecord, Vec<u8>)],
+        evidence: &[golutra_agent_core::EvidenceRecord],
+        background: Option<&golutra_agent_core::BackgroundResult>,
+    ) -> Result<(), ClientError> {
         let _writer = self.execution.event_writer.lock().await;
         let causal_before = self.execution.causal_ledger.lock().await.clone();
         let event = match self.prepare_canonical_event(event).await {
@@ -2444,13 +2490,20 @@ impl RuntimeHost {
                 return Err(error);
             }
         };
-        let event = match self
-            .storage
-            .repositories
-            .events
-            .append_tool_completed_bundle(event, artifacts, evidence)
-            .await
-        {
+        let committed = if let Some(result) = background {
+            self.storage
+                .repositories
+                .events
+                .append_background_completed_bundle(event, artifacts, evidence, result)
+                .await
+        } else {
+            self.storage
+                .repositories
+                .events
+                .append_tool_completed_bundle(event, artifacts, evidence)
+                .await
+        };
+        let event = match committed {
             Ok(event) => event,
             Err(error) => {
                 *self.execution.causal_ledger.lock().await = causal_before;
@@ -2870,7 +2923,9 @@ impl RuntimeHost {
             .map_err(|error| ClientError::Io(format!("{}: {error}", path.display())))?;
         set_owner_only_file(&path)?;
         match file.try_lock_exclusive() {
-            Ok(()) => Ok(SessionLeaseAttempt::Acquired(Some(Arc::new(file)))),
+            Ok(()) => Ok(SessionLeaseAttempt::Acquired(Some(Arc::new(
+                ExecutionLease(file),
+            )))),
             Err(error) if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
                 Ok(SessionLeaseAttempt::Busy)
             }

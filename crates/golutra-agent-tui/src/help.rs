@@ -95,6 +95,7 @@ pub(crate) fn help_lines(topic: HelpTopic, keymap: KeymapMode, context: &str) ->
             "/handoff [goal]  edit a handoff draft for a new session".to_owned(),
             "/plan            execution and verification plan".to_owned(),
             "/tasks           foreground and background activity".to_owned(),
+            "/agents          subagent list, results and controls".to_owned(),
             "/usage           tokens, context, cost and rate limits".to_owned(),
             "/terminal [cmd]  suspend Golutra and use the terminal".to_owned(),
             String::new(),

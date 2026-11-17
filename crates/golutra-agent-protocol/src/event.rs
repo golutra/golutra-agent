@@ -71,6 +71,8 @@ pub enum RuntimeEventType {
     ToolProgress,
     ToolCompleted,
     ProcessUpdated,
+    BackgroundTaskUpdated,
+    BackgroundResultsConsumed,
     SubagentUpdated,
     PolicyEvaluated,
     VerificationCompleted,
@@ -260,6 +262,8 @@ impl RuntimeEventType {
             | Self::ToolProgress
             | Self::ToolCompleted
             | Self::ProcessUpdated
+            | Self::BackgroundTaskUpdated
+            | Self::BackgroundResultsConsumed
             | Self::SubagentUpdated
             | Self::PolicyEvaluated
             | Self::VerificationCompleted

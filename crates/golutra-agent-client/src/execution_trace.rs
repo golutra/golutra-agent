@@ -110,6 +110,53 @@ impl RuntimeHost {
         coalescing: CoalescingSummary,
         auxiliary_operation: Option<&str>,
     ) -> Result<(), ClientError> {
+        if let RuntimeObservation::BackgroundResultsConsumed {
+            result_ids,
+            request_id,
+            turn_id,
+        } = &trace_event
+        {
+            let snapshot = self
+                .storage
+                .repositories
+                .artifacts
+                .latest_context(task.session_id)
+                .await?;
+            if snapshot
+                .as_ref()
+                .is_none_or(|snapshot| snapshot.provider_request_id != *request_id)
+            {
+                return Err(ClientError::TaskExecution(
+                    "background delivery has no durable model context".into(),
+                ));
+            }
+            self.record_event(agent_event_for_turn(
+                self.next_sequence_no(),
+                task,
+                *turn_id,
+                RuntimeEventType::BackgroundResultsConsumed,
+                RuntimeEventSource::Runtime,
+                json!({"summary":"background observations included in model context",
+                    "result_ids":result_ids,"request_id":request_id}),
+            ))
+            .await?;
+            self.storage
+                .store
+                .background()
+                .acknowledge_results(self.workspace_id, task.session_id, result_ids, *turn_id)
+                .await?;
+            return Ok(());
+        }
+        let delivered_messages = match &trace_event {
+            AgentLoopTraceEvent::ContextSnapshotCaptured { snapshot, .. } => snapshot
+                .message_manifest
+                .iter()
+                .filter(|message| message.origin == "subagent_message")
+                .flat_map(|message| message.source_refs.iter())
+                .filter_map(|source| source.strip_prefix("subagent-message:").map(str::to_owned))
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
         let (trace_event, context_artifacts) = match trace_event {
             AgentLoopTraceEvent::ContextSnapshotCaptured {
                 mut snapshot,
@@ -277,6 +324,16 @@ impl RuntimeHost {
                 event.payload[payload_key] = Value::String(artifact.artifact_id.to_string());
             }
             self.record_event(event).await?;
+            if !delivered_messages.is_empty() {
+                self.storage
+                    .store
+                    .acknowledge_subagent_messages(
+                        task.session_id,
+                        task.task_id,
+                        &delivered_messages,
+                    )
+                    .await?;
+            }
             if let Some((lane_id, turn_id)) = queued_turn_start {
                 self.execution
                     .lane_manager
@@ -366,6 +423,37 @@ impl RuntimeHost {
         task: &HostedAgentTask,
         report: &golutra_agent_tools::ToolExecutionReport,
     ) -> Result<(), ClientError> {
+        self.record_tool_report_with_background(task, report, None)
+            .await
+    }
+
+    pub(super) async fn record_background_tool_report(
+        &self,
+        task: &HostedAgentTask,
+        report: &golutra_agent_tools::ToolExecutionReport,
+        result: &golutra_agent_core::BackgroundResult,
+    ) -> Result<(), ClientError> {
+        self.record_tool_report_with_background(task, report, Some(result))
+            .await
+    }
+
+    async fn record_tool_report_with_background(
+        &self,
+        task: &HostedAgentTask,
+        report: &golutra_agent_tools::ToolExecutionReport,
+        background: Option<&golutra_agent_core::BackgroundResult>,
+    ) -> Result<(), ClientError> {
+        let background_event_id = background.map(|result| {
+            EventId(Uuid::new_v5(
+                &result.result_id.0,
+                b"background-result-event",
+            ))
+        });
+        if let Some(event_id) = background_event_id
+            && self.storage.store.event_by_id(event_id).await?.is_some()
+        {
+            return Ok(());
+        }
         let event_turn_id = report
             .artifacts
             .iter()
@@ -526,12 +614,17 @@ impl RuntimeHost {
         let mut event = agent_event(
             self.next_sequence_no(),
             task,
-            RuntimeEventType::ToolCompleted,
+            if background.is_some() {
+                RuntimeEventType::BackgroundTaskUpdated
+            } else {
+                RuntimeEventType::ToolCompleted
+            },
             RuntimeEventSource::Tool,
             json!({
                 "summary": report.envelope.summary,
                 "envelope": report.envelope,
                 "metrics": report.metrics,
+                "tool_artifact_refs": report.artifacts.iter().map(|artifact|artifact.artifact_id).collect::<Vec<_>>(),
                 "changed_file_count": actual_changed_files.len(),
                 "changed_files": inline_changed_files,
                 "changed_files_truncated": actual_changed_files.len() > MAX_INLINE_CHANGE_FILES,
@@ -547,6 +640,14 @@ impl RuntimeHost {
             }),
         );
         event.turn_id = Some(event_turn_id);
+        if let Some(result) = background {
+            event.id = background_event_id.expect("background result has event ID");
+            event.timestamp = result.created_at;
+            event.payload["background_task_id"] = json!(result.background_task_id);
+            event.payload["batch_id"] = json!(result.batch_id);
+            event.payload["result_id"] = json!(result.result_id);
+            event.payload["status"] = json!(result.status);
+        }
         let tool_event_id = event.id;
         let (mut replay_artifact, replay_bytes) = replay_result_artifact;
         replay_artifact.provenance_refs.push(tool_event_id);
@@ -605,8 +706,18 @@ impl RuntimeHost {
             }
             evidence_records.push(evidence);
         }
-        self.record_tool_completed_bundle(event, &artifacts, &evidence_records)
+        if background.is_some() {
+            self.record_tool_completed_bundle_with_background(
+                event,
+                &artifacts,
+                &evidence_records,
+                background,
+            )
             .await
+        } else {
+            self.record_tool_completed_bundle(event, &artifacts, &evidence_records)
+                .await
+        }
     }
 
     pub(super) async fn finish_lane(
@@ -939,7 +1050,7 @@ impl RuntimeHost {
         requested_network: bool,
         yolo: bool,
     ) -> Result<ToolRuntime, ClientError> {
-        let executor = ToolRuntime::new(policy)
+        let mut executor = ToolRuntime::new(policy)
             .with_network_access(self.network_access_enabled(requested_network))
             .with_unrestricted_access(yolo)
             .with_process_supervisor(self.execution.process_supervisor.clone());
@@ -950,6 +1061,24 @@ impl RuntimeHost {
         else {
             return Ok(executor);
         };
+        if !matches!(
+            golutra_agent_tools::browser::connection::BrowserConfig::load(&paths.home)
+                .map_err(|error| ClientError::TaskExecution(error.to_string()))?,
+            Some(golutra_agent_tools::browser::connection::BrowserConfig::Disabled(_))
+        ) {
+            let backend = Arc::new(
+                golutra_agent_tools::browser::router::BrowserRouter::new(
+                    &paths.home,
+                    &workspace_root,
+                    &paths.state_dir.join("browser"),
+                    yolo,
+                )
+                .map_err(|error| ClientError::TaskExecution(error.to_string()))?,
+            );
+            executor = executor
+                .with_external_backend(backend)
+                .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
+        }
         // A fresh installation has no plugin registry. Avoid creating the
         // plugin store and taking its lock for every ordinary task; the next
         // task will observe a registry as soon as a plugin is installed.

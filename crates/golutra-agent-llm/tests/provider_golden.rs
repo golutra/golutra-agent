@@ -108,6 +108,9 @@ async fn built_in_shell_contract_survives_all_protocol_wire_adapters() {
 #[path = "provider_golden/terminal_contract.rs"]
 mod terminal_contract;
 
+#[path = "provider_golden/browser_images.rs"]
+mod browser_images;
+
 #[path = "provider_golden/protocol_detection.rs"]
 mod protocol_detection;
 

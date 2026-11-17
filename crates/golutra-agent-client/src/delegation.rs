@@ -4,15 +4,17 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use futures_util::FutureExt;
 use golutra_agent_core::{
     Actor, ActorKind, ApprovalDecision, ApprovalId, ApprovalResolution, ApprovalScope, CommandId,
-    SessionId, TaskStatus, ThreadId, TokenUsageRecord, ToolCallId,
+    SessionId, TaskId, TaskStatus, ThreadId, TokenUsageRecord, ToolCallId,
 };
 use golutra_agent_llm::{ProviderGenerationConfig, ProviderReasoningEffort};
 use golutra_agent_protocol::{
-    AgentToolProfile, RuntimeEvent, RuntimeEventType, SessionCommand, SessionCommandKind,
-    StateProjection,
+    AgentToolProfile, CommandAck, RuntimeEvent, RuntimeEventType, SessionCommand,
+    SessionCommandKind, StateProjection,
 };
+use golutra_agent_tools::DelegationBackgroundContext;
 use golutra_agent_tools::{TaskDelegationBackend, TaskDelegationOutput, ToolError, ToolRequest};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -22,6 +24,8 @@ use uuid::Uuid;
 
 use super::{ClientError, RuntimeHost, delegation_policy};
 
+#[path = "delegation_assignment.rs"]
+mod assignment;
 #[path = "delegation_context.rs"]
 pub(crate) mod context_fork;
 #[path = "delegation_control.rs"]
@@ -31,10 +35,80 @@ pub(crate) mod notifications;
 #[cfg(test)]
 #[path = "delegation_parallel_tests.rs"]
 mod parallel_tests;
+#[path = "delegation_registry.rs"]
+pub(crate) mod registry;
 #[path = "delegation_worktree.rs"]
 pub(crate) mod worktree;
 
 pub(crate) const DELEGATED_TASK_MARKER: &str = "_delegated_task";
+
+pub(crate) async fn cancel_from_parent_command(
+    host: &Arc<RuntimeHost>,
+    parent: SessionId,
+    command: &SessionCommand,
+) -> Result<CommandAck, ClientError> {
+    let rejected = |reason: &str| CommandAck {
+        command_id: command.command_id,
+        accepted: false,
+        reason: Some(reason.into()),
+    };
+    if host
+        .execution
+        .lane_manager
+        .lock()
+        .await
+        .lane(parent)
+        .is_some_and(|lane| lane.active_controller != command.actor)
+    {
+        return Ok(rejected(
+            "subagent cancellation requires the parent session controller",
+        ));
+    }
+    let Some(child) = command.payload["child_session_id"]
+        .as_str()
+        .and_then(|id| id.parse::<SessionId>().ok())
+    else {
+        return Ok(rejected("invalid child session"));
+    };
+    control::owned_thread(host, parent, child).await?;
+    let expected = command.payload["expected_task_id"]
+        .as_str()
+        .and_then(|id| id.parse::<TaskId>().ok());
+    let controls = host.execution.task_controls.lock().await;
+    let Some(child_control) = controls.get(&child) else {
+        return Ok(rejected("child has already stopped; refresh its status"));
+    };
+    if expected != Some(child_control.task_id) {
+        return Ok(rejected("child execution changed; refresh its status"));
+    }
+    child_control.execution.cancel();
+    drop(controls);
+    if let Some(operation) = control::owned_operation(host, parent, child).await {
+        let matches = operation
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .child_task_id
+            == expected;
+        if matches {
+            operation.request_parent_cancellation();
+        }
+    }
+    Ok(CommandAck {
+        command_id: command.command_id,
+        accepted: true,
+        reason: Some("subagent cancellation requested".into()),
+    })
+}
+
+pub(crate) async fn list_subagents(
+    host: &RuntimeHost,
+    parent: SessionId,
+    cursor: u64,
+    limit: u32,
+) -> Result<Value, ClientError> {
+    registry::list(host, parent, cursor, limit).await
+}
 const DELEGATED_PARENT_THREAD_KEY: &str = "_parent_thread_id";
 pub(crate) const DELEGATED_ADMISSION_TOKEN_KEY: &str = "_delegation_admission_token";
 const DELEGATED_THREAD_TITLE: &str = "Delegated task";
@@ -70,6 +144,9 @@ struct DelegationOperationLifecycle {
     owner_abort: Option<AbortHandle>,
     child_session_id: Option<SessionId>,
     child_task_id: Option<golutra_agent_core::TaskId>,
+    background_call_id: Option<ToolCallId>,
+    origin_call_id: Option<ToolCallId>,
+    origin_digest: Option<String>,
 }
 
 impl DelegationOperation {
@@ -358,6 +435,22 @@ impl RuntimeTaskDelegationBackend {
 
 #[async_trait]
 impl TaskDelegationBackend for RuntimeTaskDelegationBackend {
+    async fn delegate_managed(
+        &self,
+        request: &ToolRequest,
+        cancellation: CancellationToken,
+        background: Option<DelegationBackgroundContext>,
+    ) -> Result<TaskDelegationOutput, ToolError> {
+        let host = self
+            .host
+            .upgrade()
+            .ok_or_else(|| ToolError::Execution("runtime host is shutting down".into()))?;
+        delegate_task_managed(&host, request, cancellation, background)
+            .await
+            .map(|output| control::page_output(output, &request.arguments))
+            .map_err(|error| ToolError::Execution(error.to_string()))
+    }
+
     async fn status(&self, session_id: SessionId) -> Result<Value, ToolError> {
         let host = self
             .host
@@ -376,9 +469,29 @@ impl TaskDelegationBackend for RuntimeTaskDelegationBackend {
             .host
             .upgrade()
             .ok_or_else(|| ToolError::Execution("runtime host is shutting down".to_owned()))?;
-        notifications::load(&host, session_id)
+        let mut notifications = notifications::load(&host, session_id)
             .await
-            .map_err(|error| ToolError::Execution(error.to_string()))
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        for message in host
+            .storage
+            .store
+            .pending_subagent_messages(session_id)
+            .await
+            .map_err(|error| ToolError::Execution(error.to_string()))?
+            .into_iter()
+            .take(8)
+        {
+            notifications.push(golutra_agent_tools::DelegationNotification {
+                id: format!("subagent-message:{}", message.message_id),
+                child_session_id: session_id.to_string(),
+                child_task_id: None,
+                content: format!(
+                    "Message from parent agent {}:\n{}",
+                    message.parent_session_id, message.content
+                ),
+            });
+        }
+        Ok(notifications)
     }
 
     async fn delegate(
@@ -402,10 +515,79 @@ async fn delegate_task(
     request: &ToolRequest,
     cancellation: CancellationToken,
 ) -> Result<TaskDelegationOutput, ClientError> {
+    delegate_task_managed(host, request, cancellation, None).await
+}
+
+async fn delegate_task_managed(
+    host: &Arc<RuntimeHost>,
+    request: &ToolRequest,
+    cancellation: CancellationToken,
+    background: Option<DelegationBackgroundContext>,
+) -> Result<TaskDelegationOutput, ClientError> {
     if cancellation.is_cancelled() {
         return Ok(cancelled_delegation_output("subagent request cancelled"));
     }
+    let mut continued_request = None;
+    if request.arguments["action"] == "send_input"
+        && request.arguments["delivery_mode"] == "continue"
+    {
+        if let Some(operation) = control::origin_operation(host, request).await? {
+            return control::wait_after_start_with_input(
+                host,
+                &operation,
+                &request.arguments,
+                cancellation,
+            )
+            .await;
+        }
+        match control::dispatch(host, request, cancellation.clone(), "send_input").await {
+            Ok(output) => return Ok(output),
+            Err(error) => {
+                let child = control::child_id(request)?;
+                control::owned_thread(host, request.session_id, child).await?;
+                let state = host
+                    .storage
+                    .repositories
+                    .projections
+                    .state(child, None)
+                    .await?;
+                if !state.task_status.is_terminal() || state.task_status.requires_reconciliation() {
+                    return Err(error);
+                }
+                let mut resumed = request.clone();
+                resumed.arguments["action"] = json!("resume");
+                resumed
+                    .arguments
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("delivery_mode");
+                continued_request = Some(resumed);
+            }
+        }
+    }
+    let origin_digest = text_sha256(&request.arguments.to_string());
+    let request = continued_request.as_ref().unwrap_or(request);
     let action = control::action(&request.arguments)?;
+    if action == "list" {
+        return Ok(TaskDelegationOutput {
+            status: golutra_agent_core::ToolResultStatus::Ok,
+            summary: "subagent list".into(),
+            content: String::new(),
+            structured_facts: registry::list(
+                host,
+                request.session_id,
+                request.arguments["cursor"].as_u64().unwrap_or(0),
+                request.arguments["page_size"]
+                    .as_u64()
+                    .unwrap_or(16)
+                    .min(16) as u32,
+            )
+            .await?,
+        });
+    }
+    if action == "send_input" && request.arguments["delivery_mode"] == "queue_only" {
+        return registry::queue(host, request).await;
+    }
     if matches!(action, "status" | "wait" | "send_input" | "cancel") {
         return control::dispatch(host, request, cancellation, action).await;
     }
@@ -518,6 +700,16 @@ async fn delegate_task(
                     .lifecycle
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .origin_call_id = Some(request.tool_call_id);
+                operation
+                    .lifecycle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .origin_digest = Some(origin_digest.clone());
+                operation
+                    .lifecycle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .child_session_id = Some(
                     resumed_child
                         .as_ref()
@@ -533,6 +725,7 @@ async fn delegate_task(
                 }
                 if let Some(thread) = &resumed_child {
                     control::ensure_resumable(host, thread.session_id).await?;
+                    control::validate_expected_execution(host, request).await?;
                 }
                 operations.insert(identity.clone(), operation.clone());
                 host.signal_active_work_change();
@@ -541,7 +734,13 @@ async fn delegate_task(
         }
     };
     let Some(()) = result_sender else {
-        return control::wait_after_start(&operation, &request.arguments, cancellation).await;
+        return control::wait_after_start_with_input(
+            host,
+            &operation,
+            &request.arguments,
+            cancellation,
+        )
+        .await;
     };
 
     // The operation belongs to the host, not to whichever tool future created it. A parent
@@ -555,7 +754,41 @@ async fn delegate_task(
     let operation_identity = identity.clone();
     let operation_parent_session_id = operation.parent_session_id;
     let owner = tokio::spawn(async move {
-        let result = run_delegated_child(
+        let managed = if let Some(context) = background {
+            match context
+                .supervisor
+                .register_external(
+                    operation_request.clone(),
+                    operation_cancellation.clone(),
+                    context.observer.clone(),
+                )
+                .await
+            {
+                Ok(registration) => {
+                    operation_for_cleanup
+                        .lifecycle
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .background_call_id = Some(operation_request.tool_call_id);
+                    Some((registration, context.policy))
+                }
+                Err(error) => {
+                    let result = Err(ClientError::TaskExecution(error.to_string()));
+                    operation_for_cleanup.complete(&result);
+                    operation_host
+                        .cleanup_delegation_operation(
+                            operation_parent_session_id,
+                            &operation_identity,
+                            &operation_for_cleanup,
+                        )
+                        .await;
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let result = std::panic::AssertUnwindSafe(Box::pin(run_delegated_child(
             &operation_host,
             &operation_request,
             operation_cancellation,
@@ -567,10 +800,50 @@ async fn delegate_task(
             identity,
             resumed_child,
             fork_context,
-        )
+        )))
+        .catch_unwind()
         .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(_) => {
+                if let Some(child) = control::operation_session(&operation_for_cleanup) {
+                    cancel_child(&operation_host, child).await;
+                }
+                Ok(TaskDelegationOutput {
+                    status: golutra_agent_core::ToolResultStatus::Error,
+                    summary:
+                        "subagent owner stopped unexpectedly; inspect the child before continuing"
+                            .into(),
+                    content: String::new(),
+                    structured_facts: json!({"outcome_unknown":true,"automatic_retry":false,"completed":false,"child_terminal":false,"child_status":"uncertain",
+                        "child_session_id":control::operation_session(&operation_for_cleanup)}),
+                })
+            }
+        };
+        let result = if managed.is_some() {
+            let mut output = result.unwrap_or_else(|error| TaskDelegationOutput {
+                status: golutra_agent_core::ToolResultStatus::Error,
+                summary: error.to_string(), content: error.to_string(),
+                structured_facts: json!({"child_terminal":true,"child_status":"failed","completed":false}),
+            });
+            output.structured_facts["background"] = json!(true);
+            output.structured_facts["background_task_id"] = json!(operation_request.tool_call_id);
+            output.structured_facts["result_pending"] = json!(false);
+            Ok(output)
+        } else {
+            result
+        };
         // 先唤醒等待结果的调用方；通知持久化不应延迟结果交付，owner 此时仍被宿主追踪。
         operation_for_cleanup.publish_result(&result);
+        if let Some((registration, policy)) = managed {
+            let output = result
+                .as_ref()
+                .expect("managed output converted above")
+                .clone();
+            registration
+                .complete(output.into_report(operation_request.clone(), policy))
+                .await;
+        }
         if let Err(error) =
             notifications::publish(&operation_host, &operation_request, &result).await
         {
@@ -587,7 +860,7 @@ async fn delegate_task(
             .await;
     });
     operation.set_owner_abort(owner.abort_handle());
-    control::wait_after_start(&operation, &request.arguments, cancellation).await
+    control::wait_after_start_with_input(host, &operation, &request.arguments, cancellation).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -605,6 +878,16 @@ async fn run_delegated_child(
     fork_context: Option<Value>,
 ) -> Result<TaskDelegationOutput, ClientError> {
     let (requested_tokens, child_generation_config) = child_generation_config(&overrides)?;
+    // Finalize the task before creating its one-shot admission capability. The
+    // assignment extends the prompt, and admission binds that exact final text.
+    let mut prompt_payload = json!({"prompt": task});
+    apply_inherited_execution_surface(
+        &mut prompt_payload,
+        overrides.execution_mode,
+        overrides.tool_profile,
+    )?;
+    control::apply_agent_type(&mut prompt_payload, request, resumed_child.as_ref(), host).await?;
+    assignment::apply(&mut prompt_payload, &request.arguments)?;
     let checkpoint_lock = parent_context.checkpoint_lock();
     let checkpoint_guard = checkpoint_lock.lock().await;
     let child_context = match parent_context.child(
@@ -656,7 +939,9 @@ async fn run_delegated_child(
         request.tool_call_id,
         child_thread_id,
         actor.id.clone(),
-        task,
+        prompt_payload["prompt"]
+            .as_str()
+            .expect("prepared child prompt"),
     );
     let admission_token = admission.token().to_owned();
     host.execution
@@ -720,6 +1005,33 @@ async fn run_delegated_child(
         )
         .await;
     }
+    let name = host
+        .storage
+        .store
+        .subagent_name(request.session_id, child_session_id)
+        .await?
+        .unwrap_or_else(|| {
+            request.arguments["name"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("agent-{child_session_id}"))
+        });
+    if let Err(error) = host
+        .storage
+        .store
+        .register_subagent(request.session_id, child_session_id, &name)
+        .await
+    {
+        return fail_delegation(
+            host,
+            request.session_id,
+            child_session_id,
+            child_thread_id,
+            &actor,
+            ClientError::TaskExecution(error.to_string()),
+        )
+        .await;
+    }
     if cancellation.is_cancelled() {
         cleanup_child_after_failure(
             host,
@@ -734,9 +1046,8 @@ async fn run_delegated_child(
         ));
     }
 
-    let mut prompt_payload = json!({
+    let execution_fields = json!({
         "_delegation_isolation": if worktree_path.is_some() { "worktree" } else { "shared" },
-        "prompt": task,
         DELEGATED_TASK_MARKER: true,
         "allow_network": parent_control.allow_network,
         "yolo": parent_control.yolo,
@@ -746,26 +1057,17 @@ async fn run_delegated_child(
         DELEGATED_ADMISSION_TOKEN_KEY: admission_token,
         "_delegation": child_context.metadata(),
     });
+    prompt_payload
+        .as_object_mut()
+        .expect("prepared child payload")
+        .extend(
+            execution_fields
+                .as_object()
+                .expect("execution fields")
+                .clone(),
+        );
     if let Some(binding) = fork_context {
         prompt_payload[context_fork::SNAPSHOT_KEY] = binding;
-    }
-    apply_inherited_execution_surface(
-        &mut prompt_payload,
-        overrides.execution_mode,
-        overrides.tool_profile,
-    )?;
-    if let Err(error) =
-        control::apply_agent_type(&mut prompt_payload, request, resumed_child.as_ref(), host).await
-    {
-        return fail_delegation(
-            host,
-            request.session_id,
-            child_session_id,
-            child_thread_id,
-            &actor,
-            error,
-        )
-        .await;
     }
     if let Some(profile) = overrides.profile.clone() {
         prompt_payload["provider_profile"] = profile;
@@ -1327,6 +1629,7 @@ fn delegation_overrides(
     tool_profile: AgentToolProfile,
     arguments: &Value,
 ) -> Result<DelegationOverrides, ClientError> {
+    let tool_profile = assignment::narrowed_profile(tool_profile, arguments.get("tool_profile"))?;
     let profile = parent.profile.clone();
     let model = arguments
         .get("model")
@@ -1772,6 +2075,8 @@ fn delegation_identity(
         "allow_network": allow_network,
         "yolo": yolo,
         "agent_type": request.arguments.get("agent_type"),
+        "assignment": request.arguments.get("assignment"),
+        "name": request.arguments.get("name"),
         "context": request.arguments.get("context"),
         "isolation": request.arguments.get("isolation"),
         "run_in_background": request.arguments.get("run_in_background"),

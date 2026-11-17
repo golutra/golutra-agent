@@ -85,6 +85,7 @@ mod approval_dialog;
 mod auth_flow;
 mod auth_models;
 mod auth_state;
+mod browser_connection;
 mod change_projection;
 mod composer_input;
 mod composer_support;
@@ -118,6 +119,7 @@ mod session_banner;
 mod session_loading;
 mod settings;
 mod stream_commit;
+mod subagents;
 mod terminal_appearance;
 mod terminal_integration;
 mod tool_detail;
@@ -367,6 +369,9 @@ struct TranscriptProjectionAnchor {
 
 #[derive(Debug)]
 struct TuiApp {
+    browser_connection: Option<browser_connection::BrowserConnection>,
+    browser_install_confirmation: bool,
+    browser_connection_details: Option<String>,
     handoff: Option<handoff::HandoffFlow>,
     thread_id: ThreadId,
     session_id: SessionId,
@@ -536,6 +541,10 @@ impl TuiApp {
     }
 
     pub(crate) async fn shutdown_pending_operations(&mut self) {
+        if let Some(task) = self.browser_connection.take() {
+            task.cancellation.cancel();
+            let _ = task.task.await;
+        }
         self.cancel_session_load();
         self.reap_session_loads(true).await;
         self.shutdown_handoff().await;
@@ -557,6 +566,9 @@ impl TuiApp {
 
 impl Drop for TuiApp {
     fn drop(&mut self) {
+        if let Some(task) = self.browser_connection.as_ref() {
+            task.cancellation.cancel();
+        }
         if let Some(pending) = self.auth_protocol_detection.as_ref() {
             pending.task.abort();
         }
@@ -771,6 +783,9 @@ impl TuiApp {
             developer_updated_at: None,
             history_reload: None,
             session_load: None,
+            browser_connection: None,
+            browser_install_confirmation: false,
+            browser_connection_details: None,
             retired_session_loads: Vec::new(),
             prepared_session_history: None,
             debug_scroll: PaneScrollState {
@@ -2852,6 +2867,18 @@ impl TuiApp {
                 }
             }
             SlashCommand::Help => self.open_help(HelpTopic::Overview),
+            SlashCommand::Connect { target } => {
+                if !matches!(target.as_deref(), Some("help" | "details" | "cancel"))
+                    && (transport.is_remote() || has_active_task(self))
+                {
+                    self.push_system_message(
+                        "浏览器",
+                        vec!["请在本地空闲会话中配置浏览器。可用 /connect details 查看最近诊断，或 /connect cancel 取消连接。".into()],
+                    );
+                } else {
+                    self.start_browser_connection(target.as_deref());
+                }
+            }
             SlashCommand::WhatsNew => self.open_help(HelpTopic::WhatsNew),
             SlashCommand::New => {
                 self.start_new_session();
@@ -3009,6 +3036,14 @@ impl TuiApp {
                 );
                 details.extend(dashboard::diagnostic_status_lines(&self.events));
                 self.push_system_message("Status", details);
+            }
+            SlashCommand::Agents {
+                action,
+                target,
+                task,
+            } => {
+                self.execute_agents_command(transport, &action, target.as_deref(), task.as_deref())
+                    .await?;
             }
             SlashCommand::Plan => {
                 self.dashboard = Some(DashboardState::new(DashboardTab::Plan));

@@ -15,14 +15,14 @@ use golutra_agent_context::{
     token_usage_record_with_cache_identity_and_estimates_and_tool_digests,
 };
 use golutra_agent_core::{
-    ApprovalDecision, ApprovalId, ApprovalRequest, ApprovalResolution, ApprovalScope, BudgetState,
-    CommandId, ContextMessageSnapshot, CorrectionEnvelope, LoopAction, LoopDecision,
-    PolicyBlockDisposition, PolicyDecision, PolicyEvaluation, PolicyId, ProviderContract,
-    SessionId, SideEffectType, TaskContract, TaskId, TokenBudgetSnapshotId, TokenUsageRecord,
-    ToolContract, ToolExecutionMetrics, ToolProgress, ToolProgressPhase, ToolRecoveryPolicy,
-    ToolResultEnvelope, ToolResultStatus, TurnId, TurnState, UserQuestionPrompt,
-    UserQuestionRequest, UserQuestionResolution, UserStep, UserStepId, UserStepKind,
-    VerificationCheck, VerificationCheckKind, VerificationPlan, VerificationRecord,
+    ApprovalDecision, ApprovalId, ApprovalRequest, ApprovalResolution, ApprovalScope,
+    BackgroundBatchId, BackgroundResult, BudgetState, CommandId, ContextMessageSnapshot,
+    CorrectionEnvelope, LoopAction, LoopDecision, PolicyBlockDisposition, PolicyDecision,
+    PolicyEvaluation, PolicyId, ProviderContract, SessionId, SideEffectType, TaskContract, TaskId,
+    TokenBudgetSnapshotId, TokenUsageRecord, ToolContract, ToolExecutionMetrics, ToolProgress,
+    ToolProgressPhase, ToolRecoveryPolicy, ToolResultEnvelope, ToolResultStatus, TurnId, TurnState,
+    UserQuestionPrompt, UserQuestionRequest, UserQuestionResolution, UserStep, UserStepId,
+    UserStepKind, VerificationCheck, VerificationCheckKind, VerificationPlan, VerificationRecord,
     VerificationRequirement, VerificationResult, WorkspaceChangeRequirement,
     summarize_user_tool_batch, user_step_tool_from_envelope,
 };
@@ -44,7 +44,7 @@ use golutra_agent_protocol::{AgentExecutionMode, AgentToolProfile, ExternalVerif
 use golutra_agent_tools::{
     CONTRACT_FILE_CONTENT_VERIFIER_TOOL, CONTRACT_PATH_VERIFIER_TOOL, FileBeforeImage,
     SideEffectPreparation, ToolError, ToolExecutionReport, ToolInvocation, ToolRegistry,
-    ToolRequest, ToolRuntime, VerifierExecutionRequest, is_pi_plus_tool,
+    ToolRequest, ToolRuntime, VerifierExecutionRequest, is_provider_tool,
     model_visible_tool_result_with_token_budget, provider_tool_rank, redact_tool_arguments,
     shell_request_is_strictly_read_only,
 };
@@ -109,8 +109,13 @@ fn append_child_notification(
         },
         ContextMessageSource {
             contributor: "runtime_context".to_owned(),
-            source_refs: vec![notification.id],
-            origin: "subagent_completion".to_owned(),
+            source_refs: vec![notification.id.clone()],
+            origin: if notification.id.starts_with("subagent-message:") {
+                "subagent_message"
+            } else {
+                "subagent_completion"
+            }
+            .to_owned(),
             visibility: ModelInputVisibility::ModelVisible,
         },
         message_token_total,
@@ -196,6 +201,7 @@ use thiserror::Error;
 use tokio::sync::{Notify, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
+mod background;
 mod checkpoint;
 mod compaction_summary;
 mod completion;
@@ -210,6 +216,7 @@ mod provider_recovery;
 mod provider_retry;
 mod provider_session;
 mod response_control;
+mod tool_images;
 mod validation_freshness;
 mod validation_output;
 use validation_freshness::validation_is_current;
@@ -217,6 +224,7 @@ mod step_machine;
 mod trace;
 mod verification;
 
+pub use background::BackgroundDeliveryMode;
 pub use checkpoint::{CheckpointError, WorkspaceCheckpointManager, checkpoint_fingerprint};
 pub use compaction_summary::{
     CompactionSummaryPlan, SummaryFailure, compaction_summary_context_snapshot,
@@ -353,6 +361,8 @@ pub enum AgentLoopError {
     PendingTurnNotFound,
     #[error("queued agent turn is already being changed")]
     PendingTurnMutationInProgress,
+    #[error("invalid background result: {0}")]
+    BackgroundResult(String),
     #[error("invalid task contract: {0}")]
     TaskContract(String),
     #[error("invalid user question response: {0}")]
@@ -804,11 +814,26 @@ impl AgentExecutionHandle {
     }
 
     pub fn pause(&self) {
+        self.pending_turns.suppress_background_continuations();
         self.pause.send_replace(true);
     }
 
     pub fn resume(&self) {
+        self.pending_turns.enable_background_continuations();
         self.pause.send_replace(false);
+    }
+
+    /// Revoke already admitted automatic continuations after a handoff or
+    /// goal replacement. Durable observations remain available for user input.
+    pub fn suppress_background_continuations(&self) {
+        self.pending_turns.suppress_background_continuations();
+    }
+
+    /// Revoke a cancelled batch's admitted continuation without affecting other
+    /// batches or removing observations. The host prevents future wake delivery
+    /// for this batch after persisting its suppression.
+    pub fn suppress_background_batch(&self, batch_id: BackgroundBatchId) {
+        self.pending_turns.suppress_background_batch(batch_id);
     }
 
     /// Publish the surface selected for the next active turn.  This is a
@@ -838,6 +863,43 @@ impl AgentExecutionHandle {
 
     pub async fn append_turn(&self, turn: PendingAgentTurn) -> Result<(), AgentLoopError> {
         self.pending_turns.push(turn)
+    }
+
+    /// Observe committed input without consuming it or cancelling an active tool.
+    pub async fn wait_for_pending_input(&self) {
+        loop {
+            let changed = self.pending_turns.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self
+                .pending_turns
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .turns
+                .iter()
+                .any(|entry| entry.durable)
+            {
+                return;
+            }
+            tokio::select! {
+                _ = self.cancellation.cancelled() => return,
+                _ = &mut changed => {},
+            }
+        }
+    }
+
+    /// Admit already durable tool observations. Admission is not acknowledgment:
+    /// the host keeps them pending until their context snapshot has been persisted.
+    pub fn enqueue_background_results(
+        &self,
+        results: Vec<BackgroundResult>,
+        mode: BackgroundDeliveryMode,
+    ) -> Result<(), AgentLoopError> {
+        if self.cancellation.is_cancelled() {
+            return Err(AgentLoopError::Cancelled);
+        }
+        self.pending_turns.enqueue_background_results(results, mode)
     }
 
     /// Queue a turn with an explicit model-facing execution surface.
@@ -944,6 +1006,7 @@ struct PendingTurnQueue {
 struct PendingTurnQueueState {
     accepting: bool,
     turns: VecDeque<PendingTurnEntry>,
+    background: background::BackgroundInbox,
 }
 
 #[derive(Debug)]
@@ -1027,6 +1090,7 @@ impl PendingTurnQueue {
             state: StdMutex::new(PendingTurnQueueState {
                 accepting: true,
                 turns: VecDeque::new(),
+                background: background::BackgroundInbox::default(),
             }),
             changed: Notify::new(),
         }
@@ -1244,6 +1308,7 @@ impl PendingTurnQueue {
         self.changed.notify_waiters();
     }
 
+    #[cfg(test)]
     async fn take_or_close(&self) -> Option<TakenPendingTurn> {
         loop {
             let changed = self.changed.notified();
@@ -1525,6 +1590,11 @@ where
             max_elapsed_ms: _,
             defer_external_verification: _,
         } = run;
+        control.pending_turns.set_background_turn(
+            request.session_id,
+            request.task_id,
+            request.turn_id,
+        )?;
         let mut current_task_contract = task_contract;
         let mut current_external_verifiers = self.external_verifiers.clone();
         let mut current_external_verifiers_require_os_sandbox =
@@ -1642,11 +1712,8 @@ where
                 &current_task_contract,
                 current_tool_profile,
                 self.tool_executor.registry(),
-                !objective_disables_tools(&current_objective),
+                true,
             );
-        }
-        if objective_disables_tools(&current_objective) {
-            provider_tools.clear();
         }
         let (mut provider_tool_schema_digests, mut planned_tool_tokens, mut provider_tool_digest) =
             provider_tool_snapshot(&provider_tools);
@@ -1692,24 +1759,20 @@ where
                             current_turn_id,
                             replay_context.initial_messages.clone(),
                         );
-                        let mut replay_candidate = provider_tools_for_turn(
+                        let replay_candidate = provider_tools_for_turn(
                             &replay_context.tools,
                             &current_task_contract,
                             current_tool_profile,
                             self.tool_executor.registry(),
                             &current_objective,
                         );
-                        let tools_disabled = objective_disables_tools(&current_objective);
-                        if tools_disabled {
-                            replay_candidate.clear();
-                        }
                         let replay_provider_tools = stable_provider_tools_for_turn(
                             &replay_context.tools,
                             replay_candidate,
                             &current_task_contract,
                             current_tool_profile,
                             self.tool_executor.registry(),
-                            !tools_disabled,
+                            true,
                         );
                         let tools_match = provider_tool_digest
                             == provider_tool_snapshot(&replay_provider_tools).2;
@@ -1794,6 +1857,10 @@ where
         // 计划只在任务开始时创建一次；后续回合原地更新消息和预算，避免先深拷贝
         // 初始消息再立即覆盖的无效分配。
         let mut plan = base_plan;
+        let mut seen_background_results = background::seed_result_ids(&plan.messages);
+        let mut pending_background_ack = Vec::new();
+        let mut include_passive_background = true;
+        let mut background_continuation_boundary = false;
         let mut seen_child_notifications: HashSet<String> = plan
             .message_sources
             .iter()
@@ -1814,12 +1881,27 @@ where
         'completion_cycle: loop {
             let mut candidate_complete = false;
             'agent_loop: loop {
+                if background_continuation_boundary {
+                    if let Some(turn) = control.pending_turns.take_ready_turn() {
+                        pending_turn_at_boundary.push_front(turn);
+                    }
+                    background_continuation_boundary = false;
+                }
                 while let Some(taken_turn) = pending_turn_at_boundary.pop_front() {
                     let execution_origin = taken_turn.execution_origin;
                     let configured_turn = taken_turn.turn;
                     let pending_execution = configured_turn.execution;
                     let pending_turn = configured_turn.turn;
                     current_turn_id = pending_turn.turn_id;
+                    control.pending_turns.set_background_turn(
+                        request.session_id,
+                        request.task_id,
+                        current_turn_id,
+                    )?;
+                    if !*control.pause.borrow() {
+                        control.pending_turns.enable_background_continuations();
+                    }
+                    include_passive_background = true;
                     if pending_turn.steer {
                         if let Some(tool_profile) = pending_execution.tool_profile {
                             current_tool_profile = tool_profile;
@@ -1830,9 +1912,6 @@ where
                                 self.tool_executor.registry(),
                                 &current_objective,
                             );
-                            if objective_disables_tools(&current_objective) {
-                                provider_tools.clear();
-                            }
                             (
                                 provider_tool_schema_digests,
                                 planned_tool_tokens,
@@ -1879,28 +1958,21 @@ where
                         current_task_contract
                             .validate()
                             .map_err(AgentLoopError::TaskContract)?;
-                        let mut next_provider_tools = provider_tools_for_turn(
+                        let next_provider_tools = provider_tools_for_turn(
                             &all_provider_tools,
                             &current_task_contract,
                             current_tool_profile,
                             self.tool_executor.registry(),
                             &current_objective,
                         );
-                        let tools_disabled = objective_disables_tools(&current_objective);
-                        if tools_disabled {
-                            next_provider_tools.clear();
-                        }
                         provider_tools = stable_provider_tools_for_turn(
                             &provider_tools,
                             next_provider_tools,
                             &current_task_contract,
                             current_tool_profile,
                             self.tool_executor.registry(),
-                            previous_tool_profile == current_tool_profile && !tools_disabled,
+                            previous_tool_profile == current_tool_profile,
                         );
-                        if tools_disabled {
-                            provider_tools.clear();
-                        }
                         (
                             provider_tool_schema_digests,
                             planned_tool_tokens,
@@ -1972,6 +2044,35 @@ where
                     .saturating_add(step_snapshot.step_no);
                 trace(AgentLoopTraceEvent::StepStarted(step_snapshot.clone()));
                 control.wait_until_runnable().await?;
+                let background_results = if pending_background_ack.is_empty() {
+                    control
+                        .pending_turns
+                        .take_background_results(include_passive_background)
+                } else {
+                    Vec::new()
+                };
+                for status in background::reconcile_completed_results(
+                    &self.tool_executor,
+                    &background_results,
+                    &mut tool_reports,
+                    &mut tool_attempts,
+                ) {
+                    update_tool_failure_counts(
+                        status,
+                        &mut failed_tool_call_count,
+                        &mut consecutive_failed_tool_call_count,
+                    );
+                }
+                background::append_results(
+                    &mut plan,
+                    background_results,
+                    &tool_reports,
+                    &self.tool_executor,
+                    &mut seen_background_results,
+                    &mut pending_background_ack,
+                    &mut message_token_total,
+                );
+                include_passive_background = false;
                 debug_assert_eq!(plan.messages.len(), plan.message_estimates.len());
                 plan.budget_snapshot.turn_id = current_turn_id;
                 plan.budget_snapshot.planned_tool_tokens = planned_tool_tokens;
@@ -1983,6 +2084,13 @@ where
                         &provider_tool_digest,
                         &primary_contract,
                     )
+                });
+                seen_child_notifications.retain(|id| {
+                    !id.starts_with("subagent-message:")
+                        || plan
+                            .message_sources
+                            .iter()
+                            .any(|source| source.source_refs.contains(id))
                 });
                 for notification in self
                     .tool_executor
@@ -2084,6 +2192,12 @@ where
                         }
                     }
                 }
+                background::restore_compacted_results(
+                    &plan,
+                    &mut seen_background_results,
+                    &mut pending_background_ack,
+                    &control.pending_turns,
+                );
                 if plan.budget_snapshot.planned_input_tokens > plan.budget_snapshot.budget_limit {
                     let reason = ContextError::BudgetExceeded {
                         planned: plan.budget_snapshot.planned_input_tokens,
@@ -2192,11 +2306,25 @@ where
                 let (mut provider_request, context_snapshot) = model_input.into_parts();
                 provider_request.cache_scope = Some(cache_scope.clone());
                 let request_for_trace = provider_request.clone();
+                let captured_background_results =
+                    background::captured_result_ids(&provider_request, &mut pending_background_ack);
                 trace(AgentLoopTraceEvent::ContextSnapshotCaptured {
                     snapshot: context_snapshot,
                     request: request_for_trace,
                 });
                 let provider_request_id = provider_request.request_id;
+                let captured_subagents =
+                    background::captured_subagent_executions(&provider_request.messages);
+                if !captured_background_results.is_empty() {
+                    control
+                        .pending_turns
+                        .acknowledge_captured_background(&captured_background_results);
+                    trace(AgentLoopTraceEvent::BackgroundResultsConsumed {
+                        result_ids: captured_background_results,
+                        request_id: provider_request_id,
+                        turn_id: current_turn_id,
+                    });
+                }
                 let provider_id = provider_request.provider_id.clone();
                 let model_id = provider_request.model_id.clone();
                 trace(AgentLoopTraceEvent::ProviderStarted {
@@ -2204,12 +2332,27 @@ where
                     provider_id: provider_id.clone(),
                     model_id: model_id.clone(),
                 });
+                // Background work can invalidate a candidate final answer. Keep
+                // its text private until we know whether this response is progress
+                // or the verified final; tool execution remains observable.
+                let defer_stream = tool_reports.iter().any(|report: &ToolExecutionReport| {
+                    report.envelope.structured_facts["background"] == true
+                        || report.envelope.structured_facts["result_pending"] == true
+                        || report
+                            .envelope
+                            .structured_facts
+                            .get("child_session_id")
+                            .is_some()
+                }) || self
+                    .tool_executor
+                    .has_pending_background_tasks(request.session_id, Some(current_turn_id));
                 let provider_result = self
-                    .complete_with_retry(
+                    .complete_with_retry_visibility(
                         provider_request,
                         runtime_deadline,
                         &mut control,
                         &mut trace,
+                        !defer_stream,
                     )
                     .await;
                 let (provider_response, completed_request, attempts_complete) =
@@ -2356,11 +2499,12 @@ where
                         return Err(AgentLoopError::Provider(error));
                     }
                 };
-                if let Some(content) = provider_response
-                    .message
-                    .as_ref()
-                    .map(|message| message.content.trim())
-                    .filter(|content| !content.is_empty())
+                if (!provider_response.tool_calls.is_empty() || continue_response)
+                    && let Some(content) = provider_response
+                        .message
+                        .as_ref()
+                        .map(|message| message.content.trim())
+                        .filter(|content| !content.is_empty())
                 {
                     let content = content.to_owned();
                     trace(AgentLoopTraceEvent::AssistantMessage {
@@ -2516,7 +2660,63 @@ where
                         );
                         continue;
                     }
-                    if let Some(pending_turn) = control.pending_turns.take_or_close().await {
+                    self.tool_executor
+                        .seal_background_batch(request.session_id, Some(current_turn_id))
+                        .await?;
+                    let next_input = loop {
+                        let input = control
+                            .next_input_or_wait_for_background(
+                                &self.tool_executor,
+                                request.session_id,
+                                current_turn_id,
+                                runtime_deadline,
+                            )
+                            .await?;
+                        let Some(background::PendingRuntimeInput::Background(mut results)) = input
+                        else {
+                            break input;
+                        };
+                        for status in background::reconcile_completed_results(
+                            &self.tool_executor,
+                            &results,
+                            &mut tool_reports,
+                            &mut tool_attempts,
+                        ) {
+                            update_tool_failure_counts(
+                                status,
+                                &mut failed_tool_call_count,
+                                &mut consecutive_failed_tool_call_count,
+                            );
+                        }
+                        let mut acknowledged = Vec::new();
+                        results.retain(|result| {
+                            if background::result_was_observed(&captured_subagents, result) {
+                                acknowledged.push(result.result_id);
+                                false
+                            } else {
+                                true
+                            }
+                        });
+                        if !acknowledged.is_empty() {
+                            // The captured wait/status result already delivered these
+                            // exact child executions. Commit their inbox ack against
+                            // that durable request without another model response.
+                            control
+                                .pending_turns
+                                .acknowledge_captured_background(&acknowledged);
+                            trace(AgentLoopTraceEvent::BackgroundResultsConsumed {
+                                result_ids: acknowledged,
+                                request_id: provider_request_id,
+                                turn_id: current_turn_id,
+                            });
+                        }
+                        if !results.is_empty() {
+                            break Some(background::PendingRuntimeInput::Background(results));
+                        }
+                        // Recheck user input, cancellation and still-running work;
+                        // consuming an observed result is not a new model step.
+                    };
+                    if let Some(input) = next_input {
                         finish_runtime_step(
                             &mut step_machine,
                             step_snapshot.clone(),
@@ -2525,11 +2725,58 @@ where
                             elapsed_millis(current_turn_started_at),
                             &mut trace,
                         );
-                        let is_steer = pending_turn.turn.turn.steer;
-                        pending_turn_at_boundary.push_back(pending_turn);
-                        if is_steer {
-                            pending_turn_at_boundary
-                                .extend(control.pending_turns.take_ready_steers());
+                        match input {
+                            background::PendingRuntimeInput::Turn(pending_turn) => {
+                                let pending_turn = *pending_turn;
+                                let is_steer = pending_turn.turn.turn.steer;
+                                if !is_steer
+                                    && !defer_stream
+                                    && let Some(content) = last_assistant_message.as_ref()
+                                {
+                                    // Independent queued questions retain their answer.
+                                    // A steer or unresolved background batch supersedes
+                                    // the candidate and must not publish it as complete.
+                                    trace(AgentLoopTraceEvent::AssistantMessage {
+                                        turn_id: current_turn_id,
+                                        content: content.clone(),
+                                    });
+                                    emit_assistant_user_step(current_turn_id, content, &mut trace);
+                                }
+                                pending_turn_at_boundary.push_back(pending_turn);
+                                if is_steer {
+                                    pending_turn_at_boundary
+                                        .extend(control.pending_turns.take_ready_steers());
+                                }
+                            }
+                            background::PendingRuntimeInput::Background(results) => {
+                                background::append_results(
+                                    &mut plan,
+                                    results,
+                                    &tool_reports,
+                                    &self.tool_executor,
+                                    &mut seen_background_results,
+                                    &mut pending_background_ack,
+                                    &mut message_token_total,
+                                );
+                                background_continuation_boundary = true;
+                            }
+                            background::PendingRuntimeInput::DeadlineElapsed => {
+                                self.tool_executor.cancel_background_tasks(
+                                    request.session_id,
+                                    Some(current_turn_id),
+                                );
+                                control.pending_turns.close();
+                                let reason =
+                                    "runtime deadline exceeded while awaiting background tasks"
+                                        .to_owned();
+                                trace(AgentLoopTraceEvent::LoopGuardTriggered {
+                                    trigger: golutra_agent_core::LoopGuardTrigger::RuntimeDeadline,
+                                    reason: reason.clone(),
+                                });
+                                runtime_deadline_guard_emitted = true;
+                                guard_reason = Some(reason);
+                                break 'agent_loop;
+                            }
                         }
                         continue;
                     }
@@ -2917,7 +3164,13 @@ where
                                 display_arguments: redact_tool_arguments(&tool_request.arguments),
                                 recovery_policy,
                             });
-                            let question_report = if tool_request.tool_name == "ask_user" {
+                            let question_report = if tool_request.tool_name == "ask_user"
+                                && self.tool_executor.registry().contract("ask_user").is_some()
+                                && tool_allowed_for_profile(
+                                    "ask_user",
+                                    current_tool_profile,
+                                    self.tool_executor.registry(),
+                                ) {
                                 match tool_request
                                     .arguments
                                     .get("questions")
@@ -2934,6 +3187,14 @@ where
                                             questions,
                                         };
                                         match question.validate() {
+                                            Ok(())
+                                                if self.tool_executor.user_input_is_deferred() =>
+                                            {
+                                                Some(deferred_question_report(
+                                                    tool_request.clone(),
+                                                    &question,
+                                                ))
+                                            }
                                             Ok(()) => {
                                                 trace(AgentLoopTraceEvent::UserQuestionRequested(
                                                     question.clone(),
@@ -3306,11 +3567,13 @@ where
                             status: report.envelope.status,
                             recoverable_failure: tool_failure_is_recoverable(&report),
                         });
-                        update_tool_failure_counts(
-                            report.envelope.status,
-                            &mut failed_tool_call_count,
-                            &mut consecutive_failed_tool_call_count,
-                        );
+                        if report.envelope.structured_facts["result_pending"] != true {
+                            update_tool_failure_counts(
+                                report.envelope.status,
+                                &mut failed_tool_call_count,
+                                &mut consecutive_failed_tool_call_count,
+                            );
+                        }
                         if report.envelope.status == ToolResultStatus::Ok
                             && !report.changed_files.is_empty()
                         {
@@ -3392,7 +3655,22 @@ where
                             },
                             &mut message_token_total,
                         );
+                        let needs_parent_input =
+                            report.envelope.structured_facts["needs_parent_input"] == true;
                         tool_reports.push(report);
+                        if needs_parent_input {
+                            guard_reason = Some("delegated agent requires parent input; resume the same child with an answer".into());
+                            governor_action = Some(GovernorAction::Block);
+                            finish_runtime_step(
+                                &mut step_machine,
+                                step_snapshot.clone(),
+                                step_fingerprint.clone(),
+                                false,
+                                elapsed_millis(current_turn_started_at),
+                                &mut trace,
+                            );
+                            break 'agent_loop;
+                        }
                         if !permits_continuation {
                             if parallel_batch {
                                 stop_after_parallel_batch = true;
@@ -3418,6 +3696,24 @@ where
                     &tool_reports[tool_reports_before_step..],
                     &mut trace,
                 );
+                if let Some(message) =
+                    tool_images::image_message(&tool_reports[tool_reports_before_step..])
+                {
+                    append_plan_message(
+                        &mut plan,
+                        message,
+                        ContextMessageSource {
+                            contributor: "tool_observation_images".to_owned(),
+                            source_refs: tool_reports[tool_reports_before_step..]
+                                .iter()
+                                .map(|report| format!("tool-call:{}", report.envelope.tool_call_id))
+                                .collect(),
+                            origin: "tool_result".to_owned(),
+                            visibility: ModelInputVisibility::ModelVisible,
+                        },
+                        &mut message_token_total,
+                    );
+                }
                 if stop_after_parallel_batch {
                     finish_runtime_step(
                         &mut step_machine,
@@ -3523,7 +3819,7 @@ where
             for verifier in &current_external_verifiers {
                 control.wait_until_runnable().await?;
                 let tool_call_id = golutra_agent_core::ToolCallId::new();
-                let execution_request = VerifierExecutionRequest {
+                let mut execution_request = VerifierExecutionRequest {
                     tool_call_id,
                     session_id: request.session_id,
                     turn_id: Some(current_turn_id),
@@ -3543,6 +3839,11 @@ where
                     max_output_bytes: verifier.max_output_bytes,
                 };
                 let tool_request = execution_request.as_tool_request();
+                let verifier_deadline = tokio::time::Instant::now()
+                    + Duration::from_millis(execution_request.timeout_ms.max(1));
+                let verifier_deadline = runtime_deadline.map_or(verifier_deadline, |deadline| {
+                    deadline.min(verifier_deadline)
+                });
                 trace(AgentLoopTraceEvent::ToolStarted {
                     tool_call_id,
                     provider_tool_call_id: None,
@@ -3558,12 +3859,25 @@ where
                         "auto-discovered verifier requires an OS-enforced sandbox",
                     )
                 } else {
-                    match self
-                        .tool_executor
-                        .prepare_verifier_side_effect(&execution_request)
-                        .await
+                    let verifier_policy = PolicyEvaluation {
+                        policy_ref: PolicyId::new(),
+                        subject: "tool".into(),
+                        action: "external_verifier".into(),
+                        resource: execution_request.cwd.to_string_lossy().into_owned(),
+                        decision: PolicyDecision::Allow,
+                        block_disposition: None,
+                        reason: "caller-declared verifier".into(),
+                        evidence_refs: vec![],
+                    };
+                    match await_runtime_operation(
+                        self.tool_executor
+                            .prepare_verifier_side_effect(&execution_request),
+                        &control.cancellation,
+                        Some(verifier_deadline),
+                    )
+                    .await
                     {
-                        Ok(preparation) => {
+                        RuntimeOperationOutcome::Completed(Ok(preparation)) => {
                             let checkpoint_error =
                                 if let Some(recorder) = &self.before_side_effect_recorder {
                                     recorder
@@ -3584,6 +3898,11 @@ where
                                 )
                             } else {
                                 control.wait_until_runnable().await?;
+                                execution_request.timeout_ms = verifier_deadline
+                                    .saturating_duration_since(tokio::time::Instant::now())
+                                    .as_millis()
+                                    .max(1)
+                                    as u64;
                                 match self
                                     .tool_executor
                                     .execute_verifier_with_preparation(
@@ -3603,9 +3922,23 @@ where
                                 }
                             }
                         }
-                        Err(error) => self
+                        RuntimeOperationOutcome::Completed(Err(error)) => self
                             .tool_executor
                             .verifier_execution_error_report(execution_request, error.to_string()),
+                        RuntimeOperationOutcome::Cancelled => {
+                            self.tool_executor.cancelled_execution_report(
+                                tool_request.clone(),
+                                verifier_policy,
+                                "verifier cancelled during side-effect preparation",
+                            )
+                        }
+                        RuntimeOperationOutcome::TimedOut => {
+                            self.tool_executor.deadline_exceeded_report(
+                                tool_request,
+                                verifier_policy,
+                                "verifier side-effect preparation",
+                            )
+                        }
                     }
                 };
                 trace(AgentLoopTraceEvent::ToolCompleted(report.clone()));
@@ -4115,6 +4448,7 @@ where
                     trace(AgentLoopTraceEvent::VerificationCompleted {
                         record: verification.clone(),
                         terminal: false,
+                        findings: None,
                     });
                     turn_state.issue_correction(
                         golutra_agent_core::ContinuationReason::VerificationFailed,
@@ -4172,6 +4506,7 @@ where
             trace(AgentLoopTraceEvent::VerificationCompleted {
                 record: verification.clone(),
                 terminal: true,
+                findings: last_assistant_message.clone(),
             });
             turn_state.terminal();
             let mut loop_decision = completion::loop_decision(
@@ -4215,6 +4550,7 @@ where
                     turn_id: current_turn_id,
                     content: content.clone(),
                 });
+                emit_assistant_user_step(current_turn_id, content, &mut trace);
             }
 
             break Ok(AgentLoopOutcome {
@@ -4367,20 +4703,6 @@ where
                 }
             }
         }
-    }
-
-    async fn complete_with_retry<F>(
-        &self,
-        request: ProviderRequest,
-        deadline: Option<tokio::time::Instant>,
-        control: &mut AgentExecutionControl,
-        trace: &mut F,
-    ) -> Result<(ProviderResponse, ProviderRequest, bool), provider_session::ProviderSessionError>
-    where
-        F: FnMut(AgentLoopTraceEvent) + Send,
-    {
-        self.complete_with_retry_visibility(request, deadline, control, trace, true)
-            .await
     }
 
     async fn complete_with_retry_visibility<F>(
@@ -4962,6 +5284,24 @@ impl AgentExecutionControl {
     }
 }
 
+fn deferred_question_report(
+    request: ToolRequest,
+    question: &UserQuestionRequest,
+) -> ToolExecutionReport {
+    let mut report = golutra_agent_tools::TaskDelegationOutput {
+        status: ToolResultStatus::Blocked,
+        summary: "parent input required".into(),
+        content: serde_json::to_string(&question.questions).unwrap_or_default(),
+        structured_facts: json!({"needs_parent_input":true,"waiting_for_user":true,"question_id":question.question_id,"questions":question.questions}),
+    }.into_report(request.clone(), PolicyEvaluation {
+        policy_ref: golutra_agent_core::PolicyId::new(), subject:"tool".into(), action:request.tool_name,
+        resource:"parent_input".into(), decision:PolicyDecision::Allow, block_disposition:None,
+        reason:"delegated questions are returned to the parent without an invisible interactive wait".into(), evidence_refs:Vec::new(),
+    });
+    report.envelope.risk = "p0_user_input".into();
+    report
+}
+
 fn user_question_report(
     request: ToolRequest,
     resolution: UserQuestionResolution,
@@ -5212,7 +5552,7 @@ fn provider_tools_for_turn(
     let mut tools = tools
         .iter()
         .filter(|tool| {
-            is_pi_plus_tool(&tool.tool_name)
+            is_provider_tool(&tool.tool_name)
                 && tool_allowed_for_profile(&tool.tool_name, profile, registry)
                 && (!matches!(
                     contract.workspace_change,
@@ -5293,7 +5633,7 @@ fn stable_provider_tools_for_turn(
         .collect::<HashSet<_>>();
     for tool in previous {
         if known.contains(&tool.tool_name)
-            || !is_pi_plus_tool(&tool.tool_name)
+            || !is_provider_tool(&tool.tool_name)
             || !tool_allowed_for_profile(&tool.tool_name, profile, registry)
             || (matches!(
                 contract.workspace_change,
@@ -5317,26 +5657,6 @@ fn sort_provider_tools(tools: &mut [ToolContract]) {
     });
 }
 
-/// A user can explicitly request a pure response.  In that case sending the
-/// complete tool catalog only adds prompt tokens and gives the model a
-/// capability it was told not to use.  This fast path is deliberately
-/// opt-in; ordinary conversational prompts retain the full coding surface.
-fn objective_disables_tools(objective: &str) -> bool {
-    let normalized = objective.trim().to_ascii_lowercase();
-    [
-        "do not use tools",
-        "don't use tools",
-        "without using tools",
-        "without tools",
-        "no tools",
-        "不使用工具",
-        "不要使用工具",
-        "无需工具",
-    ]
-    .iter()
-    .any(|phrase| normalized.contains(phrase))
-}
-
 fn tool_allowed_for_profile(
     tool_name: &str,
     profile: AgentToolProfile,
@@ -5356,7 +5676,7 @@ fn tool_profile_rejection_reason(
     profile: AgentToolProfile,
     registry: &ToolRegistry,
 ) -> Option<&'static str> {
-    if !is_pi_plus_tool(&request.tool_name) {
+    if !is_provider_tool(&request.tool_name) {
         return Some("tool is not part of the active provider surface");
     }
     if !tool_allowed_for_profile(&request.tool_name, profile, registry) {
@@ -5404,7 +5724,7 @@ fn provider_tool_call_is_parallel_read_safe(
     profile: AgentToolProfile,
     registry: &ToolRegistry,
 ) -> bool {
-    is_pi_plus_tool(&tool_call.tool_name)
+    is_provider_tool(&tool_call.tool_name)
         && tool_allowed_for_profile(&tool_call.tool_name, profile, registry)
         && registry
             .capabilities(&tool_call.tool_name)
@@ -5444,7 +5764,10 @@ fn extend_parallel_batch(current: &mut ParallelBatchKind, next: ParallelBatchKin
             true
         }
         (ParallelBatchKind::KeyedWrite(existing), ParallelBatchKind::KeyedWrite(next)) => {
-            if existing.iter().any(|path| next.contains(path)) {
+            if existing.iter().any(|path| {
+                next.iter()
+                    .any(|other| path.starts_with(other) || other.starts_with(path))
+            }) {
                 return false;
             }
             existing.extend(next);
@@ -5532,7 +5855,7 @@ async fn provider_parallel_batch_kind(
     if !matches!(
         tool_call.tool_name.as_str(),
         "write_file" | "edit_file" | "apply_patch"
-    ) || !is_pi_plus_tool(&tool_call.tool_name)
+    ) || !is_provider_tool(&tool_call.tool_name)
         || !tool_allowed_for_profile(&tool_call.tool_name, profile, registry)
         || registry
             .contract(&tool_call.tool_name)

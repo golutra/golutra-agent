@@ -80,6 +80,8 @@ class NpmPackageTest(unittest.TestCase):
                 package_json = json.loads(archive.extractfile("package/package.json").read())
             self.assertEqual(package_json["name"], "@golutra/agent")
             self.assertEqual(package_json["version"], "0.1.0")
+            self.assertEqual(package_json["dependencies"]["@jackwener/opencli"], "2.0.3")
+            self.assertEqual(package_json["engines"]["node"], ">=20.18.1")
             self.assertEqual(
                 package_json["optionalDependencies"],
                 {

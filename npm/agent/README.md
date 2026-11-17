@@ -8,6 +8,15 @@ agent; a Rust toolchain is not required.
 
 ## Install and run
 
+Requires Node.js >= 20.18.1. Chrome automation uses the bundled OpenCLI 2.0.3
+runtime and the official [OpenCLI Chrome extension](https://chromewebstore.google.com/detail/opencli/ildkmabpimmkaediidaifkhjpohdnifk).
+Automatic selection prefers installed Ego (native SDK), then Chrome; explicit choices are preserved.
+Run `golutra-agent browser connect auto --launch --wait 120`, or select `chrome` / `ego` explicitly.
+Keep OpenCLI disabled in Ego to avoid extension reconnect conflicts with Chrome.
+If neither browser is installed, Golutra asks before downloading and installing Ego
+(`golutra-agent browser install-ego`; `--yes` only after consent). Complete Ego's first-run setup yourself.
+Agents can read/change the session's `browser_backend` via `browser_config`; active tasks keep their binding.
+
 ```bash
 npm install -g @golutra/agent
 golutra-agent

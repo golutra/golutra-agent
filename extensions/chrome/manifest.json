@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "Golutra Browser Connector",
+  "version": "0.4.0",
+  "minimum_chrome_version": "125",
+  "description": "Automatically connect the local Golutra Agent and create task tabs using this Chrome profile.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1CazPdc2R9vEDFqylXkyGUlFiME3QB387wFX+x3qRBHKY4gyUZ3IEKFRucH0sKShto8HRGGs4OEmyiuCfrehU/m2soFS3Wsg1lptkl1CWqe7cpIgy6lF0sozJSlF5dqObk4D/pLZTq8wmyYzNs5ETqpZX5bfWftfZ5ooQQSZaDKyQY22F16EfxumkRIf1yLk1zWyu7oO/sEcTYZJi/MD//ecizXBqV4DM43oTDwiAEQrTdzPd8z4Rv/v0Da23y5cJbn9zlsWImhUqHmaL1JNIWnAcURFIYK6f9iPwxRmj+mjkZN9ZN5F/8RuS0WJ45BrYiMBPoTsgShHff2JVsECZwIDAQAB",
+  "permissions": ["activeTab", "tabs", "debugger", "nativeMessaging", "storage", "downloads", "alarms"],
+  "background": {"service_worker": "background.js", "type": "module"},
+  "action": {"default_popup": "popup.html", "default_title": "Golutra 浏览器连接"}
+}

@@ -1,8 +1,8 @@
 //! Runtime 领域记录与持久化协议事件之间的转换。
 
 use golutra_agent_context::{
-    ContextCompactionRecord, parse_compaction_summary_envelope, stable_prefix_message_count,
-    stable_prefix_token_estimate,
+    ContextCompactionRecord, compaction_source_checksum, parse_compaction_summary_envelope,
+    stable_prefix_message_count, stable_prefix_token_estimate,
 };
 use golutra_agent_core::{
     Actor, ActorKind, ArtifactId, ArtifactRecord, CommandId, ContextSnapshot, EventId, LoopAction,
@@ -431,11 +431,24 @@ pub(crate) fn context_compaction_artifact(
         RedactionStatus::Redacted
     };
     if let Some(object) = redacted.as_object_mut() {
-        let source_checksum = parse_compaction_summary_envelope(&record.summary)
-            .ok_or_else(|| {
-                ClientError::TaskExecution("compaction summary envelope is invalid".to_owned())
-            })?
-            .checksum;
+        let source_checksum = if record.summary.is_empty()
+            && record.dropped_message_count == 0
+            && record.summary_source_messages.is_empty()
+            && record.summary_source_sources.is_empty()
+            && record.original_message_count == record.replacement_message_count
+            && record.replacement_messages.len() == record.original_message_count
+        {
+            // The context manager may only shorten the most recent message group.
+            // No historical groups were summarized, so its baseline legitimately
+            // has no summary envelope. Still checksum the empty source sequence.
+            compaction_source_checksum(&record.summary_source_messages)
+        } else {
+            parse_compaction_summary_envelope(&record.summary)
+                .ok_or_else(|| {
+                    ClientError::TaskExecution("compaction summary envelope is invalid".to_owned())
+                })?
+                .checksum
+        };
         object.insert("source_checksum".to_owned(), Value::String(source_checksum));
         let replacement = object
             .get("replacement_messages")
@@ -596,6 +609,11 @@ pub(crate) fn observation_descriptor(observation: &RuntimeObservation) -> Observ
             RuntimeEventSource::Runtime,
             ObservationIntegrityClass::Required,
         ),
+        RuntimeObservation::BackgroundResultsConsumed { .. } => (
+            RuntimeEventType::BackgroundResultsConsumed,
+            RuntimeEventSource::Runtime,
+            ObservationIntegrityClass::Required,
+        ),
         RuntimeObservation::CandidateReady { .. } => (
             RuntimeEventType::CandidateReady,
             RuntimeEventSource::Runtime,
@@ -751,6 +769,16 @@ pub(crate) fn trace_event_payload(
 ) -> Option<(RuntimeEventType, RuntimeEventSource, Value)> {
     let descriptor = observation_descriptor(&trace_event);
     let mapped = match trace_event {
+        AgentLoopTraceEvent::BackgroundResultsConsumed {
+            result_ids,
+            request_id,
+            turn_id,
+        } => Some((
+            RuntimeEventType::BackgroundResultsConsumed,
+            RuntimeEventSource::Runtime,
+            json!({"summary":"background observations included in model context", "result_ids":result_ids,
+                "request_id":request_id,"turn_id":turn_id}),
+        )),
         AgentLoopTraceEvent::StepStarted(step) => Some((
             RuntimeEventType::StepStarted,
             RuntimeEventSource::Runtime,
@@ -930,13 +958,18 @@ pub(crate) fn trace_event_payload(
                 "assertion": assertion,
             }),
         )),
-        AgentLoopTraceEvent::VerificationCompleted { record, terminal } => Some((
+        AgentLoopTraceEvent::VerificationCompleted {
+            record,
+            terminal,
+            findings,
+        } => Some((
             RuntimeEventType::VerificationCompleted,
             RuntimeEventSource::Verifier,
             json!({
                 "summary": format!("verification result: {:?}", record.result),
                 "terminal": terminal,
                 "record": record,
+                "assistant_findings": findings,
             }),
         )),
         AgentLoopTraceEvent::CorrectionIssued(correction) => Some((

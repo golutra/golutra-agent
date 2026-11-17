@@ -1,16 +1,18 @@
-//! 当前 SQLite 格式的事务初始化与严格校验；不迁移、不修复任何历史格式。
+//! Exact-schema initialization and explicitly supported v7/v8 → v9 upgrades.
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqliteConnection, SqlitePool};
 use tokio::time::sleep;
 
-// 单一基线高于所有旧账本版本，旧 reader 也会拒绝打开，避免误把新库当旧库。
-pub(crate) const CURRENT_VERSION: i64 = 7;
+// Historical v7/v8 checksums are preserved; older binaries reject the v9 ledger.
+pub(crate) const CURRENT_VERSION: i64 = 9;
+const PREVIOUS_VERSION: i64 = 7;
 const SCHEMA_NAME: &str = "current_runtime_schema";
 const EVENT_CONTRACT: &str = "runtime_event:user_step;runtime_usage_lease:v1";
 const MIGRATION_LOCK_RETRIES: usize = 40;
 const MIGRATION_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
 
-const CURRENT_SCHEMA: &[&str] = &[
+// Keep these statement bytes unchanged: they authenticate existing v7 databases.
+const SCHEMA_V7: &[&str] = &[
     r#"
     CREATE TABLE runtime_events (
         event_id TEXT PRIMARY KEY,
@@ -218,19 +220,41 @@ const CURRENT_SCHEMA: &[&str] = &[
     "CREATE INDEX idx_context_snapshots_session_created ON context_snapshots (session_id, created_at DESC)",
 ];
 
-fn schema_checksum() -> String {
+fn checksum_for_version(version: i64) -> String {
     let mut digest = Sha256::new();
-    digest.update(CURRENT_VERSION.to_le_bytes());
+    digest.update(version.to_le_bytes());
     digest.update(SCHEMA_NAME.as_bytes());
     digest.update(EVENT_CONTRACT.as_bytes());
-    for statement in CURRENT_SCHEMA {
+    for statement in SCHEMA_V7 {
         digest.update([0_u8]);
         digest.update(statement.as_bytes());
+    }
+    if version >= 8 {
+        for statement in super::background::SCHEMA {
+            digest.update([0_u8]);
+            digest.update(statement.as_bytes());
+        }
+    }
+    if version >= 9 {
+        for statement in super::subagents::SCHEMA {
+            digest.update([0_u8]);
+            digest.update(statement.as_bytes());
+        }
     }
     format!("sha256:{:x}", digest.finalize())
 }
 
-/// 仅接受当前基线的唯一账本记录；旧 checksum 和历史版本不再豁免。
+fn schema_checksum() -> String {
+    checksum_for_version(CURRENT_VERSION)
+}
+
+pub(crate) fn can_upgrade_applied(applied: &[(i64, String, String)]) -> bool {
+    matches!(applied, [(version, name, checksum)]
+        if matches!(*version, PREVIOUS_VERSION | 8) && name == SCHEMA_NAME
+        && *checksum == checksum_for_version(*version))
+}
+
+/// Open stores require the current exact ledger; upgrade admission is checked separately.
 pub(crate) fn validate_applied(applied: &[(i64, String, String)]) -> Result<(), String> {
     if let [(version, name, checksum)] = applied
         && *version == CURRENT_VERSION
@@ -240,7 +264,7 @@ pub(crate) fn validate_applied(applied: &[(i64, String, String)]) -> Result<(), 
         return Ok(());
     }
     Err(format!(
-        "data_unsupported: expected schema {CURRENT_VERSION} with its exact checksum; old or unknown formats are not migrated; use a new GOLUTRA_AGENT_HOME"
+        "data_unsupported: expected schema {CURRENT_VERSION} or exact schema 7/8; unknown formats are not migrated; use a new GOLUTRA_AGENT_HOME"
     ))
 }
 
@@ -324,9 +348,38 @@ async fn initialize_current(connection: &mut SqliteConnection) -> Result<(), Str
                 })
                 .collect::<Result<Vec<(i64, String, String)>, sqlx::Error>>()
                 .map_err(|error| error.to_string())?;
-        return validate_applied(&applied);
+        if !can_upgrade_applied(&applied) {
+            return validate_applied(&applied);
+        }
+        let previous = applied[0].0;
+        let background = if previous == PREVIOUS_VERSION {
+            super::background::SCHEMA
+        } else {
+            &[]
+        };
+        for statement in background.iter().chain(super::subagents::SCHEMA) {
+            sqlx::query(statement)
+                .execute(&mut *connection)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        sqlx::query(
+            "UPDATE schema_migrations SET version=?, checksum=?, applied_at=? WHERE version=?",
+        )
+        .bind(CURRENT_VERSION)
+        .bind(schema_checksum())
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(previous)
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| error.to_string())?;
+        return Ok(());
     }
-    for statement in CURRENT_SCHEMA {
+    for statement in SCHEMA_V7
+        .iter()
+        .chain(super::background::SCHEMA)
+        .chain(super::subagents::SCHEMA)
+    {
         sqlx::query(statement)
             .execute(&mut *connection)
             .await
@@ -357,6 +410,150 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap()
+    }
+
+    async fn initialize_previous(pool: &SqlitePool) {
+        for statement in SCHEMA_V7 {
+            sqlx::query(statement).execute(pool).await.unwrap();
+        }
+        sqlx::query("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY,name TEXT NOT NULL,checksum TEXT NOT NULL,applied_at TEXT NOT NULL)")
+            .execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO schema_migrations VALUES (?,?,?,'original')")
+            .bind(PREVIOUS_VERSION)
+            .bind(SCHEMA_NAME)
+            .bind(checksum_for_version(PREVIOUS_VERSION))
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO runtime_events VALUES ('preserved',1,'session',NULL,NULL,'TaskCreated','runtime',1,'{}','{}')")
+            .execute(pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exact_v8_upgrade_backfills_only_delegated_children_and_preserves_ledger_on_failure() {
+        for conflict in [false, true] {
+            let pool = empty_pool().await;
+            initialize_previous(&pool).await;
+            for statement in super::super::background::SCHEMA {
+                sqlx::query(statement).execute(&pool).await.unwrap();
+            }
+            sqlx::query("UPDATE schema_migrations SET version=8,checksum=?")
+                .bind(checksum_for_version(8))
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO threads (thread_id,session_id,parent_thread_id,title,preview,created_at,updated_at,recency_at) VALUES ('p','parent',NULL,'p','','now','now','now'),('c','child','p','c','','now','now','now'),('f','fork','p','f','','now','now','now')").execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO runtime_events VALUES ('child-event',2,'child',NULL,NULL,'TaskCreated','runtime',1,'{\"payload\":{\"_delegated_task\":true}}','{}')").execute(&pool).await.unwrap();
+            if conflict {
+                sqlx::query("CREATE TABLE subagent_messages (preserved TEXT)")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                assert!(run(&pool).await.is_err());
+                let version: i64 = sqlx::query_scalar("SELECT version FROM schema_migrations")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                assert_eq!(version, 8);
+                let registry: i64 =
+                    sqlx::query_scalar("SELECT count(*) FROM sqlite_master WHERE name='subagents'")
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                assert_eq!(registry, 0);
+            } else {
+                run(&pool).await.unwrap();
+                let children: Vec<(String, String)> =
+                    sqlx::query_as("SELECT child_session_id,parent_session_id FROM subagents")
+                        .fetch_all(&pool)
+                        .await
+                        .unwrap();
+                assert_eq!(children, vec![("child".into(), "parent".into())]);
+                run(&pool).await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_previous_baseline_upgrades_transactionally_without_losing_history() {
+        assert_eq!(
+            checksum_for_version(PREVIOUS_VERSION),
+            "sha256:fff3e4e8ea90bd905c23864b5a46bc533e428ac16187e04c99b444cb6f781381"
+        );
+        let pool = empty_pool().await;
+        initialize_previous(&pool).await;
+        run(&pool).await.unwrap();
+        let saved: String = sqlx::query_scalar("SELECT event_id FROM runtime_events")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(saved, "preserved");
+        let rows: Vec<(i64, String, String)> =
+            sqlx::query_as("SELECT version,name,checksum FROM schema_migrations")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(validate_applied(&rows).is_ok());
+        assert_eq!(rows.len(), 1);
+        run(&pool).await.unwrap();
+        let tables: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name LIKE 'background_%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(tables, 3);
+    }
+
+    #[tokio::test]
+    async fn failed_upgrade_rolls_back_ddl_and_preserves_previous_ledger() {
+        let pool = empty_pool().await;
+        initialize_previous(&pool).await;
+        sqlx::query("CREATE TABLE background_tasks (keep TEXT)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(run(&pool).await.is_err());
+        let version: i64 = sqlx::query_scalar("SELECT version FROM schema_migrations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(version, PREVIOUS_VERSION);
+        let batches: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM sqlite_master WHERE name='background_batches'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(batches, 0);
+    }
+
+    #[tokio::test]
+    async fn persistent_store_opens_exact_previous_baseline_through_exclusive_upgrade() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("runtime.sqlite");
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        initialize_previous(&pool).await;
+        pool.close().await;
+        let store = crate::RuntimeStore::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.data_compatibility().await.unwrap().schema_version,
+            CURRENT_VERSION
+        );
+        let saved: String = sqlx::query_scalar("SELECT event_id FROM runtime_events")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(saved, "preserved");
     }
 
     #[tokio::test]
@@ -399,7 +596,8 @@ mod tests {
             (1, "sha256:golutra-agent-v1-base-20260808"),
             (2, "sha256:golutra-agent-v2-legacy-columns-20260808"),
             (6, "old"),
-            (8, "future"),
+            (7, "wrong_previous_checksum"),
+            (10, "future"),
             (CURRENT_VERSION, "wrong"),
         ] {
             let pool = empty_pool().await;

@@ -40,6 +40,8 @@ jobs:
           npm ci --prefix sdk/typescript
           npm test --prefix sdk/typescript
           npm audit --audit-level=high --prefix sdk/typescript
+      - name: Browser extension lifecycle
+        run: node --test extensions/chrome/*.test.mjs scripts/tests/npm_opencli.test.mjs
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -109,6 +111,8 @@ jobs:
           toolchain: 1.93.0
       - name: Cross-platform compile
         run: cargo check --workspace --all-targets --locked
+      - name: Browser bridge process and configuration
+        run: cargo test --locked -p golutra-agent-cli --test browser_process
       - name: Native database paths and shared home
         shell: bash
         run: |

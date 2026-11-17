@@ -1,6 +1,121 @@
 use super::*;
 
 #[tokio::test]
+async fn quoted_child_instructions_do_not_disable_parent_tools() {
+    for (objective, profile) in [
+        (
+            "Delegate this child task: 'calculate 17*19 with no tools'",
+            AgentToolProfile::Coding,
+        ),
+        (
+            "让子代理回答：不要使用工具。父代理负责委派。",
+            AgentToolProfile::Full,
+        ),
+        (
+            "Document the phrase `without tools` in README.md",
+            AgentToolProfile::Coding,
+        ),
+        ("An explicitly tool-free turn", AgentToolProfile::None),
+    ] {
+        let root = tempdir().unwrap();
+        let harness = AgentHarness::new(
+            MockProvider::text_response("Done."),
+            ContextBuilder::default(),
+            BasicToolExecutor::new(WorkspacePolicy::new(root.path()).unwrap()),
+        );
+        let (_, control) = agent_execution_channel(1);
+        let mut trace = Vec::new();
+        harness
+            .execute_configured(
+                ConfiguredAgentRun::new(AgentTaskRequest {
+                    session_id: SessionId::new(),
+                    task_id: TaskId::new(),
+                    turn_id: TurnId::new(),
+                    objective: objective.into(),
+                    completion_criteria: vec![],
+                    output_schema: None,
+                    touched_code: false,
+                    contributors: vec![],
+                    tools: vec!["subagent".into(), "read_file".into()],
+                })
+                .with_tool_profile(profile),
+                control,
+                |event| trace.push(event),
+            )
+            .await
+            .unwrap();
+        let request = trace
+            .iter()
+            .find_map(|event| match event {
+                AgentLoopTraceEvent::ContextSnapshotCaptured { request, .. } => Some(request),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            request.tools.is_empty(),
+            profile == AgentToolProfile::None,
+            "{objective}"
+        );
+        if profile != AgentToolProfile::None {
+            assert!(
+                request
+                    .tools
+                    .iter()
+                    .any(|tool| tool.tool_name == "subagent")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn delegated_question_returns_to_parent_without_waiting_for_a_user_channel() {
+    let workspace = tempdir().unwrap();
+    let provider = MockProvider::tool_call(
+        "ask_user",
+        json!({"questions":[{
+            "id":"scope", "header":"Scope", "question":"Which scope?", "mode":"single",
+            "options":[{"id":"small","label":"Small"},{"id":"large","label":"Large"}]
+        }]}),
+    );
+    let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).unwrap())
+        .with_deferred_user_input();
+    let harness = AgentHarness::new(provider, ContextBuilder::default(), executor);
+    let (_, control) = agent_execution_channel(1);
+    let mut trace = Vec::new();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        harness.execute_configured(
+            ConfiguredAgentRun::new(AgentTaskRequest {
+                session_id: SessionId::new(),
+                task_id: TaskId::new(),
+                turn_id: TurnId::new(),
+                objective: "Ask the parent for the scope".into(),
+                completion_criteria: vec![],
+                output_schema: None,
+                touched_code: false,
+                contributors: vec![],
+                tools: vec!["ask_user".into()],
+            })
+            .with_tool_profile(AgentToolProfile::Full),
+            control,
+            |event| trace.push(event),
+        ),
+    )
+    .await
+    .expect("child must not wait for user input")
+    .unwrap();
+    assert_eq!(outcome.loop_decision.action, LoopAction::Blocked);
+    let facts = &outcome.tool_reports[0].envelope.structured_facts;
+    assert_eq!(facts["needs_parent_input"], true);
+    assert_eq!(facts["questions"][0]["id"], "scope");
+    assert!(
+        !trace
+            .iter()
+            .any(|event| matches!(event, AgentLoopTraceEvent::UserQuestionRequested(_)))
+    );
+}
+
+#[tokio::test]
 async fn fork_uses_child_instructions_and_tools_while_preserving_parent_tool_pairs() {
     let workspace = tempdir().unwrap();
     let executor = BasicToolExecutor::new(WorkspacePolicy::new(workspace.path()).unwrap())

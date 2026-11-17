@@ -12,6 +12,16 @@
 
 按需要选择入口：
 
+- 想升级到 4.0.0：看 [发布说明](releases/v4.0.0.md)，包括安装命令、浏览器接入及共享数据升级要求。
+- 想接入自己的 Ego 浏览器：看 [Ego 浏览器工具](ego-browser.md)，包括配置、会话恢复和真实浏览器验收。
+- 想连接浏览器：看 [Chrome/OpenCLI 与 Ego 原生接入](browser-connections.md)，包括 `/connect`、官方扩展安装、会话隔离和停止。
+- 想了解后台工具、静默结果队列与自动续跑：看 [后台任务](background-tasks.md)。
+- 想使用子代理的分页查看、消息排队、同会话续跑与统一后台交付：看 [子代理](subagents.md)、[实现及验证记录](subagent-validation-2026-11-17.md)；原始比较依据见 [Codex 对照审查](subagent-review-2026-11-16.md)。
+- 想看真实子代理制作游戏的并行效率和交付质量：看 [游戏任务并行/串行实测](subagent-game-benchmark-2026-11-17.md)，包含耗时、上游重试、用量完整性与真实浏览器结果。
+- 想看上述实测问题的修复和复测：看 [子代理优化验证](subagent-optimization-2026-11-17.md)，区分运行时改动、真实模型样本和游戏界面修复。
+- 想看结果覆盖、静默交付、终答边界和结构化分工的最新实现：看 [交付重构与交错评测](subagent-delivery-refactor-2026-11-17.md)，保留真实预检发现的回归及修复证据。
+- 想查看最近提交对照及后台结果、上下文压缩、取消边界的修复：看 [Agent 运行时审查](agent-runtime-review-2026-11-16.md)。
+- 想查看本轮整体回归与安装验收：看 [2026-11-16 整体验收](full-validation-2026-11-16.md)。
 - 想了解日常使用、后台任务和配置：先看根目录 [README](../README.md)；中文用户可看
   [中文 README](../README_CN.md)，再按需阅读[运行入口](runtime-entrypoints.md)。
 - 想接入 SDK、provider 或自定义客户端：看 [LLM provider 集成](llm-provider-integration.md)、

@@ -916,13 +916,16 @@ mod tests {
         let mut before_bytes = vec![0_u8; MAX_TRACKED_FILE_BYTES as usize + 1];
         before_bytes[1] = 1;
         fs::write(&path, &before_bytes).expect("write binary baseline");
-        let before = capture(workspace.path()).await;
+        // This checks content retention and checksums, not the foreground scan's
+        // 250 ms latency budget. Deadline behavior has separate bounded-scan tests.
+        let before = capture_with_budget(workspace.path(), Duration::from_secs(10)).await;
         assert!(!before.is_complete());
 
         let mut after_bytes = before_bytes;
         after_bytes[1] = 2;
         fs::write(&path, &after_bytes).expect("modify binary file");
-        let scan = compare(workspace.path(), before).await;
+        let after = capture_with_budget(workspace.path(), Duration::from_secs(10)).await;
+        let scan = compare_snapshots(before, after);
 
         assert!(scan.complete);
         assert_eq!(scan.changed_files, vec![path]);

@@ -23,8 +23,17 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
+mod background;
+pub mod browser;
+pub use background::{
+    BackgroundToolObserver, BackgroundToolSnapshot, BackgroundToolSupervisor,
+    ExternalBackgroundTask, background_report_status,
+};
+mod resources;
 mod runtime_observation;
 mod shell_contract;
+mod subagent_projection;
+pub use subagent_projection::subagent_findings_complete;
 
 const DEFAULT_EXCERPT_LIMIT: usize = 2048;
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
@@ -70,7 +79,6 @@ const MAX_MODEL_CHANGE_PREVIEW_BYTES: usize = 3 * 1024;
 const MAX_MODEL_CHANGE_PREVIEW_LINES: usize = 24;
 const MAX_MODEL_CHANGE_PREVIEW_FILES: usize = 8;
 const MAX_MODEL_CHANGE_PREVIEW_LINE_BYTES: usize = 512;
-const MAX_MODEL_TOOL_OUTPUT_CHARS: usize = 2 * 1024;
 const MAX_MODEL_TOOL_REASON_CHARS: usize = 512;
 const MAX_MODEL_TOOL_SEARCH_QUERY_CHARS: usize = 512;
 const MAX_MODEL_TOOL_SEARCH_RESULTS: usize = 8;
@@ -92,6 +100,10 @@ const DEADLINE_CLEANUP_TIMEOUT: Duration = Duration::from_millis(250);
 const CODE_INDEX_BUILD_CONCURRENCY: usize = 1;
 static CODE_INDEX_BUILD_PERMITS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(CODE_INDEX_BUILD_CONCURRENCY)));
+// Browser SDK scripts can touch shared Profile/clipboard state. Keep all managed
+// browser calls serialized until a backend declares narrower resource ownership.
+static BROWSER_EXECUTION_PERMITS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(1)));
 // Sandbox capability is process-wide. Detecting the launcher for every task
 // adds filesystem probes to the critical path without changing the result.
 static DETECTED_SANDBOX: LazyLock<SystemSandbox> = LazyLock::new(SystemSandbox::detect);
@@ -140,6 +152,14 @@ pub const PI_PLUS_TOOL_NAMES: [&str; 8] = [
 #[must_use]
 pub fn is_pi_plus_tool(tool_name: &str) -> bool {
     PI_PLUS_TOOL_NAMES.contains(&tool_name)
+}
+
+/// 可选浏览器合同只有宿主配置后才进入 registry；基础工具集本身保持不变。
+#[must_use]
+pub fn is_provider_tool(tool_name: &str) -> bool {
+    is_pi_plus_tool(tool_name)
+        || browser::is_browser_tool(tool_name)
+        || tool_name == "background_task"
 }
 
 /// Provider 工具按常见工作流排列，让读取、命令、精确编辑和完整写入形成
@@ -206,6 +226,7 @@ pub struct SideEffectPreparation {
     pub before_images: Vec<FileBeforeImage>,
     pub complete: bool,
     workspace_snapshot: Option<workspace_scan::WorkspaceSnapshot>,
+    resource_lease: Option<resources::ResourceLease>,
 }
 
 impl SideEffectPreparation {
@@ -280,6 +301,19 @@ pub struct ExternalToolOutput {
     pub content: String,
     pub structured_facts: Value,
     pub is_error: bool,
+    pub images: Vec<ExternalToolImage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalToolImage {
+    pub mime_type: String,
+    pub bytes: Vec<u8>,
+}
+
+enum ExternalCallOutcome {
+    Completed(Result<ExternalToolOutput, ToolError>),
+    Cancelled,
+    TimedOut,
 }
 
 /// Result returned by the host-owned delegated-agent backend.
@@ -295,8 +329,46 @@ pub struct TaskDelegationOutput {
     pub structured_facts: Value,
 }
 
+#[derive(Debug, Clone)]
+pub struct DelegationBackgroundContext {
+    pub supervisor: BackgroundToolSupervisor,
+    pub observer: Arc<dyn BackgroundToolObserver>,
+    pub policy: PolicyEvaluation,
+}
+
+impl TaskDelegationOutput {
+    #[must_use]
+    pub fn into_report(
+        self,
+        request: ToolRequest,
+        policy: PolicyEvaluation,
+    ) -> ToolExecutionReport {
+        let mut result = report(
+            request,
+            self.status,
+            &self.summary,
+            self.structured_facts,
+            self.content,
+            Vec::new(),
+            policy,
+        );
+        result.envelope.risk = "delegated_agent".into();
+        result
+    }
+}
+
 #[async_trait]
 pub trait TaskDelegationBackend: std::fmt::Debug + Send + Sync {
+    /// Hosted backends can join the same durable batch as background tools.
+    async fn delegate_managed(
+        &self,
+        request: &ToolRequest,
+        cancellation: CancellationToken,
+        _background: Option<DelegationBackgroundContext>,
+    ) -> Result<TaskDelegationOutput, ToolError> {
+        self.delegate(request, cancellation).await
+    }
+
     /// 只读取该父会话的有界子任务状态，不消费通知、不接管子任务。
     async fn status(&self, _session_id: SessionId) -> Result<Value, ToolError> {
         Ok(json!({"available": false}))
@@ -327,6 +399,10 @@ pub struct DelegationNotification {
 #[async_trait]
 pub trait ExternalToolBackend: std::fmt::Debug + Send + Sync {
     fn contracts(&self) -> Vec<ToolContract>;
+
+    fn timeout(&self, _request: &ToolRequest) -> Duration {
+        Duration::from_millis(EXTERNAL_TOOL_TIMEOUT_MS)
+    }
 
     /// Optional host-reviewed execution capabilities keyed by tool name.
     /// External tools default to the full profile and serial execution.
@@ -403,7 +479,7 @@ impl ToolRegistry {
         let mut contracts = self
             .contracts
             .values()
-            .filter(|contract| is_pi_plus_tool(&contract.tool_name))
+            .filter(|contract| is_provider_tool(&contract.tool_name))
             .collect::<Vec<_>>();
         contracts.sort_by(|left, right| {
             provider_tool_rank(&left.tool_name)
@@ -579,10 +655,13 @@ pub struct ToolRuntime {
     registry: ToolRegistry,
     sandbox: SystemSandbox,
     allow_network: bool,
-    external_backend: Option<Arc<dyn ExternalToolBackend>>,
+    external_backends: HashMap<String, Arc<dyn ExternalToolBackend>>,
     delegation_backend: Option<Arc<dyn TaskDelegationBackend>>,
+    delegation_inbox: Option<Arc<dyn TaskDelegationBackend>>,
     replay_backend: Option<Arc<dyn ToolReplayBackend>>,
     process_supervisor: ProcessSupervisor,
+    background: Option<background::BackgroundBinding>,
+    deferred_user_input: bool,
 }
 
 impl ToolRuntime {
@@ -593,16 +672,30 @@ impl ToolRuntime {
             registry: ToolRegistry::p0_default(),
             sandbox: (*DETECTED_SANDBOX).clone(),
             allow_network: false,
-            external_backend: None,
+            external_backends: HashMap::new(),
             delegation_backend: None,
+            delegation_inbox: None,
             replay_backend: None,
             process_supervisor: ProcessSupervisor::new(),
+            background: None,
+            deferred_user_input: false,
         }
     }
 
     #[must_use]
     pub fn workspace_root(&self) -> &Path {
         self.policy.workspace_root()
+    }
+
+    #[must_use]
+    pub fn with_deferred_user_input(mut self) -> Self {
+        self.deferred_user_input = true;
+        self
+    }
+
+    #[must_use]
+    pub fn user_input_is_deferred(&self) -> bool {
+        self.deferred_user_input
     }
 
     #[must_use]
@@ -822,10 +915,19 @@ impl ToolRuntime {
         mut self,
         backend: Arc<dyn ExternalToolBackend>,
     ) -> Result<Self, ToolError> {
-        let contracts = backend.contracts();
+        let mut contracts = backend.contracts();
+        if self.background.is_some() {
+            for contract in &mut contracts {
+                background::enable_browser_background(contract);
+            }
+        }
         let capabilities = backend.capabilities();
-        self.registry.register_external(contracts, capabilities)?;
-        self.external_backend = Some(backend);
+        self.registry
+            .register_external(contracts.clone(), capabilities)?;
+        for contract in contracts {
+            self.external_backends
+                .insert(contract.tool_name, backend.clone());
+        }
         Ok(self)
     }
 
@@ -849,7 +951,7 @@ impl ToolRuntime {
                 (
                     contract.tool_name.clone(),
                     ToolCapabilities {
-                        available_in_coding_profile: is_pi_plus_tool(&contract.tool_name),
+                        available_in_coding_profile: is_provider_tool(&contract.tool_name),
                         parallel_read_safe: false,
                         coding_profile_hidden_arguments: Vec::new(),
                     },
@@ -874,6 +976,7 @@ impl ToolRuntime {
                 .capabilities
                 .insert(tool.name().to_owned(), tool.capabilities());
         }
+        self.delegation_inbox = Some(backend.clone());
         self.delegation_backend = Some(backend);
         Ok(self)
     }
@@ -908,6 +1011,74 @@ impl ToolRuntime {
         self
     }
 
+    /// Attach host-owned execution and durable observation without changing short calls.
+    pub fn with_background_supervisor(
+        mut self,
+        supervisor: BackgroundToolSupervisor,
+        observer: Arc<dyn BackgroundToolObserver>,
+    ) -> Result<Self, ToolError> {
+        self = self.with_external_backend(Arc::new(background::BackgroundControlBackend(
+            supervisor.clone(),
+            observer.clone(),
+        )))?;
+        if let Some(contract) = self.registry.contracts.get_mut("browser_run") {
+            background::enable_browser_background(contract);
+            self.registry.invalidate_validator("browser_run");
+        }
+        self.background = Some(background::BackgroundBinding {
+            supervisor,
+            observer,
+        });
+        Ok(self)
+    }
+
+    pub async fn seal_background_batch(
+        &self,
+        session_id: SessionId,
+        turn_id: Option<TurnId>,
+    ) -> Result<(), ToolError> {
+        if let Some(background) = &self.background {
+            background.observer.seal(session_id, turn_id).await?;
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn has_pending_background_tasks(
+        &self,
+        session_id: SessionId,
+        turn_id: Option<TurnId>,
+    ) -> bool {
+        self.background
+            .as_ref()
+            .is_some_and(|binding| binding.supervisor.has_pending(session_id, turn_id))
+    }
+
+    #[must_use]
+    pub fn subscribe_background_activity(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        self.background
+            .as_ref()
+            .map(|binding| binding.supervisor.subscribe())
+    }
+
+    pub fn cancel_background_tasks(&self, session_id: SessionId, turn_id: Option<TurnId>) {
+        if let Some(background) = &self.background {
+            background.supervisor.cancel_turn(session_id, turn_id);
+        }
+    }
+
+    pub fn take_background_completed_report(
+        &self,
+        session_id: SessionId,
+        tool_call_id: ToolCallId,
+    ) -> Option<Arc<ToolExecutionReport>> {
+        self.background.as_ref().and_then(|binding| {
+            binding
+                .supervisor
+                .take_completed_report(session_id, tool_call_id)
+        })
+    }
+
     pub async fn execute(
         &self,
         request: ToolRequest,
@@ -920,6 +1091,50 @@ impl ToolRuntime {
 
     pub async fn invoke(
         &self,
+        invocation: ToolInvocation,
+        cancellation: CancellationToken,
+        progress: Option<&mut (dyn FnMut(ToolProgress) + Send)>,
+    ) -> Result<ToolExecutionReport, ToolError> {
+        if let Some(background) = &self.background
+            && !cancellation.is_cancelled()
+            && self.replay_backend.is_none()
+        {
+            if background::requested(&invocation) {
+                let contract = self
+                    .registry
+                    .contract(&invocation.request.tool_name)
+                    .ok_or_else(|| ToolError::UnknownTool(invocation.request.tool_name.clone()))?;
+                self.registry
+                    .validate_tool_arguments(contract, &invocation.request.arguments)?;
+                return background
+                    .supervisor
+                    .submit(
+                        self.clone(),
+                        invocation,
+                        background.observer.clone(),
+                        cancellation,
+                    )
+                    .await;
+            }
+            if invocation.request.tool_name == "browser_handoff"
+                && (invocation.policy.decision == PolicyDecision::Allow
+                    || (invocation.policy.decision == PolicyDecision::Ask && invocation.approved))
+            {
+                background
+                    .observer
+                    .handoff(invocation.request.session_id, invocation.request.turn_id)
+                    .await?;
+                background
+                    .supervisor
+                    .cancel_browser_session(invocation.request.session_id);
+            }
+        }
+        self.invoke_foreground(invocation, cancellation, progress)
+            .await
+    }
+
+    async fn invoke_foreground(
+        &self,
         mut invocation: ToolInvocation,
         cancellation: CancellationToken,
         progress: Option<&mut (dyn FnMut(ToolProgress) + Send)>,
@@ -930,7 +1145,7 @@ impl ToolRuntime {
                 PolicyDecision::Ask => invocation.approved,
                 PolicyDecision::Deny | PolicyDecision::Block => false,
             };
-        let preparation = match invocation.preparation.take() {
+        let mut preparation = match invocation.preparation.take() {
             Some(preparation) => preparation,
             None if may_execute => {
                 match await_preparation_operation(
@@ -949,9 +1164,33 @@ impl ToolRuntime {
             }
             None => SideEffectPreparation::default(),
         };
+        // Compatibility callers may supply checkpoint images directly. They
+        // still coordinate the mutation, and each write validates those images
+        // against current contents before applying changes.
+        if may_execute && preparation.resource_lease.is_none() && self.replay_backend.is_none() {
+            let acquire = async {
+                let paths = self.operation_resource_paths(&invocation.request).await?;
+                Ok::<_, ToolError>(resources::acquire(invocation.request.session_id, paths).await)
+            };
+            match await_preparation_operation(acquire, &cancellation, invocation.deadline).await {
+                Ok(lease) => preparation.resource_lease = lease?,
+                Err(stop) => invocation.pre_execution_stop = Some(stop),
+            }
+        }
+        let resource_wait_ms = preparation
+            .resource_lease
+            .as_ref()
+            .map(resources::ResourceLease::wait_ms);
         invocation.preparation = Some(preparation);
-        self.invoke_prepared(invocation, cancellation, progress)
-            .await
+        let mut report = self
+            .invoke_prepared(invocation, cancellation, progress)
+            .await?;
+        if let Some(wait_ms) = resource_wait_ms
+            && let Some(facts) = report.envelope.structured_facts.as_object_mut()
+        {
+            facts.insert("resource_wait_ms".into(), json!(wait_ms));
+        }
+        Ok(report)
     }
 
     /// Execute a caller-declared verification command without shell parsing.
@@ -959,10 +1198,44 @@ impl ToolRuntime {
     /// workspace, but it does not require model-tool approval.
     pub async fn execute_verifier(
         &self,
-        request: VerifierExecutionRequest,
+        mut request: VerifierExecutionRequest,
         cancellation: CancellationToken,
     ) -> Result<ToolExecutionReport, ToolError> {
-        let preparation = self.prepare_verifier_side_effect(&request).await?;
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_millis(request.timeout_ms.clamp(1, MAX_VERIFIER_TIMEOUT_MS));
+        let preparation = match await_preparation_operation(
+            self.prepare_verifier_side_effect(&request),
+            &cancellation,
+            Some(deadline),
+        )
+        .await
+        {
+            Ok(preparation) => preparation?,
+            Err(stop) => {
+                let tool_request = request.as_tool_request();
+                let policy = execution_policy(
+                    &tool_request,
+                    PolicyDecision::Allow,
+                    "caller-declared verifier",
+                );
+                return Ok(match stop {
+                    ToolInvocationStop::Cancelled => self.cancelled_execution_report(
+                        tool_request,
+                        policy,
+                        "verifier cancelled during side-effect preparation",
+                    ),
+                    ToolInvocationStop::TimedOut => self.deadline_exceeded_report(
+                        tool_request,
+                        policy,
+                        "verifier side-effect preparation",
+                    ),
+                });
+            }
+        };
+        request.timeout_ms = deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .as_millis()
+            .max(1) as u64;
         self.execute_verifier_with_preparation(request, cancellation, preparation)
             .await
     }
@@ -982,11 +1255,17 @@ impl ToolRuntime {
             return Ok(SideEffectPreparation::default());
         }
         self.resolve_verifier_cwd(request)?;
+        let resource_lease = resources::acquire(
+            request.session_id,
+            vec![self.policy.workspace_root().to_path_buf()],
+        )
+        .await;
         let snapshot = workspace_scan::capture(self.policy.workspace_root()).await;
         Ok(SideEffectPreparation {
             before_images: snapshot.before_images(),
             complete: snapshot.is_complete(),
             workspace_snapshot: Some(snapshot),
+            resource_lease,
         })
     }
 
@@ -1016,6 +1295,7 @@ impl ToolRuntime {
         }
         let cwd = self.resolve_verifier_cwd(&request)?;
         let timeout_ms = request.timeout_ms.clamp(1, MAX_VERIFIER_TIMEOUT_MS);
+        let _resource_lease = preparation.resource_lease;
         let workspace_before = match preparation.workspace_snapshot {
             Some(snapshot) => snapshot,
             None => workspace_scan::capture(self.policy.workspace_root()).await,
@@ -1253,7 +1533,14 @@ impl ToolRuntime {
             {
                 delegation_policy(request)
             }
-            None if self.external_backend.is_some() => {
+            None if request.tool_name == "background_task" && self.background.is_some() => {
+                execution_policy(
+                    request,
+                    PolicyDecision::Allow,
+                    "session-scoped background task observation or cancellation",
+                )
+            }
+            None if self.external_backends.contains_key(&request.tool_name) => {
                 let mut policy = execution_policy(
                     request,
                     PolicyDecision::Ask,
@@ -1303,6 +1590,8 @@ impl ToolRuntime {
         self.registry
             .validate_tool_arguments(contract, &request.arguments)?;
 
+        let paths = self.operation_resource_paths(request).await?;
+        let resource_lease = resources::acquire(request.session_id, paths).await;
         match BuiltinTool::from_name(&request.tool_name) {
             Some(BuiltinTool::WriteFile) => {
                 let path = string_arg(&request.arguments, "path")?;
@@ -1311,6 +1600,7 @@ impl ToolRuntime {
                     before_images: vec![read_optional_file(&resolved_path).await?],
                     complete: true,
                     workspace_snapshot: None,
+                    resource_lease,
                 })
             }
             Some(BuiltinTool::EditFile) => {
@@ -1326,6 +1616,7 @@ impl ToolRuntime {
                     before_images: vec![before_image],
                     complete: true,
                     workspace_snapshot: None,
+                    resource_lease,
                 })
             }
             Some(BuiltinTool::ApplyPatch) => {
@@ -1348,6 +1639,7 @@ impl ToolRuntime {
                     before_images,
                     complete: true,
                     workspace_snapshot: None,
+                    resource_lease,
                 })
             }
             Some(BuiltinTool::Shell) => {
@@ -1356,6 +1648,7 @@ impl ToolRuntime {
                         before_images: Vec::new(),
                         complete: true,
                         workspace_snapshot: None,
+                        resource_lease,
                     });
                 }
                 let snapshot = workspace_scan::capture(self.policy.workspace_root()).await;
@@ -1363,6 +1656,7 @@ impl ToolRuntime {
                     before_images: snapshot.before_images(),
                     complete: snapshot.is_complete(),
                     workspace_snapshot: Some(snapshot),
+                    resource_lease,
                 })
             }
             Some(BuiltinTool::Subagent | BuiltinTool::DelegateTask) => {
@@ -1371,6 +1665,7 @@ impl ToolRuntime {
                     before_images: snapshot.before_images(),
                     complete: snapshot.is_complete(),
                     workspace_snapshot: Some(snapshot),
+                    resource_lease,
                 })
             }
             None if matches!(
@@ -1384,7 +1679,25 @@ impl ToolRuntime {
                 before_images: Vec::new(),
                 complete: true,
                 workspace_snapshot: None,
+                resource_lease,
             }),
+        }
+    }
+
+    async fn operation_resource_paths(
+        &self,
+        request: &ToolRequest,
+    ) -> Result<Vec<PathBuf>, ToolError> {
+        match BuiltinTool::from_name(&request.tool_name) {
+            Some(BuiltinTool::WriteFile | BuiltinTool::EditFile | BuiltinTool::ApplyPatch) => {
+                self.resolve_keyed_write_paths(request).await
+            }
+            Some(BuiltinTool::Shell)
+                if !shell_request_is_strictly_read_only(&request.arguments) =>
+            {
+                Ok(vec![self.policy.workspace_root().to_path_buf()])
+            }
+            _ => Ok(Vec::new()),
         }
     }
 
@@ -1476,6 +1789,7 @@ impl ToolRuntime {
                     before_images,
                     complete: true,
                     workspace_snapshot: None,
+                    resource_lease: None,
                 },
             ),
             cancellation,
@@ -1510,6 +1824,7 @@ impl ToolRuntime {
         let SideEffectPreparation {
             before_images,
             workspace_snapshot,
+            resource_lease,
             ..
         } = preparation;
         validate_checkpoint_content_limit(&before_images)?;
@@ -1635,7 +1950,11 @@ impl ToolRuntime {
                             request,
                             policy,
                             execution_cancellation.clone(),
-                            workspace_snapshot,
+                            SideEffectPreparation {
+                                workspace_snapshot,
+                                resource_lease: resource_lease.clone(),
+                                ..SideEffectPreparation::default()
+                            },
                             started_at,
                             &mut progress,
                         )
@@ -1704,11 +2023,19 @@ impl ToolRuntime {
                         ToolOperationOutcome::Completed(result) => result,
                         ToolOperationOutcome::Cancelled => {
                             execution_cancellation.cancel();
-                            Ok(cancelled_report_with_policy(
+                            let browser_outcome_unknown =
+                                browser::is_browser_tool(&deadline_request.tool_name);
+                            let mut report = cancelled_report_with_policy(
                                 deadline_request,
                                 deadline_policy,
                                 "tool call cancelled during execution",
-                            ))
+                            );
+                            if browser_outcome_unknown {
+                                report.envelope.structured_facts["outcome_unknown"] = json!(true);
+                                report.envelope.structured_facts["workspace_changes_known"] =
+                                    json!(false);
+                            }
+                            Ok(report)
                         }
                         ToolOperationOutcome::TimedOut(completed) => {
                             execution_cancellation.cancel();
@@ -2085,6 +2412,8 @@ impl ToolRuntime {
         policy: PolicyEvaluation,
         stage: &str,
     ) -> ToolExecutionReport {
+        let browser_outcome_unknown =
+            stage == "execution" && browser::is_browser_tool(&request.tool_name);
         let workspace_changes_known = self
             .registry
             .contract(&request.tool_name)
@@ -2102,6 +2431,9 @@ impl ToolRuntime {
             Vec::new(),
             policy,
         );
+        if browser_outcome_unknown {
+            result.envelope.structured_facts["outcome_unknown"] = json!(true);
+        }
         match BuiltinTool::from_name(&result.envelope.tool_name) {
             Some(BuiltinTool::Subagent | BuiltinTool::DelegateTask) => {
                 result.envelope.risk = "delegated_agent".to_owned()
@@ -3011,7 +3343,7 @@ impl ToolRuntime {
         request: ToolRequest,
         policy: PolicyEvaluation,
         cancellation: CancellationToken,
-        workspace_before: Option<workspace_scan::WorkspaceSnapshot>,
+        preparation: SideEffectPreparation,
         started_at: Instant,
         progress: &mut Option<&mut (dyn FnMut(ToolProgress) + Send)>,
     ) -> Result<ToolExecutionReport, ToolError> {
@@ -3056,7 +3388,7 @@ impl ToolRuntime {
         let baseline = if strictly_read_only {
             workspace_scan::WorkspaceSnapshot::default()
         } else {
-            match workspace_before {
+            match preparation.workspace_snapshot {
                 Some(snapshot) => snapshot,
                 None => workspace_scan::capture(self.policy.workspace_root()).await,
             }
@@ -3073,9 +3405,9 @@ impl ToolRuntime {
             })
             .min(max_poll_wait_ms());
         let process_id = format!("proc-{}", request.tool_call_id);
-        let mut snapshot = self
+        let Some(mut snapshot) = self
             .process_supervisor
-            .start_with_input(
+            .start_with_input_and_lease(
                 ProcessStartRequest {
                     process_id: process_id.clone(),
                     session_id: request.session_id,
@@ -3099,8 +3431,18 @@ impl ToolRuntime {
                 command_line.stdin.as_deref(),
                 background || tty,
                 tty,
+                preparation.resource_lease,
             )
-            .await?;
+            .await?
+        else {
+            let mut report =
+                cancelled_report_with_policy(request, policy, "process cancelled before dispatch");
+            report.envelope.structured_facts = json!({
+                "cancelled":true, "process_state":"cancelled", "terminal":true,
+                "dispatched":false, "workspace_changes_known":true, "workspace_change_count":0,
+            });
+            return Ok(report);
+        };
         let launch_ms = elapsed_millis(launch_started);
         let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms);
         let mut observed_cursor = 0;
@@ -3178,7 +3520,17 @@ impl ToolRuntime {
             .as_ref()
             .ok_or_else(|| ToolError::UnknownTool("subagent".to_owned()))?;
         let output = backend
-            .delegate(&request, cancellation.child_token())
+            .delegate_managed(
+                &request,
+                cancellation.child_token(),
+                self.background
+                    .as_ref()
+                    .map(|binding| DelegationBackgroundContext {
+                        supervisor: binding.supervisor.clone(),
+                        observer: binding.observer.clone(),
+                        policy: policy.clone(),
+                    }),
+            )
             .await?;
         let action = request
             .arguments
@@ -3263,7 +3615,7 @@ impl ToolRuntime {
         &self,
         session_id: SessionId,
     ) -> Result<Vec<DelegationNotification>, ToolError> {
-        match &self.delegation_backend {
+        match &self.delegation_inbox {
             Some(backend) => backend.notifications(session_id).await,
             None => Ok(Vec::new()),
         }
@@ -3536,49 +3888,117 @@ impl ToolRuntime {
 
     async fn execute_external(
         &self,
-        request: ToolRequest,
+        mut request: ToolRequest,
         policy: PolicyEvaluation,
         cancellation: CancellationToken,
     ) -> Result<ToolExecutionReport, ToolError> {
+        if request.tool_name == "browser_config"
+            && request.arguments.get("browser_backend").is_some()
+            && self.background.as_ref().is_some_and(|binding| {
+                binding
+                    .supervisor
+                    .list(request.session_id)
+                    .iter()
+                    .any(|job| job.tool_name == "browser_run" && job.pending)
+            })
+        {
+            return Ok(external_report(
+                request,
+                ToolResultStatus::Error,
+                "Browser selection is busy: wait for or cancel queued/running browser work before changing browser_backend",
+                json!({"code":"browser_busy","automatic_retry":false,"selection_changed":false}),
+                String::new(),
+                policy,
+            ));
+        }
+        if request.tool_name == "browser_run"
+            && let Some(arguments) = request.arguments.as_object_mut()
+        {
+            arguments.remove("background");
+        }
+        let browser_call = browser::is_browser_tool(&request.tool_name);
+        let browser_permit = if browser_call {
+            Some(tokio::select! {
+                biased;
+                () = cancellation.cancelled() => {
+                    return Ok(cancelled_report_with_policy(request, policy, "browser call cancelled before resource admission"));
+                },
+                permit = BROWSER_EXECUTION_PERMITS.acquire() => permit.map_err(|_| ToolError::Execution("browser dispatcher stopped".into()))?,
+            })
+        } else {
+            None
+        };
         let backend = self
-            .external_backend
-            .as_ref()
-            .ok_or_else(|| ToolError::UnknownTool(request.tool_name.clone()))?;
-        let call = backend.call(&request, cancellation.clone());
-        let result = tokio::select! {
-            () = cancellation.cancelled() => {
-                return Ok(external_report(
-                    request,
-                    ToolResultStatus::Cancelled,
-                    "external tool call cancelled",
-                    json!({"cancelled": true, "workspace_changes_known": false}),
-                    String::new(),
-                    policy,
-                ));
+            .external_backends
+            .get(&request.tool_name)
+            .ok_or_else(|| ToolError::UnknownTool(request.tool_name.clone()))?
+            .clone();
+        let timeout = backend.timeout(&request);
+        let backend_cancellation = cancellation.child_token();
+        let backend_request = request.clone();
+        let operation = async move {
+            let _browser_permit = browser_permit;
+            let call = backend.call(&backend_request, backend_cancellation.clone());
+            tokio::pin!(call);
+            tokio::select! {
+                () = cancellation.cancelled() => {
+                    backend_cancellation.cancel();
+                    let _ = tokio::time::timeout(Duration::from_secs(2), &mut call).await;
+                    ExternalCallOutcome::Cancelled
+                }
+                result = tokio::time::timeout(timeout, &mut call) => match result {
+                    Ok(Err(_)) if backend_cancellation.is_cancelled() => ExternalCallOutcome::Cancelled,
+                    Ok(result) => ExternalCallOutcome::Completed(result),
+                    Err(_) => {
+                        backend_cancellation.cancel();
+                        let _ = tokio::time::timeout(Duration::from_secs(2), &mut call).await;
+                        ExternalCallOutcome::TimedOut
+                    }
+                },
             }
-            result = tokio::time::timeout(
-                Duration::from_millis(EXTERNAL_TOOL_TIMEOUT_MS),
-                call,
-            ) => result,
+        };
+        let result = if browser_call {
+            // A caller's deadline can stop waiting before browser cleanup completes.
+            // The independently owned operation retains its resource permit through
+            // that cleanup, so another call cannot enter a still-running launcher.
+            match tokio::spawn(operation).await {
+                Ok(result) => result,
+                Err(_) => {
+                    return Ok(external_report(
+                        request,
+                        ToolResultStatus::Error,
+                        "browser execution stopped unexpectedly",
+                        json!({"outcome_unknown":true,"workspace_changes_known":false,"automatic_retry":false}),
+                        String::new(),
+                        policy,
+                    ));
+                }
+            }
+        } else {
+            operation.await
         };
 
         match result {
-            Ok(Ok(output)) => Ok(external_report(
-                request,
-                if output.is_error {
-                    ToolResultStatus::Error
-                } else {
-                    ToolResultStatus::Ok
-                },
-                &output.summary,
-                mark_workspace_changes_unknown(output.structured_facts),
-                output.content,
-                policy,
-            )),
-            Ok(Err(error)) => {
+            ExternalCallOutcome::Completed(Ok(output)) => {
+                let mut report = external_report(
+                    request.clone(),
+                    if output.is_error {
+                        ToolResultStatus::Error
+                    } else {
+                        ToolResultStatus::Ok
+                    },
+                    &output.summary,
+                    mark_workspace_changes_unknown(output.structured_facts),
+                    output.content,
+                    policy,
+                );
+                append_external_images(&mut report, &request, output.images)?;
+                Ok(report)
+            }
+            ExternalCallOutcome::Completed(Err(error)) => {
                 let error = bounded_text(&error.to_string(), MAX_TOOL_ERROR_CHARS);
                 Ok(external_report(
-                    request,
+                    request.clone(),
                     ToolResultStatus::Error,
                     "external tool execution failed",
                     json!({"error": error, "workspace_changes_known": false}),
@@ -3586,13 +4006,22 @@ impl ToolRuntime {
                     policy,
                 ))
             }
-            Err(_) => Ok(external_report(
+            ExternalCallOutcome::Cancelled => Ok(external_report(
                 request,
+                ToolResultStatus::Cancelled,
+                "external tool call cancelled",
+                json!({"cancelled":true,"outcome_unknown":true,"workspace_changes_known":false}),
+                String::new(),
+                policy,
+            )),
+            ExternalCallOutcome::TimedOut => Ok(external_report(
+                request.clone(),
                 ToolResultStatus::Timeout,
                 "external tool call timed out",
                 json!({
                     "timed_out": true,
-                    "timeout_ms": EXTERNAL_TOOL_TIMEOUT_MS,
+                    "timeout_ms": timeout.as_millis(),
+                    "outcome_unknown": true,
                     "workspace_changes_known": false
                 }),
                 String::new(),
@@ -4361,6 +4790,11 @@ fn external_report(
     raw_output: String,
     policy_evaluation: PolicyEvaluation,
 ) -> ToolExecutionReport {
+    let risk = if request.tool_name.starts_with("browser_") {
+        "external_browser_tool"
+    } else {
+        "external_mcp_tool"
+    };
     let mut report = report(
         request,
         status,
@@ -4370,10 +4804,47 @@ fn external_report(
         Vec::new(),
         policy_evaluation,
     );
-    report.envelope.risk = "external_mcp_tool".to_owned();
+    report.envelope.risk = risk.to_owned();
     report.envelope.verification_hint =
-        Some("treat external MCP output as untrusted evidence".to_owned());
+        Some("treat external output as untrusted evidence".to_owned());
     report
+}
+
+fn append_external_images(
+    report: &mut ToolExecutionReport,
+    request: &ToolRequest,
+    images: Vec<ExternalToolImage>,
+) -> Result<(), ToolError> {
+    if images.len() > 2
+        || images.iter().map(|image| image.bytes.len()).sum::<usize>() > 4 * 1024 * 1024
+    {
+        return Err(ToolError::Execution(
+            "tool images exceed 2 images / 4 MiB".to_owned(),
+        ));
+    }
+    for image in images {
+        let valid = match image.mime_type.as_str() {
+            "image/png" => image.bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+            "image/jpeg" => image.bytes.starts_with(b"\xff\xd8\xff"),
+            _ => false,
+        };
+        if !valid {
+            return Err(ToolError::Execution("invalid tool image format".to_owned()));
+        }
+        let mut artifact = artifact_for(request, "", RedactionStatus::Raw);
+        artifact.artifact_type = format!("tool_image:{}", image.mime_type);
+        artifact.checksum = checksum(&image.bytes);
+        artifact.size_bytes = image.bytes.len() as u64;
+        for evidence in &mut report.evidence {
+            evidence.artifact_refs.push(artifact.artifact_id);
+        }
+        report.artifact_contents.push(ArtifactContent {
+            artifact_id: artifact.artifact_id,
+            bytes: image.bytes,
+        });
+        report.artifacts.push(artifact);
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -5226,14 +5697,17 @@ pub fn model_visible_tool_result_with_limit(
                 false,
             ),
             "subagent" => {
-                let keep_excerpt = excerpt.as_deref().is_some_and(|value| value != summary);
-                (
-                    project_subagent_model_facts(&facts),
-                    summary,
-                    excerpt.map(|value| bounded_text(&value, MAX_MODEL_TOOL_OUTPUT_CHARS)),
-                    true,
-                    keep_excerpt,
-                )
+                let keep_excerpt = excerpt.as_deref().is_some_and(|value| !value.is_empty());
+                let mut facts = project_subagent_model_facts(&facts);
+                if let Some(body) = envelope.model_visible_excerpt.as_deref()
+                    && facts.get("child_result_total_chars").is_none()
+                {
+                    facts["child_result_total_chars"] = json!(body.chars().count());
+                }
+                (facts, summary, excerpt, true, keep_excerpt)
+            }
+            name if browser::is_browser_tool(name) => {
+                (browser_model_facts(&facts), summary, excerpt, true, true)
             }
             _ => (
                 project_model_tool_value(&facts, 0),
@@ -5283,6 +5757,9 @@ pub fn model_visible_tool_result_with_limit(
         if keep_excerpt && let Some(excerpt) = excerpt.filter(|value| !value.is_empty()) {
             object.insert("model_visible_excerpt".to_owned(), Value::String(excerpt));
         }
+    }
+    if envelope.tool_name == "subagent" {
+        return subagent_projection::serialize(projection, max_bytes);
     }
     // 为进程最小重读页保留正文空间；否则新增诊断字段挤占 256 字节页，
     // 每次投影都回退到同一 cursor，形成永远无法前进的重读循环。
@@ -5338,7 +5815,7 @@ pub fn model_visible_tool_result_with_limit(
 fn model_output_truncation_key(tool_name: &str) -> Option<&'static str> {
     match tool_name {
         "read_file" | "subagent" => Some("model_visible_truncated"),
-        "shell" | "shell_session" => Some("output_truncated"),
+        "shell" | "shell_session" | "browser_run" | "browser_help" => Some("output_truncated"),
         _ => None,
     }
 }
@@ -5444,6 +5921,15 @@ fn model_process_list_facts(facts: &Value) -> Value {
 }
 
 const PROCESS_MODEL_FACTS: &[&str] = &[
+    "background_task_id",
+    "background",
+    "background_status",
+    "result_pending",
+    "outcome_unknown",
+    "automatic_retry",
+    "background_verification_output_incomplete",
+    "inline_truncated",
+    "full_result_artifact_ref",
     "process_id",
     "process_count",
     "running_count",
@@ -5483,6 +5969,58 @@ const PROCESS_MODEL_FACTS: &[&str] = &[
     "reason",
     "blocked",
 ];
+
+// Browser control state determines whether an action is allowed and which
+// backend owns it. Prioritize it before arbitrary page data at every projection
+// stage, including the initial field-count bound and compact/fallback budgets.
+const BROWSER_CONTROL_MODEL_FACTS: &[&str] = &[
+    "backend",
+    "phase",
+    "code",
+    "status",
+    "outcome_unknown",
+    "automatic_retry",
+    "requires_reload",
+    "waiting_for_user",
+    "browser_backend",
+    "resolved_backend",
+    "active_backend",
+    "next_backend",
+    "switch_pending",
+    "selection_scope",
+    "background_task_id",
+    "background_status",
+    "result_pending",
+    "terminal",
+    "space_id",
+    "default_page",
+    "output_truncated",
+    "inline_truncated",
+    "full_result_artifact_ref",
+    "error",
+    "reason",
+    "next_action",
+];
+
+fn browser_model_facts(value: &Value) -> Value {
+    let Some(source) = value.as_object() else {
+        return project_model_tool_value(value, 0);
+    };
+    let mut projected = selected_model_facts(value, BROWSER_CONTROL_MODEL_FACTS);
+    let object = projected.as_object_mut().expect("selected object facts");
+    for (key, value) in source {
+        if object.len() >= MAX_MODEL_TOOL_RESULT_ITEMS {
+            break;
+        }
+        if !object.contains_key(key) {
+            object.insert(bounded_text(key, 128), project_model_tool_value(value, 1));
+        }
+    }
+    if object.len() < source.len() {
+        object.insert("_golutra_truncated".into(), json!(true));
+    }
+    projected
+}
 
 fn model_tool_result_base(tool_name: &str, status: ToolResultStatus) -> Value {
     json!({
@@ -5664,6 +6202,25 @@ fn project_subagent_model_facts(value: &Value) -> Value {
             || matches!(
                 key.as_str(),
                 "completed"
+                    | "available"
+                    | "scope"
+                    | "children"
+                    | "name"
+                    | "next_cursor"
+                    | "message_id"
+                    | "message_queued"
+                    | "duplicate"
+                    | "delivery_mode"
+                    | "wait_interrupted"
+                    | "needs_parent_input"
+                    | "waiting_for_user"
+                    | "question_id"
+                    | "questions"
+                    | "background"
+                    | "background_task_id"
+                    | "result_pending"
+                    | "outcome_unknown"
+                    | "automatic_retry"
                     | "success"
                     | "workspace_changes_known"
                     | "workspace_change_count"
@@ -5700,36 +6257,86 @@ fn project_subagent_batch(value: &Value) -> Value {
     };
     // 批量结果先去掉每个子任务重复的治理元数据，再分配内容预算；
     // 否则十个很短的答案也会因外壳过大被全部压成状态，迫使模型逐一重复查询。
-    let mut projected = results.iter().take(MAX_MODEL_TOOL_RESULT_ITEMS).map(|result| {
-        let source = &result["facts"];
-        let mut facts = serde_json::Map::new();
-        for key in ["child_task_id", "child_status", "child_terminal", "completed",
-            "child_cancel_requested", "child_verification_status", "child_verification_issues",
-            "child_diagnostic", "child_findings_available", "child_result_has_more",
-            "child_result_next_offset", "model_visible_truncated", "child_workspace_path",
-            "child_isolation", "error", "reason", "cancelled", "timed_out", "blocked"] {
-            if let Some(value) = source.get(key)
-                && !value.is_null() && !value.as_array().is_some_and(Vec::is_empty)
-            {
-                facts.insert(key.to_owned(), project_model_tool_value(value, 0));
+    let mut projected = results
+        .iter()
+        .take(MAX_MODEL_TOOL_RESULT_ITEMS)
+        .map(|result| {
+            let source = &result["facts"];
+            let mut facts = serde_json::Map::new();
+            for key in [
+                "child_task_id",
+                "child_status",
+                "child_terminal",
+                "completed",
+                "child_cancel_requested",
+                "child_verification_status",
+                "child_acceptance_status",
+                "child_acceptance_criteria",
+                "child_verification_issues",
+                "child_diagnostic",
+                "child_findings_available",
+                "child_result_has_more",
+                "child_result_next_offset",
+                "child_result_offset",
+                "child_result_total_chars",
+                "model_visible_truncated",
+                "child_workspace_path",
+                "child_isolation",
+                "needs_parent_input",
+                "waiting_for_user",
+                "question_id",
+                "questions",
+                "error",
+                "reason",
+                "cancelled",
+                "timed_out",
+                "blocked",
+            ] {
+                if let Some(value) = source.get(key)
+                    && !value.is_null()
+                    && !value.as_array().is_some_and(Vec::is_empty)
+                {
+                    facts.insert(key.to_owned(), project_model_tool_value(value, 0));
+                }
             }
-        }
-        let content = result.get("content").and_then(Value::as_str).unwrap_or_default();
-        if content.chars().take(MAX_MODEL_TOOL_RESULT_FACT_STRING_CHARS + 1).count()
-            > MAX_MODEL_TOOL_RESULT_FACT_STRING_CHARS {
-            facts.insert("model_visible_truncated".to_owned(), Value::Bool(true));
-        }
-        let mut item = json!({"child_session_id":result.get("child_session_id"),
-            "content":bounded_text(content, MAX_MODEL_TOOL_RESULT_FACT_STRING_CHARS), "facts":facts});
-        if let Some(error) = result.get("error") {
-            item["error"] = project_model_tool_value(error, 0);
-        }
-        if (content.is_empty() || source["completed"] != true)
-            && let Some(summary) = result.get("summary").and_then(Value::as_str) {
-            item["summary"] = Value::String(bounded_text(summary, MAX_MODEL_TOOL_RESULT_SUMMARY_CHARS));
-        }
-        item
-    }).collect::<Vec<_>>();
+            let content = result
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let total_chars = content.chars().count();
+            let mut facts = Value::Object(facts);
+            if facts.get("child_result_total_chars").is_none() {
+                facts["child_result_total_chars"] = json!(
+                    total_chars + facts["child_result_offset"].as_u64().unwrap_or(0) as usize
+                );
+            }
+            let content: String = content
+                .chars()
+                .take(MAX_MODEL_TOOL_RESULT_FACT_STRING_CHARS)
+                .collect();
+            if total_chars > MAX_MODEL_TOOL_RESULT_FACT_STRING_CHARS {
+                facts["model_visible_truncated"] = json!(true);
+                facts["child_result_has_more"] = json!(true);
+                facts["child_result_next_offset"] = json!(
+                    facts["child_result_offset"].as_u64().unwrap_or(0)
+                        + MAX_MODEL_TOOL_RESULT_FACT_STRING_CHARS as u64
+                );
+            }
+            subagent_projection::describe(&mut facts, &content);
+            let mut item = json!({"child_session_id":result.get("child_session_id"),
+            "content":content, "facts":facts});
+            if let Some(error) = result.get("error") {
+                item["error"] = project_model_tool_value(error, 0);
+            }
+            if (content.is_empty() || source["completed"] != true)
+                && let Some(summary) = result.get("summary").and_then(Value::as_str)
+            {
+                item["summary"] =
+                    Value::String(bounded_text(summary, MAX_MODEL_TOOL_RESULT_SUMMARY_CHARS));
+            }
+            item
+        })
+        .collect::<Vec<_>>();
     if results.len() > MAX_MODEL_TOOL_RESULT_ITEMS {
         projected.push(
             json!({"omitted_results":results.len()-MAX_MODEL_TOOL_RESULT_ITEMS,
@@ -5809,10 +6416,19 @@ fn serialize_model_tool_projection(
     let mut fallback = model_tool_result_base(tool_name, status);
     fallback["structured_facts"] = minimal_model_tool_facts(tool_name, &original_facts);
     if keep_summary {
-        fallback["summary"] = Value::String(bounded_text_bytes(
-            summary,
-            MAX_MODEL_TOOL_RESULT_SUMMARY_CHARS.min(max_bytes.saturating_sub(256)),
-        ));
+        // Budget the diagnostic after the control facts, including JSON escaping.
+        // A long error message must not force an otherwise fitting set of facts
+        // into the bare-status fallback below.
+        fallback["summary"] = json!("");
+        let budget = max_bytes.saturating_sub(serialized_value_len(&fallback));
+        let mut summary =
+            bounded_text_bytes(summary, budget.min(MAX_MODEL_TOOL_RESULT_SUMMARY_CHARS));
+        fallback["summary"] = json!(summary);
+        let overflow = serialized_value_len(&fallback).saturating_sub(max_bytes);
+        if overflow > 0 {
+            summary = bounded_text_bytes(&summary, summary.len().saturating_sub(overflow));
+            fallback["summary"] = json!(summary);
+        }
     }
     let serialized =
         serde_json::to_string(&fallback).unwrap_or_else(|_| "{\"status\":\"error\"}".to_owned());
@@ -5858,8 +6474,22 @@ fn model_fact_priority(tool_name: &str) -> &'static [&'static str] {
         "read_file" => READ_FILE_MODEL_FACTS,
         "write_file" | "edit_file" | "apply_patch" => MUTATION_MODEL_FACTS,
         "shell" | "shell_session" => PROCESS_MODEL_FACTS,
+        name if browser::is_browser_tool(name) => BROWSER_CONTROL_MODEL_FACTS,
         "web_search" => &["error", "reason", "query", "result_count", "cached"],
         "subagent" => &[
+            "needs_parent_input",
+            "waiting_for_user",
+            "question_id",
+            "questions",
+            "children",
+            "next_cursor",
+            "message_queued",
+            "message_id",
+            "delivery_mode",
+            "wait_interrupted",
+            "background",
+            "background_task_id",
+            "result_pending",
             "child_pending_ids",
             "child_results",
             "child_terminal",
@@ -5870,6 +6500,8 @@ fn model_fact_priority(tool_name: &str) -> &'static [&'static str] {
             "model_visible_truncated",
             "child_session_id",
             "child_verification_status",
+            "child_acceptance_status",
+            "child_acceptance_criteria",
             "child_verification_issues",
             "child_diagnostic",
             "child_findings_available",
@@ -5933,6 +6565,14 @@ fn model_fact_mandatory(tool_name: &str) -> &'static [&'static str] {
             "blocked",
         ],
         "shell" | "shell_session" => &[
+            "background_task_id",
+            "background_status",
+            "result_pending",
+            "outcome_unknown",
+            "automatic_retry",
+            "background_verification_output_incomplete",
+            "inline_truncated",
+            "full_result_artifact_ref",
             "processes",
             "has_more",
             "next_offset",
@@ -5952,8 +6592,22 @@ fn model_fact_mandatory(tool_name: &str) -> &'static [&'static str] {
             "reason",
             "blocked",
         ],
+        name if browser::is_browser_tool(name) => BROWSER_CONTROL_MODEL_FACTS,
         "web_search" => &["error", "reason", "query", "result_count", "cached"],
         "subagent" => &[
+            "needs_parent_input",
+            "waiting_for_user",
+            "question_id",
+            "questions",
+            "children",
+            "next_cursor",
+            "message_queued",
+            "message_id",
+            "delivery_mode",
+            "wait_interrupted",
+            "background",
+            "background_task_id",
+            "result_pending",
             "child_pending_ids",
             "child_results",
             "child_terminal",
@@ -5964,6 +6618,7 @@ fn model_fact_mandatory(tool_name: &str) -> &'static [&'static str] {
             "model_visible_truncated",
             "child_session_id",
             "child_verification_status",
+            "child_acceptance_status",
             "child_findings_available",
             "wait_expired",
             "input_accepted",

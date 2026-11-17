@@ -2,6 +2,48 @@ use super::*;
 use golutra_agent_core::{TaskId, ToolResultStatus};
 
 #[tokio::test]
+async fn subagent_wait_is_interrupted_by_input_without_cancelling_child() {
+    let host = RuntimeHost::in_memory().await.unwrap();
+    let (task, handle, _control) =
+        crate::tests::subagent_integration_tests::parent_fixture(&host).await;
+    let (child, operation) = operation(&host, task.session_id).await;
+    handle
+        .append_turn(golutra_agent_runtime::PendingAgentTurn {
+            command_id: CommandId::new(),
+            turn_id: golutra_agent_core::TurnId::new(),
+            content: "new instructions".into(),
+            task_contract: None,
+            output_schema: None,
+            external_verifiers: vec![],
+            max_elapsed_ms: None,
+            defer_external_verification: false,
+            external_verifiers_require_os_sandbox: false,
+            allow_network: false,
+            yolo: true,
+            steer: true,
+        })
+        .await
+        .unwrap();
+    let backend = RuntimeTaskDelegationBackend::new(Arc::downgrade(&host));
+    let request = request(
+        task.session_id,
+        json!({"action":"wait","child_session_id":child,"wait_ms":60000}),
+    );
+    let output = timeout(
+        Duration::from_secs(1),
+        backend.delegate(&request, CancellationToken::new()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(output.structured_facts["wait_interrupted"], "input");
+    assert!(!operation.cancellation().is_cancelled());
+    operation.force_stop();
+    host.clear_task_control(task.session_id, task.task_id).await;
+    host.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn child_wait_ignores_foreign_control_and_own_execution_noise() {
     let child = SessionId::new();
     let (sender, mut events) = tokio::sync::broadcast::channel(16);

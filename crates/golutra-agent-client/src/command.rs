@@ -200,6 +200,15 @@ impl RuntimeHost {
         self: Arc<Self>,
         command: SessionCommand,
     ) -> Result<CommandAck, ClientError> {
+        // Keep callers and recursive delegated admission off the large dispatch
+        // future's stack frame. The journal and command lock remain inside it.
+        Box::pin(self.handle_command_inner(command)).await
+    }
+
+    async fn handle_command_inner(
+        self: Arc<Self>,
+        command: SessionCommand,
+    ) -> Result<CommandAck, ClientError> {
         let idempotency_key = command.idempotency_key.trim().to_owned();
         if idempotency_key.is_empty() {
             return Ok(CommandAck {
@@ -375,13 +384,23 @@ impl RuntimeHost {
                         .await?
                 }
                 SessionCommandKind::Prompt => {
-                    self.clone().handle_prompt(session_id, command).await?
+                    if let Some(expected)=command.payload.get("expected_task_id") {
+                        let expected=expected.as_str().and_then(|id|id.parse::<TaskId>().ok());
+                        let current=self.storage.repositories.projections.state(session_id,None).await?.active_task_id;
+                        if expected.is_none() || expected!=current {
+                            return Ok(CommandAck {command_id,accepted:false,reason:Some("execution changed; stale input was not delivered".into())});
+                        }
+                    }
+                    Box::pin(self.clone().handle_prompt(session_id, command)).await?
                 }
                 SessionCommandKind::UpdateQueuedTurn => {
                     self.handle_update_queued_turn(session_id, command).await?
                 }
                 SessionCommandKind::CancelQueuedTurn => {
                     self.handle_cancel_queued_turn(session_id, command).await?
+                }
+                SessionCommandKind::Abort if command.payload.get("child_session_id").is_some() => {
+                    Box::pin(delegation::cancel_from_parent_command(&self,session_id,&command)).await?
                 }
                 SessionCommandKind::Abort => {
                     self.handle_lane_command(session_id, &command, "abort")
@@ -434,7 +453,10 @@ impl RuntimeHost {
                         .await?
                 }
                 SessionCommandKind::RunRegression | SessionCommandKind::RunRegressionCampaign => {
-                    self.handle_regression_command(session_id, command).await?
+                    // A regression dispatches isolated child commands while
+                    // this command remains on the stack. Keep that branch's
+                    // large state machine outside the common dispatcher.
+                    Box::pin(self.handle_regression_command(session_id, command)).await?
                 }
                 SessionCommandKind::Replay => {
                     Box::pin(self.handle_replay_command(session_id, command)).await?
@@ -901,6 +923,19 @@ impl RuntimeHost {
                                     );
                                 match control.execution.reserve_configured_turn(configured_turn) {
                                     Ok(reservation) => {
+                                        let results = self
+                                            .storage
+                                            .store
+                                            .background()
+                                            .pending_results(
+                                                self.workspace_id,
+                                                session_id,
+                                                golutra_agent_core::MAX_BACKGROUND_PENDING_RESULTS,
+                                            )
+                                            .await?;
+                                        control.execution.enqueue_background_results(
+                                            results, golutra_agent_runtime::BackgroundDeliveryMode::Passive,
+                                        ).map_err(|error| ClientError::TaskExecution(error.to_string()))?;
                                         let transition =
                                             self.execution.lane_manager.lock().await.queue_turn(
                                                 session_id,
@@ -1575,6 +1610,22 @@ impl RuntimeHost {
             .await
             .get(&session_id)
             .cloned();
+        if let Some(expected) = command.payload.get("expected_task_id") {
+            let expected = expected
+                .as_str()
+                .and_then(|value| value.parse::<TaskId>().ok());
+            let current = match &task_control {
+                Some(control) => Some(control.task_id),
+                None => self.persisted_active_task(session_id).await?,
+            };
+            if expected.is_none() || expected != current {
+                return Ok(CommandAck {
+                    command_id,
+                    accepted: false,
+                    reason: Some("task changed; refresh the subagent before controlling it".into()),
+                });
+            }
+        }
         let Some(task_control) = task_control else {
             let active_task_id = self.persisted_active_task(session_id).await?;
             if action == "abort"
@@ -1659,6 +1710,10 @@ impl RuntimeHost {
                 .await?;
                 match action {
                     "abort" => {
+                        self.suppress_background_continuation(session_id).await?;
+                        self.execution
+                            .background_supervisor
+                            .cancel_session(session_id);
                         if command
                             .payload
                             .get("cancel_children")
@@ -1675,7 +1730,10 @@ impl RuntimeHost {
                         }
                         task_control.execution.cancel();
                     }
-                    "pause" => task_control.execution.pause(),
+                    "pause" => {
+                        self.suppress_background_continuation(session_id).await?;
+                        task_control.execution.pause();
+                    }
                     "resume" => task_control.execution.resume(),
                     _ => unreachable!("lane action is constrained by caller"),
                 }

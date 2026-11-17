@@ -178,7 +178,8 @@ fn pending_validation(
     identity: &str,
 ) -> Option<ObjectiveValidationOutcome> {
     (report.envelope.status == ToolResultStatus::Ok
-        && report.envelope.structured_facts["process_state"] == "running")
+        && (report.envelope.structured_facts["process_state"] == "running"
+            || report.envelope.structured_facts["result_pending"] == true))
         .then(|| ObjectiveValidationOutcome {
             kind,
             identity: identity.to_owned(),
@@ -2080,6 +2081,9 @@ fn git_command_validates_result(parts: &[String]) -> bool {
 }
 
 fn test_report_executed_tests(report: &ToolExecutionReport) -> bool {
+    if report.envelope.structured_facts["background_verification_output_incomplete"] == true {
+        return false;
+    }
     let mut evidence = TestOutputEvidence::default();
     for artifact in &report.artifact_contents {
         for line in String::from_utf8_lossy(&artifact.bytes).lines() {

@@ -6,6 +6,51 @@ follow [Semantic Versioning](https://semver.org/) where applicable.
 
 ## [Unreleased]
 
+## [4.0.0] - 2026-11-17
+
+### Added
+
+- Browser automation through Ego's native SDK and Chrome's OpenCLI extension,
+  reusing the user's browser profile, with explicit connection and stop controls.
+- Automatic browser discovery (Ego first, then Chrome), session-level backend
+  selection, and consent-based Ego installation when neither browser is available.
+- Durable background batches, result inboxes, subagent registries and messages,
+  same-session continuation, and `/agents` controls.
+- Structured subagent assignments, restrictive child tool profiles, and resource,
+  queue and execution timing observations.
+
+### Changed
+
+- Attach completed background results to existing inference steps and prioritize
+  user input without adding a notification for every completed child.
+- Publish final answers after pending results and verification are reconciled;
+  retain child findings independently of public failure diagnostics.
+- Preserve short child answers when budgeting long batches and acknowledge only
+  complete observed findings, with explicit pagination and omitted-result facts.
+- Simplify `/connect` output and keep implementation diagnostics in details.
+- Include OpenCLI 2.0.3 with the npm launcher; require Node.js 20.18.1 or newer.
+
+### Fixed
+
+- Bind delegated-task authorization to the final assembled assignment text.
+- Keep natural-language acceptance criteria pending parent review instead of
+  forcing them through file-evidence matching and repeated correction loops.
+- Close background cancellation, message-attribution, process-reaping and OS-lock
+  lifetime races; preserve unfinished and uncertain outcomes during recovery.
+- Retain browser backend bindings for active tasks and separate Ego native
+  control from Chrome extension connections.
+
+### Compatibility and distribution
+
+- Align workspace crates, npm packages and SDK metadata at 4.0.0.
+- Upgrade exact supported data schemas 7 and 8 transactionally to schema 9.
+  Older readers cannot open the upgraded store; update other desktop or npm
+  runtimes sharing that home before continuing. Unsupported schemas are rejected.
+- Publish the npm launcher and six native Linux/macOS/Windows x64/arm64 packages
+  through the existing verified release workflow.
+- See [release notes](docs/releases/v4.0.0.md) and the
+  [implementation validation](docs/subagent-delivery-refactor-2026-11-17.md).
+
 ## [0.3.9] - 2026-10-12
 
 ### Fixed
@@ -352,7 +397,10 @@ This is the initial public development baseline. See the repository history
 and [architecture documentation](docs/ARCHITECTURE.md) for the implementation
 details and current compatibility boundaries.
 
-[unreleased]: https://github.com/golutra/golutra-agent/compare/v0.3.7...HEAD
+[unreleased]: https://github.com/golutra/golutra-agent/compare/v4.0.0...HEAD
+[4.0.0]: https://github.com/golutra/golutra-agent/compare/v0.3.9...v4.0.0
+[0.3.9]: https://github.com/golutra/golutra-agent/compare/v0.3.8...v0.3.9
+[0.3.8]: https://github.com/golutra/golutra-agent/compare/v0.3.7...v0.3.8
 [0.3.7]: https://github.com/golutra/golutra-agent/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/golutra/golutra-agent/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/golutra/golutra-agent/compare/v0.3.4...v0.3.5

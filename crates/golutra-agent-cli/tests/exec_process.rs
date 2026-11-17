@@ -1,29 +1,114 @@
 use std::{fs, path::Path, process::Stdio, time::Duration};
 
-use golutra_agent_client::{AppServerInfo, RuntimeTransport};
+use golutra_agent_client::{AppServerInfo, RuntimeClient, RuntimeTransport};
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use tempfile::tempdir;
 use tokio::{io::AsyncWriteExt, process::Command};
 
 #[tokio::test]
+async fn exec_provider_flags_override_project_then_global_without_changing_host_preferences() {
+    let home = tempdir().unwrap();
+    let workspace = tempdir().unwrap();
+    install_mock_provider(home.path());
+    let provider_path = home.path().join("provider.json");
+    let mut provider: Value = serde_json::from_slice(&fs::read(&provider_path).unwrap()).unwrap();
+    provider["profiles"][0]["generation_config"] =
+        json!({"reasoning_effort":"high", "max_tokens":4096});
+    fs::write(&provider_path, serde_json::to_vec(&provider).unwrap()).unwrap();
+    let original_provider = fs::read(&provider_path).unwrap();
+    fs::write(
+        home.path().join("runtime.json"),
+        r#"{"reasoning_effort":"medium"}"#,
+    )
+    .unwrap();
+    fs::create_dir(workspace.path().join(".golutra-agent")).unwrap();
+    let project_path = workspace.path().join(".golutra-agent/runtime.json");
+    fs::write(
+        &project_path,
+        r#"{"reasoning_effort":"low","model":"project-model","tool_profile":"full"}"#,
+    )
+    .unwrap();
+    let original_project = fs::read(&project_path).unwrap();
+    let (mut server, stderr) = start_app_server(home.path());
+    let (info, token, transport) =
+        wait_for_runtime(home.path(), workspace.path(), &mut server, stderr.path()).await;
+    for (flags, effort, model, profile) in [
+        (vec![], json!("low"), "project-model", "full"),
+        (
+            vec![
+                "--reasoning-effort",
+                "high",
+                "--model",
+                "flag-model",
+                "--tool-profile",
+                "coding",
+            ],
+            json!("high"),
+            "flag-model",
+            "coding",
+        ),
+        (
+            vec!["--reasoning-effort", "default"],
+            Value::Null,
+            "project-model",
+            "full",
+        ),
+    ] {
+        let mut args = vec!["exec", "--json"];
+        args.extend(flags);
+        args.push("Reply with a short acknowledgement.");
+        let output = run_cli(home.path(), workspace.path(), &info, &token, &args).await;
+        assert!(output.status.success(), "{output:?}");
+        let session = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|event| event["type"] == "thread.started")
+            .unwrap()["session_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let events = transport
+            .replay_events(golutra_agent_protocol::EventFilter {
+                session_id: session,
+                task_id: None,
+                after_sequence_no: None,
+            })
+            .await
+            .unwrap();
+        let task = events
+            .iter()
+            .find(|event| event["event_type"] == "task_created")
+            .unwrap();
+        let payload = &task["payload"]["payload"];
+        assert_eq!(
+            payload["provider_generation_config"]["reasoning_effort"],
+            effort
+        );
+        assert_eq!(payload["provider_generation_config"]["max_tokens"], 4096);
+        assert_eq!(payload["provider_model"], model);
+        assert_eq!(payload["tool_profile"], profile);
+        assert!(payload.get("provider_reasoning_effort").is_none());
+    }
+    assert_eq!(fs::read(&provider_path).unwrap(), original_provider);
+    assert_eq!(fs::read(&project_path).unwrap(), original_project);
+    server.kill().await.unwrap();
+}
+
+#[tokio::test]
 async fn exec_and_exec_resume_work_across_independent_processes() {
     let home = tempdir().expect("home");
     let workspace = tempdir().expect("workspace");
     install_mock_provider(home.path());
-    let address = reserve_address();
-    let mut app_server = Command::new(env!("CARGO_BIN_EXE_golutra-agent"))
-        .arg("app-server")
-        .arg("--addr")
-        .arg(address.to_string())
-        .env("GOLUTRA_AGENT_HOME", home.path())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("app server process");
-    let (info, token, transport) = wait_for_runtime(home.path(), workspace.path()).await;
+    let (mut app_server, stderr) = start_app_server(home.path());
+    let (info, token, transport) = wait_for_runtime(
+        home.path(),
+        workspace.path(),
+        &mut app_server,
+        stderr.path(),
+    )
+    .await;
 
     let first = run_cli(
         home.path(),
@@ -99,19 +184,14 @@ async fn exec_reads_a_piped_prompt_without_mixing_progress_into_stdout() {
     let home = tempdir().expect("home");
     let workspace = tempdir().expect("workspace");
     install_mock_provider(home.path());
-    let address = reserve_address();
-    let mut app_server = Command::new(env!("CARGO_BIN_EXE_golutra-agent"))
-        .arg("app-server")
-        .arg("--addr")
-        .arg(address.to_string())
-        .env("GOLUTRA_AGENT_HOME", home.path())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("app server process");
-    let (info, token, _transport) = wait_for_runtime(home.path(), workspace.path()).await;
+    let (mut app_server, stderr) = start_app_server(home.path());
+    let (info, token, _transport) = wait_for_runtime(
+        home.path(),
+        workspace.path(),
+        &mut app_server,
+        stderr.path(),
+    )
+    .await;
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_golutra-agent"))
         .arg("--cwd")
@@ -613,19 +693,14 @@ async fn exec_runs_caller_declared_verifier_across_the_app_server_boundary() {
     let workspace = tempdir().expect("workspace");
     install_mock_provider(home.path());
     let task_contract = write_bounded_mock_contract(home.path());
-    let address = reserve_address();
-    let mut app_server = Command::new(env!("CARGO_BIN_EXE_golutra-agent"))
-        .arg("app-server")
-        .arg("--addr")
-        .arg(address.to_string())
-        .env("GOLUTRA_AGENT_HOME", home.path())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("app server process");
-    let (info, token, _transport) = wait_for_runtime(home.path(), workspace.path()).await;
+    let (mut app_server, stderr) = start_app_server(home.path());
+    let (info, token, _transport) = wait_for_runtime(
+        home.path(),
+        workspace.path(),
+        &mut app_server,
+        stderr.path(),
+    )
+    .await;
 
     let passed = run_cli(
         home.path(),
@@ -710,6 +785,8 @@ async fn run_daemon_cli(home: &Path, workspace: &Path, args: &[&str]) -> std::pr
 async fn wait_for_runtime(
     home: &Path,
     workspace: &Path,
+    app_server: &mut tokio::process::Child,
+    stderr: &Path,
 ) -> (AppServerInfo, String, RuntimeTransport) {
     let endpoint = home.join("app-server/app-server.json");
     let token_path = home.join("app-server/transport.token");
@@ -717,6 +794,12 @@ async fn wait_for_runtime(
     // App-server startup has to initialize an isolated runtime home. Under a
     // parallel process-test load that can exceed the old five-second window.
     for _ in 0..800 {
+        if let Some(status) = app_server.try_wait().expect("app server process status") {
+            panic!(
+                "app server exited before becoming ready ({status}): {}",
+                fs::read_to_string(stderr).unwrap_or_else(|error| error.to_string())
+            );
+        }
         let attempt = async {
             let info: AppServerInfo = serde_json::from_slice(
                 &tokio::fs::read(&endpoint)
@@ -745,16 +828,28 @@ async fn wait_for_runtime(
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     panic!(
-        "app server did not become ready: {}",
-        last_error.unwrap_or_else(|| "unknown error".to_owned())
+        "app server did not become ready: {}; stderr: {}",
+        last_error.unwrap_or_else(|| "unknown error".to_owned()),
+        fs::read_to_string(stderr).unwrap_or_else(|error| error.to_string())
     );
 }
 
-fn reserve_address() -> std::net::SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
-    let address = listener.local_addr().expect("reserved address");
-    drop(listener);
-    address
+fn start_app_server(home: &Path) -> (tokio::process::Child, tempfile::NamedTempFile) {
+    let stderr = tempfile::NamedTempFile::new().expect("app server stderr file");
+    let child = Command::new(env!("CARGO_BIN_EXE_golutra-agent"))
+        .arg("app-server")
+        // Let the server keep its OS-assigned port. Reserving and releasing one
+        // here races other process tests before the child binds it again.
+        .arg("--addr")
+        .arg("127.0.0.1:0")
+        .env("GOLUTRA_AGENT_HOME", home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(stderr.reopen().expect("app server stderr handle"))
+        .kill_on_drop(true)
+        .spawn()
+        .expect("app server process");
+    (child, stderr)
 }
 
 fn install_mock_provider(home: &Path) {

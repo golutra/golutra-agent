@@ -11,7 +11,7 @@
 
 诊断来自正在服务请求的 runtime 已解析路径；连接 app-server 时反映服务端目录，不使用客户端环境猜测。只在显式查询时返回路径，不增加生产日志、不读取凭据正文。直接把 home 指向 symlink 会拒绝；父路径别名、cwd 的 `.` 等经 canonical 解析。Windows HOME 优先、USERPROFILE 回退保持不变。`--ephemeral` / `--run-dir` 保留全局配置而隔离 runtime，诊断分别显示两个 home。
 
-成功打开的 store 返回 `supported`；全空库的 `uninitialized`、旧/未知格式的 `unsupported` 可通过库的只读 `inspect_data_compatibility` 查看。无法打开的 CLI 返回错误及非零退出码，不能依赖成功的 StorageStatus 来探测一个已经拒绝打开的库。
+成功打开的 store 返回 `supported`；全空库的 `uninitialized`、不受支持的旧/未知格式的 `unsupported` 可通过库的只读 `inspect_data_compatibility` 查看。当前版本也将 checksum 精确匹配的 schema 7、8 报告为可支持，`schema_version` 保留其真实版本，`supported_schema_version` 为 9；只读检查不会执行升级，正式打开时才在独占锁下升级。无法打开的 CLI 返回错误及非零退出码，不能依赖成功的 StorageStatus 来探测一个已经拒绝打开的库。
 
 ## 桌面设置写入
 
@@ -37,17 +37,19 @@ Provider 编辑使用已有 verified API；读取 `ProviderSettings::revision()`
 
 | 数据状态 | 处理 |
 | --- | --- |
-| 当前 schema 7，唯一基线记录与 checksum 正确 | 当前桌面/npm 同次构建共享打开 |
+| 当前 schema 9，唯一基线记录与 checksum 正确 | 支持该格式的桌面/npm 共享打开 |
+| schema 7，唯一基线记录、名称及原始 checksum 精确匹配 | 取得独占锁后，一个事务新增后台任务/批次/结果表及子代理注册表/消息表，升级账本至 9；保留既有数据 |
+| schema 8，唯一基线记录、名称及原始 checksum 精确匹配 | 取得独占锁后，一个事务新增子代理注册表/消息表，升级账本至 9；保留后台结果、既有会话和 artifact |
 | 全空数据库 | 取得独占锁后一次事务创建当前完整 schema |
-| 初始化时还有活跃使用者 | 有界约 5 秒内拒绝 `data_in_use`，不终止其他进程 |
+| 初始化或升级时还有活跃使用者 | 有界约 5 秒内拒绝 `data_in_use`，不终止其他进程；关闭使用旧格式的实例后再打开 |
 | 旧 schema 1–6、无账本但已有表、空账本、未知版本或 checksum 错误 | 拒绝 `data_unsupported`，不迁移、不重置、不降级、不修复 |
-| 独占初始化完成 | 取得共享锁后再校验，关闭锁降级间隙中的版本竞争 |
+| 独占初始化或升级完成 | 取得共享锁后再校验，关闭锁降级间隙中的版本竞争；升级失败则事务回滚 |
 
-项目当前尚无需要承接的用户数据，按产品决定只支持当前格式。删除旧 migration runner 的字段补齐、线程去重、artifact 回填、历史 checksum 接受/刷新，改为单一 schema 7 基线。不得复用旧版本号宣称旧数据可读；正式发布必须使用新版本并锁定二进制 SHA-256。
+当前格式为 schema 9，支持精确 schema 7 → 9 和 8 → 9。原 schema 7、8 的 SQL 字节和 checksum 被固定，不能通过刷新 checksum、补字段、线程去重或 artifact 回填接受其他历史格式。子代理注册表只回填具有 `_delegated_task` 创建事实的子会话，不把普通 fork 当作子代理。升级后的账本为 9，旧 reader 会拒绝打开；仍使用只支持 schema 7、8 的桌面或 npm 实例时，需要先结束旧实例并更新内核。正式发布仍必须使用新软件版本并锁定二进制 SHA-256。
 
 Provider 仅支持当前 v2；v1 env-map 配置直接拒绝，不迁移密钥、不改写配置。读取配置不再依赖 SecretStore。当前格式凭据和配置可以共用，不能通过删除版本标记或补字段来导入旧格式。
 
-旧测试 home（包括此前开发 schema 6）无法继续打开。需要关闭旧实例后显式指定新的空 `GOLUTRA_AGENT_HOME`，重新配置登录；程序不会自动删除、备份、隔离或同步旧目录。本轮未清理开发者已有数据。以后格式发生不兼容变化时仍应明确拒绝，不提供静默转换。
+不受支持的旧测试 home（包括此前开发 schema 6）无法继续打开。需要关闭旧实例后显式指定新的空 `GOLUTRA_AGENT_HOME`，重新配置登录；程序不会自动删除、备份、隔离或同步旧目录。schema 7、8 的既有 home 沿上述受控路径保留并升级，无需清空会话或重新登录。其他不兼容格式仍明确拒绝，新增升级路径必须单独实现和验证。
 
 会话锁与 schema 使用锁职责不同：共享历史查询不取得会话执行权；继续任务必须取得现有 session lease。争用不强行接管；进程崩溃释放 OS 锁，原有 orphan/不确定副作用恢复规则继续生效。不同 thread 共用数据库不等于可以无冲突地修改同一个项目文件。
 
@@ -56,12 +58,13 @@ Provider 仅支持当前 v2；v1 env-map 配置直接拒绝，不迁移密钥、
 ```sh
 cargo test --locked -p golutra-agent-config --test shared_settings_process
 cargo test --locked -p golutra-agent-store --test shared_data_process
+cargo test --locked -p golutra-agent-store migrations::tests --lib
 cargo test --locked -p golutra-agent-client shared_home_tests
 python3 scripts/smoke_shared_versions.py --baseline-cli /absolute/old/golutra-agent --candidate-cli /absolute/new/golutra-agent --output dist/shared-versions.json
 ```
 
 同次构建的桌面/npm 共享由 `smoke_native_package.py` 验证：四个并发任务、共同历史、并发配置/凭据更新、格式拒绝与无 Node 启动；它同时验证新默认 home 与旧目录分离。`smoke_shared_versions.py` 在旧基线可运行时测试新旧程序双向拒绝，在显式指定的同一隔离 home、空 PATH 和两种首开顺序下确认拒绝前后数据库逻辑不变、原创建者仍能读取，报告 `expected_compatibility:reject`。
 
-Windows npm 0.2.0 在打开数据库前就因 SQLite URL 解析失败，无法作为可运行旧基线。只有这一固定版本和明确错误可以报告 `expected_compatibility:legacy_startup_unavailable`；报告保留真实 stderr，并单独验证失败的旧程序未改写当前数据、新版拒绝合成 schema 5 账本且无数据改写。此时没有验证旧程序成功创建的数据，也没有完成双向格式边界运行。两种报告均为 `shared_data_compatible:false`，不提供升级或续跑旧历史的模式，其他启动错误仍会阻止发布。
+Windows npm 0.2.0 在打开数据库前就因 SQLite URL 解析失败，无法作为可运行旧基线。只有这一固定版本和明确错误可以报告 `expected_compatibility:legacy_startup_unavailable`；报告保留真实 stderr，并单独验证失败的旧程序未改写当前数据、新版拒绝合成 schema 5 账本且无数据改写。此时没有验证旧程序成功创建的数据，也没有完成双向格式边界运行。上述 0.2.0 负向夹具的两种报告仍为 `shared_data_compatible:false`，不支持该旧格式的升级或续跑；它们不替代 schema 7/8 → 9 的正向升级测试。其他启动错误仍会阻止发布。
 
-六个平台 release runner 执行 native smoke、配置/凭据多进程测试、数据使用期锁和 session ownership 测试，并下载固定 `@golutra/agent-<platform>@0.2.0` 仅作拒绝用负向夹具（构建时下载、禁用安装脚本，不随产品交付）。`shared-versions-<target>.json` 记录包及二进制摘要，正式清单拒绝缺失、摘要不匹配或仍声明升级兼容的报告。桌面项目负责 installer、签名、ConPTY、更新和卸载验收。内置 Agent 随桌面升级；npm 自行管理；任一卸载不得删除共享 home。未运行平台必须标未验证。
+六个平台 release runner 执行 native smoke、配置/凭据多进程测试、数据使用期锁和 session ownership 测试，并下载固定 `@golutra/agent-<platform>@0.2.0` 仅作拒绝用负向夹具（构建时下载、禁用安装脚本，不随产品交付）。`shared-versions-<target>.json` 记录包及二进制摘要，正式清单拒绝缺失、摘要不匹配或错误声明该 0.2.0 负向夹具可升级的报告。桌面项目负责 installer、签名、ConPTY、更新和卸载验收。内置 Agent 随桌面升级；npm 自行管理；任一卸载不得删除共享 home。未运行平台必须标未验证。

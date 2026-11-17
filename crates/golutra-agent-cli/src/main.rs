@@ -3,17 +3,17 @@ use golutra_agent_auth::{
     CredentialRef, CredentialSource, OAuthFlow, OAuthProviderDescriptor, SecretKind,
 };
 use golutra_agent_client::{
-    AgentClient, DebugExportCoordinator, DebugExportRequest, RunBundleExportRequest,
-    RunBundleExporter, RunBundleTerminalOutcome, RuntimeClient, RuntimeExecutionOptions,
-    RuntimeTransport, TaskTraceClient, parse_session_range,
+    AgentClient, AgentTurnProviderOptions, DebugExportCoordinator, DebugExportRequest,
+    RunBundleExportRequest, RunBundleExporter, RunBundleTerminalOutcome, RuntimeClient,
+    RuntimeExecutionOptions, RuntimeTransport, TaskTraceClient, parse_session_range,
 };
 use golutra_agent_config::{
     BuiltinOAuthMethod, ProviderConfigPaths, ProviderConfigScope, ProviderInstallPlan,
     ProviderProfile, apply_oauth_provider_install_plan_verified,
     apply_provider_install_plan_verified, builtin_oauth_method, builtin_oauth_methods,
-    builtin_oauth_methods_for_provider, golutra_agent_home, load_provider_runtime_env,
-    load_provider_settings, logout_provider_profile_verified, provider_auth_service,
-    provider_onboarding_state, replace_provider_credential_verified,
+    builtin_oauth_methods_for_provider, golutra_agent_home, load_non_secret_runtime_settings,
+    load_provider_runtime_env, load_provider_settings, logout_provider_profile_verified,
+    provider_auth_service, provider_onboarding_state, replace_provider_credential_verified,
     update_provider_settings_verified, validate_provider_protocol_runtime_supported,
 };
 use golutra_agent_core::{
@@ -44,6 +44,7 @@ use uuid::Uuid;
 
 const CLI_ACTOR_ID: &str = "golutra-agent-cli";
 
+mod browser;
 mod interactive_entry;
 mod mcp_server;
 
@@ -78,6 +79,14 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Connect and diagnose optional browser backends.
+    Browser {
+        /// Emit one versioned result object for integrations, without interactive prompts.
+        #[arg(long, global = true)]
+        json: bool,
+        #[command(subcommand)]
+        command: browser::BrowserCommand,
+    },
     AppServer {
         #[arg(
             long,
@@ -246,12 +255,21 @@ struct ExecArgs {
     defer_external_verification: bool,
     /// Let the provider own planning and stopping (`open`) or apply the
     /// explicit completion-oriented adapter (`strict`).
-    #[arg(long, value_enum, default_value_t = ExecExecutionModeArg::Open)]
-    execution_mode: ExecExecutionModeArg,
+    #[arg(long, value_enum)]
+    execution_mode: Option<ExecExecutionModeArg>,
     /// Expose the compact coding surface (`coding`) or every registered
     /// extension (`full`) to the provider.
-    #[arg(long, value_enum, default_value_t = ExecToolProfileArg::Coding)]
-    tool_profile: ExecToolProfileArg,
+    #[arg(long, value_enum)]
+    tool_profile: Option<ExecToolProfileArg>,
+    /// Provider profile for this turn; overrides project and global runtime defaults.
+    #[arg(long, global = true)]
+    provider_profile: Option<String>,
+    /// Model for this turn; does not update stored preferences.
+    #[arg(long, global = true)]
+    model: Option<String>,
+    /// Reasoning effort for this turn; default clears the profile's configured effort.
+    #[arg(long, global = true, value_parser = ["default", "low", "medium", "high", "xhigh", "max", "ultra"])]
+    reasoning_effort: Option<String>,
     /// Write isolated runtime state and full owner-only observations to this new directory.
     /// Implies --ephemeral. The legacy --ephemeral-state-dir spelling remains accepted.
     #[arg(
@@ -821,8 +839,22 @@ impl ReviewDecisionArg {
 
 #[tokio::main]
 async fn main() -> miette::Result<()> {
+    // Chrome 直接启动此原生文件并传扩展 origin；在 clap/TUI 和 stdout 日志前接管。
+    if let Some(origin) = std::env::args()
+        .nth(1)
+        .filter(|arg| arg.starts_with("chrome-extension://"))
+    {
+        let root = golutra_agent_tools::browser::chrome::install::connection_dir()
+            .map_err(|e| miette::miette!("{e}"))?;
+        return golutra_agent_tools::browser::chrome::transport::serve(&root, &origin)
+            .await
+            .map_err(|e| miette::miette!("{e}"));
+    }
     interactive_entry::launch_if_interactive()?;
     let cli = Cli::parse();
+    if let Command::Browser { command, json } = &cli.command {
+        return browser::run(command, *json).await;
+    }
     if let Command::AppServer { addr, stdio } = &cli.command {
         return if *stdio {
             golutra_agent_app_server::run_stdio().await
@@ -919,6 +951,7 @@ async fn main() -> miette::Result<()> {
     let command_result: miette::Result<()> = async {
         match cli.command {
         Command::AppServer { .. } => unreachable!("app-server exits before runtime setup"),
+        Command::Browser { .. } => unreachable!("browser exits before runtime setup"),
         Command::Plugin { .. } => unreachable!("plugin exits before runtime setup"),
         Command::Service { .. } => unreachable!("service exits before runtime setup"),
         Command::Chat { prompt } => {
@@ -2638,6 +2671,52 @@ async fn run_exec(
     args: ExecArgs,
     opened_run_bundle: Option<&std::path::Path>,
 ) -> miette::Result<()> {
+    let workspace = transport
+        .cwd()
+        .ok_or_else(|| miette::miette!("exec workspace is unavailable"))?;
+    let paths = ProviderConfigPaths::global().map_err(|error| miette::miette!("{error}"))?;
+    let defaults = load_non_secret_runtime_settings(&paths, workspace)
+        .map_err(|error| miette::miette!("{error}"))?;
+    let execution = AgentTurnExecutionOptions {
+        execution_mode: args.execution_mode.map(Into::into).unwrap_or_else(|| {
+            if defaults
+                .execution_mode
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("strict"))
+            {
+                AgentExecutionMode::Strict
+            } else {
+                AgentExecutionMode::Open
+            }
+        }),
+        tool_profile: args.tool_profile.map(Into::into).unwrap_or_else(|| {
+            if defaults
+                .tool_profile
+                .as_deref()
+                .is_some_and(|value| value.eq_ignore_ascii_case("full"))
+            {
+                AgentToolProfile::Full
+            } else {
+                AgentToolProfile::Coding
+            }
+        }),
+    };
+    let provider = AgentTurnProviderOptions {
+        profile: args.provider_profile.clone().or(defaults.provider_profile),
+        model: args.model.clone().or(defaults.model),
+        reasoning_effort: args
+            .reasoning_effort
+            .as_deref()
+            .or(defaults.reasoning_effort.as_deref())
+            .map(|value| {
+                if value.eq_ignore_ascii_case("default") {
+                    Ok(None)
+                } else {
+                    parse_reasoning_effort(value).map(Some)
+                }
+            })
+            .transpose()?,
+    };
     let external_verifiers = args
         .verify_program
         .clone()
@@ -2731,7 +2810,7 @@ async fn run_exec(
         ),
     };
     let mut handle = thread
-        .start_turn_with_execution_options(
+        .start_turn_with_provider_options(
             prompt,
             AgentTurnOptions {
                 task_contract,
@@ -2744,10 +2823,8 @@ async fn run_exec(
                 external_verifiers,
                 discover_project_verifiers: !args.no_project_verifier_discovery,
             },
-            AgentTurnExecutionOptions {
-                execution_mode: args.execution_mode.into(),
-                tool_profile: args.tool_profile.into(),
-            },
+            execution,
+            provider,
         )
         .await
         .map_err(|error| miette::miette!("{error}"))?;

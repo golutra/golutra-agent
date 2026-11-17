@@ -244,6 +244,49 @@ impl SocketConnection {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subagent_list_uses_real_driver_without_switching_its_session() {
+    let (_lock, home, workspace, _env) = process_test_context().await;
+    let mut driver = StdioDriver::spawn(
+        home.path(),
+        workspace.path(),
+        &[
+            "--embedded",
+            "--stdio",
+            "--resume",
+            "subagents-driver",
+            "--heartbeat-secs",
+            "0",
+        ],
+    )
+    .await;
+    let ready = driver.receive("ready").await;
+    assert_eq!(ready["type"], "ready");
+    driver
+        .send(json!({"request_id":"agents","type":"input_slash","text":"/agents"}))
+        .await;
+    assert_eq!(driver.receive("agents").await["type"], "accepted");
+    driver.send(json!({"request_id":"agents-view","type":"snapshot","scope":"session","panes":"transcript","width":160,"height":40})).await;
+    let frame = driver.receive("agents-view").await;
+    assert_eq!(frame["type"], "snapshot", "{frame}");
+    let text = frame.to_string();
+    assert!(text.contains("当前会话没有子代理"), "{text}");
+    driver
+        .send(
+            json!({"request_id":"agents-open","type":"input_slash","text":"/agents open reviewer"}),
+        )
+        .await;
+    assert_eq!(
+        driver.receive("agents-open").await["code"],
+        "session_binding_immutable"
+    );
+    driver
+        .send(json!({"request_id":"close-agents","type":"close"}))
+        .await;
+    assert_eq!(driver.receive("close-agents").await["type"], "closed");
+    driver.wait_for_exit().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn inspect_and_stdio_driver_execute_real_offscreen_tui() {
     let (_lock, home, workspace, _env) = process_test_context().await;
 

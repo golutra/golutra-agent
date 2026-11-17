@@ -59,6 +59,10 @@ impl RuntimeHost {
     pub(crate) async fn query(&self, query: RuntimeQuery) -> Result<Value, ClientError> {
         self.ensure_session_in_workspace(query.session_id).await?;
         let value = match query.kind {
+            RuntimeQueryKind::Subagents => {
+                delegation::list_subagents(self, query.session_id, query.cursor.unwrap_or(0), 32)
+                    .await?
+            }
             RuntimeQueryKind::SessionState | RuntimeQueryKind::TaskState => serde_json::to_value(
                 self.storage
                     .repositories

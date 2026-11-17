@@ -156,6 +156,28 @@ pub(crate) fn pin_provider_turn_settings_cached(
     provider_config_paths: Option<&ProviderConfigPaths>,
     payload: &mut Value,
 ) {
+    pin_provider_defaults_cached(cache, provider_config_paths, payload);
+    // Apply a narrow turn override after pinning the host's profile. Preserve
+    // its token/window/thinking settings, including for remote CLI callers.
+    if let Some(effort) = payload
+        .as_object_mut()
+        .and_then(|object| object.remove("provider_reasoning_effort"))
+    {
+        if payload.get("provider_generation_config").is_none() {
+            payload["provider_generation_config"] = json!({});
+        }
+        if let Some(config) = payload["provider_generation_config"].as_object_mut() {
+            config.insert("reasoning_effort".into(), effort);
+        }
+        // Invalid effort/config values are rejected by normal typed validation.
+    }
+}
+
+fn pin_provider_defaults_cached(
+    cache: &mut ProviderRouteCache,
+    provider_config_paths: Option<&ProviderConfigPaths>,
+    payload: &mut Value,
+) {
     let Some(paths) = provider_config_paths else {
         return;
     };
@@ -784,6 +806,41 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn effort_override_preserves_host_generation_settings_and_can_reset_to_default() {
+        let home = tempdir().unwrap();
+        let paths = ProviderConfigPaths::from_home(home.path()).unwrap();
+        let mut profile = ProviderProfile::mock();
+        profile.generation_config = Some(serde_json::from_value(json!({
+            "reasoning_effort":"high", "max_tokens":4096, "context_window_size":32768, "enable_thinking":true,
+        })).unwrap());
+        let mut settings = ProviderSettings::default();
+        settings.upsert_profile(profile, true);
+        settings.save(&paths.user_config).unwrap();
+        for effort in [json!("low"), Value::Null] {
+            let mut payload = json!({"provider_reasoning_effort":effort});
+            pin_provider_turn_settings(Some(&paths), &mut payload);
+            assert!(payload.get("provider_reasoning_effort").is_none());
+            assert_eq!(
+                payload["provider_generation_config"]["reasoning_effort"],
+                effort
+            );
+            assert_eq!(payload["provider_generation_config"]["max_tokens"], 4096);
+            assert_eq!(
+                payload["provider_generation_config"]["context_window_size"],
+                32768
+            );
+            assert_eq!(
+                payload["provider_generation_config"]["enable_thinking"],
+                true
+            );
+            generation_config_override(&payload).unwrap();
+        }
+        let mut invalid = json!({"provider_reasoning_effort":"not-an-effort"});
+        pin_provider_turn_settings(Some(&paths), &mut invalid);
+        assert!(generation_config_override(&invalid).is_err());
+    }
 
     #[test]
     fn provider_turn_binding_pins_defaults_without_overwriting_explicit_overrides() {

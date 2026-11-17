@@ -49,6 +49,13 @@ pub enum AgentLoopTraceEvent {
         snapshot: ContextSnapshot,
         request: ProviderRequest,
     },
+    /// Emitted after the matching ContextSnapshotCaptured observation. The host
+    /// acknowledges these IDs only after that snapshot was durably recorded.
+    BackgroundResultsConsumed {
+        result_ids: Vec<golutra_agent_core::BackgroundResultId>,
+        request_id: ProviderRequestId,
+        turn_id: TurnId,
+    },
     CandidateReady {
         turn_id: TurnId,
         tool_count: usize,
@@ -62,6 +69,8 @@ pub enum AgentLoopTraceEvent {
     VerificationCompleted {
         record: VerificationRecord,
         terminal: bool,
+        /// Provider findings are evidence, even when the public final is a diagnostic.
+        findings: Option<String>,
     },
     CorrectionIssued(CorrectionEnvelope),
     ProviderStarted {

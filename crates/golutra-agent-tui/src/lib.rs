@@ -174,6 +174,9 @@ pub enum SlashDebugCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashCommand {
+    Connect {
+        target: Option<String>,
+    },
     Help,
     WhatsNew,
     New,
@@ -199,6 +202,11 @@ pub enum SlashCommand {
         from_turn_id: Option<String>,
     },
     Status,
+    Agents {
+        action: String,
+        target: Option<String>,
+        task: Option<String>,
+    },
     Plan,
     Tasks,
     Usage,
@@ -393,6 +401,11 @@ const SEARCHABLE_SLASH_HINTS: &[SlashCommandHint] = &[
         selection: SlashCommandSelection::Execute,
     },
     SlashCommandHint {
+        command: "/connect",
+        description: "connect the selected browser; /connect help for options",
+        selection: SlashCommandSelection::Fill,
+    },
+    SlashCommandHint {
         command: "/logout",
         description: "clear current provider config and reconnect",
         selection: SlashCommandSelection::Execute,
@@ -410,6 +423,11 @@ const SEARCHABLE_SLASH_HINTS: &[SlashCommandHint] = &[
     SlashCommandHint {
         command: "/tasks",
         description: "show tasks and background activity",
+        selection: SlashCommandSelection::Execute,
+    },
+    SlashCommandHint {
+        command: "/agents",
+        description: "list subagents; show, cancel, continue or open a child",
         selection: SlashCommandSelection::Execute,
     },
     SlashCommandHint {
@@ -665,6 +683,30 @@ pub fn parse_slash_input(input: &str) -> SlashInput {
         return SlashInput::Empty;
     };
     match command {
+        "/connect"
+            if tokens.len() <= 2
+                && tokens.get(1).is_none_or(|v| {
+                    [
+                        "auto", "help", "confirm-install-ego",
+                        "ego",
+                        "chrome",
+                        "launch", "launch-chrome", "launch-ego",
+                        "status", "details",
+                        "install-ego",
+                        "install-chrome",
+                        "disconnect",
+                        "cancel",
+                    ]
+                    .contains(&v.as_str())
+                }) =>
+        {
+            SlashInput::Command(SlashCommand::Connect {
+                target: tokens.get(1).cloned(),
+            })
+        }
+        "/connect" => SlashInput::Error(
+            "Use /connect [auto|ego|chrome|help|launch|launch-chrome|launch-ego|status|details|install-ego|confirm-install-ego|install-chrome|disconnect|cancel]".into(),
+        ),
         "/help" | "/?" => SlashInput::Command(SlashCommand::Help),
         "/whats-new" => SlashInput::Command(SlashCommand::WhatsNew),
         "/new" => SlashInput::Command(SlashCommand::New),
@@ -686,6 +728,7 @@ pub fn parse_slash_input(input: &str) -> SlashInput {
         }
         "/logout" => SlashInput::Error("/logout does not take arguments".to_owned()),
         "/status" => SlashInput::Command(SlashCommand::Status),
+        "/agents" => parse_agents_command(trimmed.strip_prefix("/agents").unwrap().trim()),
         "/plan" => SlashInput::Command(SlashCommand::Plan),
         "/tasks" => SlashInput::Command(SlashCommand::Tasks),
         "/usage" => SlashInput::Command(SlashCommand::Usage),
@@ -742,6 +785,67 @@ pub fn parse_slash_input(input: &str) -> SlashInput {
         "/quit" | "/exit" => SlashInput::Command(SlashCommand::Quit),
         other => SlashInput::Error(format!("unknown slash command `{other}`; try /help")),
     }
+}
+
+fn parse_agents_command(arguments: &str) -> SlashInput {
+    if arguments.is_empty() {
+        return SlashInput::Command(SlashCommand::Agents {
+            action: "list".into(),
+            target: None,
+            task: None,
+        });
+    }
+    let invalid = || {
+        SlashInput::Error("Use /agents, /agents page <cursor>, /agents show|cancel|open <name>, or /agents continue <name> <task>; quote names containing spaces".into())
+    };
+    let Some((action, tail)) = arguments.split_once(char::is_whitespace) else {
+        return invalid();
+    };
+    let tail = tail.trim_start();
+    // Only the target is shell-quoted. Keep the task's quotes, apostrophes and
+    // whitespace as user text; this never executes a shell command.
+    let mut quote = None;
+    let mut escaped = false;
+    let mut end = tail.len();
+    for (index, ch) in tail.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && quote != Some('\'') {
+            escaped = true;
+            continue;
+        }
+        if quote == Some(ch) {
+            quote = None;
+        } else if quote.is_none() && matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+        } else if quote.is_none() && ch.is_whitespace() {
+            end = index;
+            break;
+        }
+    }
+    let Some(targets) = shlex::split(&tail[..end]) else {
+        return invalid();
+    };
+    let [target] = targets.as_slice() else {
+        return invalid();
+    };
+    let task = tail[end..].trim();
+    if target.is_empty()
+        || !match action {
+            "page" | "show" | "cancel" | "open" => task.is_empty(),
+            "continue" => !task.is_empty(),
+            _ => false,
+        }
+    {
+        return invalid();
+    }
+    SlashInput::Command(SlashCommand::Agents {
+        action: action.into(),
+        target: Some(target.clone()),
+        task: (!task.is_empty()).then(|| task.to_owned()),
+    })
 }
 
 fn parse_retry_command(tokens: &[String]) -> SlashInput {

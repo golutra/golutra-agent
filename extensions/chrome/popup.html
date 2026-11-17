@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>Golutra 浏览器连接</title>
+<style>body{font:14px system-ui;width:300px;padding:16px;color:#222}h1{font-size:18px}button{display:block;width:100%;margin:12px 0;padding:10px;cursor:pointer}#status{white-space:pre-wrap;overflow-wrap:anywhere}small{color:#555}</style></head>
+<body><h1>Golutra 浏览器连接</h1><p id="status">正在检查连接…</p>
+<small>默认自动连接本机 Agent，并自动创建任务标签页，复用此 Chrome 的登录状态，无需额外开启。</small>
+<button id="enable-auto" hidden>恢复自动运行</button>
+<button id="stop">停止控制</button><button id="disconnect">断开连接</button>
+<details><summary>操作已有页面</summary><button id="authorize">使用当前标签页</button><button id="continue">在此关联页面继续当前任务</button></details>
+<small>停止后不会自动恢复；断开后不自动重连。页面会保留。首次使用前运行：golutra-agent browser chrome install</small>
+<script src="popup.js"></script></body></html>

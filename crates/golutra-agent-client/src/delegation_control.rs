@@ -36,12 +36,22 @@ pub(super) fn page_output(
 }
 
 pub(super) fn action(arguments: &Value) -> Result<&str, ClientError> {
+    if arguments.get("assignment").is_some() || arguments.get("tool_profile").is_some() {
+        let action = arguments["action"].as_str().unwrap_or("spawn");
+        if !matches!(action, "spawn" | "resume") {
+            return Err(ClientError::TaskExecution(
+                "assignment and tool_profile apply only to spawn/resume".into(),
+            ));
+        }
+    }
     match arguments
         .get("action")
         .and_then(Value::as_str)
         .unwrap_or("spawn")
     {
-        action @ ("spawn" | "status" | "wait" | "send_input" | "resume" | "cancel") => Ok(action),
+        action @ ("spawn" | "list" | "status" | "wait" | "send_input" | "resume" | "cancel") => {
+            Ok(action)
+        }
         _ => Err(ClientError::TaskExecution(
             "invalid subagent action".to_owned(),
         )),
@@ -49,6 +59,7 @@ pub(super) fn action(arguments: &Value) -> Result<&str, ClientError> {
 }
 
 pub(super) fn validate_start(arguments: &Value) -> Result<(), ClientError> {
+    assignment::validate(arguments)?;
     if !matches!(
         arguments.get("context").and_then(Value::as_str),
         None | Some("independent" | "fork")
@@ -103,7 +114,7 @@ pub(super) fn has_active_operation_for(
     })
 }
 
-async fn owned_operation(
+pub(super) async fn owned_operation(
     host: &RuntimeHost,
     parent: SessionId,
     child: SessionId,
@@ -118,7 +129,42 @@ async fn owned_operation(
         .cloned()
 }
 
-fn child_id(request: &ToolRequest) -> Result<SessionId, ClientError> {
+pub(super) async fn origin_operation(
+    host: &RuntimeHost,
+    request: &ToolRequest,
+) -> Result<Option<Arc<DelegationOperation>>, ClientError> {
+    let operation = host
+        .execution
+        .delegation_operations
+        .lock()
+        .await
+        .values()
+        .find(|operation| {
+            operation.belongs_to(request.session_id)
+                && operation
+                    .lifecycle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .origin_call_id
+                    == Some(request.tool_call_id)
+        })
+        .cloned();
+    if let Some(operation) = &operation {
+        let lifecycle = operation
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if lifecycle.origin_digest.as_deref() != Some(&text_sha256(&request.arguments.to_string()))
+        {
+            return Err(ClientError::TaskExecution(
+                "repeated input identity has different arguments".into(),
+            ));
+        }
+    }
+    Ok(operation)
+}
+
+pub(super) fn child_id(request: &ToolRequest) -> Result<SessionId, ClientError> {
     request
         .arguments
         .get("child_session_id")
@@ -131,7 +177,7 @@ fn child_id(request: &ToolRequest) -> Result<SessionId, ClientError> {
         })
 }
 
-async fn owned_thread(
+pub(super) async fn owned_thread(
     host: &RuntimeHost,
     parent: SessionId,
     child: SessionId,
@@ -209,10 +255,31 @@ pub(super) async fn apply_agent_type(
             .iter()
             .rev()
             .find(|event| event.event_type == RuntimeEventType::TaskCreated)
-            .and_then(|event| event.payload.pointer("/payload/task_contract"))
+            .and_then(|event| event.payload.get("payload"))
         {
-            let contract: TaskContract = serde_json::from_value(previous.clone())?;
-            explore |= contract.workspace_change == WorkspaceChangeRequirement::Forbidden;
+            if request.arguments.get("assignment").is_none()
+                && let Some(value) = previous.get("_delegation_assignment")
+            {
+                payload["_delegation_assignment"] = value.clone();
+            }
+            if let Some(contract) = previous.get("task_contract") {
+                let contract: TaskContract = serde_json::from_value(contract.clone())?;
+                explore |= contract.workspace_change == WorkspaceChangeRequirement::Forbidden;
+            }
+            if let Some(profile) = previous.get("tool_profile") {
+                let previous_profile: AgentToolProfile = serde_json::from_value(profile.clone())?;
+                if request.arguments.get("tool_profile").is_some() {
+                    assignment::narrowed_profile(
+                        previous_profile,
+                        request.arguments.get("tool_profile"),
+                    )?;
+                }
+                // Preserve the stricter of parent and prior execution on resume.
+                let current: AgentToolProfile =
+                    serde_json::from_value(payload["tool_profile"].clone())?;
+                payload["tool_profile"] =
+                    json!(assignment::narrowed_profile(current, Some(profile)).unwrap_or(current));
+            }
         }
     }
     if explore {
@@ -222,7 +289,62 @@ pub(super) async fn apply_agent_type(
             ..TaskContract::default()
         })?;
         payload["verify_on_change"] = json!("off");
-        payload["tool_profile"] = json!("coding");
+        if payload["tool_profile"] != "none" {
+            payload["tool_profile"] = json!("coding");
+        }
+    }
+    Ok(())
+}
+
+pub(super) async fn validate_expected_execution(
+    host: &RuntimeHost,
+    request: &ToolRequest,
+) -> Result<(), ClientError> {
+    let expected = request.arguments.get("expected_child_task_id");
+    let reply = request.arguments.get("reply_to_question_id");
+    if expected.is_none() && reply.is_none() {
+        return Ok(());
+    }
+    let expected = expected
+        .and_then(Value::as_str)
+        .and_then(|id| id.parse::<TaskId>().ok())
+        .ok_or_else(|| {
+            ClientError::TaskExecution(
+                "a question reply requires a valid expected_child_task_id".into(),
+            )
+        })?;
+    let child = child_id(request)?;
+    let state = host
+        .storage
+        .repositories
+        .projections
+        .state(child, None)
+        .await?;
+    if state.active_task_id != Some(expected) {
+        return Err(ClientError::TaskExecution(
+            "child execution changed; do not deliver this stale follow-up".into(),
+        ));
+    }
+    if let Some(reply) = reply {
+        if state.task_status != TaskStatus::Blocked {
+            return Err(ClientError::TaskExecution(
+                "child is no longer waiting for this answer".into(),
+            ));
+        }
+        let question = host
+            .storage
+            .store
+            .subagent_question(child, expected)
+            .await?;
+        if reply.as_str().is_none()
+            || question
+                .as_ref()
+                .is_none_or(|question| question["question_id"] != *reply)
+        {
+            return Err(ClientError::TaskExecution(
+                "child question changed; do not deliver this stale answer".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -249,6 +371,16 @@ fn running_operation_output(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .child_task_id
     );
+    if let Some(id) = operation
+        .lifecycle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .background_call_id
+    {
+        output.structured_facts["background_task_id"] = json!(id);
+        output.structured_facts["background"] = json!(true);
+        output.structured_facts["result_pending"] = json!(true);
+    }
     output
 }
 
@@ -268,6 +400,42 @@ pub(super) async fn wait_after_start(
             bounded_wait(operation, ms, cancellation).await
         }
         None => operation.wait(cancellation).await,
+    }
+}
+
+pub(super) async fn wait_after_start_with_input(
+    host: &RuntimeHost,
+    operation: &DelegationOperation,
+    arguments: &Value,
+    cancellation: CancellationToken,
+) -> Result<TaskDelegationOutput, ClientError> {
+    // A handle becomes observable only after durable child admission/startup.
+    operation.wait_until_ready(cancellation.clone()).await?;
+    let input = parent_input(host, operation.parent_session_id);
+    tokio::pin!(input);
+    tokio::select! {
+        biased;
+        result = wait_after_start(operation, arguments, cancellation.clone()) => result,
+        _ = &mut input => {
+            let mut output = bounded_wait(operation, 0, cancellation).await?;
+            output.structured_facts["wait_interrupted"] = json!("input");
+            Ok(output)
+        }
+    }
+}
+
+async fn parent_input(host: &RuntimeHost, session: SessionId) {
+    let control = host
+        .execution
+        .task_controls
+        .lock()
+        .await
+        .get(&session)
+        .cloned();
+    if let Some(control) = control {
+        control.execution.wait_for_pending_input().await;
+    } else {
+        std::future::pending::<()>().await;
     }
 }
 
@@ -365,6 +533,28 @@ async fn persisted_cancellation_observation(
 }
 
 pub(super) async fn dispatch(
+    host: &Arc<RuntimeHost>,
+    request: &ToolRequest,
+    cancellation: CancellationToken,
+    action: &str,
+) -> Result<TaskDelegationOutput, ClientError> {
+    if action == "wait" {
+        tokio::select! {
+            biased;
+            result = dispatch_uninterrupted(host, request, cancellation.clone(), action) => return result,
+            _ = parent_input(host, request.session_id) => {
+                let mut immediate = request.clone();
+                immediate.arguments["wait_ms"] = json!(0);
+                let mut output = dispatch_uninterrupted(host, &immediate, cancellation, action).await?;
+                output.structured_facts["wait_interrupted"] = json!("input");
+                return Ok(output);
+            }
+        }
+    }
+    dispatch_uninterrupted(host, request, cancellation, action).await
+}
+
+async fn dispatch_uninterrupted(
     host: &Arc<RuntimeHost>,
     request: &ToolRequest,
     cancellation: CancellationToken,
@@ -629,6 +819,7 @@ async fn send_input_once(
             ))
         };
     }
+    validate_expected_execution(host, request).await?;
     let result = send_input(host, request, child).await?;
     operation
         .accepted_inputs
@@ -660,6 +851,15 @@ async fn send_input(
         .ok_or_else(|| {
             ClientError::TaskExecution("child is no longer active; use resume".to_owned())
         })?;
+    if request
+        .arguments
+        .get("expected_child_task_id")
+        .is_some_and(|expected| expected.as_str() != Some(&control.task_id.to_string()))
+    {
+        return Err(ClientError::TaskExecution(
+            "child execution changed; do not deliver this stale follow-up".into(),
+        ));
+    }
     let context = control.delegation.ok_or_else(|| {
         ClientError::TaskExecution("child admission context is missing".to_owned())
     })?;
@@ -676,6 +876,7 @@ async fn send_input(
         task,
     );
     let payload = json!({"prompt": task, "steer": true, DELEGATED_TASK_MARKER: true,
+        "expected_task_id": control.task_id,
         DELEGATED_ADMISSION_TOKEN_KEY: admission.token(), "_delegation_parent_session_id": request.session_id,
         "_delegation_parent_tool_call_id": request.tool_call_id});
     host.execution
@@ -732,7 +933,7 @@ pub(super) async fn state_output(
     let terminal = state.task_status.is_terminal();
     let verification = state.last_verification.as_ref();
     let issues = verification.map(verification_issues).unwrap_or_default();
-    Ok(TaskDelegationOutput {
+    let mut output = TaskDelegationOutput {
         status: if terminal {
             delegated_result_status(state.task_status)
         } else {
@@ -763,7 +964,36 @@ pub(super) async fn state_output(
             "child_execution_status": if verification.is_some() && findings.is_some() { "response_returned" } else if terminal { "stopped" } else { "running" },
             "child_next_action": if terminal { "use available findings; resume only for additional work or unresolved issues" } else { "wait or send_input; do not spawn a duplicate" },
         }),
-    })
+    };
+    if let Some(criteria) = events
+        .iter()
+        .rev()
+        .find(|event| event.event_type == RuntimeEventType::TaskCreated)
+        .and_then(|event| {
+            event
+                .payload
+                .pointer("/payload/_delegation_assignment/acceptance")
+        })
+        .and_then(Value::as_array)
+        .filter(|criteria| !criteria.is_empty())
+    {
+        output.structured_facts["child_acceptance_status"] = json!("requires_parent_review");
+        output.structured_facts["child_acceptance_criteria"] = json!(criteria);
+    }
+    if let Some(facts) = events
+        .iter()
+        .rev()
+        .filter(|event| event.event_type == RuntimeEventType::ToolCompleted)
+        .map(|event| &event.payload["envelope"]["structured_facts"])
+        .find(|facts| facts["needs_parent_input"] == true)
+    {
+        output.structured_facts["needs_parent_input"] = json!(true);
+        output.structured_facts["waiting_for_user"] = json!(true);
+        output.structured_facts["question_id"] = facts["question_id"].clone();
+        output.structured_facts["questions"] = facts["questions"].clone();
+        output.summary = "subagent needs input; resume this child with the answer, expected_child_task_id and reply_to_question_id".into();
+    }
+    Ok(output)
 }
 
 fn verification_issues(record: &golutra_agent_core::VerificationRecord) -> Vec<Value> {
@@ -798,6 +1028,14 @@ fn findings(events: &[RuntimeEvent], task: Option<golutra_agent_core::TaskId>) -
         .iter()
         .rposition(|event| event.event_type == RuntimeEventType::VerificationCompleted)
         .unwrap_or(events.len());
+    if let Some(text) = events
+        .get(end)
+        .and_then(|event| event.payload.get("assistant_findings"))
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+    {
+        return Some(text.to_owned());
+    }
     events[..end]
         .iter()
         .rev()

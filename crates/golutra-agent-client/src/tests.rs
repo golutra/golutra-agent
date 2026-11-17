@@ -1,5 +1,8 @@
 use std::{ffi::OsString, fs, sync::RwLock};
 
+#[path = "subagent_integration_tests.rs"]
+pub(crate) mod subagent_integration_tests;
+
 use golutra_agent_auth::{AuthService, CredentialRef, MemorySecretStore, SecretKind, SecretStore};
 use golutra_agent_config::{
     ProviderConfigPaths, ProviderConfigScope, ProviderInstallPlan, ProviderProfile,
@@ -2243,7 +2246,7 @@ async fn assert_parent_interrupt_child(background: bool) {
     .await
     .expect("child thread starts");
 
-    timeout(Duration::from_secs(10), async {
+    let started = timeout(Duration::from_secs(10), async {
         loop {
             let event = events.recv().await.unwrap();
             if event.session_id == child_session_id
@@ -2253,8 +2256,32 @@ async fn assert_parent_interrupt_child(background: bool) {
             }
         }
     })
-    .await
-    .expect("child tool started");
+    .await;
+    if started.is_err() {
+        let history = host
+            .storage
+            .repositories
+            .events
+            .load(child_session_id, None, None)
+            .await
+            .unwrap();
+        let diagnostics = history
+            .iter()
+            .map(|event| {
+                (
+                    event.event_type,
+                    event.payload.get("status"),
+                    event.payload.get("message"),
+                    event.payload.get("reason"),
+                    event.payload.get("error"),
+                )
+            })
+            .collect::<Vec<_>>();
+        panic!(
+            "child tool did not start: {diagnostics:?}; delegation_finished={}",
+            delegation.is_finished()
+        );
+    }
     if background {
         delegation.await.unwrap().unwrap();
     } else {
@@ -12344,6 +12371,7 @@ async fn queued_turn_inherits_and_persists_active_provider_settings() {
             "provider_model": active_settings["provider_model"],
             "provider_generation_config": active_settings["provider_generation_config"],
         }),
+        json!({"prompt":"queued with matching effort", "provider_reasoning_effort":"high"}),
     ] {
         let queued = transport
             .send_command(command_with_payload(session_id, payload))
@@ -12382,7 +12410,7 @@ async fn queued_turn_inherits_and_persists_active_provider_settings() {
                 .is_some_and(|prompt| prompt.starts_with("queued "))
         })
         .collect::<Vec<_>>();
-    assert_eq!(queued_payloads.len(), 3);
+    assert_eq!(queued_payloads.len(), 4);
     for payload in queued_payloads {
         assert_eq!(
             payload["provider_profile"],
@@ -12446,6 +12474,8 @@ async fn queued_turn_cannot_change_active_provider_settings() {
             "generation config",
             json!({"provider_generation_config": {"reasoning_effort": "low"}}),
         ),
+        ("effort", json!({"provider_reasoning_effort":"low"})),
+        ("default effort", json!({"provider_reasoning_effort":null})),
     ] {
         let mut payload = json!({"prompt": format!("change {name}")});
         payload.as_object_mut().expect("object").extend(
@@ -13133,6 +13163,50 @@ fn context_request_artifact_redacts_secrets_inside_model_visible_messages() {
     assert_eq!(artifact.redaction_status, RedactionStatus::Redacted);
     assert!(!encoded.contains("plain-secret-value"));
     assert!(encoded.contains("<redacted-secret>"));
+}
+
+#[test]
+fn context_compaction_persists_shortened_tail_without_a_historical_summary() {
+    let task = HostedAgentTask {
+        session_id: SessionId::new(),
+        task_id: TaskId::new(),
+        turn_id: TurnId::new(),
+        payload: json!({}),
+    };
+    let message = ProviderMessage {
+        role: ProviderRole::User,
+        content: "recent task details ".repeat(2048),
+        tool_call_id: None,
+        tool_name: None,
+        tool_calls: Vec::new(),
+        metadata: Default::default(),
+    };
+    let mut record = golutra_agent_context::ContextWindowManager::new(256)
+        .compact_if_needed(task.turn_id, 0, &[message], &[], 0)
+        .unwrap()
+        .unwrap();
+    assert!(record.summary.is_empty());
+    assert_eq!(record.dropped_message_count, 0);
+    assert!(record.summary_source_messages.is_empty());
+    let (_, bytes) = context_compaction_artifact(&task, &record).expect("tail-only baseline");
+    let artifact: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        artifact["source_checksum"],
+        compaction_source_checksum(&Vec::<ProviderMessage>::new())
+    );
+    assert_eq!(
+        artifact["replacement_messages"],
+        serde_json::to_value(&record.replacement_messages).unwrap()
+    );
+
+    record.summary = "corrupt envelope".into();
+    assert!(context_compaction_artifact(&task, &record).is_err());
+    record.summary.clear();
+    record.dropped_message_count = 1;
+    assert!(
+        context_compaction_artifact(&task, &record).is_err(),
+        "missing history summary is not a tail-only compaction"
+    );
 }
 
 #[test]

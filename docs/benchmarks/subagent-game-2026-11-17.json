@@ -1,0 +1,383 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-11-17",
+  "timezone": "Asia/Shanghai",
+  "artifactDirectory": "/tmp/golutra-game-benchmark.jaq0zj",
+  "task": "ORBIT BREAKER browser Canvas game",
+  "provider": "golutra",
+  "model": "grok-4.7",
+  "reasoningEffort": "low",
+  "samplesPerArm": 1,
+  "order": [
+    "parallel-sdk",
+    "serial-sdk"
+  ],
+  "arms": {
+    "parallel-sdk": {
+      "sessionId": "01a1e593-4bd1-7001-bb03-3fed4f35f147",
+      "taskId": "01a1e593-4bf9-79b1-8296-e9ee94baf0aa",
+      "startedAt": "2026-11-16T18:16:36.949Z",
+      "finishedAt": "2026-11-16T18:19:34.538Z",
+      "exitCode": 0,
+      "wallSeconds": 177.588964125,
+      "rootTaskSeconds": 176.099,
+      "childCount": 8,
+      "childrenCompleted": 8,
+      "peakConcurrentChildren": 8,
+      "sumChildSeconds": 326.33200000000005,
+      "unionChildSeconds": 59.382999999999996,
+      "meanConcurrencyDuringActivePeriods": 5.4953774649310425,
+      "childDurationQuantiles": {
+        "min": 10.025000000000006,
+        "p50": 47.62000000000002,
+        "p90": 59.131,
+        "p95": 59.131,
+        "max": 59.131
+      },
+      "providerLogicalRequestsCompleted": 50,
+      "providerRetries": 0,
+      "toolCalls": 65,
+      "toolErrors": 2,
+      "usage": {
+        "requests": 50,
+        "inputTokens": 571982,
+        "outputTokens": 38836,
+        "reasoningTokens": 12495,
+        "cachedInputTokens": 397056,
+        "totalTokens": 610818,
+        "incompleteRequests": 0,
+        "costUsd": null
+      },
+      "backgroundConsumedEvents": 1,
+      "behavioralChecks": {
+        "passed": 23,
+        "failed": 0,
+        "total": 23
+      },
+      "browserChecks": {
+        "passed": 11,
+        "failed": 0,
+        "total": 11,
+        "failures": []
+      },
+      "children": [
+        {
+          "name": "input",
+          "sessionId": "cc31c4b2-09bb-5edc-925b-c2a649a52b97",
+          "taskId": "01a1e594-d2be-75d2-ab7f-e53f0028ccec",
+          "startSeconds": 100.034,
+          "endSeconds": 154.032,
+          "durationSeconds": 53.998000000000005,
+          "status": "completed"
+        },
+        {
+          "name": "player",
+          "sessionId": "0ed5d787-1286-5b5a-b5bc-818d8ca3bf39",
+          "taskId": "01a1e594-d311-7243-ac8b-237220f23bfe",
+          "startSeconds": 100.118,
+          "endSeconds": 110.143,
+          "durationSeconds": 10.025000000000006,
+          "status": "completed"
+        },
+        {
+          "name": "combat",
+          "sessionId": "476e44ff-b193-57dd-9418-5bb9364b66d6",
+          "taskId": "01a1e594-d323-7f71-9460-31dcdc5ec184",
+          "startSeconds": 100.135,
+          "endSeconds": 148.583,
+          "durationSeconds": 48.44799999999999,
+          "status": "completed"
+        },
+        {
+          "name": "enemies",
+          "sessionId": "b373b71a-4995-52c0-9c53-02ae6c4af895",
+          "taskId": "01a1e594-d338-7e61-8777-71b3205ffb9a",
+          "startSeconds": 100.16,
+          "endSeconds": 149.286,
+          "durationSeconds": 49.126000000000005,
+          "status": "completed"
+        },
+        {
+          "name": "collisions",
+          "sessionId": "d7dca03b-d18b-54d1-bbc6-b35488d274aa",
+          "taskId": "01a1e594-d361-7472-a440-09e2705a7019",
+          "startSeconds": 100.198,
+          "endSeconds": 147.818,
+          "durationSeconds": 47.62000000000002,
+          "status": "completed"
+        },
+        {
+          "name": "renderer",
+          "sessionId": "c0132ee0-cd5b-515d-8d77-5d6d27a22bf2",
+          "taskId": "01a1e594-d38e-7f80-9dd1-692e350fd379",
+          "startSeconds": 100.244,
+          "endSeconds": 140.074,
+          "durationSeconds": 39.83000000000001,
+          "status": "completed"
+        },
+        {
+          "name": "ui",
+          "sessionId": "2661b697-7282-57e3-b734-b6c0c50ebae9",
+          "taskId": "01a1e594-d3b9-7330-9f12-f892bc6112ab",
+          "startSeconds": 100.286,
+          "endSeconds": 159.417,
+          "durationSeconds": 59.131,
+          "status": "completed"
+        },
+        {
+          "name": "audio",
+          "sessionId": "0a927e57-ea74-5b75-aac3-c7dcaf6fd81d",
+          "taskId": "01a1e594-d3f3-74f1-99f1-20e54750a7de",
+          "startSeconds": 100.345,
+          "endSeconds": 118.499,
+          "durationSeconds": 18.153999999999996,
+          "status": "completed"
+        }
+      ],
+      "retryDurations": [],
+      "build": {
+        "schema_version": 1,
+        "package_version": "0.3.9",
+        "git_commit": "fa1d695559e03d3251e25cc80f8ac73c9bf09077",
+        "dirty": true,
+        "source_digest": "sha256:05512167e50cefec33d54875c7d0297da33a30c8d10eda5d7c0c0db6e2cda25a",
+        "cargo_lock_digest": "sha256:04710b6e7872ed1e951210b244924737d4632c5724f7910b5f8e170a0d28ab3a",
+        "target": "aarch64-apple-darwin",
+        "profile": "debug",
+        "features": [],
+        "rustc_version": "rustc 1.93.0 (254b59607 2026-01-19)",
+        "binary_checksum": null
+      },
+      "binarySha256": "56b4c8617c8d16238b9a6ef0ffc4e30865a815a1fccf484966272e5eb965196d",
+      "promptSha256": "40113e3fd50f813903009108d068b0fd2db3330f418a5e835806c281246025ea"
+    },
+    "serial-sdk": {
+      "sessionId": "01a1e596-73a6-7a91-b41f-c6331f423ea0",
+      "taskId": "01a1e596-73c0-7d00-873c-60287e121068",
+      "startedAt": "2026-11-16T18:20:04.832Z",
+      "finishedAt": "2026-11-16T18:33:07.836Z",
+      "exitCode": 0,
+      "wallSeconds": 783.002371333,
+      "rootTaskSeconds": 782.483,
+      "childCount": 8,
+      "childrenCompleted": 8,
+      "peakConcurrentChildren": 1,
+      "sumChildSeconds": 649.9309999999999,
+      "unionChildSeconds": 649.9309999999999,
+      "meanConcurrencyDuringActivePeriods": 1,
+      "childDurationQuantiles": {
+        "min": 19.15400000000001,
+        "p50": 80.12099999999998,
+        "p90": 137.33800000000002,
+        "p95": 137.33800000000002,
+        "max": 137.33800000000002
+      },
+      "providerLogicalRequestsCompleted": 60,
+      "providerRetries": 4,
+      "toolCalls": 68,
+      "toolErrors": 5,
+      "usage": {
+        "requests": 60,
+        "inputTokens": 708499,
+        "outputTokens": 42798,
+        "reasoningTokens": 17082,
+        "cachedInputTokens": 508288,
+        "totalTokens": 751297,
+        "incompleteRequests": 4,
+        "costUsd": null
+      },
+      "backgroundConsumedEvents": 1,
+      "behavioralChecks": {
+        "passed": 23,
+        "failed": 0,
+        "total": 23
+      },
+      "browserChecks": {
+        "passed": 10,
+        "failed": 1,
+        "total": 11,
+        "failures": [
+          {
+            "check": "mute button toggles",
+            "passed": false,
+            "label": "Mute"
+          }
+        ]
+      },
+      "children": [
+        {
+          "name": "input",
+          "sessionId": "f5d91586-7ccd-535a-b209-4b3a5ceaca22",
+          "taskId": "01a1e596-bdc0-7072-8072-d775a818c3b4",
+          "startSeconds": 18.945,
+          "endSeconds": 113.56,
+          "durationSeconds": 94.61500000000001,
+          "status": "completed"
+        },
+        {
+          "name": "player",
+          "sessionId": "ee3e8749-7b14-53f7-b159-0eba28e20910",
+          "taskId": "01a1e598-4a18-74b3-8ece-7aebe5cf8010",
+          "startSeconds": 120.408,
+          "endSeconds": 139.562,
+          "durationSeconds": 19.15400000000001,
+          "status": "completed"
+        },
+        {
+          "name": "combat",
+          "sessionId": "27cc93e4-b2f0-51fd-96b4-06e391c269c4",
+          "taskId": "01a1e598-b855-78c2-9432-3c58573caac3",
+          "startSeconds": 148.63,
+          "endSeconds": 184.536,
+          "durationSeconds": 35.906000000000006,
+          "status": "completed"
+        },
+        {
+          "name": "enemies",
+          "sessionId": "93ee16fd-13a5-5182-810e-2afacf33b58f",
+          "taskId": "01a1e599-6245-7a40-98dc-a1346c2d9a19",
+          "startSeconds": 192.134,
+          "endSeconds": 257.441,
+          "durationSeconds": 65.30699999999999,
+          "status": "completed"
+        },
+        {
+          "name": "collisions",
+          "sessionId": "592078c9-e6ea-56e8-98db-f24dfce0537e",
+          "taskId": "01a1e59a-8a53-7992-8bf2-6d76ec6f86eb",
+          "startSeconds": 267.924,
+          "endSeconds": 377.054,
+          "durationSeconds": 109.13,
+          "status": "completed"
+        },
+        {
+          "name": "renderer",
+          "sessionId": "1aa7fa95-b5c1-5f56-bd55-3deae5a7aff3",
+          "taskId": "01a1e59c-5440-7850-a6b0-e90c30762d7c",
+          "startSeconds": 385.153,
+          "endSeconds": 493.513,
+          "durationSeconds": 108.35999999999996,
+          "status": "completed"
+        },
+        {
+          "name": "ui",
+          "sessionId": "be5ebd77-ae55-5d66-9d9c-81d0aaf5a534",
+          "taskId": "01a1e59e-1d97-7aa2-96d8-91d75a992efb",
+          "startSeconds": 502.232,
+          "endSeconds": 639.57,
+          "durationSeconds": 137.33800000000002,
+          "status": "completed"
+        },
+        {
+          "name": "audio",
+          "sessionId": "9b20aaa4-99e7-5440-8f23-280c1477dc0b",
+          "taskId": "01a1e5a0-4992-7443-a915-6be24561f314",
+          "startSeconds": 644.563,
+          "endSeconds": 724.684,
+          "durationSeconds": 80.12099999999998,
+          "status": "completed"
+        }
+      ],
+      "retryDurations": [
+        {
+          "session": "collisions",
+          "initialFailedAttemptAndWaitSeconds": 60.28199999999998,
+          "waitedMs": 255
+        },
+        {
+          "session": "renderer",
+          "initialFailedAttemptAndWaitSeconds": 60.17700000000002,
+          "waitedMs": 235
+        },
+        {
+          "session": "ui",
+          "initialFailedAttemptAndWaitSeconds": 60.21300000000008,
+          "waitedMs": 262
+        },
+        {
+          "session": "audio",
+          "initialFailedAttemptAndWaitSeconds": 60.275999999999954,
+          "waitedMs": 247
+        }
+      ],
+      "build": {
+        "schema_version": 1,
+        "package_version": "0.3.9",
+        "git_commit": "fa1d695559e03d3251e25cc80f8ac73c9bf09077",
+        "dirty": true,
+        "source_digest": "sha256:05512167e50cefec33d54875c7d0297da33a30c8d10eda5d7c0c0db6e2cda25a",
+        "cargo_lock_digest": "sha256:04710b6e7872ed1e951210b244924737d4632c5724f7910b5f8e170a0d28ab3a",
+        "target": "aarch64-apple-darwin",
+        "profile": "debug",
+        "features": [],
+        "rustc_version": "rustc 1.93.0 (254b59607 2026-01-19)",
+        "binary_checksum": null
+      },
+      "binarySha256": "56b4c8617c8d16238b9a6ef0ffc4e30865a815a1fccf484966272e5eb965196d",
+      "promptSha256": "2a3badd37766080d1dab1e27eb3f9fd864675bbb83d65b19cbefff9662cc7e74"
+    }
+  },
+  "integrity": {
+    "checkedAt": "2026-11-16T18:47:53.534Z",
+    "executableSha256": "56b4c8617c8d16238b9a6ef0ffc4e30865a815a1fccf484966272e5eb965196d",
+    "verifierSha256": "e51a0c8ebf3cd3b8e55f22ee2ee59737f136009d4c5eff181bccbb72ed4fc832",
+    "arms": {
+      "parallel-sdk": {
+        "wallSeconds": 177.588964125,
+        "binarySha256": "56b4c8617c8d16238b9a6ef0ffc4e30865a815a1fccf484966272e5eb965196d",
+        "contractSha256": "db900182735c32d96b61366533056832f971000451e49f73ae703a1efa22ad70",
+        "rootSession": "01a1e593-4bd1-7001-bb03-3fed4f35f147",
+        "rootTask": "01a1e593-4bf9-79b1-8296-e9ee94baf0aa",
+        "allTasksCompleted": true,
+        "taskCount": 9,
+        "actualEfforts": [
+          "low"
+        ],
+        "processesObserved": 16,
+        "nonterminalProcesses": [],
+        "firstChildSeconds": 100.034,
+        "lastChildStartSeconds": 100.345,
+        "lastChildEndSeconds": 159.417,
+        "retryFailedAttemptAndWaitSeconds": 0,
+        "passed": 23,
+        "failed": 0
+      },
+      "serial-sdk": {
+        "wallSeconds": 783.002371333,
+        "binarySha256": "56b4c8617c8d16238b9a6ef0ffc4e30865a815a1fccf484966272e5eb965196d",
+        "contractSha256": "db900182735c32d96b61366533056832f971000451e49f73ae703a1efa22ad70",
+        "rootSession": "01a1e596-73a6-7a91-b41f-c6331f423ea0",
+        "rootTask": "01a1e596-73c0-7d00-873c-60287e121068",
+        "allTasksCompleted": true,
+        "taskCount": 9,
+        "actualEfforts": [
+          "low"
+        ],
+        "processesObserved": 21,
+        "nonterminalProcesses": [],
+        "firstChildSeconds": 18.945,
+        "lastChildStartSeconds": 644.563,
+        "lastChildEndSeconds": 724.684,
+        "retryFailedAttemptAndWaitSeconds": 240.94800000000004,
+        "passed": 23,
+        "failed": 0
+      }
+    },
+    "speedup": 4.409071110870753,
+    "adjustedArithmeticSpeedup": 3.0522976132202837
+  },
+  "interpretation": {
+    "rawSpeedup": 4.409071110870753,
+    "rawElapsedReductionPercent": 77.31948578614536,
+    "arithmeticTimeoutAdjustedSpeedup": 3.0522976132202837,
+    "arithmeticAdjustmentIsMeasuredRerun": false,
+    "costComparisonSupported": false,
+    "limitations": [
+      "One sequentially scheduled sample per arm; not a before/after refactor benchmark.",
+      "Serial arm recovered four HTTP 504 gateway timeouts; incomplete failed-attempt usage.",
+      "Eight module boundaries and API contract were supplied in advance.",
+      "Both generated games retain visual overlay defects; serial mute button lacks state feedback.",
+      "Behavioral and browser checks are separate; no production endurance or cross-platform claim."
+    ]
+  }
+}

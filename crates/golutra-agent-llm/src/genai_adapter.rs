@@ -633,7 +633,13 @@ fn genai_message(
 ) -> Result<ChatMessage, ProviderError> {
     match message.role {
         ProviderRole::System => Ok(ChatMessage::system(message.content.clone())),
-        ProviderRole::User => Ok(ChatMessage::user(message.content.clone())),
+        ProviderRole::User => {
+            let mut parts = vec![ContentPart::Text(message.content.clone())];
+            parts.extend(message.metadata.images.iter().map(|image| {
+                ContentPart::from_binary_base64(image.mime_type.clone(), image.base64.clone(), None)
+            }));
+            Ok(ChatMessage::user(MessageContent::from_parts(parts)))
+        }
         ProviderRole::Assistant => {
             let mut parts = Vec::new();
             if replay_openai_responses_reasoning {
@@ -1231,6 +1237,38 @@ fn tool_description(tool_name: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_observation_images_remain_binary_in_provider_messages() {
+        let message = ProviderMessage {
+            role: ProviderRole::User,
+            content: "browser screenshot".to_owned(),
+            tool_call_id: None,
+            tool_name: None,
+            tool_calls: Vec::new(),
+            metadata: super::super::ProviderMessageMetadata {
+                images: vec![super::super::ProviderImage {
+                    mime_type: "image/png".to_owned(),
+                    base64: "aW1hZ2U=".to_owned(),
+                }],
+                ..Default::default()
+            },
+        };
+        let chat = genai_message(&message, true).unwrap();
+        let serialized = serde_json::to_value(&chat).unwrap();
+        assert!(serialized.to_string().contains("image/png"));
+        assert!(serialized.to_string().contains("aW1hZ2U="));
+        assert!(!serialized.to_string().contains("encoded_bytes"));
+        let openai = super::super::openai_message(&message);
+        assert_eq!(openai["content"][1]["type"], "image_url");
+        assert_eq!(
+            openai["content"][1]["image_url"]["url"],
+            "data:image/png;base64,aW1hZ2U="
+        );
+        let replay: ProviderMessage =
+            serde_json::from_value(serde_json::to_value(&message).unwrap()).unwrap();
+        assert_eq!(message, replay);
+    }
 
     #[test]
     fn stream_parser_and_provider_error_events_are_hard_failures() {

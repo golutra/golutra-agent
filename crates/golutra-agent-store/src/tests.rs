@@ -2901,6 +2901,59 @@ async fn tool_completed_bundle_atomically_commits_facts_and_deduplicates_blobs()
 }
 
 #[tokio::test]
+async fn background_completion_bundle_keeps_artifacts_without_duplicate_tool_completion() {
+    let store = RuntimeStore::in_memory().await.unwrap();
+    let session_id = SessionId::new();
+    let event_id = EventId::new();
+    let artifact_id = ArtifactId::new();
+    let evidence_id = EvidenceId::new();
+    let bytes = b"background page output";
+    let artifact = tool_completion_artifact(artifact_id, session_id, event_id, bytes, "background");
+    let evidence = EvidenceRecord {
+        evidence_id,
+        claim: "background output captured".to_owned(),
+        artifact_refs: vec![artifact_id],
+        source_event_refs: vec![event_id],
+        evidence_strength: EvidenceStrength::Strong,
+        verifier: "test".to_owned(),
+        confidence: 1.0,
+        limitations: "fixture".to_owned(),
+    };
+    let mut event = tool_completed_event(event_id, session_id, artifact_id, evidence_id);
+    event.event_type = RuntimeEventType::BackgroundTaskUpdated;
+    assert!(
+        store
+            .append_tool_completed_bundle(event.clone(), &[], &[])
+            .await
+            .is_err()
+    );
+    assert!(store.event_by_id(event_id).await.unwrap().is_none());
+    let saved = store
+        .append_tool_completed_bundle(event, &[(artifact.clone(), bytes.to_vec())], &[evidence])
+        .await
+        .unwrap();
+    assert_eq!(
+        store.event_by_id(event_id).await.unwrap(),
+        Some(saved.clone())
+    );
+    assert_eq!(
+        store.load_artifact(artifact_id).await.unwrap(),
+        Some(artifact)
+    );
+    assert_eq!(
+        store.load_events(session_id, None, None).await.unwrap(),
+        vec![saved]
+    );
+    assert!(
+        store
+            .load_latest_model_history_event(session_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn tool_completed_bundle_rolls_back_database_facts_and_unique_blob_on_event_conflict() {
     let store = RuntimeStore::in_memory().await.expect("store");
     let conflicting_event_id = EventId::new();

@@ -346,12 +346,17 @@ async fn existing_http_transport_reattaches_after_daemon_restart_on_the_same_end
     let cwd = tempdir().expect("cwd");
     let home = tempdir().expect("home");
     install_mock_provider(home.path());
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
-    let address = listener.local_addr().expect("address");
-    drop(listener);
-
-    let mut first_daemon = spawn_daemon_at(home.path(), address);
+    // Let the daemon reserve its port. Releasing a probe listener before spawn
+    // allows another parallel test to acquire that supposedly reserved port.
+    let mut first_daemon = spawn_daemon(home.path());
     let stale_transport = wait_for_transport(home.path(), cwd.path()).await;
+    let address = stale_transport
+        .server_info()
+        .base_url
+        .strip_prefix("http://")
+        .expect("local HTTP endpoint")
+        .parse()
+        .expect("daemon socket address");
     let stale_instance = stale_transport.server_info().instance_id.clone();
     first_daemon.0.kill().await.expect("stop first daemon");
 

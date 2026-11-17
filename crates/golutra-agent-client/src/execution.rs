@@ -1092,7 +1092,7 @@ impl RuntimeHost {
     pub(super) async fn spawn_agent_task(
         self: Arc<Self>,
         task: HostedAgentTask,
-        session_lease: Option<Arc<File>>,
+        session_lease: Option<Arc<ExecutionLease>>,
         pending_turns: Vec<ConfiguredPendingAgentTurn>,
         delegation: Option<DelegationContextSeed>,
         governor_usage: AgentGovernorUsage,
@@ -1332,6 +1332,9 @@ impl RuntimeHost {
             }
         }
         self.clear_task_control(task.session_id, task.task_id).await;
+        let _ = self
+            .release_finished_background_reports(task.session_id, task.task_id)
+            .await;
         if delegated_parent_cancelled {
             let _ = delegation::cleanup_cancelled_delegated_task(&self, &task).await;
         }
@@ -1463,6 +1466,13 @@ impl RuntimeHost {
             self.resolve_provider_plan_with_auth(&task, &objective, provider_cancellation,),
         );
         let mut tool_executor = tool_executor_result?;
+        let mut background_results = self.pending_background_results(task.session_id).await?;
+        tool_executor = tool_executor
+            .with_background_supervisor(
+                self.execution.background_supervisor.clone(),
+                background::HostedBackgroundObserver::new(&self, task.clone()),
+            )
+            .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
         let prompt_cache_scope = prompt_cache_scope_result?;
         tool_executor = tool_executor
             .with_task_delegation_backend(Arc::new(
@@ -1470,7 +1480,9 @@ impl RuntimeHost {
             ))
             .map_err(|error| ClientError::TaskExecution(error.to_string()))?;
         if delegated_task {
-            tool_executor = tool_executor.without_tool("subagent");
+            tool_executor = tool_executor
+                .without_tool("subagent")
+                .with_deferred_user_input();
         }
         let workspace_tool_names = tool_executor
             .registry()
@@ -1513,6 +1525,23 @@ impl RuntimeHost {
             ),
         );
         let mut resume_context = resume_context_result?;
+        if resume_context.is_none() {
+            let mut seen = background_results
+                .iter()
+                .map(|result| result.result_id)
+                .collect::<HashSet<_>>();
+            for result in self
+                .background_results_for_context_fallback(task.session_id)
+                .await?
+            {
+                if background_results.len() == golutra_agent_core::MAX_BACKGROUND_PENDING_RESULTS {
+                    break;
+                }
+                if seen.insert(result.result_id) {
+                    background_results.push(result);
+                }
+            }
+        }
         if resume_context.is_none()
             && task
                 .payload
@@ -1602,6 +1631,7 @@ impl RuntimeHost {
         .with_execution_mode(execution_mode.explicit())
         .with_tool_profile(tool_profile)
         .with_deferred_external_verification(defer_external_verification)
+        .with_background_results(background_results)
         .with_governor_usage(governor_usage);
         let run = match resume_context {
             Some(replay_context) => run.with_replay_context(replay_context),

@@ -595,9 +595,11 @@ fn estimate_observation_bytes(observation: &RuntimeObservation) -> usize {
         RuntimeObservation::VerificationAssertionCompleted(assertion) => {
             structured_bytes(assertion)
         }
-        RuntimeObservation::VerificationCompleted { record, terminal } => {
-            structured_bytes(&(record, terminal))
-        }
+        RuntimeObservation::VerificationCompleted {
+            record,
+            terminal,
+            findings,
+        } => structured_bytes(&(record, terminal, findings)),
         RuntimeObservation::CorrectionIssued(correction) => structured_bytes(correction),
         RuntimeObservation::ProviderStarted {
             request_id,
@@ -639,6 +641,11 @@ fn estimate_observation_bytes(observation: &RuntimeObservation) -> usize {
         )),
         RuntimeObservation::ToolProgress(progress) => tool_progress_observation_bytes(progress),
         RuntimeObservation::ToolCompleted(report) => tool_report_bytes(report),
+        RuntimeObservation::BackgroundResultsConsumed {
+            result_ids,
+            request_id,
+            turn_id,
+        } => structured_bytes(&(result_ids, request_id, turn_id)),
         RuntimeObservation::PolicyEvaluated(evaluation) => structured_bytes(evaluation),
         RuntimeObservation::ApprovalRequested(request) => structured_bytes(request),
         RuntimeObservation::ApprovalResolved(resolution) => structured_bytes(resolution),

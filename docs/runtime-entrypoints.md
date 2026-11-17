@@ -45,12 +45,11 @@ arguments and the compatibility alias `golutra-agent-tui` construct an
 `golutra-agent exec` for a headless turn, and use the daemon or App Server surfaces when another
 process must observe or control the same running task.
 
-### Interactive defaults and runtime settings
+### Runtime defaults and per-turn overrides
 
 After npm installation, `golutra-agent` with no arguments opens the TUI. The
 explicit `golutra-agent exec ...` subcommand remains headless and is suitable for
-scripts and CI. TUI runtime defaults are read once at startup from two
-non-secret JSON layers:
+scripts and CI. Both TUI and exec load defaults from two non-secret JSON layers:
 
 ```text
 $GOLUTRA_AGENT_HOME/runtime.json       # global defaults
@@ -59,13 +58,35 @@ session controls                  # in-memory overrides for this TUI session
 ```
 
 Project values override global values; session controls override both. An
-explicit CLI flag such as `--execution-mode` or `--tool-profile` wins over the
-loaded files. Allowed fields are `provider_profile`, `model`,
+explicit exec flag (`--provider-profile`, `--model`, `--reasoning-effort`,
+`--execution-mode` or `--tool-profile`) wins over the loaded files. Allowed fields are `provider_profile`, `model`,
 `execution_mode` (`open`/`strict`), `verify_on_change` (`auto`/`off`/`never`),
 `tool_profile` (`coding`/`full`) and `reasoning_effort`
 (`default`/`low`/`medium`/`high`/`xhigh`/`max`/`ultra`). Unknown fields, symlinks, malformed
 JSON, secret-shaped fields and files larger than 64 KiB are rejected; API keys
 and tokens remain in the credential store or environment references.
+
+Exec resolves command-line flags → project settings → global settings → the
+host's selected provider defaults. For example:
+
+```bash
+golutra-agent exec --model grok-4.7 --reasoning-effort low "Implement the requested change"
+```
+
+These overrides apply to the submitted turn and do not change saved preferences.
+`--reasoning-effort default` clears the profile's configured effort and lets the
+provider choose its default. Changing only effort preserves the host profile's
+token limit, context window and thinking settings. Child tasks inherit the
+resolved model and effort unless explicitly overridden. The effective settings
+are pinned in the task's persisted payload; reading a configuration file alone
+does not prove which settings a task used.
+
+`verify_on_change` remains a TUI control; exec uses its explicit contract and
+verification flags. `subagent_max_concurrent` is a host admission setting, loaded
+from the same global/project files. The Rust facade exposes
+`AgentThread::start_turn_with_provider_options` with `AgentTurnProviderOptions`:
+an omitted effort inherits, `Some(None)` resets, and `Some(Some(value))` overrides.
+Queued input cannot change the provider settings of an already active turn.
 
 ### Child-process environment and CLI results
 

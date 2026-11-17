@@ -8,7 +8,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     net::{UnixStream, unix::OwnedReadHalf},
     sync::mpsc,
 };
@@ -790,28 +790,12 @@ async fn open_exchange_with_cancellation(
             .map_err(|_| ClientError::Daemon("IPC connection timed out".to_owned()))?
             .map_err(|error| ClientError::Daemon(error.to_string()))?;
         let (reader, mut writer) = stream.into_split();
-        writer
-            .write_all(&bytes)
-            .await
-            .map_err(|error| ClientError::Daemon(error.to_string()))?;
-        writer
-            .shutdown()
-            .await
-            .map_err(|error| ClientError::Daemon(error.to_string()))?;
-        let mut reader = BufReader::new(reader);
         let timeout = if path.ends_with("/handoff") {
             crate::handoff::HANDOFF_TRANSPORT_TIMEOUT
         } else {
             IPC_RESPONSE_HEAD_TIMEOUT
         };
-        let head = read_response_head(&mut reader, timeout).await?;
-        match head {
-            IpcHttpResponseFrame::Head { status, .. } => Ok((status, reader)),
-            IpcHttpResponseFrame::Error { message } => Err(ClientError::Daemon(message)),
-            _ => Err(ClientError::Daemon(
-                "IPC response did not start with a head frame".to_owned(),
-            )),
-        }
+        write_request_and_read_head(reader, &mut writer, &bytes, timeout).await
     };
     match cancellation {
         Some(cancellation) => {
@@ -823,6 +807,39 @@ async fn open_exchange_with_cancellation(
             }
         }
         None => operation.await,
+    }
+}
+
+async fn write_request_and_read_head<R, W>(
+    reader: R,
+    writer: &mut W,
+    bytes: &[u8],
+    timeout: Duration,
+) -> Result<(u16, BufReader<R>), ClientError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    writer
+        .write_all(bytes)
+        .await
+        .map_err(|error| ClientError::Daemon(error.to_string()))?;
+    // The server can read the complete newline-delimited request, respond and close
+    // before our half-close. macOS then reports NotConnected even with a valid
+    // response queued. Validate that response instead of discarding it or replaying.
+    if let Err(error) = writer.shutdown().await
+        && error.kind() != std::io::ErrorKind::NotConnected
+    {
+        return Err(ClientError::Daemon(error.to_string()));
+    }
+    let mut reader = BufReader::new(reader);
+    let head = read_response_head(&mut reader, timeout).await?;
+    match head {
+        IpcHttpResponseFrame::Head { status, .. } => Ok((status, reader)),
+        IpcHttpResponseFrame::Error { message } => Err(ClientError::Daemon(message)),
+        _ => Err(ClientError::Daemon(
+            "IPC response did not start with a head frame".to_owned(),
+        )),
     }
 }
 
@@ -838,7 +855,10 @@ where
         .map_err(|_| ClientError::Daemon("IPC response head timed out".to_owned()))?
 }
 
-async fn collect_frames(reader: &mut BufReader<OwnedReadHalf>) -> Result<Vec<u8>, ClientError> {
+async fn collect_frames<R>(reader: &mut R) -> Result<Vec<u8>, ClientError>
+where
+    R: AsyncBufRead + Unpin,
+{
     let mut body = Vec::new();
     loop {
         match read_frame(reader).await? {
@@ -992,9 +1012,163 @@ async fn validate_socket(path: &Path) -> Result<(), ClientError> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::{
+        io::{self, Cursor},
+        pin::Pin,
+        task::{Context, Poll},
+    };
 
     use super::*;
+
+    struct ShutdownFailureWriter {
+        kind: io::ErrorKind,
+        written: Vec<u8>,
+        write_count: usize,
+    }
+
+    impl ShutdownFailureWriter {
+        fn new(kind: io::ErrorKind) -> Self {
+            Self {
+                kind,
+                written: Vec::new(),
+                write_count: 0,
+            }
+        }
+    }
+
+    impl AsyncWrite for ShutdownFailureWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.written.extend_from_slice(bytes);
+            self.write_count += 1;
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::from(self.kind)))
+        }
+    }
+
+    fn response_bytes(frames: &[IpcHttpResponseFrame]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for frame in frames {
+            serde_json::to_writer(&mut bytes, frame).expect("frame JSON");
+            bytes.push(b'\n');
+        }
+        bytes
+    }
+
+    #[tokio::test]
+    async fn not_connected_half_close_preserves_a_complete_queued_response_without_replay() {
+        let body = b"{\"accepted\":true}";
+        let queued_response = response_bytes(&[
+            IpcHttpResponseFrame::Head {
+                status: 200,
+                headers: BTreeMap::new(),
+            },
+            IpcHttpResponseFrame::Chunk {
+                data_base64: BASE64.encode(body),
+            },
+            IpcHttpResponseFrame::End,
+        ]);
+        let mut writer = ShutdownFailureWriter::new(io::ErrorKind::NotConnected);
+        let request = b"{\"method\":\"POST\",\"path\":\"/commands\"}\n";
+        let (status, mut reader) = write_request_and_read_head(
+            Cursor::new(queued_response),
+            &mut writer,
+            request,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("already queued response remains usable");
+
+        assert_eq!(status, 200);
+        assert_eq!(
+            collect_frames(&mut reader)
+                .await
+                .expect("complete response"),
+            body
+        );
+        assert_eq!(writer.written, request);
+        assert_eq!(writer.write_count, 1, "request must never be replayed");
+    }
+
+    #[tokio::test]
+    async fn not_connected_half_close_still_rejects_missing_and_truncated_responses() {
+        let head = IpcHttpResponseFrame::Head {
+            status: 200,
+            headers: BTreeMap::new(),
+        };
+        let mut truncated_head = response_bytes(std::slice::from_ref(&head));
+        truncated_head.pop();
+        let responses = [
+            Vec::new(),
+            truncated_head,
+            response_bytes(std::slice::from_ref(&head)),
+            response_bytes(&[
+                head,
+                IpcHttpResponseFrame::Chunk {
+                    data_base64: BASE64.encode(b"partial"),
+                },
+            ]),
+        ];
+        for queued_response in responses {
+            let mut writer = ShutdownFailureWriter::new(io::ErrorKind::NotConnected);
+            let request = b"request\n";
+            let result = async {
+                let (_, mut reader) = write_request_and_read_head(
+                    Cursor::new(queued_response),
+                    &mut writer,
+                    request,
+                    Duration::from_secs(1),
+                )
+                .await?;
+                collect_frames(&mut reader).await
+            }
+            .await;
+            assert!(
+                result.is_err(),
+                "a half-close error cannot make an incomplete response valid"
+            );
+            assert_eq!(writer.written, request);
+            assert_eq!(writer.write_count, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn other_half_close_errors_still_fail_even_with_a_queued_response() {
+        for kind in [io::ErrorKind::BrokenPipe, io::ErrorKind::ConnectionReset] {
+            let queued_response = response_bytes(&[
+                IpcHttpResponseFrame::Head {
+                    status: 200,
+                    headers: BTreeMap::new(),
+                },
+                IpcHttpResponseFrame::End,
+            ]);
+            let mut writer = ShutdownFailureWriter::new(kind);
+            let request = b"request\n";
+            let error = write_request_and_read_head(
+                Cursor::new(queued_response),
+                &mut writer,
+                request,
+                Duration::from_secs(1),
+            )
+            .await
+            .expect_err("other write-side failures must remain failures");
+            assert!(
+                matches!(error, ClientError::Daemon(message) if message == io::Error::from(kind).to_string())
+            );
+            assert_eq!(writer.written, request);
+            assert_eq!(writer.write_count, 1);
+        }
+    }
 
     #[tokio::test]
     async fn frame_reader_accepts_a_complete_bounded_frame() {

@@ -12,6 +12,8 @@ use std::{
 #[path = "subagent_parallel_tests.rs"]
 mod subagent_parallel_tests;
 
+#[path = "background_tests.rs"]
+mod background_tests;
 #[path = "pending_batch_tests.rs"]
 mod pending_batch_tests;
 
@@ -65,6 +67,9 @@ use serde_json::json;
 use tempfile::tempdir;
 
 use super::*;
+
+#[path = "browser_image_tests.rs"]
+mod browser_image_tests;
 
 fn objective_test_report(tool_name: &str, command: Option<&str>) -> ToolExecutionReport {
     ToolExecutionReport {
@@ -6170,6 +6175,7 @@ impl ExternalToolBackend for ParallelCapabilityBackend {
         _cancellation: CancellationToken,
     ) -> Result<ExternalToolOutput, ToolError> {
         Ok(ExternalToolOutput {
+            images: Vec::new(),
             summary: "capability fixture completed".to_owned(),
             content: String::new(),
             structured_facts: json!({}),

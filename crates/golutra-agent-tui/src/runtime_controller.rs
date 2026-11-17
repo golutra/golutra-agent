@@ -197,6 +197,7 @@ impl TuiRuntimeController {
         changed |= app.poll_auth_model_discovery().await;
         changed |= app.poll_auth_protocol_detection().await;
         app.poll_export_operation().await;
+        changed |= app.poll_browser_connection().await;
         let recovered = app.poll_pending_recovery(&self.transport).await?;
         Ok(changed
             || details_changed
@@ -265,6 +266,7 @@ impl TuiRuntimeController {
         changed |= app.poll_auth_model_discovery().await;
         changed |= app.poll_auth_protocol_detection().await;
         app.poll_export_operation().await;
+        changed |= app.poll_browser_connection().await;
         let recovered = app.poll_pending_recovery(&self.transport).await?;
         Ok(changed
             || details_changed

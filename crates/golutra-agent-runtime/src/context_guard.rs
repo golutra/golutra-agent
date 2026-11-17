@@ -90,6 +90,7 @@ where
     trace(AgentLoopTraceEvent::VerificationCompleted {
         record: verification.clone(),
         terminal: true,
+        findings: None,
     });
     let final_message = if planned == 0 && limit == 0 {
         format!("Cannot continue because runtime rejected the model input: {reason}.")

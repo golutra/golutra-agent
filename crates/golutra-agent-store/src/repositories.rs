@@ -8,8 +8,9 @@
 use std::collections::HashSet;
 
 use golutra_agent_core::{
-    ArtifactId, ArtifactRecord, CommandId, ContextSnapshot, EvidenceId, EvidenceRecord,
-    PostTaskJob, PostTaskJobId, PostTaskJobStatus, SessionId, TaskId, ThreadId, VerificationPlan,
+    ArtifactId, ArtifactRecord, BackgroundResult, CommandId, ContextSnapshot, EvidenceId,
+    EvidenceRecord, PostTaskJob, PostTaskJobId, PostTaskJobStatus, SessionId, TaskId, ThreadId,
+    VerificationPlan,
 };
 use golutra_agent_protocol::{
     ArtifactReadRequest, CommandAck, RuntimeEvent, SessionCursor, SessionRangeDirection,
@@ -78,6 +79,18 @@ impl EventRepository {
     ) -> StoreResult<RuntimeEvent> {
         self.store
             .append_tool_completed_bundle(event, artifacts, evidence)
+            .await
+    }
+
+    pub async fn append_background_completed_bundle(
+        &self,
+        event: RuntimeEvent,
+        artifacts: &[(ArtifactRecord, Vec<u8>)],
+        evidence: &[EvidenceRecord],
+        result: &BackgroundResult,
+    ) -> StoreResult<RuntimeEvent> {
+        self.store
+            .append_background_completed_bundle(event, artifacts, evidence, result)
             .await
     }
 

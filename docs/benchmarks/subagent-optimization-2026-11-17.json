@@ -1,0 +1,906 @@
+{
+  "date": "2026-11-17",
+  "evidenceRoot": "/tmp/golutra-subagent-optimization.B1iYQo",
+  "baseline": {
+    "mode": "parallel-sdk",
+    "wallSeconds": 177.588964125,
+    "source": {
+      "schema_version": 1,
+      "package_version": "0.3.9",
+      "git_commit": "fa1d695559e03d3251e25cc80f8ac73c9bf09077",
+      "dirty": true,
+      "source_digest": "sha256:05512167e50cefec33d54875c7d0297da33a30c8d10eda5d7c0c0db6e2cda25a",
+      "cargo_lock_digest": "sha256:04710b6e7872ed1e951210b244924737d4632c5724f7910b5f8e170a0d28ab3a",
+      "target": "aarch64-apple-darwin",
+      "profile": "debug",
+      "features": [],
+      "rustc_version": "rustc 1.93.0 (254b59607 2026-01-19)",
+      "binary_checksum": null
+    },
+    "binarySha256": "56b4c8617c8d16238b9a6ef0ffc4e30865a815a1fccf484966272e5eb965196d",
+    "parentSession": "01a1e593-4bd1-7001-bb03-3fed4f35f147",
+    "parentTask": "01a1e593-4bf9-79b1-8296-e9ee94baf0aa",
+    "children": 8,
+    "childrenTerminal": 8,
+    "firstChildSeconds": 100.034,
+    "lastAdmissionSeconds": 100.345,
+    "peak": 8,
+    "childSumSeconds": 326.33200000000005,
+    "childUnionSeconds": 59.382999999999996,
+    "averageConcurrency": 5.4953774649310425,
+    "providerRequests": 50,
+    "providerRetries": 0,
+    "toolCalls": 65,
+    "toolFailures": [
+      {
+        "session": "parent",
+        "tool": "subagent",
+        "status": "error",
+        "summary": "tool request is invalid",
+        "time": 124.76
+      },
+      {
+        "session": "combat",
+        "tool": "shell",
+        "status": "error",
+        "summary": "process exited with an error",
+        "time": 136.293
+      }
+    ],
+    "usage": {
+      "requests": 50,
+      "inputTokens": 571982,
+      "outputTokens": 38836,
+      "reasoningTokens": 12495,
+      "cachedInputTokens": 397056,
+      "totalTokens": 610818,
+      "incompleteRequests": 0,
+      "costUsd": null
+    },
+    "allTasksLow": true
+  },
+  "intermediate": {
+    "mode": "retest-sdk",
+    "wallSeconds": 226.54379554199997,
+    "source": {
+      "schema_version": 1,
+      "package_version": "0.3.9",
+      "git_commit": "fa1d695559e03d3251e25cc80f8ac73c9bf09077",
+      "dirty": true,
+      "source_digest": "sha256:2e3dc94782589bfad3fd0026c456719e257136b23ef9074b85840ae9092998ae",
+      "cargo_lock_digest": "sha256:04710b6e7872ed1e951210b244924737d4632c5724f7910b5f8e170a0d28ab3a",
+      "target": "aarch64-apple-darwin",
+      "profile": "debug",
+      "features": [],
+      "rustc_version": "rustc 1.93.0 (254b59607 2026-01-19)",
+      "binary_checksum": null
+    },
+    "binarySha256": "97260a1c27b0f23a5a1cb4e2827dc19273055d0c74802154e6e804fc94bfdbf3",
+    "parentSession": "01a1e7a5-49b9-7251-b81c-6dc9db1cfb22",
+    "parentTask": "01a1e7a5-49e1-7673-96b5-15d1dd4dfb2e",
+    "children": 8,
+    "childrenTerminal": 8,
+    "firstChildSeconds": 91.97,
+    "lastAdmissionSeconds": 92.309,
+    "peak": 8,
+    "childSumSeconds": 536.174,
+    "childUnionSeconds": 110.298,
+    "averageConcurrency": 4.861139821211626,
+    "providerRequests": 77,
+    "providerRetries": 0,
+    "toolCalls": 94,
+    "toolFailures": [
+      {
+        "session": "parent",
+        "tool": "read_file",
+        "status": "error",
+        "summary": "tool execution failed",
+        "time": 2.63
+      },
+      {
+        "session": "parent",
+        "tool": "shell",
+        "status": "error",
+        "summary": "tool execution failed",
+        "time": 2.654
+      },
+      {
+        "session": "player",
+        "tool": "read_file",
+        "status": "error",
+        "summary": "tool execution failed",
+        "time": 94.152
+      },
+      {
+        "session": "input",
+        "tool": "read_file",
+        "status": "error",
+        "summary": "tool execution failed",
+        "time": 94.2
+      },
+      {
+        "session": "combat",
+        "tool": "read_file",
+        "status": "error",
+        "summary": "tool execution failed",
+        "time": 94.346
+      },
+      {
+        "session": "combat",
+        "tool": "shell",
+        "status": "error",
+        "summary": "process exited with an error",
+        "time": 150.189
+      },
+      {
+        "session": "combat",
+        "tool": "shell",
+        "status": "error",
+        "summary": "process exited with an error",
+        "time": 155.33
+      },
+      {
+        "session": "input",
+        "tool": "shell",
+        "status": "error",
+        "summary": "process exited with an error",
+        "time": 165.75
+      },
+      {
+        "session": "collisions",
+        "tool": "shell",
+        "status": "error",
+        "summary": "process exited with an error",
+        "time": 173.291
+      }
+    ],
+    "usage": {
+      "requests": 77,
+      "inputTokens": 902937,
+      "outputTokens": 47631,
+      "reasoningTokens": 16980,
+      "cachedInputTokens": 692736,
+      "totalTokens": 950568,
+      "incompleteRequests": 0,
+      "costUsd": null
+    },
+    "background": {
+      "acknowledgements": 1,
+      "delivered": 8,
+      "total": 8,
+      "processes": {
+        "count": 28,
+        "terminal": 28,
+        "nonterminal": []
+      },
+      "finalResponses": 1
+    },
+    "allTasksLow": true
+  },
+  "measuredGameCandidate": {
+    "mode": "retest-final-sdk",
+    "wallSeconds": 141.210979125,
+    "source": {
+      "schema_version": 1,
+      "package_version": "0.3.9",
+      "git_commit": "fa1d695559e03d3251e25cc80f8ac73c9bf09077",
+      "dirty": true,
+      "source_digest": "sha256:1727a7e0b8f41498fd302df7ec702c0f21371fea7f16a4c614966e0c1f0b6aca",
+      "cargo_lock_digest": "sha256:04710b6e7872ed1e951210b244924737d4632c5724f7910b5f8e170a0d28ab3a",
+      "target": "aarch64-apple-darwin",
+      "profile": "debug",
+      "features": [],
+      "rustc_version": "rustc 1.93.0 (254b59607 2026-01-19)",
+      "binary_checksum": null
+    },
+    "binarySha256": "685fb7d6696a4ffa1cf1f000e59d34552806d6872e0a326fa52b9534b87685f3",
+    "parentSession": "01a1e7a9-4d21-7d62-9318-0bb36c6b6d95",
+    "parentTask": "01a1e7a9-4d46-7642-9c84-420ea41c28d7",
+    "children": 8,
+    "childrenTerminal": 8,
+    "firstChildSeconds": 33.372,
+    "lastAdmissionSeconds": 33.718,
+    "peak": 8,
+    "childSumSeconds": 469.194,
+    "childUnionSeconds": 84.31400000000001,
+    "averageConcurrency": 5.5648409516806225,
+    "providerRequests": 68,
+    "providerRetries": 0,
+    "toolCalls": 75,
+    "toolFailures": [
+      {
+        "session": "collisions",
+        "tool": "read_file",
+        "status": "error",
+        "summary": "tool execution failed",
+        "time": 35.637
+      },
+      {
+        "session": "input",
+        "tool": "read_file",
+        "status": "error",
+        "summary": "tool execution failed",
+        "time": 37.475
+      },
+      {
+        "session": "collisions",
+        "tool": "shell",
+        "status": "error",
+        "summary": "process exited with an error",
+        "time": 113.696
+      },
+      {
+        "session": "parent",
+        "tool": "shell",
+        "status": "error",
+        "summary": "process exited with an error",
+        "time": 121.5
+      },
+      {
+        "session": "parent",
+        "tool": "shell",
+        "status": "error",
+        "summary": "process exited with an error",
+        "time": 121.555
+      }
+    ],
+    "usage": {
+      "requests": 68,
+      "inputTokens": 720182,
+      "outputTokens": 37330,
+      "reasoningTokens": 14011,
+      "cachedInputTokens": 493440,
+      "totalTokens": 757512,
+      "incompleteRequests": 0,
+      "costUsd": null
+    },
+    "background": {
+      "acknowledgements": 2,
+      "delivered": 8,
+      "total": 8,
+      "processes": {
+        "count": 31,
+        "terminal": 31,
+        "nonterminal": []
+      },
+      "finalResponses": 2
+    },
+    "allTasksLow": true
+  },
+  "finalSourceCliSmoke": {
+    "mode": "cli-final-probe",
+    "wallSeconds": 10.678788167,
+    "source": {
+      "schema_version": 1,
+      "package_version": "0.3.9",
+      "git_commit": "fa1d695559e03d3251e25cc80f8ac73c9bf09077",
+      "dirty": true,
+      "source_digest": "sha256:fc77d5f1f8a7ff6d974f01fb54e4244537e6e329b9ebcea1d1c8ac77188c9d99",
+      "cargo_lock_digest": "sha256:04710b6e7872ed1e951210b244924737d4632c5724f7910b5f8e170a0d28ab3a",
+      "target": "aarch64-apple-darwin",
+      "profile": "debug",
+      "features": [],
+      "rustc_version": "rustc 1.93.0 (254b59607 2026-01-19)",
+      "binary_checksum": null
+    },
+    "binarySha256": "5ba82c95a82206282bbfa4d36566f78cbf11777ea2f7f1d2babdbac9176e1f91",
+    "parentSession": "01a1e7b5-455a-7d50-8423-248845fcff01",
+    "parentTask": "01a1e7b5-4583-74b0-8c0e-607c9f72977c",
+    "children": 8,
+    "childrenTerminal": 8,
+    "firstChildSeconds": 4.007,
+    "lastAdmissionSeconds": 4.391,
+    "peak": 8,
+    "childSumSeconds": 16.254,
+    "childUnionSeconds": 3.3000000000000007,
+    "averageConcurrency": 4.925454545454545,
+    "providerRequests": 12,
+    "providerRetries": 0,
+    "toolCalls": 10,
+    "toolFailures": [],
+    "usage": {
+      "requests": 12,
+      "inputTokens": 58222,
+      "outputTokens": 1007,
+      "reasoningTokens": 412,
+      "cachedInputTokens": 32256,
+      "totalTokens": 59229,
+      "incompleteRequests": 0,
+      "costUsd": null
+    },
+    "background": {
+      "acknowledgements": 1,
+      "delivered": 8,
+      "total": 8,
+      "processes": {
+        "count": 1,
+        "terminal": 1,
+        "nonterminal": []
+      },
+      "finalResponses": 1
+    },
+    "allTasksLow": true
+  },
+  "configurationSmoke": {
+    "mode": "cli-probe",
+    "wallSeconds": 7.1000658329999995,
+    "source": {
+      "schema_version": 1,
+      "package_version": "0.3.9",
+      "git_commit": "fa1d695559e03d3251e25cc80f8ac73c9bf09077",
+      "dirty": true,
+      "source_digest": "sha256:2e3dc94782589bfad3fd0026c456719e257136b23ef9074b85840ae9092998ae",
+      "cargo_lock_digest": "sha256:04710b6e7872ed1e951210b244924737d4632c5724f7910b5f8e170a0d28ab3a",
+      "target": "aarch64-apple-darwin",
+      "profile": "debug",
+      "features": [],
+      "rustc_version": "rustc 1.93.0 (254b59607 2026-01-19)",
+      "binary_checksum": null
+    },
+    "binarySha256": "c8c1c3a25b97eb3722a0380882916204ee8b145a4f5556b87233b4aa3149a253",
+    "parentSession": "01a1e7a4-f92f-7591-8557-8893a63ea35b",
+    "parentTask": "01a1e7a4-f956-7f51-97b3-4434458e67ed",
+    "children": 1,
+    "childrenTerminal": 1,
+    "firstChildSeconds": 2.166,
+    "lastAdmissionSeconds": 2.166,
+    "peak": 1,
+    "childSumSeconds": 1.5910000000000002,
+    "childUnionSeconds": 1.5910000000000002,
+    "averageConcurrency": 1,
+    "providerRequests": 4,
+    "providerRetries": 0,
+    "toolCalls": 2,
+    "toolFailures": [],
+    "usage": {
+      "requests": 4,
+      "inputTokens": 20344,
+      "outputTokens": 197,
+      "reasoningTokens": 103,
+      "cachedInputTokens": 8704,
+      "totalTokens": 20541,
+      "incompleteRequests": 0,
+      "costUsd": null
+    },
+    "allTasksLow": true
+  },
+  "hashes": {
+    "contract": "db900182735c32d96b61366533056832f971000451e49f73ae703a1efa22ad70",
+    "verifier": "e51a0c8ebf3cd3b8e55f22ee2ee59737f136009d4c5eff181bccbb72ed4fc832",
+    "prompt": "40113e3fd50f813903009108d068b0fd2db3330f418a5e835806c281246025ea"
+  },
+  "validation": {
+    "rust": {
+      "passed": 2366,
+      "failed": 0,
+      "ignored": 11,
+      "targets": 59,
+      "logs": [
+        "final-client-tests.log",
+        "final-other-targets.log"
+      ]
+    },
+    "strictWorkspaceClippy": true,
+    "formatCheck": true,
+    "diffCheck": true,
+    "games": [
+      {
+        "mode": "parallel-game",
+        "functionalPassed": 23,
+        "functionalTotal": 23,
+        "browserPassed": 14,
+        "browserFailed": 0,
+        "browserTotal": 14
+      },
+      {
+        "mode": "serial-game",
+        "functionalPassed": 23,
+        "functionalTotal": 23,
+        "browserPassed": 14,
+        "browserFailed": 0,
+        "browserTotal": 14
+      },
+      {
+        "mode": "retest-final-fixed",
+        "functionalPassed": 23,
+        "functionalTotal": 23,
+        "browserPassed": 14,
+        "browserFailed": 0,
+        "browserTotal": 14
+      }
+    ],
+    "rawCandidateBrowserSmoke": {
+      "passed": 3,
+      "total": 4,
+      "failed": "mute feedback",
+      "additionalVisualIssue": "paused action labelled Pause"
+    },
+    "fixedCandidateFirstBrowser": {
+      "passed": 12,
+      "total": 14,
+      "reason": "mute label updated on next animation frame; repaired by immediate UI update"
+    }
+  },
+  "limitations": [
+    "One full-game sample per version; no randomized or repeated causal benchmark.",
+    "The complete-game candidate predates the final equivalent system-prompt compression. Final source has separate eight-child CLI smoke.",
+    "First candidate overlapped a subsequent local build near the end.",
+    "Observed full-game tokens increased by 24.02%; no claim of cost reduction.",
+    "No high-effort full-game retest, touch-device, acoustic, long-duration, or cross-platform acceptance.",
+    "One final smoke child used a shell despite the natural-language no-tools instruction; this is not an enforced tool-profile policy."
+  ],
+  "tests": [
+    {
+      "source": "final-client-tests.log",
+      "target": "unittests src/lib.rs (target/debug/deps/golutra_agent_client-fa95a1491b0a48fb)",
+      "status": "ok",
+      "passed": 478,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-client-tests.log",
+      "target": "unittests examples/live_subagent_benchmark.rs (target/debug/examples/live_subagent_benchmark-dd7b5c9b6c3b0e75)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/lib.rs (target/debug/deps/golutra_agent_app_server-e61043323530b64b)",
+      "status": "ok",
+      "passed": 57,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/main.rs (target/debug/deps/golutra_agent_app_server-8293f6d64118620d)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "tests/cross_process.rs (target/debug/deps/cross_process-84dbe6ea6273661b)",
+      "status": "ok",
+      "passed": 7,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "tests/rpc_process.rs (target/debug/deps/rpc_process-27a1061f22893ef6)",
+      "status": "ok",
+      "passed": 6,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/lib.rs (target/debug/deps/golutra_agent_auth-65bda4516f2e0572)",
+      "status": "ok",
+      "passed": 25,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "tests/shared_credentials_process.rs (target/debug/deps/shared_credentials_process-8bff6d8a611fca67)",
+      "status": "ok",
+      "passed": 3,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/main.rs (target/debug/deps/golutra_agent-a8516b9da4955a34)",
+      "status": "ok",
+      "passed": 27,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "tests/browser_process.rs (target/debug/deps/browser_process-5311bddb24e76642)",
+      "status": "ok",
+      "passed": 8,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "tests/exec_process.rs (target/debug/deps/exec_process-bb5d49997c874468)",
+      "status": "ok",
+      "passed": 9,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "tests/mcp_server_process.rs (target/debug/deps/mcp_server_process-ca8c4503e44da5f8)",
+      "status": "ok",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "tests/service_process.rs (target/debug/deps/service_process-79ec315ce1d4be4c)",
+      "status": "ok",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/lib.rs (target/debug/deps/golutra_agent_code_intelligence-ba5d7e99e7a2bbcf)",
+      "status": "ok",
+      "passed": 2,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/lib.rs (target/debug/deps/golutra_agent_config-5bb15b3fba54c725)",
+      "status": "ok",
+      "passed": 53,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "tests/shared_settings_process.rs (target/debug/deps/shared_settings_process-970779650e1732aa)",
+      "status": "ok",
+      "passed": 3,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/lib.rs (target/debug/deps/golutra_agent_context-e60daaa5011d7ef9)",
+      "status": "ok",
+      "passed": 37,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/lib.rs (target/debug/deps/golutra_agent_core-9b84a27cc69b8227)",
+      "status": "ok",
+      "passed": 40,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/lib.rs (target/debug/deps/golutra_agent_eval-d9ad9bbf8880794a)",
+      "status": "ok",
+      "passed": 25,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/lib.rs (target/debug/deps/golutra_agent_eval_model-37e17272394d21ba)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/main.rs (target/debug/deps/golutra_agent_eval_worker-a2126fc797c5d1ed)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "tests/smoke.rs (target/debug/deps/smoke-493191be7822e794)",
+      "status": "ok",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/lib.rs (target/debug/deps/golutra_agent_event-2f5e80641c06ea6a)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/lib.rs (target/debug/deps/golutra_agent_evolution-a07345bcc9b51d12)",
+      "status": "ok",
+      "passed": 3,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/lib.rs (target/debug/deps/golutra_agent_file_search-8a5aee6a713f7768)",
+      "status": "ok",
+      "passed": 7,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/lib.rs (target/debug/deps/golutra_agent_governor-14d95246842074ba)",
+      "status": "ok",
+      "passed": 8,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/lib.rs (target/debug/deps/golutra_agent_llm-445d51bf74189184)",
+      "status": "ok",
+      "passed": 105,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "tests/provider_golden.rs (target/debug/deps/provider_golden-b4e5e22a5b105610)",
+      "status": "ok",
+      "passed": 51,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/lib.rs (target/debug/deps/golutra_agent_mcp-0a7b243e8316761c)",
+      "status": "ok",
+      "passed": 5,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/lib.rs (target/debug/deps/golutra_agent_memory-283162164496c3a6)",
+      "status": "ok",
+      "passed": 12,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/lib.rs (target/debug/deps/golutra_agent_plugin-2433deaf04cfe3b9)",
+      "status": "ok",
+      "passed": 4,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/lib.rs (target/debug/deps/golutra_agent_policy-b7bb0b8ac0c22b77)",
+      "status": "ok",
+      "passed": 35,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/lib.rs (target/debug/deps/golutra_agent_project_service-ec85908d03e1adff)",
+      "status": "ok",
+      "passed": 28,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/lib.rs (target/debug/deps/golutra_agent_protocol-e378351d3d963799)",
+      "status": "ok",
+      "passed": 11,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/lib.rs (target/debug/deps/golutra_agent_protocol_fixtures-e291606e3204e653)",
+      "status": "ok",
+      "passed": 2,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/bin/export_sdk_schema.rs (target/debug/deps/export_sdk_schema-dbe52534fbacd4b1)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/lib.rs (target/debug/deps/golutra_agent_release-81f08cfe48250337)",
+      "status": "ok",
+      "passed": 13,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/bin/golutra-agent-launcher.rs (target/debug/deps/golutra_agent_launcher-1620c026279464c6)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/lib.rs (target/debug/deps/golutra_agent_runtime-febce3e3b149937b)",
+      "status": "ok",
+      "passed": 310,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/lib.rs (target/debug/deps/golutra_agent_sandbox-da749f0d5a82c84a)",
+      "status": "ok",
+      "passed": 6,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/lib.rs (target/debug/deps/golutra_agent_store-5bd94bdd27217310)",
+      "status": "ok",
+      "passed": 84,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "tests/shared_data_process.rs (target/debug/deps/shared_data_process-f1ff6d396836e509)",
+      "status": "ok",
+      "passed": 4,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/lib.rs (target/debug/deps/golutra_agent_supervisor-891d2666eca4a48e)",
+      "status": "ok",
+      "passed": 24,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/main.rs (target/debug/deps/golutra_agent_supervisor-79aeab759bcb469f)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/lib.rs (target/debug/deps/golutra_agent_test_client-493a5c2036100d47)",
+      "status": "ok",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/main.rs (target/debug/deps/golutra_agent_test_client-1aecb5931cd9bf49)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/lib.rs (target/debug/deps/golutra_agent_tools-74438b893d4d89c7)",
+      "status": "ok",
+      "passed": 273,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "tests/background_browser_live.rs (target/debug/deps/background_browser_live-f65556acfe4593c7)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 3
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "tests/chrome_browser_live.rs (target/debug/deps/chrome_browser_live-51a278b4612cffc6)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "tests/ego_browser_live.rs (target/debug/deps/ego_browser_live-a22acc55ec9991dd)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "tests/opencli_browser_live.rs (target/debug/deps/opencli_browser_live-32ae2d81bfa7458a)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests examples/chrome_fixture_host.rs (target/debug/examples/chrome_fixture_host-ddfac749dd7603b3)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/lib.rs (target/debug/deps/golutra_agent_tui-32a9f890e657d63a)",
+      "status": "ok",
+      "passed": 19,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/main.rs (target/debug/deps/golutra_agent_tui-357b28e1ee21fc2d)",
+      "status": "ok",
+      "passed": 510,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "tests/pty_acceptance.rs (target/debug/deps/pty_acceptance-2eb44b1b86dbdd92)",
+      "status": "ok",
+      "passed": 35,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "tests/tui_driver_process.rs (target/debug/deps/tui_driver_process-f4b8e99709cd20d4)",
+      "status": "ok",
+      "passed": 8,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/lib.rs (target/debug/deps/golutra_agent_verify-bbee8211e61cb569)",
+      "status": "ok",
+      "passed": 24,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/lib.rs (target/debug/deps/golutra_agent_vis-191fc34cec60e05d)",
+      "status": "ok",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "source": "final-other-targets.log",
+      "target": "unittests src/main.rs (target/debug/deps/golutra_agent_vis-74e968bad9c9a0e8)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    }
+  ]
+}

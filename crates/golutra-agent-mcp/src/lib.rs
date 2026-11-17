@@ -402,6 +402,7 @@ fn convert_result(result: CallToolResult) -> Result<ExternalToolOutput, McpError
     }
     let is_error = result.is_error.unwrap_or(false);
     Ok(ExternalToolOutput {
+        images: Vec::new(),
         summary: if is_error {
             "MCP tool returned an error"
         } else {

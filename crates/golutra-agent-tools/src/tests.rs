@@ -104,6 +104,7 @@ impl FakeExternalBackend {
             calls: AtomicUsize::new(0),
             delay,
             output: ExternalToolOutput {
+                images: Vec::new(),
                 summary: "external response".to_owned(),
                 content: "token=plain-secret-value\nexternal output".to_owned(),
                 structured_facts: json!({"provider": "fixture", "api_key": "secret"}),
@@ -207,6 +208,60 @@ fn external_tool_capabilities_are_explicit_and_validated() {
             .registry()
             .capabilities("mcp__fixture__echo")
             .is_none()
+    );
+}
+
+#[tokio::test]
+async fn browser_registration_preserves_existing_external_backend_dispatch() {
+    let workspace = tempdir().unwrap();
+    let browser = crate::browser::EgoBrowserBackend::new(
+        crate::browser::EgoBrowserConfig {
+            executable: workspace.path().join("missing-ego"),
+            sdk_path: None,
+        },
+        workspace.path(),
+        &workspace.path().join("state"),
+        true,
+    )
+    .unwrap();
+    let runtime = executor(workspace.path())
+        .with_unrestricted_access(true)
+        .with_external_backend(Arc::new(FakeExternalBackend::successful(Duration::ZERO)))
+        .unwrap()
+        .with_external_backend(Arc::new(browser))
+        .unwrap();
+    assert_eq!(
+        runtime
+            .registry()
+            .provider_contracts()
+            .iter()
+            .filter(|contract| contract.tool_name.starts_with("browser_"))
+            .count(),
+        6
+    );
+    assert!(
+        !ToolRegistry::p0_default()
+            .provider_contracts()
+            .iter()
+            .any(|contract| contract.tool_name.starts_with("browser_"))
+    );
+    let call = request("mcp__fixture__echo", json!({}));
+    let report = runtime
+        .execute(call, CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(report.envelope.status, ToolResultStatus::Ok);
+    assert_eq!(report.envelope.summary, "external response");
+    let report = runtime
+        .execute(
+            request("browser_status", json!({})),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        report.envelope.structured_facts["code"],
+        "browser_unavailable"
     );
 }
 
@@ -1398,6 +1453,78 @@ fn ten_short_child_findings_survive_budget_without_repeated_governance_metadata(
 }
 
 #[test]
+fn mixed_child_budget_keeps_short_findings_and_pages_the_large_answer() {
+    let results: Vec<_> = (0..8)
+        .map(|index| {
+            json!({
+                "child_session_id":format!("child-{index}"),
+                "content":if index == 0 {"长结果🙂".repeat(1024)} else {format!("finding-{index}")},
+                "facts":{"child_task_id":format!("execution-{index}"),"child_terminal":true,
+                    "child_status":if index == 1 {"failed"} else {"completed"},
+                    "child_verification_status":if index == 1 {"fail"} else {"pass"},
+                    "child_acceptance_status":"requires_parent_review"}
+            })
+        })
+        .collect();
+    let envelope = projection_envelope(
+        "subagent",
+        ToolResultStatus::Ok,
+        "8 results",
+        json!({"child_results":results}),
+        None,
+    );
+    let visible = model_visible_tool_result_with_limit(&envelope, 4096);
+    assert!(visible.len() <= 4096);
+    let output: Value = serde_json::from_str(&visible).unwrap();
+    let children = output["structured_facts"]["child_results"]
+        .as_array()
+        .unwrap();
+    assert_eq!(children.len(), 8);
+    for (index, child) in children.iter().enumerate().skip(1) {
+        assert_eq!(child["content"], format!("finding-{index}"));
+        assert!(subagent_findings_complete(
+            &child["facts"],
+            child["content"].as_str().unwrap()
+        ));
+    }
+    assert_eq!(children[1]["facts"]["child_verification_status"], "fail");
+    assert_eq!(
+        children[1]["facts"]["child_acceptance_status"],
+        "requires_parent_review"
+    );
+    let first = &children[0];
+    let body = first["content"].as_str().unwrap();
+    assert!(body.chars().count() > 0);
+    assert_eq!(
+        first["facts"]["child_result_next_offset"],
+        body.chars().count()
+    );
+    assert!(!subagent_findings_complete(&first["facts"], body));
+}
+
+#[test]
+fn last_child_page_and_missing_body_never_claim_full_coverage() {
+    let envelope = projection_envelope(
+        "subagent",
+        ToolResultStatus::Ok,
+        "done",
+        json!({"child_task_id":"task","child_session_id":"child","child_terminal":true,
+            "child_result_offset":100,"child_result_total_chars":104,"child_result_has_more":false}),
+        Some("尾页🙂好"),
+    );
+    let visible: Value = serde_json::from_str(&model_visible_tool_result(&envelope)).unwrap();
+    assert!(!subagent_findings_complete(
+        &visible["structured_facts"],
+        "尾页🙂好"
+    ));
+    let full = json!({"child_terminal":true,"child_result_coverage":{
+        "offset":0,"visible_chars":4,"total_chars":4,"complete":true}});
+    assert!(subagent_findings_complete(&full, "尾页🙂好"));
+    assert!(!subagent_findings_complete(&full, "尾页"));
+    assert!(!subagent_findings_complete(&full, ""));
+}
+
+#[test]
 fn batch_projection_preserves_child_failure_and_pagination_without_raw_metadata() {
     let envelope = projection_envelope(
         "subagent",
@@ -1631,6 +1758,72 @@ fn model_visible_tool_result_keeps_clipping_truth_for_unusual_facts() {
                 .as_str()
                 .is_some_and(|value| !value.is_empty())
         );
+    }
+}
+
+#[test]
+fn browser_projection_preserves_control_state_before_large_page_payloads() {
+    let controls = json!({
+        "backend":"ego", "phase":"outcome_unknown", "code":"browser_outcome_unknown",
+        "outcome_unknown":true, "automatic_retry":false, "requires_reload":true,
+        "browser_backend":"chrome", "resolved_backend":"ego", "active_backend":"ego",
+        "next_backend":"chrome", "switch_pending":true, "selection_scope":"session",
+        "next_action":{"tool":"browser_run","arguments":{"observation":"snapshot"}},
+    });
+    let mut facts = controls.clone();
+    for index in 0..64 {
+        facts[format!("a_page_data_{index:02}")] = json!("字".repeat(1024));
+    }
+    for tool in ["browser_run", "browser_status", "browser_config"] {
+        let envelope = projection_envelope(
+            tool,
+            ToolResultStatus::Error,
+            "Inspect state before retrying",
+            facts.clone(),
+            None,
+        );
+        for budget in [1024, 2048, MAX_MODEL_TOOL_RESULT_BYTES] {
+            let serialized = model_visible_tool_result_with_limit(&envelope, budget);
+            let (projection, _) = parse_model_visible_tool_result(&serialized);
+            assert!(serialized.len() <= budget);
+            for (key, value) in controls.as_object().unwrap() {
+                assert_eq!(
+                    projection["structured_facts"][key], *value,
+                    "{tool} at {budget}: {key}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn long_browser_diagnostic_preserves_control_facts_with_a_small_budget() {
+    let controls = json!({
+        "backend":"ego", "phase":"outcome_unknown", "code":"browser_outcome_unknown",
+        "outcome_unknown":true, "automatic_retry":false, "requires_reload":true,
+        "browser_backend":"chrome", "resolved_backend":"ego", "active_backend":"ego",
+        "next_backend":"chrome", "switch_pending":true, "selection_scope":"session",
+        "next_action":{"tool":"browser_run","arguments":{"observation":"snapshot"}},
+    });
+    for summary in ["长诊断".repeat(4096), "quoted \"message\"\n".repeat(4096)] {
+        let envelope = projection_envelope(
+            "browser_run",
+            ToolResultStatus::Error,
+            &summary,
+            controls.clone(),
+            None,
+        );
+        let serialized = model_visible_tool_result_with_limit(&envelope, 1024);
+        let (projection, _) = parse_model_visible_tool_result(&serialized);
+        assert!(serialized.len() <= 1024);
+        assert!(
+            projection["summary"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty())
+        );
+        for (key, value) in controls.as_object().unwrap() {
+            assert_eq!(projection["structured_facts"][key], *value, "{key}");
+        }
     }
 }
 
@@ -4143,6 +4336,47 @@ async fn background_python_heredoc_receives_input_and_eof() {
 }
 
 #[tokio::test]
+async fn shell_cancelled_at_process_admission_returns_a_cancelled_report_without_dispatch() {
+    let workspace = tempdir().unwrap();
+    let executor = executor(workspace.path());
+    let request = request("shell", json!({"command":"touch should-not-exist"}));
+    let session_id = request.session_id;
+    let policy = executor.evaluate(&request).unwrap();
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    // Enter after the outer execution checks, as happens when cancellation arrives
+    // during the baseline scan or while waiting for the supervisor's start gate.
+    let report = executor
+        .shell(
+            request,
+            policy,
+            cancellation,
+            SideEffectPreparation {
+                workspace_snapshot: Some(workspace_scan::WorkspaceSnapshot::default()),
+                ..SideEffectPreparation::default()
+            },
+            Instant::now(),
+            &mut None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(report.envelope.status, ToolResultStatus::Cancelled);
+    assert_eq!(report.envelope.structured_facts["dispatched"], false);
+    assert_eq!(
+        report.envelope.structured_facts["process_state"],
+        "cancelled"
+    );
+    assert!(
+        executor
+            .process_supervisor
+            .list(session_id)
+            .await
+            .is_empty()
+    );
+    assert!(!workspace.path().join("should-not-exist").exists());
+}
+
+#[tokio::test]
 async fn shell_timeout_and_cancellation_have_distinct_statuses() {
     let workspace = tempdir().expect("workspace");
     let executor = executor(workspace.path());
@@ -4690,7 +4924,7 @@ async fn shell_session_wait_for_terminal_returns_one_idempotent_terminal_snapsho
                     "process_id": process_id,
                     "authoritative_pid": authoritative_pid,
                     "cursor": cursor,
-                    "wait_ms": 1_000,
+                    "wait_ms": 5_000,
                     "wait_for_terminal": true,
                 }),
             ),
@@ -4828,7 +5062,21 @@ async fn process_list_is_session_scoped_and_reports_background_status() {
         .as_str()
         .expect("process id")
         .to_owned();
-    let cursor = start.envelope.structured_facts["output_cursor"]
+    let ready = executor
+        .execute(
+            request_for_session(
+                session_id,
+                "shell_session",
+                json!({
+                    "action":"wait", "process_id":process_id, "cursor":0, "wait_ms":5_000,
+                }),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("background process readiness");
+    assert!(artifact_text(&ready).contains("ready"));
+    let cursor = ready.envelope.structured_facts["output_cursor"]
         .as_u64()
         .expect("output cursor");
 
@@ -5892,8 +6140,11 @@ async fn background_process_output_journal_is_bounded_and_reports_cursor_loss() 
             .execute(
                 request_for_session(
                     session_id,
-                    "process_poll",
-                    json!({"process_id": process_id, "cursor": cursor, "wait_ms": 250}),
+                    "shell_session",
+                    // Wait on lifecycle while the producer fills the journal;
+                    // repeatedly redacting its body would benchmark formatting.
+                    json!({"action":"wait", "process_id": process_id, "cursor": cursor,
+                        "wait_ms":250, "wait_for_terminal":true, "max_output_bytes":256}),
                 ),
                 CancellationToken::new(),
             )
@@ -5907,7 +6158,8 @@ async fn background_process_output_journal_is_bounded_and_reports_cursor_loss() 
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "output journal did not reach its retention bound"
+            "output journal did not reach its retention bound: {}",
+            report.envelope.structured_facts
         );
     }
     let report = executor
@@ -5949,27 +6201,35 @@ async fn background_process_output_journal_is_bounded_and_reports_cursor_loss() 
 async fn process_cancellation_terminates_descendants_and_drains_pipes() {
     let workspace = tempdir().expect("workspace");
     let cancellation = CancellationToken::new();
-    let cancel_from_task = cancellation.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        cancel_from_task.cancel();
-    });
-
-    let output = tokio::time::timeout(
-        Duration::from_secs(1),
+    let process_cancellation = cancellation.clone();
+    let ready_path = workspace.path().join("ready");
+    let worker = tokio::spawn(async move {
         run_process(
             "sh",
-            &["-c".to_owned(), "sleep 5 & wait".to_owned()],
+            &["-c".into(), "sleep 5 & printf ready > ready; wait".into()],
             workspace.path(),
             DEFAULT_TIMEOUT_MS,
-            cancellation,
+            process_cancellation,
             &golutra_agent_sandbox::SystemSandbox::detect(),
             golutra_agent_sandbox::WorkspaceAccess::ReadWrite,
-        ),
-    )
+        )
+        .await
+    });
+    // Measure cancellation after the descendant exists, not cold process startup.
+    // Progress callbacks are throttled, so use a durable readiness marker.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !tokio::fs::try_exists(&ready_path).await.unwrap() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
     .await
-    .expect("process tree terminates promptly")
-    .expect("process result");
+    .expect("process startup");
+    cancellation.cancel();
+    let output = tokio::time::timeout(Duration::from_secs(1), worker)
+        .await
+        .expect("process tree terminates promptly")
+        .expect("process worker")
+        .expect("process result");
 
     assert!(output.cancelled);
 }
@@ -6298,6 +6558,57 @@ fn executor(path: &Path) -> BasicToolExecutor {
     BasicToolExecutor::new(WorkspacePolicy::new(path).expect("policy"))
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn subagent_workspace_lease_outlives_shell_receipt_and_refreshes_the_next_checkpoint() {
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("shared.txt"), "before").unwrap();
+    let first = executor(root.path()).with_unrestricted_access(true);
+    let second = executor(root.path()).with_unrestricted_access(true);
+    let call = request(
+        "shell",
+        json!({"command":"sh -c 'read value; printf %s \"$value\" > shared.txt'","background":true}),
+    );
+    let owner = call.session_id;
+    let policy = first.evaluate(&call).unwrap();
+    let output = first
+        .execute_with_policy(call, policy, true, CancellationToken::new())
+        .await
+        .unwrap();
+    let process = output.envelope.structured_facts["process_id"]
+        .as_str()
+        .expect("running process");
+    let write = request("write_file", json!({"path":"shared.txt","content":"next"}));
+    assert_ne!(write.session_id, owner);
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(30),
+            second.prepare_side_effect_snapshot(&write)
+        )
+        .await
+        .is_err()
+    );
+    first
+        .process_supervisor
+        .write(owner, process, "after\n", 0, 1000)
+        .await
+        .unwrap();
+    let preparation = tokio::time::timeout(
+        Duration::from_secs(10),
+        second.prepare_side_effect_snapshot(&write),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        preparation.before_images[0].content.as_deref(),
+        Some(b"after".as_slice())
+    );
+    drop(preparation);
+    first.process_supervisor.shutdown_and_wait().await.unwrap();
+    second.process_supervisor.shutdown_and_wait().await.unwrap();
+}
+
 fn request(tool_name: &str, arguments: Value) -> ToolRequest {
     request_for_session(SessionId::new(), tool_name, arguments)
 }
@@ -6348,6 +6659,48 @@ async fn keyed_write_paths_share_policy_identity_and_deduplicate_patch_targets()
 
 fn artifact_text(report: &ToolExecutionReport) -> String {
     String::from_utf8_lossy(&report.artifact_contents[0].bytes).into_owned()
+}
+
+#[tokio::test]
+async fn verifier_resource_wait_honors_cancellation_and_deadline_before_dispatch() {
+    let workspace = tempdir().unwrap();
+    let executor = executor(workspace.path());
+    let _lease = resources::acquire(
+        SessionId::new(),
+        vec![executor.workspace_root().to_path_buf()],
+    )
+    .await
+    .unwrap();
+    for cancel in [true, false] {
+        let cancellation = CancellationToken::new();
+        if cancel {
+            cancellation.cancel();
+        }
+        let request = VerifierExecutionRequest {
+            tool_call_id: ToolCallId::new(),
+            session_id: SessionId::new(),
+            turn_id: None,
+            program: "sh".into(),
+            args: vec!["-c".into(), "printf unexpected > marker.txt".into()],
+            cwd: ".".into(),
+            timeout_ms: 25,
+            expected_exit_code: 0,
+            max_output_bytes: 1024,
+        };
+        let report = tokio::time::timeout(
+            Duration::from_secs(5),
+            executor.execute_verifier(request, cancellation),
+        )
+        .await
+        .expect("resource wait must be bounded")
+        .unwrap();
+        assert_ne!(report.envelope.status, ToolResultStatus::Ok);
+        assert!(!workspace.path().join("marker.txt").exists());
+        assert_eq!(
+            report.envelope.structured_facts[if cancel { "cancelled" } else { "timed_out" }],
+            true
+        );
+    }
 }
 
 #[tokio::test]

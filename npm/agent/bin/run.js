@@ -62,6 +62,8 @@ export async function runNative(binaryName) {
       ...process.env,
       GOLUTRA_AGENT_MANAGED_PACKAGE_ROOT: packageRoot,
       GOLUTRA_AGENT_PACKAGE_TARGET: platformKey,
+      GOLUTRA_AGENT_OPENCLI_EXECUTABLE: bundledOpenCli(),
+      GOLUTRA_AGENT_OPENCLI_NODE: process.execPath,
     },
     stdio: "inherit",
   });
@@ -87,6 +89,12 @@ export async function runNative(binaryName) {
     process.kill(process.pid, result.signal);
   }
   process.exitCode = result.code ?? 1;
+}
+
+function bundledOpenCli() {
+  if (process.env.GOLUTRA_AGENT_OPENCLI_EXECUTABLE) return process.env.GOLUTRA_AGENT_OPENCLI_EXECUTABLE;
+  // 浏览器依赖损坏不应阻止纯编码任务；原生浏览器探测会返回安装指引。
+  try { return require.resolve("@jackwener/opencli"); } catch { return undefined; }
 }
 
 function isVersionRequest(args) {
