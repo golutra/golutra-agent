@@ -15,7 +15,10 @@
   "homepage": "https://github.com/golutra/golutra-agent/tree/main/sdk/typescript",
   "keywords": ["golutra", "agent", "coding-agent", "runtime", "sdk"],
   "overrides": {
-    "js-yaml": "4.3.2"
+    "js-yaml": "4.3.2",
+    "json-schema-to-typescript": {
+      "glob": "14.0.6"
+    }
   },
   "type": "module",
   "exports": {
@@ -32,7 +35,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "json-schema-to-typescript": "^15.0.4",
+    "json-schema-to-typescript": "15.0.2",
     "typescript": "^5.5.0"
   }
 }

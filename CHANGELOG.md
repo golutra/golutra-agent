@@ -18,6 +18,9 @@ follow [Semantic Versioning](https://semver.org/) where applicable.
 - Preserve the canonical script target when launching OpenCLI through Node on
   Windows, and distinguish a failed version probe from an incompatible version
   with bounded, redacted diagnostics.
+- Pin SDK schema-generation tooling to `json-schema-to-typescript` 15.0.2 with
+  patched `glob` 14.0.6, removing vulnerable transitive dependencies without
+  changing the generated protocol types.
 
 ## [4.0.0] - 2026-11-17
 
