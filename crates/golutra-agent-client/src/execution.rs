@@ -1184,12 +1184,14 @@ impl RuntimeHost {
         let (start_tx, start_rx) = oneshot::channel();
         let worker_host = self.clone();
         let worker_task = task.clone();
-        let worker = tokio::spawn(async move {
+        // Box before spawn so constructing/moving the worker future does not
+        // inflate the caller's command-dispatch stack in unoptimized builds.
+        let worker = tokio::spawn(Box::pin(async move {
             start_rx.await.map_err(|_| ClientError::TaskCancelled)?;
             worker_host
                 .run_agent_task(worker_task, control, governor_usage)
                 .await
-        });
+        }));
         let abort_handle = worker.abort_handle();
         let (completion_sender, completion) = watch::channel(false);
         let mut task_controls = self.execution.task_controls.lock().await;
@@ -1229,11 +1231,11 @@ impl RuntimeHost {
         self.signal_active_work_change();
         let supervisor = self.clone();
         let supervised_task = task.clone();
-        tokio::spawn(async move {
+        tokio::spawn(Box::pin(async move {
             supervisor
                 .supervise_agent_task(supervised_task, worker, completion_sender)
                 .await;
-        });
+        }));
         start_tx.send(()).map_err(|_| ClientError::TaskCancelled)?;
         Ok(())
     }

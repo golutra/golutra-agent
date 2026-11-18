@@ -235,7 +235,19 @@ async fn exec_run_dir_retains_an_isolated_structured_runtime_bundle() {
     let export_parent = tempdir().expect("export parent");
     let state_dir = export_parent.path().join("runtime");
     let task_contract = export_parent.path().join("task-contract.json");
-    let verifier = std::env::current_exe().expect("current test executable");
+    // The Cargo test executable lives outside this temporary workspace and is
+    // intentionally not mounted by Linux's filesystem sandbox. Use standard
+    // sandbox-visible tools on Unix rather than widening its read permissions.
+    #[cfg(unix)]
+    let (verifier, verifier_args) = (
+        std::path::PathBuf::from("/bin/sh"),
+        vec!["-c", "printf %s retained | cmp -s retained.txt -"],
+    );
+    #[cfg(not(unix))]
+    let (verifier, verifier_args) = (
+        std::env::current_exe().expect("current test executable"),
+        vec!["--ignored", "--exact", "retained_file_verifier_helper"],
+    );
     fs::write(
         &task_contract,
         serde_json::to_vec_pretty(&json!({
@@ -255,10 +267,24 @@ async fn exec_run_dir_retains_an_isolated_structured_runtime_bundle() {
     .expect("task contract");
     install_mock_provider(home.path());
 
+    // Exercise embedded command dispatch with Windows' default main-stack
+    // budget on Unix too, without changing any production stack settings.
+    #[cfg(unix)]
+    let mut cli = {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("ulimit -s 1024 && exec \"$@\"")
+            .arg("exec-stack-regression")
+            .arg(env!("CARGO_BIN_EXE_golutra-agent"));
+        command
+    };
+    #[cfg(not(unix))]
+    let mut cli = Command::new(env!("CARGO_BIN_EXE_golutra-agent"));
+
     let output = tokio::time::timeout(
         Duration::from_secs(60),
-        Command::new(env!("CARGO_BIN_EXE_golutra-agent"))
-            .arg("--cwd")
+        cli.arg("--cwd")
             .arg(workspace.path())
             .arg("exec")
             .arg("--run-dir")
@@ -271,24 +297,29 @@ async fn exec_run_dir_retains_an_isolated_structured_runtime_bundle() {
             .arg("auto")
             .arg("--verify-program")
             .arg(&verifier)
-            .arg("--verify-arg")
-            .arg("--ignored")
-            .arg("--verify-arg")
-            .arg("--exact")
-            .arg("--verify-arg")
-            .arg("retained_file_verifier_helper")
+            .args(
+                verifier_args
+                    .into_iter()
+                    .flat_map(|arg| ["--verify-arg", arg]),
+            )
             .arg("write file retained.txt with content retained")
             .env("GOLUTRA_AGENT_HOME", home.path())
+            .kill_on_drop(true)
             .output(),
     )
     .await
     .expect("run-dir exec timeout")
     .expect("run-dir exec output");
 
-    assert!(
-        output.status.success(),
-        "persisted run-dir exec failed: {output:?}"
-    );
+    if !output.status.success() {
+        let evidence = export_parent.keep();
+        panic!(
+            "persisted run-dir exec failed; bundle retained at {}; stdout={}; stderr={}",
+            evidence.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
     assert_eq!(
         fs::read_to_string(workspace.path().join("retained.txt")).expect("workspace file"),
         "retained"
@@ -383,6 +414,7 @@ async fn exec_run_dir_retains_an_isolated_structured_runtime_bundle() {
 }
 
 #[test]
+#[cfg(not(unix))]
 #[ignore = "invoked by the run-dir process test as an external verifier"]
 fn retained_file_verifier_helper() {
     assert_eq!(

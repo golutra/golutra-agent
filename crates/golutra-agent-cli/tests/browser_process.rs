@@ -11,6 +11,35 @@ use tokio::{
 #[path = "../../golutra-agent-tui/src/browser_presentation.rs"]
 mod browser_presentation;
 
+#[cfg(unix)]
+#[tokio::test]
+async fn browser_command_fits_a_one_mib_main_stack() {
+    let home = tempfile::tempdir().unwrap();
+    let output = tokio::time::timeout(
+        Duration::from_secs(15),
+        Command::new("/bin/sh")
+            .arg("-c")
+            .arg("ulimit -s 1024 && exec \"$1\" browser chrome install")
+            .arg("browser-stack-regression")
+            .arg(env!("CARGO_BIN_EXE_golutra-agent"))
+            .env("GOLUTRA_AGENT_HOME", home.path())
+            .env("HOME", home.path())
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .expect("browser command timeout")
+    .expect("browser command output");
+    assert!(
+        output.status.success(),
+        "browser command exceeded the Windows-sized stack: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["transport"], "opencli");
+}
+
 fn json_report(output: &std::process::Output) -> (Value, String) {
     let raw = std::str::from_utf8(&output.stdout).unwrap();
     let report = browser_presentation::BrowserReport::parse(raw, output.status.success())

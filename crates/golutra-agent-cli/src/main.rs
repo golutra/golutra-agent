@@ -839,6 +839,12 @@ impl ReviewDecisionArg {
 
 #[tokio::main]
 async fn main() -> miette::Result<()> {
+    // Tokio's block_on keeps its root future on the main thread's stack.
+    // Heap-allocate the CLI dispatcher before entering that polling chain.
+    Box::pin(run_cli()).await
+}
+
+async fn run_cli() -> miette::Result<()> {
     // Chrome 直接启动此原生文件并传扩展 origin；在 clap/TUI 和 stdout 日志前接管。
     if let Some(origin) = std::env::args()
         .nth(1)
@@ -897,6 +903,12 @@ async fn main() -> miette::Result<()> {
         .await
         .map_err(|error| miette::miette!("{error}"));
     }
+    // Keep runtime setup and its large command dispatcher out of lightweight
+    // commands' poll frames, especially on Windows' default 1 MiB main stack.
+    Box::pin(run_runtime_command(cli)).await
+}
+
+async fn run_runtime_command(cli: Cli) -> miette::Result<()> {
     let cwd = cli
         .cwd
         .clone()
@@ -948,8 +960,12 @@ async fn main() -> miette::Result<()> {
     .map_err(|error| miette::miette!("{error}"))?;
     let session_id = resolve_session_id(cli.session_id.as_deref(), &transport)?;
 
-    let command_result: miette::Result<()> = async {
-        match cli.command {
+    let command_result: miette::Result<()> = match cli.command {
+        // Embedded execution also polls the runtime dispatcher. Keep the
+        // administrative command match off that nested call chain.
+        Command::Exec(args) => Box::pin(run_exec(&transport, args, opened_run_bundle.as_deref())).await,
+        other => Box::pin(async {
+        match other {
         Command::AppServer { .. } => unreachable!("app-server exits before runtime setup"),
         Command::Browser { .. } => unreachable!("browser exits before runtime setup"),
         Command::Plugin { .. } => unreachable!("plugin exits before runtime setup"),
@@ -972,7 +988,7 @@ async fn main() -> miette::Result<()> {
                 );
             }
         }
-        Command::Exec(args) => run_exec(&transport, args, opened_run_bundle.as_deref()).await?,
+        Command::Exec(_) => unreachable!("exec uses its own dispatch frame"),
         Command::McpServer(_) => unreachable!("mcp-server exits before runtime setup"),
         Command::Status => {
             let state = transport
@@ -2212,8 +2228,9 @@ async fn main() -> miette::Result<()> {
         }
         }
         Ok(())
-    }
-    .await;
+    })
+    .await,
+    };
     let close_result = transport
         .close()
         .await

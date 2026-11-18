@@ -8,6 +8,16 @@ use golutra_agent_protocol::pending_user_question;
 
 const EXPLICIT_COMPACTION_TOKEN_BUDGET: u64 = DEFAULT_COMPACTION_SUMMARY_TOKENS;
 
+// Box::pin(future()) alone still constructs the future in the caller. A
+// separate factory keeps large handler temporaries off the shared dispatcher
+// stack before the boxed future is polled. This matters in debug Windows CLIs.
+#[inline(never)]
+fn boxed_command_handler<F: std::future::Future>(
+    build: impl FnOnce() -> F,
+) -> std::pin::Pin<Box<F>> {
+    Box::pin(build())
+}
+
 fn queued_turn_id_from_payload(payload: &Value) -> Option<TurnId> {
     payload
         .get("turn_id")
@@ -326,6 +336,8 @@ impl RuntimeHost {
             }
             CommandClaim::Claimed { .. } => {}
         }
+        // Construct and poll only the selected handler outside this common
+        // dispatch frame. The command lock and journal still cover its lifetime.
         let result: Result<CommandAck, ClientError> = async {
             let ack = match command.kind {
                 SessionCommandKind::Create => {
@@ -380,7 +392,7 @@ impl RuntimeHost {
                 SessionCommandKind::RenameThread
                 | SessionCommandKind::ArchiveThread
                 | SessionCommandKind::DeleteThread => {
-                    self.handle_thread_metadata_command(session_id, command)
+                    boxed_command_handler(|| self.handle_thread_metadata_command(session_id, command))
                         .await?
                 }
                 SessionCommandKind::Prompt => {
@@ -391,142 +403,142 @@ impl RuntimeHost {
                             return Ok(CommandAck {command_id,accepted:false,reason:Some("execution changed; stale input was not delivered".into())});
                         }
                     }
-                    Box::pin(self.clone().handle_prompt(session_id, command)).await?
+                    boxed_command_handler(|| self.clone().handle_prompt(session_id, command)).await?
                 }
                 SessionCommandKind::UpdateQueuedTurn => {
-                    self.handle_update_queued_turn(session_id, command).await?
+                    boxed_command_handler(|| self.handle_update_queued_turn(session_id, command)).await?
                 }
                 SessionCommandKind::CancelQueuedTurn => {
-                    self.handle_cancel_queued_turn(session_id, command).await?
+                    boxed_command_handler(|| self.handle_cancel_queued_turn(session_id, command)).await?
                 }
                 SessionCommandKind::Abort if command.payload.get("child_session_id").is_some() => {
-                    Box::pin(delegation::cancel_from_parent_command(&self,session_id,&command)).await?
+                    boxed_command_handler(|| delegation::cancel_from_parent_command(&self,session_id,&command)).await?
                 }
                 SessionCommandKind::Abort => {
-                    self.handle_lane_command(session_id, &command, "abort")
+                    boxed_command_handler(|| self.handle_lane_command(session_id, &command, "abort"))
                         .await?
                 }
                 SessionCommandKind::ReconcileTask => {
-                    self.handle_reconcile_task_command(session_id, command)
+                    boxed_command_handler(|| self.handle_reconcile_task_command(session_id, command))
                         .await?
                 }
                 SessionCommandKind::Takeover => {
-                    self.handle_takeover_command(session_id, &command).await?
+                    boxed_command_handler(|| self.handle_takeover_command(session_id, &command)).await?
                 }
                 SessionCommandKind::Pause => {
-                    self.handle_lane_command(session_id, &command, "pause")
+                    boxed_command_handler(|| self.handle_lane_command(session_id, &command, "pause"))
                         .await?
                 }
                 SessionCommandKind::Resume => {
-                    self.handle_lane_command(session_id, &command, "resume")
+                    boxed_command_handler(|| self.handle_lane_command(session_id, &command, "resume"))
                         .await?
                 }
                 SessionCommandKind::Approve => {
-                    self.handle_approval_command(session_id, command, ApprovalDecision::Approved)
+                    boxed_command_handler(|| self.handle_approval_command(session_id, command, ApprovalDecision::Approved))
                         .await?
                 }
                 SessionCommandKind::Deny => {
-                    self.handle_approval_command(session_id, command, ApprovalDecision::Denied)
+                    boxed_command_handler(|| self.handle_approval_command(session_id, command, ApprovalDecision::Denied))
                         .await?
                 }
                 SessionCommandKind::AnswerQuestion => {
-                    self.handle_answer_question_command(session_id, command)
+                    boxed_command_handler(|| self.handle_answer_question_command(session_id, command))
                         .await?
                 }
                 SessionCommandKind::Compact => {
-                    self.handle_compact_command(session_id, command).await?
+                    boxed_command_handler(|| self.handle_compact_command(session_id, command)).await?
                 }
                 SessionCommandKind::MemoryRollback => {
-                    self.handle_memory_rollback_command(session_id, command)
+                    boxed_command_handler(|| self.handle_memory_rollback_command(session_id, command))
                         .await?
                 }
                 SessionCommandKind::MemoryFeedback => {
-                    self.handle_memory_feedback_command(session_id, command)
+                    boxed_command_handler(|| self.handle_memory_feedback_command(session_id, command))
                         .await?
                 }
                 SessionCommandKind::ReviewMemoryCandidate => {
-                    self.handle_review_memory_candidate_command(session_id, command)
+                    boxed_command_handler(|| self.handle_review_memory_candidate_command(session_id, command))
                         .await?
                 }
                 SessionCommandKind::ExpireMemory => {
-                    self.handle_expire_memory_command(session_id, command)
+                    boxed_command_handler(|| self.handle_expire_memory_command(session_id, command))
                         .await?
                 }
                 SessionCommandKind::RunRegression | SessionCommandKind::RunRegressionCampaign => {
                     // A regression dispatches isolated child commands while
                     // this command remains on the stack. Keep that branch's
                     // large state machine outside the common dispatcher.
-                    Box::pin(self.handle_regression_command(session_id, command)).await?
+                    boxed_command_handler(|| self.handle_regression_command(session_id, command)).await?
                 }
                 SessionCommandKind::Replay => {
-                    Box::pin(self.handle_replay_command(session_id, command)).await?
+                    boxed_command_handler(|| self.handle_replay_command(session_id, command)).await?
                 }
                 SessionCommandKind::ReviewCandidate => {
-                    self.handle_review_candidate_command(session_id, command)
+                    boxed_command_handler(|| self.handle_review_candidate_command(session_id, command))
                         .await?
                 }
                 SessionCommandKind::ApplyCandidate => {
-                    self.handle_apply_candidate_command(session_id, command)
+                    boxed_command_handler(|| self.handle_apply_candidate_command(session_id, command))
                         .await?
                 }
                 SessionCommandKind::RollbackCandidate => {
-                    self.handle_rollback_candidate_command(session_id, command)
+                    boxed_command_handler(|| self.handle_rollback_candidate_command(session_id, command))
                         .await?
                 }
                 SessionCommandKind::RecordBenchmark => {
-                    self.handle_record_benchmark_command(session_id, command)
+                    boxed_command_handler(|| self.handle_record_benchmark_command(session_id, command))
                         .await?
                 }
                 SessionCommandKind::IngestExternalEvaluation => {
-                    self.handle_external_evaluation_command(session_id, command)
+                    boxed_command_handler(|| self.handle_external_evaluation_command(session_id, command))
                         .await?
                 }
                 SessionCommandKind::CompareCounterfactual => {
-                    self.handle_compare_counterfactual_command(session_id, command)
+                    boxed_command_handler(|| self.handle_compare_counterfactual_command(session_id, command))
                         .await?
                 }
                 SessionCommandKind::PlanEvolution => {
-                    self.handle_plan_evolution_command(session_id, command)
+                    boxed_command_handler(|| self.handle_plan_evolution_command(session_id, command))
                         .await?
                 }
                 SessionCommandKind::RunEvolution => {
-                    self.handle_run_evolution_command(session_id, command)
+                    boxed_command_handler(|| self.handle_run_evolution_command(session_id, command))
                         .await?
                 }
                 SessionCommandKind::StageSkill => {
-                    self.handle_stage_skill_command(session_id, command).await?
+                    boxed_command_handler(|| self.handle_stage_skill_command(session_id, command)).await?
                 }
                 SessionCommandKind::ReviewSkill => {
-                    self.handle_review_skill_command(session_id, command)
+                    boxed_command_handler(|| self.handle_review_skill_command(session_id, command))
                         .await?
                 }
                 SessionCommandKind::InstallSkill => {
-                    self.handle_install_skill_command(session_id, command)
+                    boxed_command_handler(|| self.handle_install_skill_command(session_id, command))
                         .await?
                 }
                 SessionCommandKind::RollbackSkill => {
-                    self.handle_rollback_skill_command(session_id, command)
+                    boxed_command_handler(|| self.handle_rollback_skill_command(session_id, command))
                         .await?
                 }
                 SessionCommandKind::ProviderConfigured
                 | SessionCommandKind::ProviderAuthSubmitted => {
-                    self.handle_provider_configured_command(session_id, command)
+                    boxed_command_handler(|| self.handle_provider_configured_command(session_id, command))
                         .await?
                 }
                 SessionCommandKind::ProviderAuthCancelled => {
-                    self.handle_provider_auth_cancelled_command(session_id, command)
+                    boxed_command_handler(|| self.handle_provider_auth_cancelled_command(session_id, command))
                         .await?
                 }
                 SessionCommandKind::RunStorageMaintenance => {
-                    self.handle_storage_maintenance_command(session_id, command)
+                    boxed_command_handler(|| self.handle_storage_maintenance_command(session_id, command))
                         .await?
                 }
                 SessionCommandKind::WaitPostTaskJob => {
-                    self.handle_wait_post_task_job_command(session_id, command)
+                    boxed_command_handler(|| self.handle_wait_post_task_job_command(session_id, command))
                         .await?
                 }
                 SessionCommandKind::RetryPostTaskJob => {
-                    self.handle_retry_post_task_job_command(session_id, command)
+                    boxed_command_handler(|| self.handle_retry_post_task_job_command(session_id, command))
                         .await?
                 }
                 SessionCommandKind::Verify | SessionCommandKind::Export => {
