@@ -26,6 +26,44 @@ pub(super) fn find_on_path(name: &str) -> Option<PathBuf> {
         .find(|path| path.is_absolute() && path.is_file())
 }
 
+#[cfg(windows)]
+fn node_script_path(path: &Path) -> PathBuf {
+    use std::path::{Component, Prefix};
+
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return path.to_path_buf();
+    };
+    let mut conventional = match prefix.kind() {
+        Prefix::VerbatimDisk(drive) => PathBuf::from(format!("{}:", char::from(drive))),
+        Prefix::VerbatimUNC(server, share) => {
+            let mut root = std::ffi::OsString::from(r"\\");
+            root.push(server);
+            root.push(r"\");
+            root.push(share);
+            PathBuf::from(root)
+        }
+        _ => return path.to_path_buf(),
+    };
+    conventional.extend(components);
+    // Node's ESM entrypoint needs a conventional Windows path. Preserve the
+    // canonical target: stripping a verbatim prefix can otherwise change the
+    // meaning of reserved names or trailing dots/spaces.
+    if conventional
+        .canonicalize()
+        .is_ok_and(|canonical| canonical == path)
+    {
+        conventional
+    } else {
+        path.to_path_buf()
+    }
+}
+
+#[cfg(not(windows))]
+fn node_script_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
 impl Launcher {
     pub fn new(executable: &Path) -> Result<Self, ToolError> {
         if !executable.is_absolute() {
@@ -47,7 +85,7 @@ impl Launcher {
                 .ok_or_else(|| ToolError::Execution("OpenCLI requires Node.js >=20.18.1".into()))?;
             return Ok(Self {
                 program: node,
-                prefix: vec![path.to_string_lossy().into_owned()],
+                prefix: vec![node_script_path(&path).to_string_lossy().into_owned()],
             });
         }
         if path
@@ -70,7 +108,7 @@ impl Launcher {
         cwd: &Path,
         cancel: CancellationToken,
         timeout: Duration,
-    ) -> Result<(bool, String), ToolError> {
+    ) -> Result<(bool, String, String), ToolError> {
         if cancel.is_cancelled() {
             return Err(ToolError::Execution(
                 "opencli_cancelled before launch".into(),
@@ -97,7 +135,7 @@ impl Launcher {
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
         let operation = async {
-            let (status, out, _err) = tokio::try_join!(
+            let (status, out, err) = tokio::try_join!(
                 async { child.wait().await.map_err(super::super::state::io_error) },
                 limited_read(stdout),
                 limited_read(stderr)
@@ -106,6 +144,7 @@ impl Launcher {
                 status.success(),
                 String::from_utf8(out)
                     .map_err(|_| ToolError::Execution("OpenCLI stdout is not UTF-8".into()))?,
+                String::from_utf8_lossy(&err).into_owned(),
             ))
         };
         let result = tokio::select! {
@@ -120,11 +159,23 @@ impl Launcher {
     }
 
     pub async fn verify(&self, cwd: &Path, cancel: CancellationToken) -> Result<(), ToolError> {
-        let (ok, version) = self
+        let (ok, version, stderr) = self
             .output(&["--version".into()], cwd, cancel, Duration::from_secs(10))
             .await?;
+        if !ok {
+            let diagnostic = crate::redact_sensitive_text(&stderr).0;
+            let diagnostic = crate::bounded_text(diagnostic.trim(), 2048);
+            return Err(ToolError::Execution(format!(
+                "OpenCLI version probe failed: {}",
+                if diagnostic.is_empty() {
+                    "process exited unsuccessfully without diagnostics"
+                } else {
+                    &diagnostic
+                }
+            )));
+        }
         // 固定经过验收的 CLI 契约；不同版本不能把退出成功误判成兼容。
-        if !ok || version.trim() != "2.0.3" {
+        if version.trim() != "2.0.3" {
             return Err(ToolError::Execution("OpenCLI 2.0.3 required; run npm install -g @jackwener/opencli@2.0.3 or configure the bundled executable".into()));
         }
         Ok(())
@@ -136,7 +187,7 @@ impl Launcher {
         cwd: &Path,
         cancel: CancellationToken,
     ) -> Result<Value, ToolError> {
-        let (success, text) = self
+        let (success, text, _) = self
             .output(args, cwd, cancel, Duration::from_secs(75))
             .await?;
         let value: Value = serde_json::from_str(&text).map_err(|_| ToolError::Execution("OpenCLI did not return a valid JSON envelope; inspect browser state before retrying".into()))?;

@@ -15,6 +15,9 @@ follow [Semantic Versioning](https://semver.org/) where applicable.
 - Bound CLI and runtime dispatch stack usage with separate async handlers,
   preventing browser and embedded execution commands from overflowing Windows'
   default stack.
+- Preserve the canonical script target when launching OpenCLI through Node on
+  Windows, and distinguish a failed version probe from an incompatible version
+  with bounded, redacted diagnostics.
 
 ## [4.0.0] - 2026-11-17
 

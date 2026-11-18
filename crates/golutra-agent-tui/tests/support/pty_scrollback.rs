@@ -543,6 +543,21 @@ fn resize_during_stream_repairs_final_source_once_without_repeating_messages() {
     submit(&mut pty, &mut parser, "Resize streaming regression");
     wait_for_visible(&mut pty, &mut parser, "Paragraph 001");
     submit(&mut pty, &mut parser, "/status");
+    // The resize assertions require an executed Status message, not merely
+    // bytes written to the PTY. Under the parallel workspace suite the UI can
+    // still be processing paste/Enter when the first resize arrives.
+    let status_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let history = all_terminal_rows(&mut parser);
+        if history.contains("• Status") {
+            break;
+        }
+        assert!(
+            Instant::now() < status_deadline,
+            "status command was not processed before resizing:\n{history}"
+        );
+        parser.process(&pty.collect_for(Duration::from_millis(50)));
+    }
     for (width, height) in [(22, 12), (60, 24), (140, 30)] {
         pty.resize(width, height);
         parser.screen_mut().set_size(height, width);
