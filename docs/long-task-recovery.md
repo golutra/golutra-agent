@@ -2,6 +2,20 @@
 
 ## Contract
 
+Capacity errors use the same bounded retry budget as other transient provider
+errors. The adapter recognizes `at capacity`, `high demand` and `insufficient
+capacity` in semantic error fields, including underscore/hyphen variants, or
+affirmative capacity flags (`true`/`1`, including their string forms). False,
+null and unrelated diagnostic/input fields do not enable retries. Primary
+messages are examined independently of long secondary diagnostics. Native SSE
+and HTTP error adapters carry the same structured capacity reason.
+
+Without server retry advice, capacity waits are 5–5.5 seconds and 15–16.5 seconds
+for the two default retries. Request-specific jitter spreads concurrent agents;
+the runtime uses classified metadata rather than matching display text again.
+Cancellation, deadlines, permanent error classification and complete-response
+tool execution boundaries remain in force.
+
 A temporary connection failure keeps the current task and logical provider request alive. The user does not have to submit another prompt. This is waiting for the remote model, not offline inference. No daemon, new slash command, database migration, or separate user data directory is required.
 
 Connection retries use a 5, 10, 20, 40, 60 second schedule with 90–100% request-specific jitter and a 60 second ceiling. Only typed connection failures enter this path. The task deadline and cancellation still apply. The default governor has no total wall-clock, tool-count or cost cutoff. Explicit budgets, cancellation and verification rules still apply. Waiting counts toward an explicitly configured deadline, but not toward an explicitly configured correction no-progress time limit. Reaching the deadline is not reported as successful completion.

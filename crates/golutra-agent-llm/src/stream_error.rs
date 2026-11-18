@@ -23,8 +23,6 @@ struct ErrorEnvelope {
     response: Option<ResponseError>,
     #[serde(rename = "type")]
     kind: Option<String>,
-    code: Option<Value>,
-    message: Option<String>,
     request_id: Option<String>,
 }
 
@@ -58,18 +56,20 @@ impl StreamErrorCapture {
         }
         let error = envelope
             .error
-            .or_else(|| envelope.response.and_then(|response| response.error))
-            .or_else(|| {
-                (envelope.kind.as_deref() == Some("error")).then(|| {
-                    serde_json::json!({
-                        "code": envelope.code, "message": envelope.message,
-                    })
-                })
-            });
-        let Some(error) = error else {
+            .or_else(|| envelope.response.and_then(|response| response.error));
+        let value = if let Some(error) = error {
+            serde_json::json!({"error": error, "request_id": envelope.request_id})
+        } else if envelope.kind.as_deref() == Some("error") {
+            // Only error frames need a second, bounded parse. Keep their
+            // semantic fields (status, retry_after, capacity flags, ...), while
+            // ordinary output frames still skip all unrelated payloads.
+            let Ok(value) = serde_json::from_str::<Value>(data) else {
+                return;
+            };
+            value
+        } else {
             return;
         };
-        let value = serde_json::json!({"error": error, "request_id": envelope.request_id});
         if state.error.is_none() {
             let error = crate::provider_error_from_value(&value, Some(200), &Default::default());
             let mut metadata = error.metadata().cloned().unwrap_or_default();
