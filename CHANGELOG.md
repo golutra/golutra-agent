@@ -6,6 +6,8 @@ follow [Semantic Versioning](https://semver.org/) where applicable.
 
 ## [Unreleased]
 
+## [4.0.1] - 2026-11-18
+
 ### Fixed
 
 - Retry confirmed provider capacity errors within the existing retry budget,
@@ -413,7 +415,8 @@ This is the initial public development baseline. See the repository history
 and [architecture documentation](docs/ARCHITECTURE.md) for the implementation
 details and current compatibility boundaries.
 
-[unreleased]: https://github.com/golutra/golutra-agent/compare/v4.0.0...HEAD
+[unreleased]: https://github.com/golutra/golutra-agent/compare/v4.0.1...HEAD
+[4.0.1]: https://github.com/golutra/golutra-agent/compare/v4.0.0...v4.0.1
 [4.0.0]: https://github.com/golutra/golutra-agent/compare/v0.3.9...v4.0.0
 [0.3.9]: https://github.com/golutra/golutra-agent/compare/v0.3.8...v0.3.9
 [0.3.8]: https://github.com/golutra/golutra-agent/compare/v0.3.7...v0.3.8

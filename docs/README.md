@@ -12,7 +12,7 @@
 
 按需要选择入口：
 
-- 想升级到 4.0.0：看 [发布说明](releases/v4.0.0.md)，包括安装命令、浏览器接入及共享数据升级要求。
+- 想升级到 4.0.1：看 [发布说明](releases/v4.0.1.md)，包括安装命令、容量重试与 Windows 修复；从旧版本升级时同时阅读 [4.0.0 的共享数据升级要求](releases/v4.0.0.md#data-compatibility)。
 - 想接入自己的 Ego 浏览器：看 [Ego 浏览器工具](ego-browser.md)，包括配置、会话恢复和真实浏览器验收。
 - 想连接浏览器：看 [Chrome/OpenCLI 与 Ego 原生接入](browser-connections.md)，包括 `/connect`、官方扩展安装、会话隔离和停止。
 - 想了解后台工具、静默结果队列与自动续跑：看 [后台任务](background-tasks.md)。

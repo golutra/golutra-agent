@@ -20,8 +20,8 @@ serde.workspace = true
 futures-util.workspace = true
 chrono.workspace = true
 golutra-agent-core.workspace = true
-golutra-agent-code-intelligence = { path = "../golutra-agent-code-intelligence", version = "4.0.0" }
-golutra-agent-policy = { path = "../golutra-agent-policy", version = "4.0.0" }
+golutra-agent-code-intelligence = { path = "../golutra-agent-code-intelligence", version = "4.0.1" }
+golutra-agent-policy = { path = "../golutra-agent-policy", version = "4.0.1" }
 golutra-agent-sandbox.workspace = true
 jsonschema.workspace = true
 regex.workspace = true
