@@ -24,6 +24,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+mod capacity;
 mod genai_adapter;
 mod model_catalog;
 mod openai_responses;
@@ -437,7 +438,7 @@ pub struct ProviderErrorMetadata {
     pub stream_interrupted: bool,
     pub retry_after: Option<Duration>,
     pub request_id: Option<String>,
-    /// 错误对象任意字段命中容量不足措辞。重试等待读取此标记，不依赖对外句子是否包含原文。
+    /// 适配器从错误语义字段确认容量不足；运行时不再从展示文字反推重试原因。
     #[serde(default, skip_serializing_if = "is_false")]
     pub capacity_pressure: bool,
     /// 上游流内响应身份，与 HTTP Request ID 分开；SDK 未暴露响应头时仍可追踪。
@@ -3627,19 +3628,29 @@ fn provider_error_metadata(
     let payload_status = value.and_then(provider_error_status);
     let payload_retry_after = value.and_then(provider_error_retry_after);
     let payload_request_id = value.and_then(request_id_from_value);
+    let http_status = status.filter(|status| *status >= 400).or(payload_status);
     ProviderErrorMetadata {
         response_http_status: status,
-        http_status: status.filter(|status| *status >= 400).or(payload_status),
+        http_status,
         provider_code: value.and_then(provider_error_code),
         error_type: value.and_then(provider_error_type),
         error_detail: value.map(provider_error_message),
         retry_after: payload_retry_after.or_else(|| retry_after_from_headers(headers)),
         request_id: payload_request_id.or_else(|| request_id_from_headers(headers)),
+        capacity_pressure: !http_status
+            .is_some_and(|status| (400..500).contains(&status) && status != 429)
+            && value.is_some_and(|value| {
+                !is_permanent_provider_marker(value) && capacity::in_error(value)
+            }),
         ..ProviderErrorMetadata::default()
     }
 }
 
-fn provider_error_kind(status: Option<u16>, value: &Value) -> ProviderError {
+fn provider_error_kind(
+    status: Option<u16>,
+    value: &Value,
+    capacity_pressure: bool,
+) -> ProviderError {
     let message = provider_error_message(value);
     match status {
         Some(429) => ProviderError::RateLimited { message },
@@ -3692,7 +3703,7 @@ fn provider_error_kind(status: Option<u16>, value: &Value) -> ProviderError {
                     "503",
                     "504",
                 ],
-            ) || is_capacity_pressure(&error_text_for_matching(value))
+            ) || capacity_pressure
                 || provider_error_retry_after(value).is_some()
             {
                 ProviderError::Unavailable { message }
@@ -3702,7 +3713,6 @@ fn provider_error_kind(status: Option<u16>, value: &Value) -> ProviderError {
         }
     }
 }
-
 
 fn is_permanent_provider_marker(value: &Value) -> bool {
     let code = provider_error_code(value)
@@ -3736,54 +3746,6 @@ fn marker_text_has_any(text: &str, markers: &[&str]) -> bool {
     markers.iter().any(|marker| text.contains(marker))
 }
 
-/// 容量不足是短暂拥塞，不是请求内容错误。匹配时把字段名和下划线写法折成同一形式，
-/// 这样同一句话出现在新字段里也不需要再加分支。
-#[must_use]
-pub fn is_capacity_pressure(text: &str) -> bool {
-    let normalized = text.to_ascii_lowercase().replace(['_', '-'], " ");
-    ["at capacity", "high demand", "insufficient capacity"]
-        .iter()
-        .any(|marker| normalized.contains(marker))
-}
-
-fn error_text_for_matching(value: &Value) -> String {
-    let mut text = String::new();
-    append_error_text(value, &mut text, 0);
-    text
-}
-
-fn append_error_text(value: &Value, text: &mut String, depth: u8) {
-    if depth > 4 || text.len() >= 2_048 {
-        return;
-    }
-    match value {
-        Value::String(value) => push_match_text(text, value),
-        Value::Array(values) => {
-            for value in values.iter().take(8) {
-                append_error_text(value, text, depth.saturating_add(1));
-            }
-        }
-        Value::Object(fields) => {
-            for (key, value) in fields.iter().take(24) {
-                push_match_text(text, key);
-                append_error_text(value, text, depth.saturating_add(1));
-            }
-        }
-        _ => {}
-    }
-}
-
-fn push_match_text(text: &mut String, value: &str) {
-    if text.len() >= 2_048 || value.is_empty() {
-        return;
-    }
-    if !text.is_empty() {
-        text.push(' ');
-    }
-    let remaining = 2_048 - text.len();
-    text.extend(value.chars().take(remaining));
-}
-
 fn provider_error_from_value(
     value: &Value,
     response_status: Option<u16>,
@@ -3794,11 +3756,8 @@ fn provider_error_from_value(
     let status = response_status
         .filter(|status| *status >= 400)
         .or_else(|| provider_error_status(value));
-    let mapped = provider_error_kind(status, value);
-    let mut metadata = provider_error_metadata(response_status, headers, Some(value));
-    metadata.capacity_pressure = status.is_none()
-        && !is_permanent_provider_marker(value)
-        && is_capacity_pressure(&error_text_for_matching(value));
+    let metadata = provider_error_metadata(response_status, headers, Some(value));
+    let mapped = provider_error_kind(status, value, metadata.capacity_pressure);
     mapped.with_metadata(metadata)
 }
 

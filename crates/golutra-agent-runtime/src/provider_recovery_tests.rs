@@ -692,3 +692,126 @@ async fn real_connection_outage_soak() {
         .unwrap_or(120);
     real_offline_recovery(Duration::from_secs(seconds)).await;
 }
+
+fn capacity_provider(failures: usize) -> FaultProvider {
+    let mut provider = FaultProvider::offline(failures);
+    provider.error = ProviderError::Unavailable {
+        message: "Please try again.".into(),
+    }
+    .with_metadata(ProviderErrorMetadata {
+        capacity_pressure: true,
+        ..Default::default()
+    });
+    provider
+}
+
+#[tokio::test(start_paused = true)]
+async fn capacity_exhausts_after_two_retries() {
+    let provider = capacity_provider(usize::MAX);
+    let mut waits = Vec::new();
+    let started = Instant::now();
+    let result = ProviderSession::new(&provider, None, ProviderSessionPolicy::default())
+        .complete(
+            super::tests::request(),
+            &CancellationToken::new(),
+            &mut |event| {
+                if let ProviderSessionEvent::Recovery(recovery) = event
+                    && recovery.phase == RecoveryPhase::Waiting
+                {
+                    waits.push(recovery.delay_ms);
+                }
+            },
+        )
+        .await;
+    assert!(result.is_err());
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(waits.len(), 2);
+    assert!((5_000..=5_500).contains(&waits[0]));
+    assert!((15_000..=16_500).contains(&waits[1]));
+    assert_eq!(started.elapsed(), Duration::from_millis(waits.iter().sum()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn capacity_retry_recovers_same_request_and_resets_preview() {
+    let mut provider = capacity_provider(1);
+    provider.preview = true;
+    let original = super::tests::request();
+    let mut resets = Vec::new();
+    let (response, actual) =
+        ProviderSession::new(&provider, None, ProviderSessionPolicy::default())
+            .complete(original.clone(), &CancellationToken::new(), &mut |event| {
+                if let ProviderSessionEvent::Recovery(recovery) = event
+                    && recovery.phase == RecoveryPhase::Waiting
+                {
+                    resets.push(recovery.reset_stream);
+                }
+            })
+            .await
+            .unwrap();
+    assert!(response.message.unwrap().content.contains("完成"));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(resets, [true]);
+    assert_eq!(actual.request_id, original.request_id);
+    assert_eq!(actual.turn_id, original.turn_id);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancel_interrupts_capacity_backoff() {
+    let provider = capacity_provider(usize::MAX);
+    let cancellation = CancellationToken::new();
+    let cancel = cancellation.clone();
+    tokio::spawn(async move {
+        sleep(Duration::from_secs(1)).await;
+        cancel.cancel();
+    });
+    let started = Instant::now();
+    let result = ProviderSession::new(&provider, None, ProviderSessionPolicy::default())
+        .complete(super::tests::request(), &cancellation, &mut |_| {})
+        .await;
+    assert!(matches!(
+        result,
+        Err(ProviderSessionError::Provider(ProviderError::Cancelled))
+    ));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(started.elapsed(), Duration::from_secs(1));
+}
+
+#[tokio::test(start_paused = true)]
+async fn server_delay_overrides_capacity_schedule() {
+    let mut provider = capacity_provider(usize::MAX);
+    let mut metadata = provider.error.metadata().unwrap().clone();
+    metadata.retry_after = Some(Duration::from_secs(7));
+    provider.error = provider.error.with_metadata(metadata);
+    let started = Instant::now();
+    let result = ProviderSession::new(&provider, None, ProviderSessionPolicy::default())
+        .complete(
+            super::tests::request(),
+            &CancellationToken::new(),
+            &mut |_| {},
+        )
+        .await;
+    assert!(result.is_err());
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(started.elapsed(), Duration::from_secs(14));
+}
+
+#[tokio::test(start_paused = true)]
+async fn deadline_interrupts_capacity_backoff_without_an_extra_request() {
+    let provider = capacity_provider(usize::MAX);
+    let started = Instant::now();
+    let error = ProviderSession::new(&provider, None, ProviderSessionPolicy::default())
+        .with_deadline(Some(started + Duration::from_secs(3)))
+        .complete(
+            super::tests::request(),
+            &CancellationToken::new(),
+            &mut |_| {},
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ProviderSessionError::DeadlineExceeded { .. }
+    ));
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(started.elapsed(), Duration::from_secs(3));
+}

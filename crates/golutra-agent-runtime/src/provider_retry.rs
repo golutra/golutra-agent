@@ -70,19 +70,24 @@ pub(crate) fn retry_delay(error: &ProviderError, attempt: u32, request_seed: u64
     if let Some(server_delay) = error.retry_after() {
         return server_delay;
     }
-    if error
+    let capacity_pressure = error
         .metadata()
-        .is_some_and(|metadata| metadata.capacity_pressure)
-        || golutra_agent_llm::is_capacity_pressure(&error.to_string())
-    {
+        .is_some_and(|metadata| metadata.capacity_pressure);
+    let base = if capacity_pressure {
         // 容量不足通常会持续一段时间；短退避会立刻打到同一拥塞窗口。
-        return Duration::from_secs(if attempt <= 1 { 5 } else { 15 });
-    }
-
-    let base = backoff(attempt).as_millis() as u64;
+        if attempt <= 1 { 5_000 } else { 15_000 }
+    } else {
+        backoff(attempt).as_millis() as u64
+    };
     // ProviderRequestId 是随机且时间有序的；确定性分桶能在不引入运行时 RNG 的情况下分散请求。
     let bucket = request_seed.wrapping_add(u64::from(attempt).wrapping_mul(0x9E37_79B9)) % 21;
-    let multiplier = 90_u64 + bucket;
+    // Capacity waits start at 5/15 seconds and add up to 10% jitter; parallel
+    // children should neither retry early nor all re-enter the same window.
+    let multiplier = if capacity_pressure {
+        100 + bucket / 2
+    } else {
+        90 + bucket
+    };
     Duration::from_millis(base.saturating_mul(multiplier) / 100)
 }
 
@@ -131,5 +136,38 @@ mod tests {
         let delay = retry_delay(&error, 2, 123);
         assert!(delay >= Duration::from_millis(450));
         assert!(delay <= Duration::from_millis(550));
+    }
+
+    #[test]
+    fn capacity_backoff_is_bounded_and_spreads_parallel_requests() {
+        let error = ProviderError::Unavailable {
+            message: "Try later".into(),
+        }
+        .with_metadata(ProviderErrorMetadata {
+            capacity_pressure: true,
+            ..Default::default()
+        });
+        for (attempt, minimum, maximum) in [(1, 5_000, 5_500), (2, 15_000, 16_500)] {
+            let delays = (0..42)
+                .map(|seed| {
+                    let delay = retry_delay(&error, attempt, seed);
+                    assert_eq!(delay, retry_delay(&error, attempt, seed));
+                    assert!(
+                        (Duration::from_millis(minimum)..=Duration::from_millis(maximum))
+                            .contains(&delay)
+                    );
+                    delay
+                })
+                .collect::<std::collections::BTreeSet<_>>();
+            assert!(delays.len() > 1, "parallel requests need distinct waits");
+        }
+    }
+
+    #[test]
+    fn capacity_backoff_uses_classified_metadata_not_display_wording() {
+        let error = ProviderError::Unavailable {
+            message: "at capacity".into(),
+        };
+        assert!(retry_delay(&error, 1, 7) < Duration::from_secs(1));
     }
 }

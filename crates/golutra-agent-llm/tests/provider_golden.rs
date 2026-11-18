@@ -24,6 +24,9 @@ use tokio::{
 
 const TEST_API_KEY: &str = "golden-test-key";
 
+#[path = "provider_golden/capacity_errors.rs"]
+mod capacity_errors;
+
 fn shell_contract_request(model: &str) -> ProviderRequest {
     let registry = golutra_agent_tools::ToolRegistry::p0_default();
     let mut request = simple_request(model);
