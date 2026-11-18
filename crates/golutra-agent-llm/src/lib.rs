@@ -437,6 +437,9 @@ pub struct ProviderErrorMetadata {
     pub stream_interrupted: bool,
     pub retry_after: Option<Duration>,
     pub request_id: Option<String>,
+    /// 错误对象任意字段命中容量不足措辞。重试等待读取此标记，不依赖对外句子是否包含原文。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub capacity_pressure: bool,
     /// 上游流内响应身份，与 HTTP Request ID 分开；SDK 未暴露响应头时仍可追踪。
     pub upstream_response_id: Option<String>,
     pub attempts: Vec<ProviderAttemptError>,
@@ -469,6 +472,7 @@ impl ProviderErrorMetadata {
             && self.retry_after.is_none()
             && self.request_id.is_none()
             && self.upstream_response_id.is_none()
+            && !self.capacity_pressure
     }
 }
 
@@ -3642,31 +3646,7 @@ fn provider_error_kind(status: Option<u16>, value: &Value) -> ProviderError {
         Some(status) if (500..600).contains(&status) => ProviderError::Unavailable { message },
         Some(_) => ProviderError::Failed { message },
         None => {
-            let code = provider_error_code(value)
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            let kind = provider_error_type(value)
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            // 明确的业务分类优先于正文措辞，不能因参数错误提到 upstream 就当作服务故障。
-            if [code.as_str(), kind.as_str()].iter().any(|marker| {
-                matches!(
-                    *marker,
-                    "invalid_request"
-                        | "invalid_prompt"
-                        | "bio_policy"
-                        | "misalignment_policy_violation"
-                        | "cyber_policy_violation"
-                        | "invalid_request_error"
-                        | "invalid_argument"
-                        | "authentication_error"
-                        | "unauthenticated"
-                        | "permission_error"
-                        | "permission_denied"
-                        | "not_found"
-                        | "not_found_error"
-                )
-            }) {
+            if is_permanent_provider_marker(value) {
                 return ProviderError::Failed { message };
             }
             // 网关常用 code/type 表达瞬态错误，不能只依赖 HTTP status 或 message。
@@ -3688,30 +3668,32 @@ fn provider_error_kind(status: Option<u16>, value: &Value) -> ProviderError {
             .any(|marker| marker_text.contains(marker))
             {
                 ProviderError::RateLimited { message }
-            } else if [
-                "bad gateway",
-                "bad_gateway",
-                "gateway timeout",
-                "gateway_timeout",
-                "service unavailable",
-                "service_unavailable",
-                "temporarily unavailable",
-                "temporarily_unavailable",
-                "server error",
-                "server_error",
-                "internal server",
-                "internal_error",
-                "internal_server_error",
-                "upstream",
-                "overloaded",
-                "overload",
-                "connection reset",
-                "502",
-                "503",
-                "504",
-            ]
-            .iter()
-            .any(|marker| marker_text.contains(marker))
+            } else if marker_text_has_any(
+                &marker_text,
+                &[
+                    "bad gateway",
+                    "bad_gateway",
+                    "gateway timeout",
+                    "gateway_timeout",
+                    "service unavailable",
+                    "service_unavailable",
+                    "temporarily unavailable",
+                    "temporarily_unavailable",
+                    "server error",
+                    "server_error",
+                    "internal server",
+                    "internal_error",
+                    "internal_server_error",
+                    "upstream",
+                    "overloaded",
+                    "overload",
+                    "connection reset",
+                    "502",
+                    "503",
+                    "504",
+                ],
+            ) || is_capacity_pressure(&error_text_for_matching(value))
+                || provider_error_retry_after(value).is_some()
             {
                 ProviderError::Unavailable { message }
             } else {
@@ -3719,6 +3701,87 @@ fn provider_error_kind(status: Option<u16>, value: &Value) -> ProviderError {
             }
         }
     }
+}
+
+
+fn is_permanent_provider_marker(value: &Value) -> bool {
+    let code = provider_error_code(value)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let kind = provider_error_type(value)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    // 明确的业务分类优先于正文措辞，不能因参数错误提到 upstream 就当作服务故障。
+    [code.as_str(), kind.as_str()].iter().any(|marker| {
+        matches!(
+            *marker,
+            "invalid_request"
+                | "invalid_prompt"
+                | "bio_policy"
+                | "misalignment_policy_violation"
+                | "cyber_policy_violation"
+                | "invalid_request_error"
+                | "invalid_argument"
+                | "authentication_error"
+                | "unauthenticated"
+                | "permission_error"
+                | "permission_denied"
+                | "not_found"
+                | "not_found_error"
+        )
+    })
+}
+
+fn marker_text_has_any(text: &str, markers: &[&str]) -> bool {
+    markers.iter().any(|marker| text.contains(marker))
+}
+
+/// 容量不足是短暂拥塞，不是请求内容错误。匹配时把字段名和下划线写法折成同一形式，
+/// 这样同一句话出现在新字段里也不需要再加分支。
+#[must_use]
+pub fn is_capacity_pressure(text: &str) -> bool {
+    let normalized = text.to_ascii_lowercase().replace(['_', '-'], " ");
+    ["at capacity", "high demand", "insufficient capacity"]
+        .iter()
+        .any(|marker| normalized.contains(marker))
+}
+
+fn error_text_for_matching(value: &Value) -> String {
+    let mut text = String::new();
+    append_error_text(value, &mut text, 0);
+    text
+}
+
+fn append_error_text(value: &Value, text: &mut String, depth: u8) {
+    if depth > 4 || text.len() >= 2_048 {
+        return;
+    }
+    match value {
+        Value::String(value) => push_match_text(text, value),
+        Value::Array(values) => {
+            for value in values.iter().take(8) {
+                append_error_text(value, text, depth.saturating_add(1));
+            }
+        }
+        Value::Object(fields) => {
+            for (key, value) in fields.iter().take(24) {
+                push_match_text(text, key);
+                append_error_text(value, text, depth.saturating_add(1));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn push_match_text(text: &mut String, value: &str) {
+    if text.len() >= 2_048 || value.is_empty() {
+        return;
+    }
+    if !text.is_empty() {
+        text.push(' ');
+    }
+    let remaining = 2_048 - text.len();
+    text.extend(value.chars().take(remaining));
 }
 
 fn provider_error_from_value(
@@ -3732,11 +3795,11 @@ fn provider_error_from_value(
         .filter(|status| *status >= 400)
         .or_else(|| provider_error_status(value));
     let mapped = provider_error_kind(status, value);
-    mapped.with_metadata(provider_error_metadata(
-        response_status,
-        headers,
-        Some(value),
-    ))
+    let mut metadata = provider_error_metadata(response_status, headers, Some(value));
+    metadata.capacity_pressure = status.is_none()
+        && !is_permanent_provider_marker(value)
+        && is_capacity_pressure(&error_text_for_matching(value));
+    mapped.with_metadata(metadata)
 }
 
 fn provider_credential_error(error: golutra_agent_auth::AuthError) -> ProviderError {
