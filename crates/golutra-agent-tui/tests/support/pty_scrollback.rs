@@ -1738,11 +1738,21 @@ fn narration_and_real_tool_results_remain_in_order_without_raw_file_previews() {
         vt100::MouseProtocolMode::None
     );
     pty.write(b"\x0f");
-    parser.process(&pty.collect_for(Duration::from_millis(200)));
+    // Synchronize on the opened pane before navigating. A fixed 200/300 ms
+    // collection can end before the CI runner has handled or drawn either key.
+    wait_for_visible(&mut pty, &mut parser, "Tool details");
+    assert!(
+        parser.screen().alternate_screen(),
+        "{}",
+        parser.screen().contents()
+    );
     pty.write(b"\x1b[D");
-    parser.process(&pty.collect_for(Duration::from_millis(300)));
-    assert!(parser.screen().contents().contains("first.txt"));
-    assert!(!parser.screen().contents().contains("second.txt"));
+    wait_for_visible(&mut pty, &mut parser, "first.txt");
+    assert!(
+        !parser.screen().contents().contains("second.txt"),
+        "{}",
+        parser.screen().contents()
+    );
     pty.write(b"\x1b");
     parser.process(&pty.collect_for(Duration::from_millis(300)));
     submit(&mut pty, &mut parser, "/quit");
