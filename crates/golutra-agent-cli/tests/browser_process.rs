@@ -314,7 +314,9 @@ async fn chrome_install_points_to_opencli_without_registering_legacy_host() {
 #[tokio::test]
 async fn opencli_connect_saves_validated_profile_and_version_failure_keeps_previous_config() {
     let root = tempfile::tempdir().unwrap();
-    let executable = root.path().join("opencli.mjs");
+    let scripts = root.path().join("OpenCLI scripts 测试");
+    std::fs::create_dir(&scripts).unwrap();
+    let executable = scripts.join("opencli.mjs");
     let fixture = include_str!("../../golutra-agent-tools/src/browser/opencli/fixture.mjs");
     std::fs::write(&executable, fixture).unwrap();
     let run = || {
@@ -348,6 +350,22 @@ async fn opencli_connect_saves_validated_profile_and_version_failure_keeps_previ
     let failed = run().output().await.unwrap();
     assert!(!failed.status.success());
     assert!(String::from_utf8_lossy(&failed.stderr).contains("OpenCLI 2.0.3 required"));
+    assert_eq!(
+        saved,
+        std::fs::read(root.path().join("browser.json")).unwrap()
+    );
+    std::fs::write(
+        &executable,
+        "console.error('fixture launch failed: api_key=fixture-private-key'); process.exit(7);",
+    )
+    .unwrap();
+    let failed = run().output().await.unwrap();
+    assert!(!failed.status.success());
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(stderr.contains("OpenCLI version probe failed"));
+    assert!(stderr.contains("fixture launch failed"));
+    assert!(!stderr.contains("fixture-private-key"));
+    assert!(!stderr.contains("2.0.3 required"));
     assert_eq!(
         saved,
         std::fs::read(root.path().join("browser.json")).unwrap()
