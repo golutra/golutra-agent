@@ -12,6 +12,9 @@ follow [Semantic Versioning](https://semver.org/) where applicable.
   using 5/15 second backoff with request-specific jitter and server retry advice
   taking precedence. Preserve capacity signals across SSE and HTTP adapters,
   without treating false flags, echoed input or unrelated diagnostics as errors.
+- Bound CLI and runtime dispatch stack usage with separate async handlers,
+  preventing browser and embedded execution commands from overflowing Windows'
+  default stack.
 
 ## [4.0.0] - 2026-11-17
 
