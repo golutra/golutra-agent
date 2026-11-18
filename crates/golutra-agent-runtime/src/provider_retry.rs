@@ -70,6 +70,14 @@ pub(crate) fn retry_delay(error: &ProviderError, attempt: u32, request_seed: u64
     if let Some(server_delay) = error.retry_after() {
         return server_delay;
     }
+    if error
+        .metadata()
+        .is_some_and(|metadata| metadata.capacity_pressure)
+        || golutra_agent_llm::is_capacity_pressure(&error.to_string())
+    {
+        // 容量不足通常会持续一段时间；短退避会立刻打到同一拥塞窗口。
+        return Duration::from_secs(if attempt <= 1 { 5 } else { 15 });
+    }
 
     let base = backoff(attempt).as_millis() as u64;
     // ProviderRequestId 是随机且时间有序的；确定性分桶能在不引入运行时 RNG 的情况下分散请求。
