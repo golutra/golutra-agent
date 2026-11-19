@@ -605,6 +605,9 @@ pub fn slash_command_candidates(input: &str) -> Vec<SlashCommandCandidate> {
 
     let tokens = input.split_whitespace().collect::<Vec<_>>();
     let first_token = tokens.first().copied().unwrap_or("/");
+    if first_token != "/" && !looks_like_slash_command_name(first_token) {
+        return Vec::new();
+    }
     if tokens.len() > 2 || (tokens.len() > 1 && input.ends_with(char::is_whitespace)) {
         return Vec::new();
     }
@@ -642,6 +645,21 @@ pub fn slash_command_candidates(input: &str) -> Vec<SlashCommandCandidate> {
         });
     }
     suggestions.into_iter().take(5).collect()
+}
+
+fn looks_like_slash_command_name(token: &str) -> bool {
+    let Some(name) = token.strip_prefix('/') else {
+        return false;
+    };
+    if name == "?" {
+        return true;
+    }
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
 }
 
 fn matching_hints(
@@ -682,6 +700,11 @@ pub fn parse_slash_input(input: &str) -> SlashInput {
     let Some(command) = tokens.first().map(|value| value.as_str()) else {
         return SlashInput::Empty;
     };
+    // 命令名只有 `/?`，或 `/` 加 ASCII 字母开头、后接字母数字和连字符。
+    // 路径、扩展名、标点、下划线都不是命令，原样交给模型，避免再报 unknown slash command。
+    if !looks_like_slash_command_name(command) {
+        return SlashInput::Prompt(trimmed.to_owned());
+    }
     match command {
         "/connect"
             if tokens.len() <= 2
@@ -1465,6 +1488,39 @@ mod tests {
             parse_slash_input("read README.md"),
             SlashInput::Prompt("read README.md".to_owned())
         );
+    }
+
+    #[test]
+    fn slash_parser_sends_non_command_shapes_as_prompts() {
+        let path = "/Users/monkeyz/Downloads/往来账供应商信息维护和短信发送功能开发需求";
+        let with_note = format!("{path} 请按这个目录开发");
+        for input in [
+            path,
+            "/tmp/build.log",
+            "/var/log/syslog",
+            "/README.md",
+            "/**",
+            "/commit:",
+            "/fix_issue",
+            "/--",
+            "//server/share/notes.md",
+            with_note.as_str(),
+        ] {
+            assert_eq!(
+                parse_slash_input(input),
+                SlashInput::Prompt(input.to_owned()),
+                "{input}"
+            );
+            assert!(slash_command_candidates(input).is_empty(), "{input}");
+        }
+        assert_eq!(
+            parse_slash_input("/help"),
+            SlashInput::Command(SlashCommand::Help)
+        );
+        assert!(matches!(
+            parse_slash_input("/does-not-exist"),
+            SlashInput::Error(error) if error.contains("unknown slash command")
+        ));
     }
 
     #[test]
